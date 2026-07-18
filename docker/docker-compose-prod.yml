@@ -1,0 +1,108 @@
+services:
+  user-service-db:
+    image: surrealdb/surrealdb:main
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../schemas/user-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
+
+  booking-service-db:
+    image: surrealdb/surrealdb:main
+    ports:
+      - "8001:8000"
+    volumes:
+      - ../schemas/booking-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
+
+  spot-service-db:
+    image: surrealdb/surrealdb:main
+    ports:
+      - "8002:8000"
+    volumes:
+      - ../schemas/spot-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
+
+  user-service:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      args:
+        SERVICE: user-service
+    environment:
+      SURREALDB_ADDR: user-service-db:8000
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRATION: ${JWT_EXPIRATION}
+      REFRESH_TOKEN_EXPIRATION: ${REFRESH_TOKEN_EXPIRATION}
+    depends_on:
+      user-service-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  booking-service:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      args:
+        SERVICE: booking-service
+    environment:
+      SURREALDB_ADDR: booking-service-db:8000
+      JWT_SECRET: ${JWT_SECRET}
+    depends_on:
+      booking-service-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  spot-service:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      args:
+        SERVICE: spot-service
+    environment:
+      SURREALDB_ADDR: spot-service-db:8000
+      JWT_SECRET: ${JWT_SECRET}
+      LOCATIONIQ_API_KEY: ${LOCATIONIQ_API_KEY}
+    volumes:
+      - spot-uploads:/app/uploads
+    depends_on:
+      spot-service-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Single origin for every client (browser + tauri): serves the built SPA and
+  # reverse-proxies /api/* to the 3 Rust services by their compose service names
+  # over the shared bridge network. Paths are relative to this file's dir.
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../apps/frontend/dist:/srv/dist:ro
+    depends_on:
+      - user-service
+      - booking-service
+      - spot-service
+
+volumes:
+  spot-uploads:

@@ -1,0 +1,7 @@
+**/target/
+**/node_modules/
+.git/
+**/.env
+apps/frontend/dist/
+apps/frontend/src-tauri/gen/
+docker/

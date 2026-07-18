@@ -1,0 +1,25 @@
+[package]
+name = "spot-service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+surrealdb = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+axum-extra = { workspace = true }
+cookie = { workspace = true }
+axum-reverse-proxy = { workspace = true }
+geo = { workspace = true }
+tzf-rs = { workspace = true }
+reqwest = { workspace = true }
+dotenvy = { workspace = true }
+garde = { workspace = true }
+
+shared = { path = "../../../shared" }

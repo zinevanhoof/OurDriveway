@@ -1,0 +1,53 @@
+services:
+  user-service-db:
+    image: surrealdb/surrealdb:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../schemas/user-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
+
+  booking-service-db:
+    image: surrealdb/surrealdb:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - ../schemas/booking-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
+
+  spot-service-db:
+    image: surrealdb/surrealdb:latest
+    ports:
+      - "8002:8000"
+    volumes:
+      - ../schemas/spot-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
+
+  # Single origin for every client (browser + tauri): serves the built SPA and
+  # reverse-proxies /api/* to the 3 Rust services by their compose service names
+  # over the shared bridge network. Paths are relative to this file's dir.
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: "host"
+    volumes:
+      - ./Caddyfile-mobile:/etc/caddy/Caddyfile:ro
+      - ../apps/frontend/dist:/srv/dist:ro

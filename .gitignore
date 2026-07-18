@@ -1,0 +1,5 @@
+/target
+/.vscode
+.claude
+Cargo.lock
+*.env

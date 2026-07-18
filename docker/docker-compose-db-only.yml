@@ -1,0 +1,42 @@
+services:
+  user-service-db:
+    image: surrealdb/surrealdb:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../schemas/user-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
+
+  booking-service-db:
+    image: surrealdb/surrealdb:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - ../schemas/booking-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
+
+  spot-service-db:
+    image: surrealdb/surrealdb:latest
+    ports:
+      - "8002:8000"
+    volumes:
+      - ../schemas/spot-schema.surql:/schema.surql:ro
+    command:
+      - start
+      - --log=trace
+      - --user=root
+      - --pass=root
+      - --import-file
+      - /schema.surql
