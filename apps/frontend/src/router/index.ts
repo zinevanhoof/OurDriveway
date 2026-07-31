@@ -1,24 +1,18 @@
 import HomeView from "@/views/HomeView.vue";
 import { createWebHistory, createRouter } from "vue-router";
 import type { Component } from "vue";
-import HeaderNotification from "@/components/header/HeaderNotification.vue";
 import ProfileView from "@/views/ProfileView.vue";
 import SearchView from "@/views/SearchView.vue";
-import HeaderAddSpot from "@/components/header/HeaderAddSpot.vue";
 import LoginView from "@/views/LoginView.vue";
 import { useAuthStore } from "@/stores/auth";
-import HeaderLogout from "@/components/header/HeaderLogout.vue";
 import SpotsView from "@/views/SpotsView.vue";
 import DetailedSpotViewOwned from "@/views/DetailedSpotViewOwned.vue";
-
-type HeaderAction = {
-  component: Component;
-  props?: Record<string, any>;
-};
+import MobileHomeHeader from "@/components/header/MobileHomeHeader.vue";
+import MobileProfileHeader from "@/components/header/MobileProfileHeader.vue";
+import AddSpotView from "@/views/AddSpotView.vue";
 
 export type RouteMeta = {
-  title: string;
-  headerActions: HeaderAction[];
+  header: Component | null;
   requiresAuth: boolean;
 };
 
@@ -28,12 +22,7 @@ const routes = [
     name: "home",
     component: HomeView,
     meta: {
-      title: "Home",
-      headerActions: [
-        {
-          component: HeaderNotification,
-        },
-      ],
+      header: MobileHomeHeader,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -42,8 +31,7 @@ const routes = [
     name: "login",
     component: LoginView,
     meta: {
-      title: "Login",
-      headerActions: [],
+      header: null,
       requiresAuth: false,
     } satisfies RouteMeta,
   },
@@ -52,15 +40,16 @@ const routes = [
     name: "spots",
     component: SpotsView,
     meta: {
-      title: "Parking spots",
-      headerActions: [
-        {
-          component: HeaderAddSpot,
-        },
-        {
-          component: HeaderNotification,
-        },
-      ],
+      header: null,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    path: "/spot/add",
+    name: "spot-add",
+    component: AddSpotView,
+    meta: {
+      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -70,12 +59,7 @@ const routes = [
     component: DetailedSpotViewOwned,
     props: true,
     meta: {
-      title: "Parking spot",
-      headerActions: [
-        {
-          component: HeaderNotification,
-        },
-      ],
+      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -84,15 +68,7 @@ const routes = [
     name: "profile",
     component: ProfileView,
     meta: {
-      title: "Profile",
-      headerActions: [
-        {
-          component: HeaderNotification,
-        },
-        {
-          component: HeaderLogout,
-        },
-      ],
+      header: MobileProfileHeader,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -101,12 +77,7 @@ const routes = [
     name: "search",
     component: SearchView,
     meta: {
-      title: "Search parking spots",
-      headerActions: [
-        {
-          component: HeaderNotification,
-        },
-      ],
+      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },

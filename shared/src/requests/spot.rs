@@ -13,12 +13,14 @@ pub struct CreateSpotRequest {
     pub title: String,
     #[garde(inner(length(min = 20, max = 100)))]
     pub description: Option<String>,
+    /// EUR cents, integer. The client sends cents so no float ever reaches the
+    /// money path — the form still collects euros and converts on submit.
     #[garde(custom(is_positive))]
-    pub price_per_hour: f64,
+    pub price_per_hour_cents: i64,
 
     #[garde(dive)]
     pub address: AddressRequest,
-    #[garde(dive)]
+    #[garde(dive, custom(has_any_slot))]
     pub availability: AvailabilityRequest,
 }
 
@@ -77,8 +79,30 @@ pub struct TimeSlotRequest {
     pub end: String,
 }
 
-fn is_positive(value: &f64, _: &()) -> garde::Result {
-    require(*value > 0.0, "Price per hour must be greater than 0")
+fn is_positive(value: &i64, _: &()) -> garde::Result {
+    require(*value > 0, "Price per hour must be greater than 0")
+}
+
+/// A spot with no slots at all can never be booked, so at least one weekly or
+/// one-off slot is required. Mirrors the same guard in AddSpotView.
+fn has_any_slot(value: &AvailabilityRequest, _: &()) -> garde::Result {
+    let w = &value.weekly;
+    let weekly = [
+        &w.monday,
+        &w.tuesday,
+        &w.wednesday,
+        &w.thursday,
+        &w.friday,
+        &w.saturday,
+        &w.sunday,
+    ]
+    .iter()
+    .any(|slots| !slots.is_empty());
+
+    require(
+        weekly || value.single.values().any(|slots| !slots.is_empty()),
+        "Add at least one availability slot.",
+    )
 }
 
 /// Full mirror of the frontend weekday-slot rules: `HH:MM`, 30-minute
@@ -203,11 +227,11 @@ mod tests {
         }
     }
 
-    fn req(price: f64, weekly_monday: Vec<TimeSlotRequest>) -> CreateSpotRequest {
+    fn req(price_cents: i64, weekly_monday: Vec<TimeSlotRequest>) -> CreateSpotRequest {
         CreateSpotRequest {
             title: "A valid spot title".into(),
             description: Some("A description that is comfortably long enough.".into()),
-            price_per_hour: price,
+            price_per_hour_cents: price_cents,
             address: AddressRequest {
                 line1: "1 Main St".into(),
                 line2: None,
@@ -234,24 +258,40 @@ mod tests {
 
     #[test]
     fn valid_request_passes() {
-        assert!(req(5.0, vec![slot("08:00", "10:00")]).validate().is_ok());
+        assert!(req(500, vec![slot("08:00", "10:00")]).validate().is_ok());
     }
 
     #[test]
     fn rejects_non_positive_price() {
-        assert!(req(0.0, vec![]).validate().is_err());
+        // Needs a slot, otherwise `has_any_slot` would fail it regardless of price.
+        assert!(req(0, vec![slot("08:00", "10:00")]).validate().is_err());
+    }
+
+    #[test]
+    fn rejects_availability_without_any_slot() {
+        assert!(req(500, vec![]).validate().is_err());
+    }
+
+    #[test]
+    fn accepts_availability_with_only_a_single_date() {
+        let mut r = req(500, vec![]);
+        let tomorrow = (Utc::now() + chrono::Duration::days(1)).date_naive();
+        r.availability
+            .single
+            .insert(tomorrow.to_string(), vec![slot("08:00", "10:00")]);
+        assert!(r.validate().is_ok());
     }
 
     #[test]
     fn rejects_malformed_time() {
-        assert!(req(5.0, vec![slot("08:15", "10:00")]).validate().is_err()); // not a 30-min increment
-        assert!(req(5.0, vec![slot("25:00", "26:00")]).validate().is_err()); // out of range
+        assert!(req(500, vec![slot("08:15", "10:00")]).validate().is_err()); // not a 30-min increment
+        assert!(req(500, vec![slot("25:00", "26:00")]).validate().is_err()); // out of range
     }
 
     #[test]
     fn rejects_overlapping_slots() {
         assert!(
-            req(5.0, vec![slot("08:00", "10:00"), slot("09:00", "11:00")])
+            req(500, vec![slot("08:00", "10:00"), slot("09:00", "11:00")])
                 .validate()
                 .is_err()
         );
@@ -259,7 +299,7 @@ mod tests {
 
     #[test]
     fn rejects_past_single_date() {
-        let mut r = req(5.0, vec![]);
+        let mut r = req(500, vec![]);
         r.availability
             .single
             .insert("2000-01-01".into(), vec![slot("08:00", "10:00")]);

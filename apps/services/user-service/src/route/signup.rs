@@ -7,7 +7,10 @@ pub async fn signup(
     State(state): State<AppState>,
     Valid(req): Valid<SignupRequest>,
 ) -> MyResult<()> {
-    state.user_service.signup(&req.email, &req.password).await?;
+    state
+        .user_service
+        .signup(&req.first_name, &req.last_name, &req.email, &req.password)
+        .await?;
 
     Ok(())
 }

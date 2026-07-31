@@ -3,23 +3,33 @@ import { cacheExchange } from "@urql/exchange-graphcache";
 import { authExchange } from "@urql/exchange-auth";
 import { useAuthStore } from "@/stores/auth";
 import { refreshAccessToken } from "@/api/refresh";
+import { awaitSeqHeader } from "@/lib/awaitSeq";
 
-export type Service = "user" | "booking" | "spot";
-
-// Each service has its own GraphQL endpoint. One client routes per operation
-// via context.url (see useServiceQuery), falling back to this default.
-export const graphql = (s: Service) => `/api/${s}/graphql`;
+// Every read comes from the view service: one combined database, projected from
+// all the event streams, with real record links so queries can nest. The
+// per-service GraphQL endpoints still exist but nothing points at them.
+export const GRAPHQL_URL = "/api/view/graphql";
 
 export const urqlClient = new Client({
-  url: graphql("spot"),
+  url: GRAPHQL_URL,
   // urql defaults to GET-for-queries ("within-url-limit"); SurrealDB's GraphQL
   // endpoint only accepts POST with a JSON body, so force POST.
   preferGetMethod: false,
+  // Reads are served from an eventually-consistent projection, so carry the
+  // position of this client's newest write and let view-service block until its
+  // projector has applied it. No-ops once the projector is past that position.
+  fetchOptions: () => ({ headers: awaitSeqHeader() }),
   exchanges: [
-    // `address` is embedded on a spot (no own id), so it can't be normalized.
-    // Return null to embed it on the parent entity instead of keying it.
+    // `address` and `location` are embedded on a spot (no own id), so they
+    // can't be normalized. Return null to embed them on the parent entity
+    // instead of keying them.
     cacheExchange({
-      keys: { spot_address: () => null },
+      keys: {
+        spot_address: () => null,
+        GeometryPoint: () => null,
+        spot_availability: () => null,
+        user: () => null,
+      },
     }),
     authExchange(async (utils) => ({
       addAuthToOperation(operation) {

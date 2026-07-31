@@ -1,12 +1,14 @@
 use std::sync::OnceLock;
 
+use async_nats::jetstream::Context;
 use geo::Point;
 use shared::error::myerror::{ContextExt, MyResult};
-use shared::{domain_models::spot::CreateSpot, requests::spot::CreateSpotRequest};
-use surrealdb::types::Geometry;
+use shared::events::spot::{SpotCreated, SpotEvent};
+use shared::events::{Envelope, shard_of, spot_subject};
+use shared::requests::spot::CreateSpotRequest;
 use tzf_rs::DefaultFinder;
+use uuid::Uuid;
 
-use crate::repository::spot_repository::SpotRepository;
 use crate::service::locationiq;
 
 /// IANA timezone name for a point. `lng`/`lat` order (geo `Point`: x = lng,
@@ -22,16 +24,29 @@ fn timezone_for(lng: f64, lat: f64) -> String {
     }
 }
 
+/// Write side. Validates, then publishes — it never touches the database.
+///
+/// The event is the commit: this instance's projector applies it a moment later,
+/// as does every other instance's. Writing locally *and* publishing would be a
+/// dual write with no atomicity, and the copies drift the first time one fails.
 pub struct SpotService {
-    pub spot_repository: SpotRepository,
+    pub js: Context,
+}
+
+pub struct Created {
+    pub spot_id: Uuid,
+    /// Stream sequence the event landed at — returned to the client so a
+    /// follow-up read can wait for its own write to be projected.
+    pub seq: u64,
 }
 
 impl SpotService {
     pub async fn create_spot(
         &self,
         request: CreateSpotRequest,
+        owner_id: String,
         images: Vec<String>,
-    ) -> MyResult<()> {
+    ) -> MyResult<Created> {
         // Independently geocode the submitted address (never trust client coords).
         // No confident match -> reject; the frontend renders `detail` from 422s.
         let (lng, lat) = locationiq::geocode(&request.address.formatted)
@@ -41,13 +56,35 @@ impl SpotService {
                 "We couldn't locate that address. Please check the fields.",
             ))?;
         let point = Point::new(lng, lat);
-        let timezone = timezone_for(point.x(), point.y());
-        let location = Geometry::Point(point);
-        self.spot_repository
-            .create_spot(CreateSpot::from((request, images, location, timezone)))
-            .await?;
 
-        Ok(())
+        // Id and shard are minted here, before publishing. A database-generated id
+        // would differ on every replica applying this same event.
+        let spot_id = Uuid::now_v7();
+        let shard = shard_of(&spot_id);
+
+        let event = SpotEvent::Created(SpotCreated {
+            spot_id,
+            shard: shard.clone(),
+            owner_id: owner_id.clone(),
+            title: request.title,
+            description: request.description,
+            price_per_hour_cents: request.price_per_hour_cents,
+            images,
+            lng: point.x(),
+            lat: point.y(),
+            address: request.address.into(),
+            availability: request.availability.into(),
+            timezone: timezone_for(point.x(), point.y()),
+        });
+
+        let seq = bus::publish(
+            &self.js,
+            spot_subject(&shard, &spot_id),
+            &Envelope::new(event, Some(owner_id)),
+        )
+        .await?;
+
+        Ok(Created { spot_id, seq })
     }
 }
 

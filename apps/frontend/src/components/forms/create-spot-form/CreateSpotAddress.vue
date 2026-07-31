@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { useDebounceFn } from '@vueuse/core'
-import type { AcceptableValue } from 'reka-ui'
 import { Field as VeeField } from 'vee-validate'
 import {
     Field,
@@ -20,11 +19,12 @@ import {
     ComboboxEmpty,
 } from '@/components/ui/combobox'
 import { suggestAddress } from '@/api/address'
-import type { Address } from '@/types/requests/CreateSpotRequest'
+import type { Address } from '@/types/domain/spot'
+import { AcceptableValue } from 'reka-ui';
 
-// setValues comes from the parent vee-validate <Form> slot; picking a suggestion
-// fills every address.* field in one shot.
-const props = defineProps<{ setValues: (values: Record<string, any>) => void }>()
+// setValues comes from the parent's useForm; picking a suggestion fills every
+// address.* field in one shot.
+const props = defineProps<{ setValues: (values: Record<string, any>, shouldValidate?: boolean) => void }>()
 
 const term = ref('')
 const items = ref<Address[]>([])
@@ -52,7 +52,6 @@ watch(term, (q) => {
 })
 
 const onSelect = (value: AcceptableValue) => {
-    if (!value || typeof value !== 'object') return
     const addr = value as Address
     props.setValues({
         address: {
@@ -62,9 +61,8 @@ const onSelect = (value: AcceptableValue) => {
             postalCode: addr.postalCode,
             region: addr.region ?? undefined,
             country: addr.country,
-            formatted: addr.formatted,
         },
-    })
+    }, false)
     suppress = true
     term.value = addr.formatted
     items.value = []
@@ -73,15 +71,13 @@ const onSelect = (value: AcceptableValue) => {
 </script>
 
 <template>
-    <FieldGroup>
-        <Field>
-            <FieldLabel for="address-search">
-                Search address
-            </FieldLabel>
+    <FieldGroup class="gap-4">
+        <div class="font-bold">Address</div>
+        <Field class="gap-1">
             <Combobox v-model:open="open" :ignore-filter="true" :reset-search-term-on-blur="false"
                 @update:model-value="onSelect">
-                <ComboboxAnchor>
-                    <ComboboxInput id="address-search" v-model="term" placeholder="Start typing your address…" />
+                <ComboboxAnchor class="bg-card rounded-md">
+                    <ComboboxInput id="address-search" v-model="term" placeholder="Search your address" />
                 </ComboboxAnchor>
                 <ComboboxList>
                     <ComboboxViewport>
@@ -98,69 +94,73 @@ const onSelect = (value: AcceptableValue) => {
         </Field>
 
         <VeeField v-slot="{ componentField, errors }" name="address.line1">
-            <Field :data-invalid="!!errors.length">
+            <Field :data-invalid="!!errors.length" class="gap-1">
                 <FieldLabel for="address.line1">
                     Line 1
                 </FieldLabel>
                 <Input id="address.line1" v-bind="componentField" placeholder="Line 1" autocomplete="off"
-                    :aria-invalid="!!errors.length" />
+                    :aria-invalid="!!errors.length" class="bg-card" />
                 <FieldError v-if="errors.length" :errors="errors" />
             </Field>
         </VeeField>
 
         <VeeField v-slot="{ componentField, errors }" name="address.line2">
-            <Field :data-invalid="!!errors.length">
+            <Field :data-invalid="!!errors.length" class="gap-1">
                 <FieldLabel for="address.line2">
                     Line 2
                 </FieldLabel>
                 <Input id="address.line2" v-bind="componentField" placeholder="Line 2" autocomplete="off"
-                    :aria-invalid="!!errors.length" />
+                    :aria-invalid="!!errors.length" class="bg-card" />
                 <FieldError v-if="errors.length" :errors="errors" />
             </Field>
         </VeeField>
 
-        <VeeField v-slot="{ componentField, errors }" name="address.city">
-            <Field :data-invalid="!!errors.length">
-                <FieldLabel for="address.city">
-                    City
-                </FieldLabel>
-                <Input id="address.city" v-bind="componentField" placeholder="City" autocomplete="off"
-                    :aria-invalid="!!errors.length" />
-                <FieldError v-if="errors.length" :errors="errors" />
-            </Field>
-        </VeeField>
+        <div class="flex gap-4">
+            <VeeField v-slot="{ componentField, errors }" name="address.city">
+                <Field :data-invalid="!!errors.length" class="gap-1">
+                    <FieldLabel for="address.city">
+                        City
+                    </FieldLabel>
+                    <Input id="address.city" v-bind="componentField" placeholder="City" autocomplete="off"
+                        :aria-invalid="!!errors.length" class="bg-card" />
+                    <FieldError v-if="errors.length" :errors="errors" />
+                </Field>
+            </VeeField>
 
-        <VeeField v-slot="{ componentField, errors }" name="address.postalCode">
-            <Field :data-invalid="!!errors.length">
-                <FieldLabel for="address.postalCode">
-                    Postal Code
-                </FieldLabel>
-                <Input id="address.postalCode" v-bind="componentField" placeholder="Postal Code" autocomplete="off"
-                    :aria-invalid="!!errors.length" />
-                <FieldError v-if="errors.length" :errors="errors" />
-            </Field>
-        </VeeField>
+            <VeeField v-slot="{ componentField, errors }" name="address.postalCode">
+                <Field :data-invalid="!!errors.length" class="gap-1">
+                    <FieldLabel for="address.postalCode">
+                        Postal Code
+                    </FieldLabel>
+                    <Input id="address.postalCode" v-bind="componentField" placeholder="Postal Code" autocomplete="off"
+                        :aria-invalid="!!errors.length" class="bg-card" />
+                    <FieldError v-if="errors.length" :errors="errors" />
+                </Field>
+            </VeeField>
+        </div>
 
-        <VeeField v-slot="{ componentField, errors }" name="address.region">
-            <Field :data-invalid="!!errors.length">
-                <FieldLabel for="address.region">
-                    Region
-                </FieldLabel>
-                <Input id="address.region" v-bind="componentField" placeholder="Region" autocomplete="off"
-                    :aria-invalid="!!errors.length" />
-                <FieldError v-if="errors.length" :errors="errors" />
-            </Field>
-        </VeeField>
+        <div class="flex gap-4">
+            <VeeField v-slot="{ componentField, errors }" name="address.region">
+                <Field :data-invalid="!!errors.length" class="gap-1">
+                    <FieldLabel for="address.region">
+                        Region
+                    </FieldLabel>
+                    <Input id="address.region" v-bind="componentField" placeholder="Region" autocomplete="off"
+                        :aria-invalid="!!errors.length" class="bg-card" />
+                    <FieldError v-if="errors.length" :errors="errors" />
+                </Field>
+            </VeeField>
 
-        <VeeField v-slot="{ componentField, errors }" name="address.country">
-            <Field :data-invalid="!!errors.length">
-                <FieldLabel for="address.country">
-                    Country
-                </FieldLabel>
-                <Input id="address.country" v-bind="componentField" placeholder="Country" autocomplete="off"
-                    :aria-invalid="!!errors.length" />
-                <FieldError v-if="errors.length" :errors="errors" />
-            </Field>
-        </VeeField>
+            <VeeField v-slot="{ componentField, errors }" name="address.country">
+                <Field :data-invalid="!!errors.length" class="gap-1">
+                    <FieldLabel for="address.country">
+                        Country
+                    </FieldLabel>
+                    <Input id="address.country" v-bind="componentField" placeholder="Country" autocomplete="off"
+                        :aria-invalid="!!errors.length" class="bg-card" />
+                    <FieldError v-if="errors.length" :errors="errors" />
+                </Field>
+            </VeeField>
+        </div>
     </FieldGroup>
 </template>

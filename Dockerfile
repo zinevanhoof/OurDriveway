@@ -18,7 +18,9 @@ RUN --mount=type=cache,target=/app/target,sharing=locked \
     cargo build --release --bin ${SERVICE} && cp target/release/${SERVICE} /out
 
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# curl is for the compose healthchecks against /healthz — without it the
+# `depends_on: condition: service_healthy` clauses can never pass.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # spot-service serves ./uploads relative to CWD; mount a volume here to persist it.

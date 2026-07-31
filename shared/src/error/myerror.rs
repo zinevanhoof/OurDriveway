@@ -33,6 +33,12 @@ pub enum MyError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Multipart(#[from] MultipartError),
+    /// Publishing to, or reading from, the event log failed.
+    ///
+    /// A write handler that hits this has NOT written anything — the publish is
+    /// the commit — so returning 500 is honest: nothing happened, retry is safe.
+    #[error("event bus: {0}")]
+    Bus(String),
 }
 
 impl MyError {

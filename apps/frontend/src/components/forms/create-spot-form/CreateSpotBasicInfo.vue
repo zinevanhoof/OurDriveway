@@ -17,24 +17,25 @@ import {
 </script>
 
 <template>
-    <FieldGroup>
+    <FieldGroup class="gap-4">
+        <div class="font-bold">Basic details</div>
         <VeeField v-slot="{ componentField, errors }" name="title">
-            <Field :data-invalid="!!errors.length">
+            <Field :data-invalid="!!errors.length" class="gap-1">
                 <FieldLabel for="title">
                     Title
                 </FieldLabel>
                 <Input id="title" v-bind="componentField" placeholder="Title" autocomplete="off"
-                    :aria-invalid="!!errors.length" />
+                    :aria-invalid="!!errors.length" class="bg-card" />
                 <FieldError v-if="errors.length" :errors="errors" />
             </Field>
         </VeeField>
 
         <VeeField v-slot="{ field, componentField, errors }" name="description">
-            <Field :data-invalid="!!errors.length">
+            <Field :data-invalid="!!errors.length" class="gap-1">
                 <FieldLabel for="description">
                     Description
                 </FieldLabel>
-                <InputGroup>
+                <InputGroup class="bg-card">
                     <InputGroupTextarea id="description" v-bind="componentField" placeholder="Description" :rows="4"
                         class="min-h-24 resize-none" :aria-invalid="!!errors.length" />
                     <InputGroupAddon align="block-end">
@@ -51,12 +52,12 @@ import {
         </VeeField>
 
         <VeeField v-slot="{ componentField, errors }" name="pricePerHour">
-            <Field :data-invalid="!!errors.length">
+            <Field :data-invalid="!!errors.length" class="gap-1">
                 <FieldLabel for="pricePerHour">
                     Price per hour
                 </FieldLabel>
                 <Input type="number" id="pricePerHour" v-bind="componentField" placeholder="Price per hour"
-                    autocomplete="off" :aria-invalid="!!errors.length" />
+                    autocomplete="off" :aria-invalid="!!errors.length" class="bg-card" />
                 <FieldError v-if="errors.length" :errors="errors" />
             </Field>
         </VeeField>

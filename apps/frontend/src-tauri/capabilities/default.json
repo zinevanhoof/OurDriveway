@@ -14,7 +14,7 @@
           "url": "http://192.168.50.29:*"
         },
         {
-          "url": "https://tiles.locationiq.com"
+          "url": "https://tiles.openfreemap.org"
         }
       ]
     },

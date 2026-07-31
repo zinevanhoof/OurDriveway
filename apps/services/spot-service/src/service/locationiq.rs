@@ -18,15 +18,21 @@ pub struct ResolvedAddress {
     pub region: Option<String>,
     pub country: String,
     pub formatted: String,
+    pub lat: f64,
+    pub lng: f64,
 }
 
 /// One `/v1/autocomplete` result (`addressdetails=1`). Unknown fields (name,
 /// suburb, county, country_code, ...) are ignored — we only pull what maps to
-/// our `Address`.
+/// our `Address`. lat/lon come back as strings, same as `/v1/search`.
 #[derive(Deserialize)]
 struct IqResult {
     #[serde(default)]
     address: IqAddress,
+    #[serde(default)]
+    lat: String,
+    #[serde(default)]
+    lon: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -49,7 +55,7 @@ struct IqPoint {
 impl From<IqResult> for ResolvedAddress {
     fn from(r: IqResult) -> Self {
         let a = r.address;
-        let line1 = [a.house_number.as_deref(), a.road.as_deref()]
+        let line1 = [a.road.as_deref(), a.house_number.as_deref()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -86,6 +92,8 @@ impl From<IqResult> for ResolvedAddress {
             region,
             country,
             formatted,
+            lat: r.lat.parse().unwrap_or_default(),
+            lng: r.lon.parse().unwrap_or_default(),
         }
     }
 }

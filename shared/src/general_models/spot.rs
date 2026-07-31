@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+// Serialize is here because these types travel inside events on the wire, not
+// just into the database.
+use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
-#[derive(Deserialize, SurrealValue)]
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
 #[serde(rename_all = "camelCase")]
 pub struct Address {
     pub line1: String,
@@ -15,13 +17,13 @@ pub struct Address {
     pub formatted: String,
 }
 
-#[derive(Deserialize, SurrealValue)]
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
 pub struct Availability {
     pub weekly: WeeklyAvailability,
     pub single: HashMap<String, Vec<TimeSlot>>,
 }
 
-#[derive(Deserialize, SurrealValue)]
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
 pub struct WeeklyAvailability {
     pub monday: Vec<TimeSlot>,
     pub tuesday: Vec<TimeSlot>,
@@ -32,7 +34,7 @@ pub struct WeeklyAvailability {
     pub sunday: Vec<TimeSlot>,
 }
 
-#[derive(Deserialize, SurrealValue)]
+#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
 pub struct TimeSlot {
     pub start: String, // "08:00"
     pub end: String,   // "18:00"

@@ -3,3 +3,4 @@
 .claude
 Cargo.lock
 *.env
+/uploads

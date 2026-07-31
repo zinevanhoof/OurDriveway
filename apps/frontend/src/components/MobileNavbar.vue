@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { cn } from '@/lib/utils';
 import { Home, ParkingSquare, Search, User } from '@lucide/vue';
 import { motion } from 'motion-v';
 import { RouterLink, useRoute } from 'vue-router';
@@ -6,25 +7,29 @@ import { RouterLink, useRoute } from 'vue-router';
 const route = useRoute();
 
 const items = [
-    { id: "home", path: "/", icon: Home },
-    { id: "search", path: "/search", icon: Search },
-    { id: "spots", path: "/spots", icon: ParkingSquare },
-    { id: "profile", path: "/profile", icon: User }
+    { id: "Home", path: "/", icon: Home },
+    { id: "Search", path: "/search", icon: Search },
+    { id: "Spots", path: "/spots", icon: ParkingSquare },
+    { id: "Profile", path: "/profile", icon: User }
 ]
 </script>
 
 <template>
-    <nav class="flex shrink-0 h-10 justify-around items-center border-t">
-        <RouterLink @click="route.path === item.path" v-for="item in items" :key="item.id" :to="item.path"
-            class="relative flex items-center justify-center">
-            <component :is="item.icon" />
-
+    <nav
+        class="pointer-events-auto relative z-60 flex h-15 justify-around items-center border-t bg-card text-muted-foreground">
+        <!-- Opaque backing over the safe-area strip below the bar, so drawers/overlays
+             don't show through the translucent Android navigation bar. -->
+        <div class="absolute inset-x-0 top-full h-(--safe-bottom) bg-card" />
+        <RouterLink v-for="item in items" :key="item.id" :to="item.path"
+            :class="cn('relative flex flex-col items-center justify-center gap-1 h-full transition-all', route.path === item.path ? 'text-primary' : '')">
             <motion.div v-if="route.path === item.path" layoutId="nav-indicator"
-                class="absolute -bottom-2 h-1 w-8 rounded-full bg-primary" :transition="{
+                class="absolute top-0 h-0.75 w-6 rounded-full bg-primary" :transition="{
                     type: 'spring',
                     stiffness: 500,
                     damping: 35
                 }" />
+            <component :is="item.icon" />
+            <div class="text-xs font-semibold">{{ item.id }}</div>
         </RouterLink>
     </nav>
 </template>

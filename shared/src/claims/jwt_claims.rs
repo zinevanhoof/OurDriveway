@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Shared by the issuer (user-service) and every verifier, so the two can't drift.
+pub const ISSUER: &str = "OurDriveway";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JwtClaims {
     // ─── Standard JWT claims ─────────────────────
     pub iat: i64,

@@ -1,49 +1,89 @@
+# Mobile dev topology: the databases plus Caddy on the host network, so a phone
+# on the LAN reaches one origin. The Rust services run natively on the host.
+#
+# Same DB config as the other two compose files, deliberately.
+x-surrealdb: &surrealdb
+  # Pinned to match the `surrealdb` crate version in Cargo.toml.
+  image: surrealdb/surrealdb:v3.2.1
+  restart: unless-stopped
+  # ponytail: the image runs as `nonroot`, but a fresh named volume is created
+  # root-owned, so the datastore can't be written. Running the DB process as root
+  # *inside its own container* is the cheap fix. Upgrade path if it ever matters:
+  # an init container that chowns the volume to uid 65532 first.
+  user: "0:0"
+  command:
+    - start
+    - --log=info
+    - --user=root
+    - --pass=root
+    - --import-file
+    - /schema.surql
+    # Persistent datastore — without this every restart wipes your dev data.
+    # Requires every DEFINE in the schema to be OVERWRITE.
+    - surrealkv:/data/db
+  healthcheck:
+    # Distroless image (no shell), so exec form only. Subcommand is `is-ready`.
+    test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 10s
+
 services:
+  # The event log. Published on the host port because in this topology the Rust
+  # services run natively, outside compose.
+  nats:
+    image: nats:alpine
+    restart: unless-stopped
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
   user-service-db:
-    image: surrealdb/surrealdb:latest
+    <<: *surrealdb
     ports:
       - "8000:8000"
     volumes:
+      - user-db-data:/data
       - ../schemas/user-schema.surql:/schema.surql:ro
-    command:
-      - start
-      - --log=trace
-      - --user=root
-      - --pass=root
-      - --import-file
-      - /schema.surql
 
   booking-service-db:
-    image: surrealdb/surrealdb:latest
+    <<: *surrealdb
     ports:
       - "8001:8000"
     volumes:
+      - booking-db-data:/data
       - ../schemas/booking-schema.surql:/schema.surql:ro
-    command:
-      - start
-      - --log=trace
-      - --user=root
-      - --pass=root
-      - --import-file
-      - /schema.surql
 
   spot-service-db:
-    image: surrealdb/surrealdb:latest
+    <<: *surrealdb
     ports:
       - "8002:8000"
     volumes:
+      - spot-db-data:/data
       - ../schemas/spot-schema.surql:/schema.surql:ro
-    command:
-      - start
-      - --log=trace
-      - --user=root
-      - --pass=root
-      - --import-file
-      - /schema.surql
+
+  # The combined read model. Rebuildable from the log, so losing this volume
+  # costs a replay, not data.
+  view-service-db:
+    <<: *surrealdb
+    ports:
+      - "8003:8000"
+    volumes:
+      - view-db-data:/data
+      - ../schemas/view-schema.surql:/schema.surql:ro
 
   # Single origin for every client (browser + tauri): serves the built SPA and
-  # reverse-proxies /api/* to the 3 Rust services by their compose service names
-  # over the shared bridge network. Paths are relative to this file's dir.
+  # reverse-proxies /api/* to the 3 Rust services running on the host.
   caddy:
     image: caddy:2
     restart: unless-stopped
@@ -51,3 +91,10 @@ services:
     volumes:
       - ./Caddyfile-mobile:/etc/caddy/Caddyfile:ro
       - ../apps/frontend/dist:/srv/dist:ro
+
+volumes:
+  nats-data:
+  user-db-data:
+  booking-db-data:
+  spot-db-data:
+  view-db-data:

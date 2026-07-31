@@ -1,5 +1,34 @@
 import { gql } from "@urql/vue";
 
+// `owner` nests because the view projects a real `record<user>` link, not just the
+// denormalized `owner_id` string — one round trip instead of spot-then-owner.
+// Nullable: a spot whose UserRegistered hasn't been projected yet has `owner: null`
+// until the backfill lands, so every read of it must be optional.
+const FULL_SPOT = gql`
+  query GetSpot($id: ID!) {
+    spot(id: $id) {
+      id
+      owner {
+        firstName: first_name
+        lastName: last_name
+        profilePicture: profile_picture
+      }
+      title
+      description
+      price_per_hour
+      images
+      timezone
+      address {
+        formatted
+      }
+      availability {
+        weekly
+        single
+      }
+    }
+  }
+`;
+
 const SPOT = gql`
   query GetSpot($id: ID!) {
     spot(id: $id) {
@@ -17,8 +46,11 @@ const SPOTS_OWNED = gql`
     spots(where: { owner_id: { eq: $id } }) {
       id
       title
+      images
+      price_per_hour
       address {
-        formatted
+        line1
+        city
       }
     }
   }
@@ -30,6 +62,10 @@ const SPOTS_OWNED = gql`
 // that rebuilds the point from plain floats, since geo::distance's geometry arg can't
 // pass through the JSON filter. `op: lt` is a fixed enum literal (enums can't be
 // variables); the coords/radius ride the `JSON` scalar the filter uses.
+//
+// `availability` (weekly + single, both `object` scalars) is selected so the map's
+// weekday/date + time-slot filter can be applied client-side (see spotMatches). The
+// auto GraphQL filter input excludes object fields, so it can't be a `where` clause.
 const SPOTS_IN_RADIUS = gql`
   query SpotsInRadius($lng: Float!, $lat: Float!, $meters: Float!) {
     spots(
@@ -45,11 +81,17 @@ const SPOTS_IN_RADIUS = gql`
       }
     ) {
       id
+      title
+      price_per_hour
       location {
         coordinates
+      }
+      availability {
+        weekly
+        single
       }
     }
   }
 `;
 
-export { SPOT, SPOTS_OWNED, SPOTS_IN_RADIUS };
+export { FULL_SPOT, SPOT, SPOTS_OWNED, SPOTS_IN_RADIUS };

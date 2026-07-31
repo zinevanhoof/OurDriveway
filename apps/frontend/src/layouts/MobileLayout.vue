@@ -1,15 +1,16 @@
 <script setup lang="ts">
-import MobileHeader from '@/components/header/MobileHeader.vue';
 import MobileNavbar from '@/components/MobileNavbar.vue';
 import { useAuthStore } from '@/stores/auth';
-import { RouterView } from 'vue-router';
+import { RouterView, useRoute } from 'vue-router';
 
 const auth = useAuthStore();
+
+const route = useRoute()
 </script>
 
 <template>
-    <MobileHeader v-if="auth.isAuthenticated" />
-    <main class="flex flex-1 flex-col overflow-y-auto">
+    <component :is="route.meta.header" v-if="auth.isAuthenticated && route.meta.header" />
+    <main class="flex flex-1 flex-col overflow-y-auto bg-background text-foreground">
         <RouterView />
     </main>
 

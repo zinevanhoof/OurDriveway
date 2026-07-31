@@ -1,8 +1,10 @@
 use std::sync::LazyLock;
 
 pub mod claims;
+pub mod db;
 pub mod domain_models;
 pub mod error;
+pub mod events;
 pub mod extract;
 pub mod extractors;
 pub mod general_models;
@@ -23,3 +25,13 @@ pub struct SharedConfig {
 static SHARED_CONFIG: LazyLock<SharedConfig> = LazyLock::new(|| SharedConfig {
     jwt_secret: std::env::var("JWT_SECRET").expect("JWT_SECRET must be set"),
 });
+
+/// Forces the shared config to resolve at startup.
+///
+/// Without this a missing JWT_SECRET stays invisible until the first request
+/// that needs it, then panics inside a handler and poisons the LazyLock — so
+/// the service passes its health check and fails every authenticated request.
+/// Call once from main, right after loading the environment.
+pub fn check_config() {
+    LazyLock::force(&SHARED_CONFIG);
+}

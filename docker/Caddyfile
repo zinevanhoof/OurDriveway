@@ -5,15 +5,32 @@
 # ponytail: plain HTTP on the LAN. Upgrade path is `tls internal` (or a real domain
 # + ACME), which also unblocks Android release builds — they block cleartext. Bare
 # `:80` avoids auto-HTTPS and doesn't hardcode the IP.
+#
+# Every upstream is health-checked against /readyz, not /healthz. Once services
+# project their state from the event log, an instance that is up but still
+# replaying answers from a half-built database — this check is what actually keeps
+# it out of rotation until it has caught up.
+(api_upstream) {
+	health_uri /readyz
+	health_interval 5s
+	health_timeout 2s
+}
+
 :80 {
-	handle /api/user/* {
-		reverse_proxy user-service:3000
+	handle /api/view/* {
+		reverse_proxy view-service:3003 {
+			import api_upstream
+		}
 	}
-	handle /api/booking/* {
-		reverse_proxy booking-service:3001
+	handle /api/user/* {
+		reverse_proxy user-service:3000 {
+			import api_upstream
+		}
 	}
 	handle /api/spot/* {
-		reverse_proxy spot-service:3002
+		reverse_proxy spot-service:3002 {
+			import api_upstream
+		}
 	}
 
 	handle {

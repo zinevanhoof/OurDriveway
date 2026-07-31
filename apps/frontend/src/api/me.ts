@@ -1,12 +1,27 @@
-import { urqlClient, graphql } from "@/urql";
+import { apiFetch } from "@/api/king";
 import { User } from "@/types/User";
-import { ME } from "./graphql/user";
 
-// Caller must set the access token first — authExchange reads it from the store.
+// Why REST and not a GraphQL query: the view's `user` table must be readable by
+// everyone so spot-owner profiles resolve, which means `users { id }` would
+// return every user rather than you. Here the server picks the row from the
+// signature-verified JWT claim, so no permission clause has to be both
+// "only me" and "public" at once.
+//
+// `profile` is null for the moment between registering and the projection
+// catching up; `id` always resolves because it comes from the claim itself.
 export async function fetchMe(): Promise<User> {
-  const { data } = await urqlClient
-    .query(ME, {}, { url: graphql("user"), requestPolicy: "network-only" })
-    .toPromise();
+  const response = await apiFetch("/api/view/me");
+  if (!response.ok) throw new Error(`fetchMe failed: ${response.status}`);
 
-  return data.users[0];
+  const me = (await response.json()) as {
+    id: string;
+    profile: { first_name: string; last_name: string; profile_picture?: string | null } | null;
+  };
+
+  return {
+    id: me.id,
+    firstName: me.profile?.first_name ?? "",
+    lastName: me.profile?.last_name ?? "",
+    profilePicture: me.profile?.profile_picture ?? null,
+  };
 }

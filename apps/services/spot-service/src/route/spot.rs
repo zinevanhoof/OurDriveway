@@ -1,19 +1,49 @@
-use axum::extract::Multipart;
+use axum::Json;
+use axum::extract::{Multipart, State};
+use axum::http::StatusCode;
 use garde::Validate;
-use shared::error::myerror::{ContextExt, MyResult};
+use serde::Serialize;
+use shared::error::myerror::{ContextExt, MyError, MyResult};
+use shared::events::STREAM_SPOTS;
+use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::spot::CreateSpotRequest;
 use tokio::{fs::File, io::AsyncWriteExt};
 
-use crate::extractors::db_authenticated::DbAuthenticated;
+use crate::AppState;
 
-pub async fn test_spot(
-    DbAuthenticated(spot_service): DbAuthenticated,
+#[derive(Serialize)]
+pub struct CreatedResponse {
+    pub id: String,
+    /// `"SPOTS:4712"` — where this write landed in the log. The client echoes it
+    /// back on its next read so a load balancer can't route it to an instance
+    /// that hasn't projected this event yet.
+    pub seq: String,
+}
+
+/// 202, not 201: the event is committed to the log, but the projections that
+/// answer reads are still catching up. `seq` is how a caller waits for its own
+/// write.
+///
+/// `Multipart` consumes the body, so it must stay the last extractor.
+pub async fn create_spot(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
     multipart: Multipart,
-) -> MyResult<()> {
-    let form = parse_spot_form(multipart).await?;
-    spot_service.create_spot(form.0, form.1).await?;
+) -> MyResult<(StatusCode, Json<CreatedResponse>)> {
+    let (request, images) = parse_spot_form(multipart).await?;
+    // Ownership comes from the verified token, never from the request body.
+    let created = state
+        .spot_service
+        .create_spot(request, user_id, images)
+        .await?;
 
-    Ok(())
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CreatedResponse {
+            id: shared::events::user::record_key(&created.spot_id),
+            seq: format!("{STREAM_SPOTS}:{}", created.seq),
+        }),
+    ))
 }
 
 async fn parse_spot_form(mut multipart: Multipart) -> MyResult<(CreateSpotRequest, Vec<String>)> {
@@ -42,7 +72,9 @@ async fn parse_spot_form(mut multipart: Multipart) -> MyResult<(CreateSpotReques
 
                 let bytes = field.bytes().await?;
 
-                images.push(format!("http://192.168.50.29:3002/api/uploads/{file_name}"));
+                images.push(format!(
+                    "http://192.168.50.29:3002/api/spot/uploads/{file_name}"
+                ));
                 File::create(format!("uploads/{file_name}"))
                     .await?
                     .write_all(&bytes)
@@ -50,6 +82,15 @@ async fn parse_spot_form(mut multipart: Multipart) -> MyResult<(CreateSpotReques
             }
             other => tracing::warn!("unknown multipart field: {other}"),
         }
+    }
+
+    // Images live outside CreateSpotRequest, so garde can't reach them.
+    if images.is_empty() {
+        return Err(MyError::api(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Validation failed",
+            "Add at least one photo.",
+        ));
     }
 
     Ok((

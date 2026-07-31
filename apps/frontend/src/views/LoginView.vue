@@ -4,5 +4,5 @@ import LoginComponent from '@/components/LoginComponent.vue';
 </script>
 
 <template>
-    <LoginComponent class="mt-2 mx-2" />
+    <LoginComponent />
 </template>

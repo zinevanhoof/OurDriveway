@@ -1,5 +1,6 @@
 import { useAuthStore } from "@/stores/auth";
 import { refreshAccessToken } from "./refresh";
+import { awaitSeqHeader } from "@/lib/awaitSeq";
 
 // Paths are relative: the app is always served from the same origin that serves the
 // API (Caddy in prod, the vite proxy in dev), which is what lets the refresh cookie
@@ -13,6 +14,8 @@ async function baseFetch(path: string, options: RequestInit) {
       ...(auth.accessToken && {
         Authorization: `Bearer ${auth.accessToken}`,
       }),
+      // Wait for this client's own writes to be projected before reading.
+      ...awaitSeqHeader(),
       ...options.headers,
     },
   });

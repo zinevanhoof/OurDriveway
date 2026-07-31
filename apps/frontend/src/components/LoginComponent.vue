@@ -23,7 +23,6 @@ const login = async (response: AuthResponse) => {
     auth.setAccessToken(response.access_token)
     const user = await fetchMe()
     auth.setUser(user)
-    toast.success(`Hello ${user.email}`)
     router.push({ name: 'home' })
 }
 
@@ -34,7 +33,7 @@ const signup = () => {
 </script>
 
 <template>
-    <div class="m-4 mt-22">
+    <div class="mx-4 mt-22">
         <Tabs v-model="tab">
             <TabsList class="w-full">
                 <TabsTrigger value="login">

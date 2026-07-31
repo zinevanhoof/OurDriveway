@@ -1,29 +1,23 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { Toaster } from "vue-sonner";
-import { useIsMobile } from "./composables/useIsMobile";
-import { useAuthStore } from "./stores/auth";
+import { native } from "./api/http";
 import MobileLayout from "./layouts/MobileLayout.vue";
 import WebLayout from "./layouts/WebLayout.vue";
 
 import 'vue-sonner/style.css'
 
-const { isMobile } = useIsMobile();
-const auth = useAuthStore();
-
-// The Toaster is viewport-fixed, so lift bottom toasts above the mobile navbar
-// (h-10 = 2.5rem, shown only when mobile + authenticated) plus the safe-area inset.
+// Toasts drop from the top; passing `top` replaces vue-sonner's default gap, so on
+// native (mobile) we add the safe-area inset (--safe-top) to clear the native status bar.
 const toastOffset = computed(() =>
-  isMobile.value && auth.isAuthenticated
-    ? { bottom: "calc(var(--safe-bottom))" }
-    : undefined,
+  true ? { top: "calc(var(--safe-top) + 1rem)" } : undefined,
 );
 </script>
 
 <template>
-  <MobileLayout v-if="isMobile" />
+  <MobileLayout v-if="true" />
   <WebLayout v-else />
-  <Toaster :offset="toastOffset" :mobile-offset="toastOffset" />
+  <Toaster position="top-center" :offset="toastOffset" :mobile-offset="toastOffset" />
 </template>
 
 <style>

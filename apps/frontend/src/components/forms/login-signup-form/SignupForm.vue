@@ -29,6 +29,8 @@ const emit = defineEmits<{
 
 const formSchema = toTypedSchema(
     z.object({
+        firstName: z.string(),
+        lastName: z.string(),
         email: z.string().email(),
         password: z
             .string()
@@ -49,6 +51,8 @@ const formSchema = toTypedSchema(
 const { handleSubmit, setErrors, isSubmitting } = useForm({
     validationSchema: formSchema,
     initialValues: {
+        firstName: '',
+        lastName: '',
         email: '',
         password: '',
         confirmPassword: ''
@@ -82,6 +86,28 @@ const onSubmit = handleSubmit(async ({ confirmPassword, ...form }) => {
         <CardContent>
             <form id="form-register" @submit="onSubmit">
                 <FieldGroup>
+                    <div class="flex justify-center gap-2 items-center">
+                        <VeeField v-slot="{ field, errors }" name="firstName">
+                            <Field :data-invalid="!!errors.length">
+                                <FieldLabel for="form-register-firstName">
+                                    First name
+                                </FieldLabel>
+                                <Input id="form-register-firstName" v-bind="field" placeholder="First name"
+                                    autocomplete="off" :aria-invalid="!!errors.length" />
+                                <FieldError v-if="errors.length" :errors="errors" />
+                            </Field>
+                        </VeeField>
+                        <VeeField v-slot="{ field, errors }" name="lastName">
+                            <Field :data-invalid="!!errors.length">
+                                <FieldLabel for="form-register-lastName">
+                                    Last name
+                                </FieldLabel>
+                                <Input id="form-register-lastName" v-bind="field" placeholder="Last name"
+                                    autocomplete="off" :aria-invalid="!!errors.length" />
+                                <FieldError v-if="errors.length" :errors="errors" />
+                            </Field>
+                        </VeeField>
+                    </div>
                     <VeeField v-slot="{ field, errors }" name="email">
                         <Field :data-invalid="!!errors.length">
                             <FieldLabel for="form-register-email">

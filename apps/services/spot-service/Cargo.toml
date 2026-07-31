@@ -15,11 +15,15 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 axum-extra = { workspace = true }
 cookie = { workspace = true }
-axum-reverse-proxy = { workspace = true }
 geo = { workspace = true }
 tzf-rs = { workspace = true }
 reqwest = { workspace = true }
 dotenvy = { workspace = true }
 garde = { workspace = true }
 
+async-nats = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+bus = { path = "../../../bus" }
 shared = { path = "../../../shared" }
