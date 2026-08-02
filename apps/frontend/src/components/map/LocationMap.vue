@@ -63,7 +63,7 @@ const { data: spotsInRadius } = useQuery({
 // Full detail for the selected pin, fetched on click (paused until then) so nothing
 // runs at render time and there's one query total, not one per pin. The owner's
 // profile nests in the same query — the view's `spot.owner` record link resolves it.
-const { data: selectedSpot } = useQuery({
+const { data: selectedSpot, executeQuery: reexecuteSpot } = useQuery({
   query: FULL_SPOT,
   variables: computed(() => ({ id: recordId(selectedId.value) })),
   pause: computed(() => selectedId.value === null)
@@ -377,6 +377,6 @@ onBeforeUnmount(() => {
       </DrawerContent>
     </Drawer>
     <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot?.spot"
-      @submit="(draft) => { console.log('booking draft', draft); bookingOpen = false; }" />
+      @booked="() => reexecuteSpot({ requestPolicy: 'network-only' })" />
   </div>
 </template>

@@ -72,8 +72,12 @@ export function resolveOpenWindows(
   return availability?.single?.[iso] ?? availability?.weekly?.[weekday] ?? [];
 }
 
-// What's still bookable on a date: open windows minus slots already taken by
-// confirmed bookings.
+// What's still bookable on a date: open windows minus what's already taken.
+//
+// `occupied` is the spot's `booked` field verbatim — no reshaping and no
+// filtering. Everything in it is taken, including a slot someone is paying for
+// right now; a hold that lapses is removed server-side by the expiry sweeper, so
+// there is no expiry for this side to reason about.
 export function remainingWindows(
   availability: SpotAvailability | undefined,
   occupied: Record<string, TimeSlot[]>,
@@ -83,18 +87,6 @@ export function remainingWindows(
     resolveOpenWindows(availability, date),
     occupied[date.toString()] ?? [],
   );
-}
-
-// Index `spot_busy` rows by date. The view projects one row per (spot, date)
-// with no renter identity attached, so this is a reshape rather than a join —
-// it used to flatten each booking's `booked` map, which required reading the
-// `booking` table that only the renter and owner can see.
-export function mergeBusy(
-  rows: { date: string; slots?: TimeSlot[] }[],
-): Record<string, TimeSlot[]> {
-  const out: Record<string, TimeSlot[]> = {};
-  for (const row of rows) (out[row.date] ??= []).push(...(row.slots ?? []));
-  return out;
 }
 
 // ponytail: runnable self-check for the interval math — call demo() from a scratch

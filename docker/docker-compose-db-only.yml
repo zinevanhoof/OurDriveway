@@ -1,4 +1,6 @@
-# Dev topology: just the databases. Services run natively via `cargo run`, the
+# Dev topology: just the databases. Services run natively via the "run-all-services"
+# VS Code task (cargo build --workspace, then exec the binaries from the repo root —
+# `cargo run -p <svc>` resolves features differently and rebuilds the world), the
 # frontend via `npm run dev` (vite proxies /api/* to localhost:3000/3001/3002).
 #
 # Same DB config as docker-compose-prod.yml, deliberately — dev/prod parity on

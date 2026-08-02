@@ -2,11 +2,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{Router, routing::get};
 use axum_reverse_proxy::ReverseProxy;
-use shared::events::{STREAM_SPOTS, STREAM_USERS};
+use shared::events::{STREAM_BOOKINGS, STREAM_SPOTS, STREAM_USERS};
 
 use crate::{
     await_seq::AppliedSeqs,
-    projector::{SpotProjector, UserProjector},
+    projector::{BookingProjector, SpotProjector, UserProjector},
     repository::ViewRepository,
 };
 
@@ -40,13 +40,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let js = bus::connect().await?;
     bus::ensure_streams(&js).await?;
-    let readiness = bus::Readiness::new(js.client().clone(), &[STREAM_USERS, STREAM_SPOTS]);
+    let readiness =
+        bus::Readiness::new(js.client().clone(), &[STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS]);
 
     // Cold start only: restore the projection from the newest snapshot before the
     // projectors begin, so replay resumes from the snapshot's cursor instead of
     // sequence 1. A warm restart finds a non-empty projection and skips this.
     let snapshotter = std::sync::Arc::new(
-        bus::snapshot::connect(&js, &db_addr, "view-service", vec![STREAM_USERS, STREAM_SPOTS]).await?,
+        bus::snapshot::connect(
+            &js,
+            &db_addr,
+            "view-service",
+            vec![STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS],
+        )
+        .await?,
     );
     snapshotter.restore_if_empty().await?;
     bus::snapshot::spawn(snapshotter, bus::snapshot::interval_from_env());
@@ -54,6 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let applied = AppliedSeqs(Arc::new(HashMap::from([
         (STREAM_USERS, readiness.applied_rx(STREAM_USERS).unwrap()),
         (STREAM_SPOTS, readiness.applied_rx(STREAM_SPOTS).unwrap()),
+        (
+            STREAM_BOOKINGS,
+            readiness.applied_rx(STREAM_BOOKINGS).unwrap(),
+        ),
     ])));
 
     tokio::spawn(bus::projector::run(
@@ -64,8 +75,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
-        js,
+        js.clone(),
         Arc::new(SpotProjector {
+            repository: repository.clone(),
+        }),
+        readiness.clone(),
+    ));
+    tokio::spawn(bus::projector::run(
+        js,
+        Arc::new(BookingProjector {
             repository: repository.clone(),
         }),
         readiness.clone(),

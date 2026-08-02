@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { Toaster } from "vue-sonner";
-import { native } from "./api/http";
 import MobileLayout from "./layouts/MobileLayout.vue";
 import WebLayout from "./layouts/WebLayout.vue";
 

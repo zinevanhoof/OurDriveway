@@ -107,7 +107,10 @@ fn has_any_slot(value: &AvailabilityRequest, _: &()) -> garde::Result {
 
 /// Full mirror of the frontend weekday-slot rules: `HH:MM`, 30-minute
 /// increments, end after start, and no overlaps or duplicates within the day.
-fn validate_slots(slots: &Vec<TimeSlotRequest>, _: &()) -> garde::Result {
+///
+/// `pub(crate)` because a booking request needs the identical rules — see
+/// `requests/booking.rs`. Two copies of these would drift.
+pub(crate) fn validate_slots(slots: &Vec<TimeSlotRequest>, _: &()) -> garde::Result {
     for slot in slots {
         check_time(&slot.start)?;
         check_time(&slot.end)?;
@@ -131,7 +134,7 @@ fn validate_slots(slots: &Vec<TimeSlotRequest>, _: &()) -> garde::Result {
 
 /// Single-day availability: date key must be today or later, and each day's
 /// slots follow the same rules as the weekly ones.
-fn validate_single(map: &HashMap<String, Vec<TimeSlotRequest>>, _: &()) -> garde::Result {
+pub(crate) fn validate_single(map: &HashMap<String, Vec<TimeSlotRequest>>, _: &()) -> garde::Result {
     // ponytail: past-date compared against UTC today, not the spot's timezone
     // (unknown until after geocoding). Fine ±1 day at the boundary; make it
     // tz-aware if the zone is resolved earlier.

@@ -1,4 +1,4 @@
-import type { TimeSlot } from './requests/CreateSpotRequest'
+import type { TimeSlot } from './domain/spot'
 
 // The map availability filter: specific dates only. Each date carries a
 // precomputed `weekday` so the matcher can fall back to a spot's recurring

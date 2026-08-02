@@ -1,5 +1,5 @@
 import { apiFetch } from "./king";
-import type { Address } from "@/types/requests/CreateSpotRequest";
+import type { Address } from "@/types/domain/spot";
 
 // Type-ahead suggestions proxied through spot-service (keeps the LocationIQ key
 // server-side). Each item already carries every Address field, so a pick fills

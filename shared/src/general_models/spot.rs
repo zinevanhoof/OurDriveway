@@ -34,7 +34,7 @@ pub struct WeeklyAvailability {
     pub sunday: Vec<TimeSlot>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, SurrealValue)]
 pub struct TimeSlot {
     pub start: String, // "08:00"
     pub end: String,   // "18:00"

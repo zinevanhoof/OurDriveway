@@ -2,9 +2,11 @@ use shared::{
     error::myerror::MyResult,
     events::{
         Envelope,
+        booking::{BookingEvent, BookingReserved},
         spot::{SpotCreated, SpotEvent, SpotUpdated},
         user::{UserEvent, UserRegistered, UserUpdated, record_key, user_claim_id},
     },
+    general_models::booking::{BookingRow, fold_booked},
 };
 use surrealdb::{Surreal, engine::remote::ws::Client, types::Datetime};
 use uuid::Uuid;
@@ -126,21 +128,35 @@ impl ViewRepository {
         // `owner` resolves to NONE when the owner's UserRegistered hasn't been
         // applied yet; the user projector backfills it on arrival. `owner_id` is
         // always written, and that is what permissions and filters use.
+        //
+        // MERGE, not CONTENT. CONTENT replaces the whole record body with exactly
+        // the listed keys, which silently drops `booked`. The projectors advance
+        // independently, so on any cold rebuild or snapshot restore this event can
+        // land *after* the BOOKINGS projector has already written that spot's
+        // slots — and BOOKINGS never replays them. Safe because SpotCreated always
+        // carries every field, so there's no "absent means clear" case to get wrong.
+        //
+        // The `booked` line is the mirror-image fix, for bookings that were applied
+        // before this row existed at all: the booking projector's UPDATE matched
+        // nothing and was dropped. Recomputing here covers that ordering, and is
+        // idempotent — same backfill idiom as `user_registered` above.
+        let rows = self.bookings_for_spot(&record_key(&e.spot_id)).await?;
         self.db
             .query(
                 "BEGIN;
-                 UPSERT type::record('spot', $id) CONTENT {
+                 UPSERT type::record('spot', $id) MERGE {
                      owner: (SELECT VALUE id FROM ONLY user
                              WHERE record::id(id) = $owner_uuid LIMIT 1),
                      owner_id: $owner_id, title: $title, description: $description,
                      price_per_hour: $price, images: $images,
                      location: type::point([$lng, $lat]), active: true,
-                     address: $address, availability: $availability,
+                     address: $address, availability: $availability, booked: $booked,
                      timezone: $timezone, created_at: $at, updated_at: $at
                  };
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
+            .bind(("booked", fold_booked(&rows, at)))
             .bind(("id", record_key(&e.spot_id)))
             .bind(("owner_id", e.owner_id.clone()))
             // owner_id is "user:<uuid>"; the record key is just the uuid.
@@ -215,6 +231,140 @@ impl ViewRepository {
             .await?
             .check()?;
         Ok(())
+    }
+
+    // ─── bookings ───────────────────────────────────────────────────────────
+
+    pub async fn apply_booking(&self, envelope: Envelope<BookingEvent>, seq: u64) -> MyResult<()> {
+        let at = envelope.occurred_at;
+        match envelope.payload {
+            BookingEvent::Reserved(e) => self.booking_reserved(e, at, seq).await,
+            BookingEvent::Confirmed { booking_id } => {
+                self.booking_settled(booking_id, "confirmed", None, at, seq)
+                    .await
+            }
+            BookingEvent::Released { booking_id, reason } => {
+                self.booking_settled(booking_id, "released", Some(reason.as_str()), at, seq)
+                    .await
+            }
+        }
+    }
+
+    async fn booking_reserved(
+        &self,
+        e: BookingReserved,
+        at: chrono::DateTime<chrono::Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
+        // `spot` and `renter` are the record links that make nested GraphQL work;
+        // both resolve to NONE if the referenced event hasn't been projected yet,
+        // and the string ids are what permissions actually use.
+        self.db
+            .query(
+                "UPSERT type::record('booking', $id) CONTENT {
+                     spot:   (SELECT VALUE id FROM ONLY spot WHERE record::id(id) = $spot_id LIMIT 1),
+                     renter: (SELECT VALUE id FROM ONLY user WHERE record::id(id) = $renter_uuid LIMIT 1),
+                     spot_id: $spot_id, owner_id: $owner_id, renter_id: $renter_id,
+                     booked: $booked, amount: $amount, status: 'reserved',
+                     hold_until: $expires_at, release_reason: NONE, created_at: $at
+                 };",
+            )
+            .bind(("id", record_key(&e.booking_id)))
+            .bind(("spot_id", record_key(&e.spot_id)))
+            .bind((
+                "renter_uuid",
+                e.renter_id.strip_prefix("user:").unwrap_or("").to_string(),
+            ))
+            .bind(("owner_id", e.owner_id))
+            .bind(("renter_id", e.renter_id))
+            .bind(("booked", e.booked))
+            .bind(("amount", e.amount_cents))
+            .bind(("expires_at", Datetime::from(e.expires_at)))
+            .bind(("at", Datetime::from(at)))
+            .await?
+            .check()?;
+        self.refold_spot(&record_key(&e.spot_id), at, seq).await
+    }
+
+    async fn booking_settled(
+        &self,
+        booking_id: Uuid,
+        status: &str,
+        reason: Option<&str>,
+        at: chrono::DateTime<chrono::Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
+        // Scoped to 'reserved'. A payment landing microseconds before the hold
+        // lapses, with the sweeper's expiry arriving second, must not undo the
+        // confirmation — this WHERE clause is the whole guard.
+        let spot_id: Option<String> = self
+            .db
+            .query(
+                "UPDATE type::record('booking', $id) SET
+                     status = $status, hold_until = NONE,
+                     release_reason = $reason ?? release_reason
+                 WHERE status = 'reserved'
+                 RETURN VALUE spot_id;",
+            )
+            .bind(("id", record_key(&booking_id)))
+            .bind(("status", status.to_string()))
+            .bind(("reason", reason.map(str::to_string)))
+            .await?
+            .take(0)?;
+
+        match spot_id {
+            Some(id) => self.refold_spot(&id, at, seq).await,
+            // The transition didn't apply. `booked` is unchanged, but the cursor
+            // still has to advance or this event replays forever.
+            None => {
+                self.db
+                    .query("UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;")
+                    .bind(("at", Datetime::from(at)))
+                    .bind(("seq", seq as i64))
+                    .await?
+                    .check()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Recomputes a spot's `booked` map from its booking rows, and advances the
+    /// cursor in the same transaction.
+    ///
+    /// `UPDATE`, not `UPSERT`: this must not create a spot row. The view's `spot`
+    /// table is SCHEMAFULL with required fields a bookings-first partial row can't
+    /// satisfy. Matching zero rows is fine — `spot_created` recomputes `booked`
+    /// when the spot finally lands.
+    async fn refold_spot(
+        &self,
+        spot_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
+        let rows = self.bookings_for_spot(spot_id).await?;
+        self.db
+            .query(
+                "BEGIN;
+                 UPDATE type::record('spot', $id) SET booked = $booked;
+                 UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;
+                 COMMIT;",
+            )
+            .bind(("id", spot_id.to_string()))
+            .bind(("booked", fold_booked(&rows, at)))
+            .bind(("at", Datetime::from(at)))
+            .bind(("seq", seq as i64))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn bookings_for_spot(&self, spot_id: &str) -> MyResult<Vec<BookingRow>> {
+        Ok(self
+            .db
+            .query("SELECT status, booked FROM booking WHERE spot_id = $spot_id")
+            .bind(("spot_id", spot_id.to_string()))
+            .await?
+            .take(0)?)
     }
 
     // ─── reads ──────────────────────────────────────────────────────────────

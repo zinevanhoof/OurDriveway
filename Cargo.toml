@@ -4,10 +4,14 @@ members = [
     "apps/services/booking-service",
     "apps/services/spot-service",
     "apps/services/view-service",
-    "apps/frontend/src-tauri",
     "bus",
     "shared"
 ]
+# src-tauri is its own workspace root. Its dep graph shares nothing with the
+# services, and sharing one target/ meant Tauri's cross/host profiles and the
+# services' dev profile kept invalidating each other's fingerprints — every
+# switch rebuilt surrealdb-core and everything above it.
+exclude = ["apps/frontend/src-tauri"]
 
 resolver = "2"
 
@@ -15,7 +19,6 @@ resolver = "2"
 edition = "2024"
 
 [workspace.dependencies]
-# Services
 axum = { version = "0.8.9", features = ["macros", "multipart"] }
 tower-http = { version = "0.7.0", features = ["fs"] }
 tokio = { version = "1.52.3", features = ["full"] }
@@ -33,7 +36,7 @@ cookie = "0.18.1"
 axum-reverse-proxy = "1.3.0"
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 chrono = "0.4.45"
-uuid = { version = "1.23.4", features = ["v4", "v7"] }
+uuid = { version = "1.23.4", features = ["v4", "v5", "v7"] }
 dotenvy = "0.15.7"
 reqwest = { version = "0.13.4", features = ["json", "query"] }
 geo = "=0.32.0"
@@ -46,8 +49,3 @@ sha2 = "0.10.9"
 hex = "0.4.3"
 bytes = "1.12.0"
 tokio-util = { version = "0.7.18", features = ["io"] }
-
-# Frontend
-tauri-build = { version = "2.6.3", features = [] }
-tauri = { version = "2.11.3", features = [] }
-tauri-plugin-opener = "2.5.4"

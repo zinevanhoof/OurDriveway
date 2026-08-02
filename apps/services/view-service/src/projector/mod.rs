@@ -3,7 +3,10 @@ use std::sync::Arc;
 use bus::Projector;
 use shared::{
     error::myerror::{MyError, MyResult},
-    events::{Envelope, STREAM_SPOTS, STREAM_USERS, spot::SpotEvent, user::UserEvent},
+    events::{
+        Envelope, STREAM_BOOKINGS, STREAM_SPOTS, STREAM_USERS, booking::BookingEvent,
+        spot::SpotEvent, user::UserEvent,
+    },
 };
 
 use crate::repository::ViewRepository;
@@ -44,5 +47,23 @@ impl Projector for SpotProjector {
         let envelope: Envelope<SpotEvent> = serde_json::from_slice(payload)
             .map_err(|e| MyError::Bus(format!("decode SpotEvent at seq {seq}: {e}")))?;
         self.repository.apply_spot(envelope, seq).await
+    }
+}
+
+pub struct BookingProjector {
+    pub repository: Arc<ViewRepository>,
+}
+
+impl Projector for BookingProjector {
+    const STREAM: &'static str = STREAM_BOOKINGS;
+
+    async fn last_seq(&self) -> MyResult<u64> {
+        self.repository.last_seq(STREAM_BOOKINGS).await
+    }
+
+    async fn apply(&self, payload: &[u8], seq: u64) -> MyResult<()> {
+        let envelope: Envelope<BookingEvent> = serde_json::from_slice(payload)
+            .map_err(|e| MyError::Bus(format!("decode BookingEvent at seq {seq}: {e}")))?;
+        self.repository.apply_booking(envelope, seq).await
     }
 }

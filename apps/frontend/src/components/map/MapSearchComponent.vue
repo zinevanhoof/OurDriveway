@@ -12,7 +12,7 @@ import {
     ComboboxEmpty,
 } from '@/components/ui/combobox';
 import { suggestAddress } from '@/api/address';
-import type { Address } from '@/types/requests/CreateSpotRequest';
+import type { Address } from '@/types/domain/spot';
 import type { SpotFilter } from '@/types/SpotFilter';
 import MapSearchFilterComponent from './MapSearchFilterComponent.vue';
 import Input from '../ui/input/Input.vue';
