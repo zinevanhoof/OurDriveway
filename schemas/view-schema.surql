@@ -95,6 +95,20 @@ DEFINE FIELD OVERWRITE availability.single.*         ON spot TYPE array<object>;
 DEFINE FIELD OVERWRITE availability.single.*.*.start ON spot TYPE string;
 DEFINE FIELD OVERWRITE availability.single.*.*.end   ON spot TYPE string;
 
+-- Slots taken on this spot: "YYYY-MM-DD" -> [{ start, end }], the same shape as
+-- `availability.single` above so the client subtracts one from the other with no
+-- reshaping. Recomputed from this spot's booking rows on every BOOKINGS event.
+--
+-- Safe to expose on a world-readable table: it carries no renter identity, no
+-- booking id, and no hold expiry. That replaced a client query against `booking`
+-- filtered by spot_id, which was a live bug — `booking` is only selectable by its
+-- renter or the spot owner, so a prospective renter got an empty list back and
+-- every slot looked free.
+DEFINE FIELD OVERWRITE booked           ON spot TYPE object DEFAULT {};
+DEFINE FIELD OVERWRITE booked.*         ON spot TYPE array<object>;
+DEFINE FIELD OVERWRITE booked.*.*.start ON spot TYPE string;
+DEFINE FIELD OVERWRITE booked.*.*.end   ON spot TYPE string;
+
 DEFINE FIELD OVERWRITE timezone   ON spot TYPE string;
 DEFINE FIELD OVERWRITE created_at ON spot TYPE datetime;
 DEFINE FIELD OVERWRITE updated_at ON spot TYPE datetime;
@@ -102,10 +116,10 @@ DEFINE FIELD OVERWRITE updated_at ON spot TYPE datetime;
 DEFINE INDEX OVERWRITE spot_owner  ON spot FIELDS owner_id;
 DEFINE INDEX OVERWRITE spot_active ON spot FIELDS active;
 
--- ─── booking (defined, not yet projected) ───────────────────────────────────
--- Declared now so the frontend can move to this endpoint in one go. Nothing
--- publishes booking events yet, so these return empty — exactly what the old
--- per-service query returned, so no behaviour regresses.
+-- ─── booking ────────────────────────────────────────────────────────────────
+-- The renter's and owner's view of a booking. Availability does NOT come from
+-- here — a prospective renter can't select these rows at all — it comes from
+-- `spot.booked` above.
 DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS
     FOR select WHERE renter_id = $token.ID OR owner_id = $token.ID,
     FOR create, update, delete NONE;
@@ -120,31 +134,17 @@ DEFINE FIELD OVERWRITE booked.*         ON booking TYPE array<object>;
 DEFINE FIELD OVERWRITE booked.*.*.start ON booking TYPE string;
 DEFINE FIELD OVERWRITE booked.*.*.end   ON booking TYPE string;
 DEFINE FIELD OVERWRITE amount     ON booking TYPE int;           -- EUR cents
-DEFINE FIELD OVERWRITE status     ON booking TYPE string;
+DEFINE FIELD OVERWRITE status     ON booking TYPE string
+    ASSERT $value IN ['reserved', 'confirmed', 'released', 'completed', 'cancelled'];
+-- Lets the renter's own checkout show a countdown. Only ever readable by the
+-- renter or the owner; `spot.booked` carries no expiry at all.
+DEFINE FIELD OVERWRITE hold_until     ON booking TYPE option<datetime>;
+DEFINE FIELD OVERWRITE release_reason ON booking TYPE option<string>;
 DEFINE FIELD OVERWRITE rating     ON booking TYPE option<int>;
 DEFINE FIELD OVERWRITE created_at ON booking TYPE datetime;
 
 DEFINE INDEX OVERWRITE booking_spot   ON booking FIELDS spot_id;
 DEFINE INDEX OVERWRITE booking_renter ON booking FIELDS renter_id;
-
--- ─── spot_busy ──────────────────────────────────────────────────────────────
--- Occupied slots per (spot, date), with NO renter identity attached, so it is
--- safe to read publicly.
---
--- This replaces querying `booking` for availability. That query was a live bug:
--- `booking` is only selectable by its renter or the spot owner, so a prospective
--- renter got an empty list back and every slot looked free.
-DEFINE TABLE OVERWRITE spot_busy SCHEMAFULL PERMISSIONS
-    FOR select WHERE true,
-    FOR create, update, delete NONE;
-
-DEFINE FIELD OVERWRITE spot_id ON spot_busy TYPE string;
-DEFINE FIELD OVERWRITE date    ON spot_busy TYPE string;         -- "YYYY-MM-DD"
-DEFINE FIELD OVERWRITE slots   ON spot_busy TYPE array<object>;
-DEFINE FIELD OVERWRITE slots.*.start ON spot_busy TYPE string;
-DEFINE FIELD OVERWRITE slots.*.end   ON spot_busy TYPE string;
-
-DEFINE INDEX OVERWRITE spot_busy_spot ON spot_busy FIELDS spot_id;
 
 -- ─── projector cursors ──────────────────────────────────────────────────────
 -- One row per stream (_projection:USERS, _projection:SPOTS, …), each written in

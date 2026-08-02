@@ -14,7 +14,7 @@ import {
 import { computed, ref, watch } from 'vue'
 import FilterChips from './FilterChips.vue'
 import { cn } from '@/lib/utils';
-import { TimeSlot } from '@/types/requests/CreateSpotRequest.ts'
+import type { TimeSlot } from '@/types/domain/spot'
 import type { SpotFilter } from '@/types/SpotFilter'
 import type { DateValue } from '@internationalized/date'
 import { DateFormatter, getLocalTimeZone, today } from '@internationalized/date'

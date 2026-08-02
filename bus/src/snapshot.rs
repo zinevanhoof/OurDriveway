@@ -168,9 +168,36 @@ impl Snapshotter {
             cursors.insert((*stream).to_string(), seq.unwrap_or(0).to_string());
         }
 
+        // Data only. Every database already applies its own schema at boot via
+        // `--import-file /schema.surql`, so exporting definitions re-does work
+        // that is already done — and drags along statements that don't survive
+        // the round trip.
+        //
+        // `configs` is the one that actually bites: SurrealDB 3.2.1 serialises a
+        // GraphQL config as `GRAPHQL TABLES AUTO FUNCTIONS AUTO;`, dropping the
+        // `DEFINE CONFIG` prefix, and its own parser then rejects the line. That
+        // made every cold restore of view-service — the only database with a
+        // GraphQL config — fail outright, which is strictly worse than having no
+        // snapshot, because the service refuses to boot instead of quietly
+        // replaying from sequence 1.
+        //
+        // The rest are off for the same reason in principle, and because a
+        // snapshot has no business restoring database users or access rules.
         let backup = self
             .db
             .export(())
+            .with_config()
+            .configs(false)
+            .users(false)
+            .accesses(false)
+            .params(false)
+            .functions(false)
+            .analyzers(false)
+            // Tables stay on: `records` are emitted per table and are skipped
+            // entirely if the table isn't included. The `DEFINE TABLE` that comes
+            // with them is redundant but harmless — see restore_if_empty.
+            .tables(true)
+            .records(true)
             .await
             .map_err(|e| MyError::Bus(format!("snapshot export: {e}")))?;
 

@@ -1,9 +1,24 @@
-use axum::Router;
-use surrealdb::{Surreal, engine::remote::ws::Client};
+use std::sync::Arc;
+
+use axum::{
+    Router,
+    routing::{delete, post},
+};
+
+use crate::{
+    projector::{BookingProjector, SpotProjector},
+    repository::booking_repository::BookingRepository,
+    service::booking_service::BookingService,
+};
+
+mod projector;
+mod repository;
+mod route;
+mod service;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Surreal<Client>,
+    pub booking_service: Arc<BookingService>,
 }
 
 #[tokio::main]
@@ -17,14 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let db_addr = std::env::var("SURREALDB_ADDR").unwrap_or_else(|_| "localhost:8001".into());
     let db = shared::db::connect(&db_addr).await?;
-
-    let _state = AppState { db };
+    let repository = Arc::new(BookingRepository { db });
 
     let js = bus::connect().await?;
     bus::ensure_streams(&js).await?;
-    // booking-service will consume SPOTS too — it needs a local projection of spot
-    // price and availability to compute an amount server-side, since the spot table
-    // lives in another service's database.
+    // SPOTS as well as BOOKINGS: this service needs a local projection of spot
+    // price and availability to authorize and price a booking server-side, since
+    // the spot table lives in another service's database.
     let readiness = bus::Readiness::new(
         js.client().clone(),
         &[
@@ -37,24 +51,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // projectors begin, so replay resumes from the snapshot's cursor instead of
     // sequence 1. A warm restart finds a non-empty projection and skips this.
     let snapshotter = std::sync::Arc::new(
-        bus::snapshot::connect(&js, &db_addr, "booking-service", vec![shared::events::STREAM_SPOTS, shared::events::STREAM_BOOKINGS]).await?,
+        bus::snapshot::connect(
+            &js,
+            &db_addr,
+            "booking-service",
+            vec![
+                shared::events::STREAM_SPOTS,
+                shared::events::STREAM_BOOKINGS,
+            ],
+        )
+        .await?,
     );
     snapshotter.restore_if_empty().await?;
     bus::snapshot::spawn(snapshotter, bus::snapshot::interval_from_env());
-    // Nothing publishes or projects yet; the booking write path is a later phase.
-    readiness.mark_caught_up(shared::events::STREAM_SPOTS);
-    readiness.mark_caught_up(shared::events::STREAM_BOOKINGS);
 
-    // No GraphQL proxy here any more: every client read is served by
-    // view-service from the combined projection. This database is private to
-    // this service — no browser identity can reach it at all.
+    // The projectors are the only writers to `db`; the service only publishes.
+    // No `mark_caught_up` short-circuit any more — /readyz must stay 503 until
+    // these have actually replayed, or Caddy routes bookings at an instance whose
+    // availability projection is still half-built.
+    tokio::spawn(bus::projector::run(
+        js.clone(),
+        Arc::new(SpotProjector {
+            repository: repository.clone(),
+        }),
+        readiness.clone(),
+    ));
+    tokio::spawn(bus::projector::run(
+        js.clone(),
+        Arc::new(BookingProjector {
+            repository: repository.clone(),
+        }),
+        readiness.clone(),
+    ));
 
-    let app = Router::new().merge(bus::health::routes(readiness));
+    // Nothing else frees a lapsed hold — `spot.booked` carries no expiry, so no
+    // reader can filter one out. See service/expiry.rs.
+    service::expiry::spawn(js.clone(), repository.clone());
 
-    // run our app with hyper, listening globally on port 3000
+    let state = AppState {
+        booking_service: Arc::new(BookingService::new(js, repository, &readiness)),
+    };
+
+    // No GraphQL proxy here: every client read is served by view-service from the
+    // combined projection. This database is private to this service — no browser
+    // identity can reach it at all.
+    let api_router: Router<AppState> = Router::new()
+        .route("/api/booking", post(route::booking::reserve))
+        .route("/api/booking/{id}/confirm", post(route::booking::confirm))
+        .route("/api/booking/{id}", delete(route::booking::release));
+
+    let app = Router::new()
+        .merge(api_router)
+        .merge(bus::health::routes(readiness))
+        .with_state(state);
+
     // PORT is overridable so several instances can run on one host — needed to
-    // test that independent projections converge on the same log.
+    // test that two instances racing the same slot produce exactly one winner.
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".into());
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
-    Ok(axum::serve(listener, app).await.unwrap())
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    tracing::info!(%port, "booking-service listening");
+    Ok(axum::serve(listener, app).await?)
 }

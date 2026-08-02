@@ -3,5 +3,10 @@
 .git/
 **/.env
 apps/frontend/dist/
-apps/frontend/src-tauri/gen/
+# The whole Tauri crate, not just gen/: it's its own workspace, so the Rust builder
+# never compiles it, and the frontend image has no use for 448K of Rust source.
+apps/frontend/src-tauri/
 docker/
+# ...except the Caddyfile, which Dockerfile.frontend bakes into the image so the
+# VPS needs nothing on disk but the compose file.
+!docker/Caddyfile

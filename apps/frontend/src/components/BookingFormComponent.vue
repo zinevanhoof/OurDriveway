@@ -1,25 +1,24 @@
 <script setup lang="ts">
-import { useQuery } from "@urql/vue";
 import { formatCents } from '@/lib/money';
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import FullScreenLayoutComponent from "./FullScreenLayoutComponent.vue";
 import Calendar from "./ui/calendar/Calendar.vue";
-import { ArrowRight, CalendarDays, Clock, Plus, X } from "@lucide/vue";
+import { ArrowRight, CalendarDays, Clock, Plus, ShieldCheck, Timer, X } from "@lucide/vue";
 import Button from "./ui/button/Button.vue";
 import Input from "./ui/input/Input.vue";
 import Separator from "./ui/separator/Separator.vue";
 import FilterChips from "./map/FilterChips.vue";
+import { toast } from "vue-sonner";
 
 import { DateFormatter, DateValue, getLocalTimeZone, today } from "@internationalized/date";
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
-import { SPOT_BUSY } from "@/api/graphql/booking";
 import { recordId } from "@/lib/utils";
+import * as bookingApi from "@/api/bookingApi";
+import type { Reservation } from "@/api/bookingApi";
 import type { TimeSlot } from "@/types/domain/spot";
-import type { BookingDraft } from "@/types/requests/BookingRequest";
 import {
     type SpotAvailability,
-    mergeBusy,
     remainingWindows,
     subtract,
     toMin,
@@ -32,19 +31,17 @@ const props = defineProps<{
         price_per_hour: number | string;
         address?: { formatted?: string };
         availability?: SpotAvailability;
+        booked?: Record<string, TimeSlot[]>;
     };
 }>();
 
 const open = defineModel<boolean>({ required: true });
-const emit = defineEmits<{ submit: [draft: BookingDraft] }>();
+const emit = defineEmits<{ booked: [bookingId: string] }>();
 
-// ─── Confirmed bookings → occupied slots to subtract from availability ───
-const { data: bookingsData } = useQuery({
-    query: SPOT_BUSY,
-    variables: computed(() => ({ id: recordId(props.spot?.id) })),
-    pause: computed(() => !props.spot?.id),
-});
-const occupied = computed(() => mergeBusy(bookingsData.value?.spotBusies ?? []));
+// Slots already taken, straight off the spot. No reshaping and no filtering:
+// everything in `booked` is taken, and a lapsed hold is removed server-side by
+// the expiry sweeper rather than being filtered out here.
+const occupied = computed(() => props.spot?.booked ?? {});
 
 // ─── Calendar: only host-open dates (minus bookings) within 90 days ───
 const minDate = today(getLocalTimeZone());
@@ -150,10 +147,93 @@ const description = computed(() => {
     return parts.join(" · ");
 });
 
+// ─── Checkout: hold the slots, then pay ───
+// Reserving blocks the slots for everyone else while payment runs. The hold is
+// what makes a slow card form safe; it lapses server-side if we never confirm.
+const reservation = ref<Reservation | null>(null);
+const busy = ref(false);
+const remainingMs = ref(0);
+
+const holdLabel = computed(() => {
+    const total = Math.max(0, Math.ceil(remainingMs.value / 1000));
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+});
+
+// One ticker for the whole component; it only does anything while a hold is live.
+let ticker: ReturnType<typeof setInterval> | undefined;
+onMounted(() => {
+    ticker = setInterval(() => {
+        if (!reservation.value) return;
+        remainingMs.value = new Date(reservation.value.expiresAt).getTime() - Date.now();
+        if (remainingMs.value <= 0) {
+            // The server has already freed these slots. Drop back to the picker
+            // rather than letting them pay for something they no longer hold.
+            reservation.value = null;
+            toast.error("Your hold expired", {
+                description: "Those times are back on the market. Please pick again.",
+            });
+        }
+    }, 1000);
+});
+onBeforeUnmount(() => clearInterval(ticker));
+
+async function submit() {
+    if (!totals.value.slots || !props.spot || busy.value) return;
+    const booked: Record<string, TimeSlot[]> = {};
+    for (const [k, arr] of Object.entries(pickedSlots.value)) if (arr.length) booked[k] = arr;
+
+    busy.value = true;
+    try {
+        reservation.value = await bookingApi.reserve({
+            spotId: recordId(props.spot.id)!,
+            booked,
+            amountCents: totals.value.amountCents,
+        });
+        remainingMs.value = new Date(reservation.value.expiresAt).getTime() - Date.now();
+    } catch (e: any) {
+        // Someone took the slots between rendering and submitting, or the host
+        // isn't open then. Either way the message names the offending slot.
+        toast.error("Couldn't hold those times", { description: e.message });
+    } finally {
+        busy.value = false;
+    }
+}
+
+async function pay() {
+    if (!reservation.value || busy.value) return;
+    busy.value = true;
+    try {
+        const id = reservation.value.id;
+        await bookingApi.confirm(id);
+        reservation.value = null;
+        open.value = false;
+        toast.success("Booked", { description: "Your parking spot is confirmed." });
+        emit("booked", id);
+    } catch (e: any) {
+        toast.error("Payment couldn't be completed", { description: e.message });
+    } finally {
+        busy.value = false;
+    }
+}
+
+/** Gives the slots back immediately instead of making the next renter wait. */
+async function abandon() {
+    const held = reservation.value;
+    reservation.value = null;
+    if (!held) return;
+    try {
+        await bookingApi.release(held.id);
+    } catch {
+        // Best effort — the server's expiry sweeper collects it either way.
+    }
+}
+
 // The drawer only hides on close (component stays mounted), so clear the picks
-// when it closes — reopening starts fresh.
+// when it closes — reopening starts fresh. A live hold is released rather than
+// silently left to expire.
 watch(open, (o) => {
     if (!o) {
+        void abandon();
         selectedDates.value = [];
         activeKey.value = "";
         pickedSlots.value = {};
@@ -161,12 +241,23 @@ watch(open, (o) => {
     }
 });
 
-function submit() {
-    if (!totals.value.slots || !props.spot) return;
-    const booked: Record<string, TimeSlot[]> = {};
-    for (const [k, arr] of Object.entries(pickedSlots.value)) if (arr.length) booked[k] = arr;
-    emit("submit", { spotId: recordId(props.spot.id)!, booked, amountCents: totals.value.amountCents });
+// The renter who closes the tab mid-checkout. `beforeunload` shows the browser's
+// warning; `pagehide` fires whether or not they heed it, so the release goes out
+// either way. Both are courtesies — the server-side sweeper is the guarantee.
+function warnIfHolding(e: BeforeUnloadEvent) {
+    if (reservation.value) e.preventDefault();
 }
+function releaseOnUnload() {
+    if (reservation.value) void bookingApi.release(reservation.value.id, true).catch(() => { });
+}
+onMounted(() => {
+    window.addEventListener("beforeunload", warnIfHolding);
+    window.addEventListener("pagehide", releaseOnUnload);
+});
+onBeforeUnmount(() => {
+    window.removeEventListener("beforeunload", warnIfHolding);
+    window.removeEventListener("pagehide", releaseOnUnload);
+});
 </script>
 
 <template>
@@ -176,6 +267,54 @@ function submit() {
             <FullScreenLayoutComponent @close="open = false" :title="spot?.title ?? 'Book this spot'"
                 :description="description">
                 <template #main>
+                    <!-- Checkout: the slots are held, the clock is running. -->
+                    <div v-if="reservation" class="space-y-3">
+                        <div
+                            class="flex items-center gap-2.5 bg-card border border-border rounded-lg px-3.5 py-3.25">
+                            <div class="bg-accent text-accent-foreground p-2 rounded-md">
+                                <Timer class="size-5" />
+                            </div>
+                            <div class="space-y-0.5">
+                                <div class="text-[15px] font-extrabold">Held for {{ holdLabel }}</div>
+                                <div class="text-xs text-muted-foreground font-medium">
+                                    We're holding these times while you pay. Leave now and they go back
+                                    on the market.
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="bg-card border border-border rounded-lg px-3.5 py-3.25 space-y-2">
+                            <div class="text-[15px] font-extrabold">Your booking</div>
+                            <div v-for="date in sortedDates" :key="date.toString()" class="space-y-1">
+                                <div class="text-xs text-muted-foreground font-bold">
+                                    {{ dfShort.format(date.toDate(getLocalTimeZone())) }}
+                                </div>
+                                <div v-for="(s, i) in (pickedSlots[date.toString()] ?? [])"
+                                    :key="`${s.start}-${s.end}-${i}`"
+                                    class="flex items-center justify-between gap-2 bg-accent text-accent-foreground rounded-md px-2.5 py-1.5 text-sm font-semibold">
+                                    <span>{{ s.start }} – {{ s.end }}</span>
+                                    <span class="text-xs text-muted-foreground">
+                                        {{ slotHours(s) }} hr · {{ formatCents(slotCents(s)) }}
+                                    </span>
+                                </div>
+                            </div>
+                            <Separator />
+                            <!-- The server's figure, not the one the picker computed: it prices
+                                 off the minutes it actually authorised, and that is what's charged. -->
+                            <div class="flex items-center justify-between font-bold">
+                                <span class="text-muted-foreground">Total</span>
+                                <span>{{ formatCents(reservation.amountCents) }}</span>
+                            </div>
+                        </div>
+
+                        <div
+                            class="flex items-center gap-2 text-xs text-muted-foreground font-medium px-1">
+                            <ShieldCheck class="size-4 shrink-0" />
+                            No card is charged yet — payment isn't wired up.
+                        </div>
+                    </div>
+
+                    <template v-else>
                     <div class="space-y-2">
                         <div class="text-[15px] font-extrabold">Pick your dates</div>
                         <Calendar multiple :model-value="(selectedDates as any)" @update:model-value="onDatesChange"
@@ -252,21 +391,34 @@ function submit() {
                             </div>
                         </div>
                     </div>
+                    </template>
                 </template>
 
                 <template #footer>
-                    <div v-if="totals.slots" class="flex items-center justify-between pb-2.5 text-sm font-bold">
-                        <span class="text-muted-foreground">
-                            {{ totals.dates }} date{{ totals.dates > 1 ? 's' : '' }} ·
-                            {{ totals.slots }} slot{{ totals.slots > 1 ? 's' : '' }} ·
-                            {{ totals.hours }} hr{{ totals.hours !== 1 ? 's' : '' }}
-                        </span>
-                        <span>{{ formatCents(totals.amountCents) }}</span>
-                    </div>
-                    <Button class="w-full h-11 font-bold" :disabled="!totals.slots" @click="submit">
-                        Continue to payment
-                        <ArrowRight />
-                    </Button>
+                    <template v-if="reservation">
+                        <Button class="w-full h-11 font-bold" :disabled="busy" @click="pay">
+                            Pay {{ formatCents(reservation.amountCents) }}
+                            <ArrowRight />
+                        </Button>
+                        <Button variant="ghost" class="w-full h-11 font-bold" :disabled="busy"
+                            @click="abandon">
+                            Back — release these times
+                        </Button>
+                    </template>
+                    <template v-else>
+                        <div v-if="totals.slots" class="flex items-center justify-between pb-2.5 text-sm font-bold">
+                            <span class="text-muted-foreground">
+                                {{ totals.dates }} date{{ totals.dates > 1 ? 's' : '' }} ·
+                                {{ totals.slots }} slot{{ totals.slots > 1 ? 's' : '' }} ·
+                                {{ totals.hours }} hr{{ totals.hours !== 1 ? 's' : '' }}
+                            </span>
+                            <span>{{ formatCents(totals.amountCents) }}</span>
+                        </div>
+                        <Button class="w-full h-11 font-bold" :disabled="!totals.slots || busy" @click="submit">
+                            Continue to payment
+                            <ArrowRight />
+                        </Button>
+                    </template>
                 </template>
             </FullScreenLayoutComponent>
         </DrawerContent>

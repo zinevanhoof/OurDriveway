@@ -1,0 +1,117 @@
+name: CI
+
+# Tests run on every PR into main. The image pipeline only runs once the merge
+# has landed on main, so nothing is published for code that was never merged.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A new push to a PR branch supersedes the previous run. Main is excluded: a merge
+# must never be cancelled halfway through publishing images.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Also read by docker-bake.hcl, which declares REGISTRY as a variable — so the
+  # bake targets and the retag step below can't drift apart.
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # A branch ref, not a tag — that's this action's documented usage
+      # (@stable / @nightly / @1.89.0).
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # PRs restore the cache but never write it, so a busy branch can't evict
+          # what main built.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # No --exclude: src-tauri is its own workspace, so this can't reach the
+      # Tauri crate (which would need webkit2gtk).
+      - run: cargo test --workspace
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/frontend/package-lock.json
+
+      # `npm run build` is `vue-tsc --noEmit && vite build` — the same check the
+      # frontend image runs, so a type error fails here first and cheaper.
+      - run: npm ci && npm run build
+        working-directory: apps/frontend
+
+  publish:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Deliberately uncached. A cold workspace build is ~10 min on a runner, and
+      # exporting a multi-GB layer cache through the Actions cache service can cost
+      # more wall clock than it saves at that size.
+      #
+      # bake resolves all five targets in one graph, so the shared `builder` stage
+      # compiles the Rust workspace exactly once for all four service images.
+      - uses: docker/bake-action@v7
+        with:
+          push: true
+          # Default provenance attestations land as extra untagged package
+          # versions, doubling what the cleanup job has to sift through.
+          provenance: false
+        env:
+          TAG: ${{ github.sha }}
+
+      # Only now, with every image pushed, does :latest move — a partial failure
+      # above leaves the previous release as :latest. Manifest copy, no rebuild.
+      - name: Point :latest at this commit
+        run: |
+          for p in user-service booking-service spot-service view-service frontend; do
+            docker buildx imagetools create \
+              -t "$REGISTRY/ourdriveway-$p:latest" \
+              "$REGISTRY/ourdriveway-$p:${{ github.sha }}"
+          done
+
+  # Every push adds five immutable sha tags. Keep enough for rollback, bin the rest.
+  cleanup:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        pkg:
+          - ourdriveway-user-service
+          - ourdriveway-booking-service
+          - ourdriveway-spot-service
+          - ourdriveway-view-service
+          - ourdriveway-frontend
+    steps:
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ matrix.pkg }}
+          package-type: container
+          # ~20 pushes of rollback depth. :latest always points at the newest, so
+          # it is never a deletion candidate.
+          min-versions-to-keep: 20

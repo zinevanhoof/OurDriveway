@@ -12,5 +12,5 @@ pub mod snapshot;
 pub use connect::{connect, ensure_streams};
 pub use health::Readiness;
 pub use projector::Projector;
-pub use publisher::publish;
+pub use publisher::{PublishError, publish, publish_expecting, subject_head};
 pub use snapshot::Snapshotter;

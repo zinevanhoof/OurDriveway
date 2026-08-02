@@ -9,15 +9,28 @@ import {
 } from '@lucide/vue';
 
 
+import { computed } from "vue"
 import type { ToasterProps } from "vue-sonner"
 import { Toaster as Sonner } from "vue-sonner"
 import { cn } from "@/lib/utils"
 
 const props = defineProps<ToasterProps>()
+
+// Merged here rather than as a separate :toast-options binding: v-bind="props"
+// already carries toastOptions, and specifying it twice makes one silently win.
+// Caller values take precedence over the rounded-corner default.
+const toasterProps = computed(() => ({
+  ...props,
+  toastOptions: {
+    ...props.toastOptions,
+    classes: { toast: "rounded-2xl", ...props.toastOptions?.classes },
+  },
+}))
 </script>
 
 <template>
   <Sonner
+    v-bind="toasterProps"
     :class="cn('toaster group', props.class)"
     :style="{
       '--normal-bg': 'var(--popover)',
@@ -30,12 +43,6 @@ const props = defineProps<ToasterProps>()
       '--gray5': 'var(--border)',
       '--gray12': 'var(--popover-foreground)',
     }"
-    :toast-options="{
-      classes: {
-        toast: 'rounded-2xl',
-      },
-    }"
-    v-bind="props"
   >
     <template #success-icon>
       <CircleCheckIcon class="size-4" />

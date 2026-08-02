@@ -29,6 +29,11 @@
 			import api_upstream
 		}
 	}
+	handle /api/booking* {
+		reverse_proxy localhost:3001 {
+			import api_upstream
+		}
+	}
 
 	handle {
 		root * /srv/dist

@@ -25,6 +25,11 @@ const FULL_SPOT = gql`
         weekly
         single
       }
+      # Slots already taken: "YYYY-MM-DD" -> [{ start, end }]. Same shape as
+      # availability.single, so the picker subtracts one from the other directly.
+      # This replaced a spot_busy query — and before that a booking query that
+      # was a live bug, since a prospective renter can't select booking rows at all.
+      booked
     }
   }
 `;

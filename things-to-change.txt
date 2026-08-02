@@ -1,0 +1,2 @@
+Every private db schema permissions
+record_key etc.
