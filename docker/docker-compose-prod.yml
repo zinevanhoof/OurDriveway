@@ -4,7 +4,7 @@ x-surrealdb: &surrealdb
   # Pinned to match the `surrealdb` crate version in Cargo.toml. `:latest` and
   # `:main` are moving targets (3.1.5 and a nightly at time of writing) and drift
   # between dev and prod is not something you want under a projection store.
-  image: surrealdb/surrealdb:v3.2.1
+  image: surrealdb/surrealdb:v3.2.4
   restart: unless-stopped
   # ponytail: the image runs as `nonroot`, but a fresh named volume is created
   # root-owned, so the datastore can't be written. Running the DB process as root
@@ -42,7 +42,7 @@ services:
   # Single node here; three (odd, for quorum) once losing it would mean losing
   # data rather than just an outage.
   nats:
-    image: nats:alpine
+    image: nats:2.14.4-alpine
     restart: unless-stopped
     command: ["-js", "-sd", "/data", "-m", "8222"]
     volumes:
@@ -83,8 +83,15 @@ services:
   user-service:
     image: ghcr.io/zinevanhoof/ourdriveway-user-service:${TAG:-latest}
     environment:
+      # Every variable the service's Config struct requires — there are no
+      # defaults left in the code, so an omission crash-loops the container at
+      # startup instead of surfacing as a 500 later.
+      PORT: 80
       SURREALDB_ADDR: user-service-db:8000
+      SURREALDB_USER: root
+      SURREALDB_PASS: root
       NATS_URL: nats://nats:4222
+      SNAPSHOT_INTERVAL_SECS: 0
       JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRATION: ${JWT_EXPIRATION}
       REFRESH_TOKEN_EXPIRATION: ${REFRESH_TOKEN_EXPIRATION}
@@ -96,7 +103,7 @@ services:
     healthcheck:
       # /readyz, not /healthz: an instance that is up but still replaying the log
       # must not receive traffic. Generous retries — a cold start replays a stream.
-      test: ["CMD", "curl", "-fsS", "http://localhost:3000/readyz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/readyz"]
       interval: 5s
       timeout: 3s
       retries: 60
@@ -106,8 +113,15 @@ services:
   booking-service:
     image: ghcr.io/zinevanhoof/ourdriveway-booking-service:${TAG:-latest}
     environment:
+      # Every variable the service's Config struct requires — there are no
+      # defaults left in the code, so an omission crash-loops the container at
+      # startup instead of surfacing as a 500 later.
+      PORT: 80
       SURREALDB_ADDR: booking-service-db:8000
+      SURREALDB_USER: root
+      SURREALDB_PASS: root
       NATS_URL: nats://nats:4222
+      SNAPSHOT_INTERVAL_SECS: 0
       JWT_SECRET: ${JWT_SECRET}
     depends_on:
       booking-service-db:
@@ -117,7 +131,7 @@ services:
     healthcheck:
       # /readyz, not /healthz: an instance that is up but still replaying the log
       # must not receive traffic. Generous retries — a cold start replays a stream.
-      test: ["CMD", "curl", "-fsS", "http://localhost:3001/readyz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/readyz"]
       interval: 5s
       timeout: 3s
       retries: 60
@@ -127,8 +141,15 @@ services:
   spot-service:
     image: ghcr.io/zinevanhoof/ourdriveway-spot-service:${TAG:-latest}
     environment:
+      # Every variable the service's Config struct requires — there are no
+      # defaults left in the code, so an omission crash-loops the container at
+      # startup instead of surfacing as a 500 later.
+      PORT: 80
       SURREALDB_ADDR: spot-service-db:8000
+      SURREALDB_USER: root
+      SURREALDB_PASS: root
       NATS_URL: nats://nats:4222
+      SNAPSHOT_INTERVAL_SECS: 0
       JWT_SECRET: ${JWT_SECRET}
       LOCATIONIQ_API_KEY: ${LOCATIONIQ_API_KEY}
     volumes:
@@ -141,7 +162,7 @@ services:
     healthcheck:
       # /readyz, not /healthz: an instance that is up but still replaying the log
       # must not receive traffic. Generous retries — a cold start replays a stream.
-      test: ["CMD", "curl", "-fsS", "http://localhost:3002/readyz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/readyz"]
       interval: 5s
       timeout: 3s
       retries: 60
@@ -152,8 +173,15 @@ services:
   view-service:
     image: ghcr.io/zinevanhoof/ourdriveway-view-service:${TAG:-latest}
     environment:
+      # Every variable the service's Config struct requires — there are no
+      # defaults left in the code, so an omission crash-loops the container at
+      # startup instead of surfacing as a 500 later.
+      PORT: 80
       SURREALDB_ADDR: view-service-db:8000
+      SURREALDB_USER: root
+      SURREALDB_PASS: root
       NATS_URL: nats://nats:4222
+      SNAPSHOT_INTERVAL_SECS: 0
       JWT_SECRET: ${JWT_SECRET}
     depends_on:
       view-service-db:
@@ -163,7 +191,7 @@ services:
     healthcheck:
       # A cold start replays every stream from sequence 1, so this can legitimately
       # take a while on a wiped volume — hence the generous retry budget.
-      test: ["CMD", "curl", "-fsS", "http://localhost:3003/readyz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/readyz"]
       interval: 5s
       timeout: 3s
       retries: 60

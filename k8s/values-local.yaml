@@ -1,0 +1,10 @@
+# Dev cluster (k3d — see README.md).
+ingress:
+  host: ourdriveway.local
+  tls:
+    enabled: false
+
+# Use the images you built and imported with `k3d image import`. With the
+# default Always, the `latest` tag would send kubelet to ghcr for the last image
+# CI published and your local build would never run.
+imagePullPolicy: IfNotPresent

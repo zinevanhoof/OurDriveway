@@ -1,41 +1,27 @@
-# Single origin for every client: browser, tauri desktop, tauri android.
-# Serving the SPA and the API from one origin is what keeps requests same-origin,
-# so the SameSite=Strict refresh cookie works and no CORS is needed anywhere.
+# Static SPA delivery, nothing else.
 #
-# ponytail: plain HTTP on the LAN. Upgrade path is `tls internal` (or a real domain
-# + ACME), which also unblocks Android release builds — they block cleartext. Bare
-# `:80` avoids auto-HTTPS and doesn't hardcode the IP.
+# The reverse_proxy blocks that used to live here moved into the Ingress in
+# k8s/30-frontend.yaml: it routes /api/* to the four services and everything else
+# to this pod, so the browser still sees ONE origin — which is what keeps the
+# SameSite=Strict refresh cookie working and CORS unnecessary. Routing declared in
+# two places is just two places to forget.
 #
-# Every upstream is health-checked against /readyz, not /healthz. Once services
-# project their state from the event log, an instance that is up but still
-# replaying answers from a half-built database — this check is what actually keeps
-# it out of rotation until it has caught up.
-(api_upstream) {
-	health_uri /readyz
-	health_interval 5s
-	health_timeout 2s
-}
-
+# Nothing load-balances here any more either. A ClusterIP Service does that in
+# front of each service's pods, and `readinessProbe: /readyz` keeps a replica that
+# is still replaying the log out of the endpoint list — the job the old
+# `health_uri /readyz` snippet was doing.
+#
+# ponytail: plain HTTP. TLS terminates at the ingress now, so `tls internal` here
+# would only re-encrypt inside the cluster. Android release builds block cleartext,
+# so the ingress is where a real certificate has to land.
+#
+# Tauri never touches this at all: desktop and mobile ship the SPA as local files
+# and call the ingress origin directly.
 :80 {
-	handle /api/view/* {
-		reverse_proxy view-service:3003 {
-			import api_upstream
-		}
-	}
-	handle /api/user/* {
-		reverse_proxy user-service:3000 {
-			import api_upstream
-		}
-	}
-	handle /api/spot/* {
-		reverse_proxy spot-service:3002 {
-			import api_upstream
-		}
-	}
-	handle /api/booking* {
-		reverse_proxy booking-service:3001 {
-			import api_upstream
-		}
+	# Something cheap for the probes to hit that isn't the whole SPA. First
+	# matching `handle` wins, so this has to come before the catch-all.
+	handle /healthz {
+		respond "ok" 200
 	}
 
 	handle {

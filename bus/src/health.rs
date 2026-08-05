@@ -110,7 +110,6 @@ pub fn routes<S>(readiness: Arc<Readiness>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let ready = readiness.clone();
     Router::new()
         // Liveness: deliberately does not consult NATS. If this returned 503 while
         // the broker was down, an orchestrator would restart a perfectly healthy
@@ -118,13 +117,11 @@ where
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/readyz",
-            get(move || {
-                let ready = ready.clone();
-                async move {
-                    match ready.status() {
-                        Ok(()) => (StatusCode::OK, "ready".to_string()),
-                        Err(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason),
-                    }
+            get(async move || {
+                let ready = readiness.clone();
+                match ready.status() {
+                    Ok(()) => (StatusCode::OK, "ready".to_string()),
+                    Err(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason),
                 }
             }),
         )

@@ -72,9 +72,12 @@ async fn parse_spot_form(mut multipart: Multipart) -> MyResult<(CreateSpotReques
 
                 let bytes = field.bytes().await?;
 
-                images.push(format!(
-                    "http://192.168.50.29:3002/api/spot/uploads/{file_name}"
-                ));
+                // Origin-relative on purpose. These strings are persisted in an
+                // event, so a hostname baked in here outlives the box it named:
+                // every spot created on the old LAN IP would keep pointing at it
+                // forever. Relative resolves against whatever origin served the
+                // page — ingress, Caddy, or a Tauri webview.
+                images.push(format!("/api/spot/uploads/{file_name}"));
                 File::create(format!("uploads/{file_name}"))
                     .await?
                     .write_all(&bytes)

@@ -1,0 +1,24 @@
+# Everything not listed here is the chart default. Set `tag` to a commit sha to
+# pin a release or a rollback — the CI workflow pushes one per merge to main.
+tag: latest
+
+replicas: 2
+
+ingress:
+  host: ourdriveway.example.com
+  tls:
+    enabled: true
+
+services:
+  spot:
+    # Pinned to one. Uploaded images sit on this pod's emptyDir, so a second
+    # replica would serve 404s for every image the first one received. This is
+    # the constraint that lifts the day uploads move to an object store.
+    replicas: 1
+
+nats:
+  config:
+    jetstream:
+      fileStore:
+        pvc:
+          size: 20Gi

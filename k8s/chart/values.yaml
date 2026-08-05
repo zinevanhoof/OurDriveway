@@ -1,0 +1,132 @@
+# The four backends differ in two facts: some extra env, and whether they hold
+# uploads. Everything else about them is identical, so they are data here and one
+# template in templates/services.yaml — not four near-copies that drift the first
+# time a probe changes.
+registry: ghcr.io/zinevanhoof
+
+# Every service listens on 80 in a container. Locally they need distinct ports to
+# share one host (3000-3003, in each service's .env); here each one has its own
+# Service and DNS name, so there is nothing left to disambiguate.
+port: 80
+
+# Overridden per-environment by values-local.yaml / values-prod.yaml. Set this to
+# a commit sha to pin a release or a rollback.
+tag: latest
+
+# Kubernetes defaults this to Always whenever the tag is `latest`, which is right
+# for a deployed environment and wrong on a laptop: it would re-pull the last
+# image CI published and quietly discard the one you just built and imported into
+# k3d. values-local.yaml sets IfNotPresent for exactly that reason.
+imagePullPolicy: Always
+
+# Keys are load-bearing three times over: the image is
+# ourdriveway-<name>-service, the schema key is <name>-schema.surql, and the
+# ingress path is /api/<name>. Rename one and all three follow.
+services:
+  user:
+    env:
+      # MINUTES — user_service.rs does Duration::minutes on this.
+      JWT_EXPIRATION: "15"
+      # DAYS — Duration::days.
+      REFRESH_TOKEN_EXPIRATION: "15"
+  booking: {}
+  spot:
+    # ponytail: emptyDir, so uploaded images die with the pod and every spot keeps
+    # a /api/spot/uploads/… URL that now 404s. Accepted deliberately: this is the
+    # one piece of state NATS cannot rebuild, and a portfolio app can wear it.
+    # Upgrade path is the NATS object store (already a dependency, used by the
+    # snapshotter) or S3 — at which point spot-service can also scale past one
+    # replica, which local disk prevents today.
+    uploads: true
+  view: {}
+
+replicas: 1
+
+surrealdb:
+  # Pinned to match the `surrealdb` crate in Cargo.toml. `:latest` drifting under
+  # a projection store is not a surprise anyone wants.
+  image: surrealdb/surrealdb:v3.2.4
+  # Used for BOTH the sidecar's --user/--pass and the app's SURREALDB_USER/PASS,
+  # so the two can't drift into a boot-time auth failure. Not a secret worth
+  # hiding: the sidecar binds 127.0.0.1, so nothing outside the pod can reach it.
+  user: root
+  pass: root
+  # surrealkv on an emptyDir: a real on-disk datastore that happens to be
+  # disposable. NOT `memory` — that would hold every projection in RAM, and the
+  # read model is the largest thing here.
+  #
+  # The emptyDir is node-local scratch deleted with the pod, which is the whole
+  # trick: disk-backed like production, stateless like a cache. No PVC, no
+  # StatefulSet, no volume to back up or migrate. Every pod start replays the log
+  # from sequence 1 and rebuilds this from scratch.
+  storage: surrealkv:/data/db
+  # Sized for the projection, not the log. This is scratch — if a service ever
+  # OOMs the node's ephemeral storage, that is the signal to turn snapshots back
+  # on, not to grow this.
+  sizeLimit: 2Gi
+
+# 0 disables the snapshot/restore path entirely. Nothing worth snapshotting while
+# the datastore is disposable — a snapshot would only ever be a slower way to
+# reach the state the log already produces. Set this (900 is the code default)
+# once the log is long enough for replay to be felt, and pair it with an S3 or
+# NATS object store the objects can live in.
+snapshotIntervalSecs: 0
+
+# Created outside this chart, by deploy.sh, from the gitignored k8s/secrets.env.
+# Deliberately not templated: Helm stores every rendered value in the release
+# secret and prints them back with `helm get values`, so a chart is a poor place
+# to put a signing key. Rotating it needs a `kubectl rollout restart`.
+secretName: app-secrets
+
+schemaConfigMap: surreal-schemas
+# Filled at install time by deploy.sh via `--set-file schemas.<name>=…`, keyed by
+# service name. Empty here so that a plain `helm template` with no --set-file
+# fails loudly on a missing schema rather than booting a database with no tables.
+schemas: {}
+
+frontend:
+  # Caddy serving the built SPA and nothing else — all routing lives in the
+  # Ingress now. Tauri builds ignore this entirely; they ship the SPA locally.
+  replicas: 1
+
+ingress:
+  # Traefik, because k3s ships it: one less thing to install on the VPS, and the
+  # local cluster can run the same controller as production.
+  #
+  # It is also the surviving option. `kubernetes-sigs/ingress-nginx` was retired
+  # and the GitHub repository now 404s — its Helm index is still served, but that
+  # is not something to build on.
+  className: traefik
+  # Controller-specific annotations, if you ever need any. Deliberately empty:
+  # this app's only such dependency was nginx's proxy-body-size, and that limit
+  # now lives in spot-service (MAX_UPLOAD_BYTES) where no controller can lose it.
+  annotations: {}
+  # One host for the SPA and the API. Not cosmetic: the refresh cookie is
+  # SameSite=Strict, so the moment /api lives on another origin, login breaks.
+  host: ourdriveway.local
+  tls:
+    enabled: false
+    secretName: ourdriveway-tls
+
+# Subchart values. `helm show values nats/nats` is the authority if these keys
+# ever move.
+nats:
+  # A `nats` CLI in a Deployment that runs `sleep infinity`, plus its own Secret.
+  # Purely a debug shell for poking at streams by hand; nothing in the data path
+  # touches it, and `kubectl run --rm -it --image=natsio/nats-box` gets you the
+  # same thing on the rare occasion you want it.
+  natsBox:
+    enabled: false
+
+  config:
+    jetstream:
+      enabled: true
+      # The one PVC in the whole deployment. Everything else is rebuilt from it.
+      fileStore:
+        enabled: true
+        pvc:
+          size: 5Gi
+    cluster:
+      # One node. Three (odd, for quorum) the day losing this pod means losing
+      # data rather than taking an outage.
+      enabled: false

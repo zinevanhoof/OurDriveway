@@ -32,19 +32,34 @@ pub struct Snapshotter {
     pub streams: Vec<&'static str>,
 }
 
+/// Everything the snapshotter needs, all of it from the calling service's own
+/// `Config`.
+///
+/// A struct rather than seven positional arguments: `db_addr`, `db_user`,
+/// `db_pass` and `service` are four adjacent `&str`, and getting two of them the
+/// wrong way round would produce a runtime auth failure that reads like a
+/// network problem.
+pub struct SnapshotConfig<'a> {
+    pub db_addr: &'a str,
+    pub db_user: &'a str,
+    pub db_pass: &'a str,
+    /// Object name — one per service, e.g. "spot-service".
+    pub service: &'a str,
+    /// Streams whose cursors this service owns, e.g. `["USERS", "SESSIONS"]`.
+    pub streams: Vec<&'static str>,
+    /// Seconds between snapshots. **0 disables the whole path**, which is how
+    /// this runs against a disposable projection store.
+    pub every_secs: u64,
+}
+
 /// Connects the HTTP engine and ensures the bucket exists.
-pub async fn connect(
-    js: &Context,
-    db_addr: &str,
-    name: &str,
-    streams: Vec<&'static str>,
-) -> MyResult<Snapshotter> {
-    let db = Surreal::new::<surrealdb::engine::remote::http::Http>(db_addr)
+async fn connect(js: &Context, cfg: &SnapshotConfig<'_>) -> MyResult<Snapshotter> {
+    let db = Surreal::new::<surrealdb::engine::remote::http::Http>(cfg.db_addr)
         .await
         .map_err(|e| MyError::Bus(format!("snapshot http connect: {e}")))?;
     db.signin(surrealdb::opt::auth::Root {
-        username: std::env::var("SURREALDB_USER").unwrap_or_else(|_| "root".into()),
-        password: std::env::var("SURREALDB_PASS").unwrap_or_else(|_| "root".into()),
+        username: cfg.db_user.to_string(),
+        password: cfg.db_pass.to_string(),
     })
     .await
     .map_err(|e| MyError::Bus(format!("snapshot signin: {e}")))?;
@@ -68,8 +83,8 @@ pub async fn connect(
     Ok(Snapshotter {
         db,
         store,
-        name: name.to_string(),
-        streams,
+        name: cfg.service.to_string(),
+        streams: cfg.streams.clone(),
     })
 }
 
@@ -241,7 +256,8 @@ impl Snapshotter {
     }
 }
 
-/// Takes a snapshot on a jittered interval, forever.
+/// Takes a snapshot on a jittered interval, forever. Reached only via `install`,
+/// which is what decides whether snapshots run at all.
 ///
 /// ponytail: every instance snapshots and the last write wins. They are all
 /// projections of the same log, so whichever object survives is valid — only the
@@ -250,7 +266,7 @@ impl Snapshotter {
 ///
 /// The jitter keeps N instances from uploading in lockstep after a simultaneous
 /// deploy.
-pub fn spawn(snapshotter: Arc<Snapshotter>, every: Duration) {
+fn spawn(snapshotter: Arc<Snapshotter>, every: Duration) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(jittered(every, std::process::id())).await;
@@ -264,15 +280,28 @@ pub fn spawn(snapshotter: Arc<Snapshotter>, every: Duration) {
     });
 }
 
-/// How often to snapshot. Configurable mainly so the restore path can be
-/// exercised without waiting a quarter of an hour.
-pub fn interval_from_env() -> Duration {
-    Duration::from_secs(
-        std::env::var("SNAPSHOT_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(15 * 60),
-    )
+/// Restore on boot, then snapshot forever — or do nothing at all.
+///
+/// The whole snapshot path is one call so that "off" is one decision in one
+/// place. Off is a legitimate steady state, not a degraded one: against a
+/// disposable projection store every start is a cold start anyway, and replaying
+/// a few thousand events costs less than the object-store round trip. Raise
+/// `every_secs` once the log is long enough for replay to be felt.
+pub async fn install(js: &Context, cfg: SnapshotConfig<'_>) -> MyResult<()> {
+    if cfg.every_secs == 0 {
+        tracing::info!(
+            service = cfg.service,
+            "snapshots disabled; projections replay from the log"
+        );
+        return Ok(());
+    }
+
+    // Cold start only: restore from the newest snapshot before the projectors
+    // begin, so replay resumes from the snapshot's cursor instead of sequence 1.
+    let snapshotter = Arc::new(connect(js, &cfg).await?);
+    snapshotter.restore_if_empty().await?;
+    spawn(snapshotter, Duration::from_secs(cfg.every_secs));
+    Ok(())
 }
 
 /// `every` scaled by ±20%, derived from the process id so replicas spread out

@@ -3,11 +3,11 @@ use shared::events::STREAMS;
 
 /// Connects to NATS and returns a JetStream context.
 ///
-/// `NATS_URL` defaults to the compose service name so a service started with no
-/// configuration in dev behaves the same as in a container.
-pub async fn connect() -> Result<Context, async_nats::Error> {
-    let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into());
-    let client = async_nats::connect(&url).await?;
+/// The URL is passed in from the caller's `Config`. It used to default to
+/// `nats://localhost:4222` when unset — which in a container meant a service
+/// quietly dialled itself, failed, and looked like a broker outage.
+pub async fn connect(url: &str) -> Result<Context, async_nats::Error> {
+    let client = async_nats::connect(url).await?;
     tracing::info!(%url, "connected to NATS");
     Ok(jetstream::new(client))
 }

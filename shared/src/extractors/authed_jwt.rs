@@ -3,12 +3,12 @@ use axum_extra::{
     TypedHeader,
     headers::{Authorization, authorization::Bearer},
 };
-use jsonwebtoken::{DecodingKey, TokenData, Validation, decode};
+use jsonwebtoken::{TokenData, Validation, decode};
 
 use crate::{
-    SHARED_CONFIG,
     claims::jwt_claims::{ISSUER, JwtClaims},
     error::myerror::{ContextExt, MyError},
+    jwt_decoding_key,
 };
 
 /// The only authentication extractor. Verifies the token's signature in Rust and
@@ -47,7 +47,7 @@ where
 
         let token_data: TokenData<JwtClaims> = decode(
             auth.token(),
-            &DecodingKey::from_secret(SHARED_CONFIG.jwt_secret.as_bytes()),
+            jwt_decoding_key(),
             &validation,
         )
         // The detail string must keep containing "JWT": the frontend's apiFetch

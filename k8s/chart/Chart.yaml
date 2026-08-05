@@ -1,0 +1,23 @@
+apiVersion: v2
+name: ourdriveway
+description: Event-sourced parking-spot booking app — four Rust services, each with its own disposable projection database, all replayed from one NATS JetStream log.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
+dependencies:
+  # NATS is the ONLY durable thing in this deployment. Every projection sits on a
+  # disposable emptyDir and is rebuilt from this log on boot, so this chart's PVC
+  # is the whole backup story — not a cache, the source of truth.
+  #
+  # Upstream chart rather than a hand-written StatefulSet: clustering NATS for
+  # quorum later is a values change here and a week of YAML otherwise.
+  #
+  # Pinned to an exact version, NOT a `^` range. The chart re-versioned from the
+  # 1.x line to track its appVersion, so a `^1.x` constraint silently pinned NATS
+  # server 2.11 forever while `nats:alpine` in the compose files moved on to 2.14
+  # — dev and prod drifting apart on the one component that holds the data.
+  # An exact pin makes an upgrade a visible commit.
+  - name: nats
+    version: "2.14.2"
+    repository: https://nats-io.github.io/k8s/helm/charts/

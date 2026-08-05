@@ -1,6 +1,7 @@
 use std::sync::{Arc, LazyLock};
 
 use axum::{Router, routing::post};
+use shared::env;
 
 use crate::{
     projector::{SessionProjector, UserProjector},
@@ -15,22 +16,37 @@ pub struct AppState {
     pub user_service: Arc<UserService>,
 }
 
+/// Every variable this service reads, in one place.
+///
+/// One-to-one with `apps/services/user-service/.env`: if a variable is not a
+/// field here it is not read, and if it is a field here it is required. Nothing
+/// falls back to a default, because a default is a value you cannot discover by
+/// reading the `.env`.
 pub struct Config {
+    pub surrealdb_addr: String,
+    pub surrealdb_user: String,
+    pub surrealdb_pass: String,
+    pub nats_url: String,
+    pub port: u16,
+    /// 0 disables snapshots entirely — see `bus::snapshot::install`.
+    pub snapshot_interval_secs: u64,
     pub jwt_secret: String,
+    /// Minutes.
     pub jwt_expiration: i64,
+    /// Days.
     pub refresh_token_expiration: i64,
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
-    jwt_secret: std::env::var("JWT_SECRET").expect("JWT_SECRET must be set"),
-    jwt_expiration: std::env::var("JWT_EXPIRATION")
-        .expect("JWT_EXPIRATION must be set")
-        .parse()
-        .unwrap(),
-    refresh_token_expiration: std::env::var("REFRESH_TOKEN_EXPIRATION")
-        .expect("REFRESH_TOKEN_EXPIRATION must be set")
-        .parse()
-        .unwrap(),
+    surrealdb_addr: env::require("SURREALDB_ADDR"),
+    surrealdb_user: env::require("SURREALDB_USER"),
+    surrealdb_pass: env::require("SURREALDB_PASS"),
+    nats_url: env::require("NATS_URL"),
+    port: env::require_parsed("PORT"),
+    snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
+    jwt_secret: env::require("JWT_SECRET"),
+    jwt_expiration: env::require_parsed("JWT_EXPIRATION"),
+    refresh_token_expiration: env::require_parsed("REFRESH_TOKEN_EXPIRATION"),
 });
 
 mod auth;
@@ -44,15 +60,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
     shared::install_default_crypto_provider();
 
-    // Read user-service's own .env explicitly so the key resolves regardless of the
-    // process CWD (the workspace has several services).
+    // Local dev only: in a container the environment comes from the orchestrator
+    // and this file does not exist, so the failure is discarded. Read explicitly by
+    // path so the variables resolve regardless of the process CWD.
     dotenvy::from_filename("apps/services/user-service/.env").ok();
-    shared::check_config();
 
-    let db_addr = std::env::var("SURREALDB_ADDR").unwrap_or_else(|_| "localhost:8000".into());
-    let db = shared::db::connect(&db_addr).await?;
+    // Resolve the whole environment before anything binds a port. Without this a
+    // missing variable would surface as a panic inside the first handler that
+    // needed it, leaving a process that passes its health check and fails requests.
+    LazyLock::force(&CONFIG);
+    shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
-    let js = bus::connect().await?;
+    let db = shared::db::connect(
+        &CONFIG.surrealdb_addr,
+        &CONFIG.surrealdb_user,
+        &CONFIG.surrealdb_pass,
+    )
+    .await?;
+
+    let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
     let readiness = bus::Readiness::new(
         js.client().clone(),
@@ -62,14 +88,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ],
     );
 
-    // Cold start only: restore the projection from the newest snapshot before the
-    // projectors begin, so replay resumes from the snapshot's cursor instead of
-    // sequence 1. A warm restart finds a non-empty projection and skips this.
-    let snapshotter = std::sync::Arc::new(
-        bus::snapshot::connect(&js, &db_addr, "user-service", vec![shared::events::STREAM_USERS, shared::events::STREAM_SESSIONS]).await?,
-    );
-    snapshotter.restore_if_empty().await?;
-    bus::snapshot::spawn(snapshotter, bus::snapshot::interval_from_env());
+    // No-op when SNAPSHOT_INTERVAL_SECS=0, which is how this runs with a
+    // disposable projection store: every start replays from sequence 1.
+    bus::snapshot::install(
+        &js,
+        bus::SnapshotConfig {
+            db_addr: &CONFIG.surrealdb_addr,
+            db_user: &CONFIG.surrealdb_user,
+            db_pass: &CONFIG.surrealdb_pass,
+            service: "user-service",
+            streams: vec![
+                shared::events::STREAM_USERS,
+                shared::events::STREAM_SESSIONS,
+            ],
+            every_secs: CONFIG.snapshot_interval_secs,
+        },
+    )
+    .await?;
+
     let users_applied = readiness
         .applied_rx(shared::events::STREAM_USERS)
         .expect("USERS registered above");
@@ -118,10 +154,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .merge(bus::health::routes(readiness))
         .with_state(state);
 
-    // run our app with hyper, listening globally on port 3000
-    // PORT is overridable so several instances can run on one host — needed to
-    // test that independent projections converge on the same log.
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".into());
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
-    Ok(axum::serve(listener, app).await.unwrap())
+    // PORT differs per service in local dev so several can run on one host — which
+    // is also how you test that independent projections converge on the same log.
+    // Containerised, every service listens on 80 and is told apart by its Service.
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", CONFIG.port)).await?;
+    tracing::info!(port = CONFIG.port, "user-service listening");
+    Ok(axum::serve(listener, app).await?)
 }

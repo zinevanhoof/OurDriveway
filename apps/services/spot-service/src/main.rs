@@ -1,6 +1,7 @@
 use std::sync::{Arc, LazyLock};
 
 use axum::{Router, extract::DefaultBodyLimit, routing::{get, post}};
+use shared::env;
 use tower_http::services::ServeDir;
 
 use crate::{
@@ -13,6 +14,11 @@ mod repository;
 mod route;
 mod service;
 
+/// Ceiling for a whole create-spot request — several phone photos in one
+/// multipart body, not one image. Matches the 20m the nginx ingress used to
+/// enforce, so nothing that worked before starts failing.
+const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+
 /// `SpotService` is built once at boot, not per request. It used to be assembled
 /// inside the `DbAuthenticated` extractor on every call, purely so the connection
 /// could be re-authenticated with the caller's JWT — which is exactly the pattern
@@ -22,13 +28,34 @@ pub struct AppState {
     pub spot_service: Arc<SpotService>,
 }
 
+/// Every variable this service reads, in one place.
+///
+/// One-to-one with `apps/services/spot-service/.env`: if a variable is not a
+/// field here it is not read, and if it is a field here it is required. Nothing
+/// falls back to a default, because a default is a value you cannot discover by
+/// reading the `.env`.
 pub struct Config {
+    pub surrealdb_addr: String,
+    pub surrealdb_user: String,
+    pub surrealdb_pass: String,
+    pub nats_url: String,
+    pub port: u16,
+    /// 0 disables snapshots entirely — see `bus::snapshot::install`.
+    pub snapshot_interval_secs: u64,
+    /// Verification only. This service mints no tokens; user-service does.
+    pub jwt_secret: String,
     pub locationiq_api_key: String,
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
-    locationiq_api_key: std::env::var("LOCATIONIQ_API_KEY")
-        .expect("LOCATIONIQ_API_KEY must be set"),
+    surrealdb_addr: env::require("SURREALDB_ADDR"),
+    surrealdb_user: env::require("SURREALDB_USER"),
+    surrealdb_pass: env::require("SURREALDB_PASS"),
+    nats_url: env::require("NATS_URL"),
+    port: env::require_parsed("PORT"),
+    snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
+    jwt_secret: env::require("JWT_SECRET"),
+    locationiq_api_key: env::require("LOCATIONIQ_API_KEY"),
 });
 
 #[tokio::main]
@@ -36,26 +63,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
     shared::install_default_crypto_provider();
 
-    // Read spot-service's own .env explicitly so the key resolves regardless of the
-    // process CWD (the workspace has several services).
+    // Local dev only: in a container the environment comes from the orchestrator
+    // and this file does not exist, so the failure is discarded. Read explicitly by
+    // path so the variables resolve regardless of the process CWD.
     dotenvy::from_filename("apps/services/spot-service/.env").ok();
-    shared::check_config();
 
-    let db_addr = std::env::var("SURREALDB_ADDR").unwrap_or_else(|_| "localhost:8002".into());
-    let db = shared::db::connect(&db_addr).await?;
+    // Resolve the whole environment before anything binds a port. Without this a
+    // missing variable would surface as a panic inside the first handler that
+    // needed it, leaving a process that passes its health check and fails requests.
+    LazyLock::force(&CONFIG);
+    shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
-    let js = bus::connect().await?;
+    let db = shared::db::connect(
+        &CONFIG.surrealdb_addr,
+        &CONFIG.surrealdb_user,
+        &CONFIG.surrealdb_pass,
+    )
+    .await?;
+
+    let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
     let readiness = bus::Readiness::new(js.client().clone(), &[shared::events::STREAM_SPOTS]);
 
-    // Cold start only: restore the projection from the newest snapshot before the
-    // projectors begin, so replay resumes from the snapshot's cursor instead of
-    // sequence 1. A warm restart finds a non-empty projection and skips this.
-    let snapshotter = std::sync::Arc::new(
-        bus::snapshot::connect(&js, &db_addr, "spot-service", vec![shared::events::STREAM_SPOTS]).await?,
-    );
-    snapshotter.restore_if_empty().await?;
-    bus::snapshot::spawn(snapshotter, bus::snapshot::interval_from_env());
+    // No-op when SNAPSHOT_INTERVAL_SECS=0, which is how this runs with a
+    // disposable projection store: every start replays from sequence 1.
+    bus::snapshot::install(
+        &js,
+        bus::SnapshotConfig {
+            db_addr: &CONFIG.surrealdb_addr,
+            db_user: &CONFIG.surrealdb_user,
+            db_pass: &CONFIG.surrealdb_pass,
+            service: "spot-service",
+            streams: vec![shared::events::STREAM_SPOTS],
+            every_secs: CONFIG.snapshot_interval_secs,
+        },
+    )
+    .await?;
 
     // The projector is the only writer to `db`; the service only publishes.
     tokio::spawn(bus::projector::run(
@@ -74,7 +117,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/spot", post(route::spot::create_spot))
         .route("/api/spot/address/suggest", get(route::address::suggest))
         .nest_service("/api/spot/uploads", ServeDir::new("uploads"))
-        .layer(DefaultBodyLimit::disable());
+        // Was `disable()`, which relied on the ingress to cap uploads — an
+        // nginx-only annotation that Traefik has no equivalent of, so swapping
+        // controllers would have quietly made this unbounded. The limit belongs
+        // to the service that owns the upload, where it holds no matter what is
+        // proxying in front of it.
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));
 
     // No GraphQL proxy here any more: every client read is served by
     // view-service from the combined projection. This database is private to
@@ -85,10 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .merge(bus::health::routes(readiness))
         .with_state(state);
 
-    // run our app with hyper, listening globally on port 3000
-    // PORT is overridable so several instances can run on one host — needed to
-    // test that independent projections converge on the same log.
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3002".into());
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
-    Ok(axum::serve(listener, app).await.unwrap())
+    // PORT differs per service in local dev so several can run on one host — which
+    // is also how you test that independent projections converge on the same log.
+    // Containerised, every service listens on 80.
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", CONFIG.port)).await?;
+    tracing::info!(port = CONFIG.port, "spot-service listening");
+    Ok(axum::serve(listener, app).await?)
 }
