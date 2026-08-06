@@ -33,6 +33,9 @@ pub struct SpotForBooking {
     pub availability: Option<Availability>,
     pub active: bool,
     pub booked: Booked,
+    /// IANA name, e.g. `"Europe/Brussels"`. `booked` is bare wall-clock strings in
+    /// this zone, so cancel's deadline can't be placed on a timeline without it.
+    pub timezone: Option<String>,
     /// Stream sequence of the last BOOKINGS event applied for this spot — the
     /// value reserve asserts as `Nats-Expected-Last-Subject-Sequence`.
     pub bookings_seq: u64,
@@ -80,7 +83,7 @@ impl BookingRepository {
                 // `?? {}` / `?? 0` rather than trusting the schema DEFAULTs: a row
                 // created by the BOOKINGS-first ordering, or one written before
                 // these fields existed, has neither, and NONE won't deserialize.
-                "SELECT owner_id, shard, price_per_hour, availability, active,
+                "SELECT owner_id, shard, price_per_hour, availability, active, timezone,
                         booked ?? {} AS booked, bookings_seq ?? 0 AS bookings_seq
                  FROM ONLY type::record('spot', $id)",
             )
@@ -207,6 +210,7 @@ impl BookingRepository {
             BookingEvent::Released { booking_id, reason } => {
                 self.released(booking_id, reason, at, seq).await
             }
+            BookingEvent::Cancelled { booking_id } => self.cancelled(booking_id, at, seq).await,
         }
     }
 
@@ -255,6 +259,17 @@ impl BookingRepository {
         // undo the confirmation — this WHERE clause is the whole guard.
         let spot_id = self
             .status_transition(booking_id, "released", &["reserved"], Some(reason.as_str()))
+            .await?;
+        self.refold_opt(spot_id, at, seq).await
+    }
+
+    async fn cancelled(&self, booking_id: Uuid, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
+        // Only a *confirmed* booking can be cancelled, so a redelivery after the
+        // booking was settled some other way is a no-op. `release_reason` stays
+        // NONE: the status already says which of the two happened, and a value on a
+        // field named *release*_reason would only repeat it.
+        let spot_id = self
+            .status_transition(booking_id, "cancelled", &["confirmed"], None)
             .await?;
         self.refold_opt(spot_id, at, seq).await
     }

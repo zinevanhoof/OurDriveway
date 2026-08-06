@@ -74,6 +74,21 @@ pub async fn release(
     Ok(accepted(seq))
 }
 
+/// The renter withdraws a booking they already paid for, up to an hour before it
+/// starts.
+///
+/// Its own endpoint rather than letting DELETE dispatch on status: a client that
+/// means "abandon my hold" must never cancel a paid booking because the payment
+/// landed between rendering the button and pressing it.
+pub async fn cancel(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(booking_id): Path<String>,
+) -> MyResult<impl IntoResponse> {
+    let seq = state.booking_service.cancel(&booking_id, &user_id).await?;
+    Ok(accepted(seq))
+}
+
 fn accepted(seq: u64) -> impl IntoResponse {
     (
         StatusCode::ACCEPTED,

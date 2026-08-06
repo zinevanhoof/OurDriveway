@@ -137,7 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api_router: Router<AppState> = Router::new()
         .route("/api/booking", post(route::booking::reserve))
         .route("/api/booking/{id}/confirm", post(route::booking::confirm))
-        .route("/api/booking/{id}", delete(route::booking::release));
+        .route("/api/booking/{id}", delete(route::booking::release))
+        .route("/api/booking/{id}/cancel", post(route::booking::cancel));
 
     let app = Router::new()
         .merge(api_router)

@@ -25,6 +25,16 @@ pub enum BookingEvent {
         booking_id: Uuid,
         reason: ReleaseReason,
     },
+    /// A paid booking is withdrawn by the renter, up to an hour before it starts.
+    ///
+    /// Its own variant rather than a third `ReleaseReason`, because `fold_booked`
+    /// keys off the row's *status*: a `Released { reason: Cancelled }` would still
+    /// have to land as `status = 'cancelled'`, so both projectors would need to
+    /// branch on the reason to pick the target status *and* the allowed `from` —
+    /// two branches in two files instead of one straight arm each. It also keeps
+    /// "your hold ran out" and "you cancelled a booking you paid for" apart in the
+    /// one field a renter's history already reads.
+    Cancelled { booking_id: Uuid },
 }
 
 /// Why a hold ended without becoming a booking. Costs nothing to carry and it's

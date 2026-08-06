@@ -54,6 +54,18 @@ export async function release(bookingId: string, keepalive = false): Promise<voi
   await settle(`/api/booking/${bookingId}`, "DELETE", keepalive);
 }
 
+/**
+ * Withdraws a booking that was already paid for.
+ *
+ * Not the same thing as `release`, which only ends an unpaid hold and answers 409
+ * for anything confirmed. The server re-checks the one-hour cutoff against the
+ * *spot's* timezone and is the authority on it — the UI hiding the button is a
+ * courtesy, not the rule.
+ */
+export async function cancel(bookingId: string): Promise<void> {
+  await settle(`/api/booking/${bookingId}/cancel`, "POST");
+}
+
 async function settle(path: string, method: string, keepalive = false): Promise<void> {
   const res = await apiFetch(path, { method, keepalive });
   if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));

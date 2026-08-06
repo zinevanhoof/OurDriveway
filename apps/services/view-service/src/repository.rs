@@ -240,11 +240,22 @@ impl ViewRepository {
         match envelope.payload {
             BookingEvent::Reserved(e) => self.booking_reserved(e, at, seq).await,
             BookingEvent::Confirmed { booking_id } => {
-                self.booking_settled(booking_id, "confirmed", None, at, seq)
+                self.booking_settled(booking_id, "reserved", "confirmed", None, at, seq)
                     .await
             }
             BookingEvent::Released { booking_id, reason } => {
-                self.booking_settled(booking_id, "released", Some(reason.as_str()), at, seq)
+                self.booking_settled(
+                    booking_id,
+                    "reserved",
+                    "released",
+                    Some(reason.as_str()),
+                    at,
+                    seq,
+                )
+                .await
+            }
+            BookingEvent::Cancelled { booking_id } => {
+                self.booking_settled(booking_id, "confirmed", "cancelled", None, at, seq)
                     .await
             }
         }
@@ -289,24 +300,29 @@ impl ViewRepository {
     async fn booking_settled(
         &self,
         booking_id: Uuid,
+        from: &str,
         status: &str,
         reason: Option<&str>,
         at: chrono::DateTime<chrono::Utc>,
         seq: u64,
     ) -> MyResult<()> {
-        // Scoped to 'reserved'. A payment landing microseconds before the hold
-        // lapses, with the sweeper's expiry arriving second, must not undo the
-        // confirmation — this WHERE clause is the whole guard.
+        // Scoped to the status the event is allowed to leave. A payment landing
+        // microseconds before the hold lapses, with the sweeper's expiry arriving
+        // second, must not undo the confirmation — this WHERE clause is the whole
+        // guard. It is a parameter because a cancel leaves 'confirmed', not
+        // 'reserved', and a hardcoded 'reserved' would drop cancels *silently*:
+        // the None branch below still advances the cursor.
         let spot_id: Option<String> = self
             .db
             .query(
                 "UPDATE type::record('booking', $id) SET
                      status = $status, hold_until = NONE,
                      release_reason = $reason ?? release_reason
-                 WHERE status = 'reserved'
+                 WHERE status = $from
                  RETURN VALUE spot_id;",
             )
             .bind(("id", record_key(&booking_id)))
+            .bind(("from", from.to_string()))
             .bind(("status", status.to_string()))
             .bind(("reason", reason.map(str::to_string)))
             .await?

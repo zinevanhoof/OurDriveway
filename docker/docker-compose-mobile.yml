@@ -2,8 +2,8 @@
 # on the LAN reaches one origin. The Rust services run natively on the host.
 #
 # Same DB config as the other two compose files, deliberately.
-x-surrealdb: &surrealdb
-  # Pinned to match the `surrealdb` crate version in Cargo.toml.
+x-surrealdb:
+  &surrealdb # Pinned to match the `surrealdb` crate version in Cargo.toml.
   image: surrealdb/surrealdb:v3.2.4
   restart: unless-stopped
   # ponytail: the image runs as `nonroot`, but a fresh named volume is created
@@ -53,7 +53,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - user-db-data:/data
       - ../schemas/user-schema.surql:/schema.surql:ro
 
   booking-service-db:
@@ -61,7 +60,6 @@ services:
     ports:
       - "8001:8000"
     volumes:
-      - booking-db-data:/data
       - ../schemas/booking-schema.surql:/schema.surql:ro
 
   spot-service-db:
@@ -69,7 +67,6 @@ services:
     ports:
       - "8002:8000"
     volumes:
-      - spot-db-data:/data
       - ../schemas/spot-schema.surql:/schema.surql:ro
 
   # The combined read model. Rebuildable from the log, so losing this volume
@@ -79,7 +76,6 @@ services:
     ports:
       - "8003:8000"
     volumes:
-      - view-db-data:/data
       - ../schemas/view-schema.surql:/schema.surql:ro
 
   # Single origin for every client (browser + tauri): serves the built SPA and

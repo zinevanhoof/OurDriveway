@@ -7,6 +7,11 @@
     "core:default",
     "opener:default",
     {
+      "identifier": "opener:allow-open-url",
+      "comment": "opener:default covers only mailto:/tel:/http:/https:, so Directions would silently no-op without these. geo: is what gives Android a chooser across every installed navigation app instead of forcing Google Maps; maps: is the iOS equivalent, dormant until there is an iOS target.",
+      "allow": [{ "url": "geo:*" }, { "url": "maps:*" }]
+    },
+    {
       "identifier": "http:default",
       "allow": [
         {

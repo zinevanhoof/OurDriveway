@@ -16,11 +16,7 @@ import { recordId } from "@/lib/utils";
 import { native } from "@/api/http";
 import MapPinComponent from "./MapPinComponent.vue";
 import MapSearchComponent from "./MapSearchComponent.vue";
-import Avatar from "../ui/avatar/Avatar.vue";
-import AvatarImage from "../ui/avatar/AvatarImage.vue";
-import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
-import { Star } from "@lucide/vue";
-import Button from "../ui/button/Button.vue";
+import SpotDetailDrawer from "../spot/SpotDetailDrawer.vue";
 import BookingFormComponent from "../BookingFormComponent.vue";
 
 // Dynamic OSM map via OpenFreeMap (Liberty vector style) + MapLibre GL. Keyless:
@@ -327,55 +323,8 @@ onBeforeUnmount(() => {
         </div>
       </DrawerContent>
     </Drawer>
-    <Drawer v-model:open="detailOpen">
-      <DrawerContent @close-auto-focus.prevent
-        class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
-        <div class="m-4 space-y-4">
-          <div class="flex h-40 gap-4 overflow-x-auto snap-x snap-mandatory no-scrollbar">
-            <!-- `only:` = the sole image, so it fills the row instead of leaving a gap. -->
-            <img v-for="url in selectedSpot?.spot?.images" :src="url"
-              class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md border-border" />
-          </div>
-          <div>
-            <div class="flex items-end justify-between">
-              <div class="text-lg font-bold">{{ selectedSpot?.spot?.title }}</div>
-              <div class="flex items-baseline text-xl font-extrabold text-primary">{{
-                formatCents(Number(selectedSpot?.spot?.price_per_hour))
-              }}
-                <div class="text-xs text-muted-foreground font-medium">/hr</div>
-              </div>
-            </div>
-            <div class="flex max-w-3/4 gap-1 items-center text-xs text-muted-foreground font-medium">
-              {{ selectedSpot?.spot?.address?.formatted }}
-            </div>
-          </div>
-          <div class="flex items-center gap-2">
-            <Avatar size="lg">
-              <AvatarImage v-if="selectedSpot?.spot?.owner?.profilePicture"
-                :src="selectedSpot?.spot?.owner.profilePicture" />
-              <AvatarFallback
-                :name="{ firstName: selectedSpot?.spot?.owner?.firstName, lastName: selectedSpot?.spot?.owner?.lastName }" />
-            </Avatar>
-            <div>
-              <div class="font-semibold">{{ selectedSpot?.spot?.owner?.firstName }} {{
-                selectedSpot?.spot?.owner?.lastName
-                }}</div>
-              <div class="flex items-center gap-1 text-xs text-muted-foreground font-medium">
-                <Star :size="16" class="fill-star text-star" />
-                4.9 · 128 trips
-              </div>
-            </div>
-          </div>
-          <div class="space-y-2">
-            <Button class="w-full h-11 font-bold" @click="bookingOpen = true">
-              Check availability & book
-            </Button>
-            <div class="text-xs text-muted-foreground font-medium text-center">Free cancellation up to 1 hour before
-            </div>
-          </div>
-        </div>
-      </DrawerContent>
-    </Drawer>
+    <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable
+      @book="bookingOpen = true" />
     <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot?.spot"
       @booked="() => reexecuteSpot({ requestPolicy: 'network-only' })" />
   </div>

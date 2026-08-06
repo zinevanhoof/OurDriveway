@@ -4,7 +4,8 @@ use std::time::Duration;
 use async_nats::jetstream::Context;
 use axum::http::StatusCode;
 use bus::{PublishError, Readiness};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeDelta, TimeZone, Utc};
+use chrono_tz::Tz;
 use shared::{
     error::myerror::{ContextExt, MyError, MyResult},
     events::{
@@ -12,6 +13,7 @@ use shared::{
         booking::{BookingEvent, BookingReserved, ReleaseReason},
         booking_subject, user::record_key,
     },
+    general_models::booking::Booked,
     requests::booking::CreateBookingRequest,
 };
 use tokio::sync::watch;
@@ -195,6 +197,57 @@ impl BookingService {
         .await
     }
 
+    /// The renter withdraws a booking they already paid for.
+    ///
+    /// Deliberately not `transition`. That path re-checks availability, which is
+    /// meaningless here — the slots are already ours and we are handing them back,
+    /// so a host who narrowed their hours since would turn a cancel into a 422. It
+    /// also publishes under compare-and-swap, which a cancel doesn't need: like the
+    /// expiry sweeper it only ever *frees* slots, so it can't lose a race in a way
+    /// that matters, and the projector's `WHERE status IN ['confirmed']` makes a
+    /// redelivery or a client retry a no-op.
+    pub async fn cancel(&self, booking_id: &str, renter_id: &str) -> MyResult<u64> {
+        let id = parse_uuid(booking_id)?;
+        let booking = self
+            .repository
+            .booking_for_update(booking_id)
+            .await?
+            .context_not_found(("Not Found", "That booking doesn't exist."))?;
+        authorize(&booking, renter_id, "confirmed")?;
+
+        let timezone = self
+            .repository
+            .spot_for_booking(&booking.spot_id)
+            .await?
+            .and_then(|s| s.timezone);
+
+        // Fails closed. A spot whose projection hasn't landed, an unknown zone, or
+        // times that don't parse all mean we cannot *prove* the cancel is in time —
+        // and the host has been holding the space on the strength of this booking.
+        if timezone
+            .as_deref()
+            .and_then(|tz| in_time(&booking.booked, tz, Utc::now()))
+            != Some(true)
+        {
+            return Err(MyError::api(
+                StatusCode::CONFLICT,
+                "Too late to cancel",
+                "A booking can only be cancelled up to an hour before it starts.",
+            ));
+        }
+
+        let event = BookingEvent::Cancelled { booking_id: id };
+        match self
+            .publish(&booking.spot_id, &booking.spot_shard, &event, renter_id, None)
+            .await
+        {
+            Ok(seq) => Ok(seq),
+            // Unreachable with `expected: None` — there is no assertion to lose.
+            Err(PublishError::Stale) => Err(taken_now()),
+            Err(PublishError::Failed(e)) => Err(e),
+        }
+    }
+
     /// Shared confirm/release path: authorize, re-check, publish under CAS.
     async fn transition(
         &self,
@@ -211,7 +264,7 @@ impl BookingService {
                 .await?
                 .context_not_found(("Not Found", "That booking doesn't exist."))?;
 
-            authorize(&booking, renter_id)?;
+            authorize(&booking, renter_id, "reserved")?;
             self.recheck(&booking).await?;
 
             let seq = self
@@ -304,7 +357,7 @@ impl BookingService {
     }
 }
 
-fn authorize(booking: &BookingForUpdate, renter_id: &str) -> MyResult<()> {
+fn authorize(booking: &BookingForUpdate, renter_id: &str, expected: &str) -> MyResult<()> {
     // Ownership from the verified token, never from the request.
     if booking.renter_id != renter_id {
         // 404 rather than 403: whether a booking id exists isn't this caller's
@@ -315,7 +368,9 @@ fn authorize(booking: &BookingForUpdate, renter_id: &str) -> MyResult<()> {
             "That booking doesn't exist.",
         ));
     }
-    if booking.status != "reserved" {
+    // A parameter, not a constant: confirm and release leave `reserved`, cancel
+    // leaves `confirmed`.
+    if booking.status != expected {
         return Err(MyError::api(
             StatusCode::CONFLICT,
             "Already settled",
@@ -323,6 +378,46 @@ fn authorize(booking: &BookingForUpdate, renter_id: &str) -> MyResult<()> {
         ));
     }
     Ok(())
+}
+
+/// How long before a booking starts cancelling closes. Any shorter and the host
+/// is already standing in the driveway.
+const CUTOFF: TimeDelta = TimeDelta::hours(1);
+
+/// Whether a cancel at `now` is still in time.
+///
+/// `None` when the start can't be determined at all — an unknown zone, or times
+/// that don't parse. The caller treats that as "no", because we can't hand out a
+/// cancel we can't prove is in time.
+///
+/// `now` is a parameter rather than a clock read so this stays pure and testable.
+fn in_time(booked: &Booked, timezone: &str, now: DateTime<Utc>) -> Option<bool> {
+    Some(now + CUTOFF <= starts_at(booked, timezone)?)
+}
+
+/// The first moment a booking occupies, as a UTC instant.
+///
+/// `booked` is `"YYYY-MM-DD"` plus `"HH:MM"` with no zone attached — it is the
+/// *spot's* wall clock. Reading it as UTC would slide an hour-long deadline by the
+/// spot's whole offset, which in Brussels means two hours the wrong way in summer.
+///
+/// The minimum is taken across every date and every slot: `booked` is a `HashMap`,
+/// so the first one iterated is not the first one that happens.
+fn starts_at(booked: &Booked, timezone: &str) -> Option<DateTime<Utc>> {
+    let tz: Tz = timezone.parse().ok()?;
+    let first = booked
+        .iter()
+        .flat_map(|(date, slots)| slots.iter().map(move |s| format!("{date} {}", s.start)))
+        .filter_map(|local| NaiveDateTime::parse_from_str(&local, "%Y-%m-%d %H:%M").ok())
+        .min()?;
+    // A wall time inside a spring-forward gap names no instant at all. The same
+    // time an hour later always does; being an hour stricter one night a year beats
+    // a booking that can never be cancelled. `earliest` also settles the autumn
+    // ambiguity, in the host's favour.
+    tz.from_local_datetime(&first)
+        .earliest()
+        .or_else(|| tz.from_local_datetime(&(first + TimeDelta::hours(1))).earliest())
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 fn parse_uuid(key: &str) -> MyResult<Uuid> {
@@ -354,5 +449,54 @@ fn reject(rejection: Rejection) -> MyError {
             "Invalid times",
             "Those time slots don't look right.",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::general_models::spot::TimeSlot;
+    use std::collections::HashMap;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn slot(start: &str, end: &str) -> TimeSlot {
+        TimeSlot {
+            start: start.into(),
+            end: end.into(),
+        }
+    }
+
+    #[test]
+    fn cancel_closes_one_hour_before_the_first_slot_in_the_spots_zone() {
+        // 09:00 in Brussels on this date is 07:00Z (CEST, UTC+2), so the deadline is
+        // 06:00Z. Reading `booked` as bare UTC would put the deadline at 08:00Z and
+        // hand out two extra hours of cancelling — the bug this test exists for.
+        let booked: Booked = HashMap::from([(
+            "2026-08-03".to_string(),
+            // Out of order on purpose: `booked` is a HashMap, so "first" has to be a
+            // minimum, not whatever happens to iterate first.
+            vec![slot("11:00", "12:00"), slot("09:00", "10:00")],
+        )]);
+        let tz = "Europe/Brussels";
+
+        assert_eq!(in_time(&booked, tz, at("2026-08-03T05:59:59Z")), Some(true));
+        // Exactly on the hour still counts — the boundary is inclusive.
+        assert_eq!(in_time(&booked, tz, at("2026-08-03T06:00:00Z")), Some(true));
+        assert_eq!(in_time(&booked, tz, at("2026-08-03T06:00:01Z")), Some(false));
+        // Inside the naive-UTC window, and correctly refused anyway.
+        assert_eq!(in_time(&booked, tz, at("2026-08-03T07:30:00Z")), Some(false));
+        // An earlier date wins over an earlier clock time on a later date: 22:00 on
+        // the 3rd is 20:00Z, so the deadline is 19:00Z — not 07:00 on the 4th.
+        let spread: Booked = HashMap::from([
+            ("2026-08-04".to_string(), vec![slot("08:00", "09:00")]),
+            ("2026-08-03".to_string(), vec![slot("22:00", "23:00")]),
+        ]);
+        assert_eq!(in_time(&spread, tz, at("2026-08-03T19:00:00Z")), Some(true));
+        assert_eq!(in_time(&spread, tz, at("2026-08-03T19:00:01Z")), Some(false));
+        // Fails closed: an unknown zone can't be proven in time.
+        assert_eq!(in_time(&booked, "Not/AZone", at("2026-08-03T05:00:00Z")), None);
     }
 }
