@@ -6,7 +6,6 @@ import {
     TabsList,
     TabsTrigger,
 } from '@/components/ui/tabs'
-import { isUpcoming } from '@/lib/bookingDates';
 import { useAuthStore } from '@/stores/auth';
 import { useQuery } from '@urql/vue';
 import { computed } from 'vue';
@@ -23,15 +22,24 @@ const { data, executeQuery } = useQuery({
 })
 
 // A booking that ended without happening is not history the renter wants a tab
-// full of — an abandoned checkout in particular is noise, not a record. Anything
-// still live is bucketed purely on whether a day is left, in the spot's zone.
+// full of — an abandoned checkout in particular is noise, not a record. The one
+// exception is a booking the *host* withdrew: that one has to stay visible, or a
+// trip someone paid for just disappears without ever saying why.
 const live = computed(() =>
     (data.value?.bookings ?? []).filter(
-        (b: any) => b?.status !== 'released' && b?.status !== 'cancelled',
+        (b: any) =>
+            b?.status !== 'released' &&
+            (b?.status !== 'cancelled' || b?.cancelReason === 'spot_unavailable'),
     ),
 )
-const upcoming = computed(() => live.value.filter((b: any) => isUpcoming(b, b?.spot?.timezone)))
-const past = computed(() => live.value.filter((b: any) => !isUpcoming(b, b?.spot?.timezone)))
+
+// One comparison against the server-folded end instant, in place of walking every
+// booking's date map. `Date.parse` rather than a string compare: the server emits
+// RFC 3339 with an offset, which doesn't sort against an ISO "Z" string.
+const stillToCome = (booking: any) => Date.parse(booking?.endsAt) > Date.now()
+
+const upcoming = computed(() => live.value.filter(stillToCome))
+const past = computed(() => live.value.filter((b: any) => !stillToCome(b)))
 
 /** After a cancel, re-read past the projection rather than trusting the cache. */
 const refresh = () => executeQuery({ requestPolicy: 'network-only' })

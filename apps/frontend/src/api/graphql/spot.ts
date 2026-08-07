@@ -34,6 +34,84 @@ const FULL_SPOT = gql`
   }
 `;
 
+const MANAGE_SPOT = gql`
+  # "datetime" (lowercase) is SurrealDB's own scalar name for a datetime field —
+  # it coerces an RFC 3339 string, which is what toISOString() gives.
+  query GetSpotAndBookings($spotId: ID!, $now: datetime!) {
+    spot(id: $spotId) {
+      id
+      title
+      description
+      pricePerHour: price_per_hour
+      images
+      timezone
+      # Drives the live switch. Not the same as "deleted" — off just stops new
+      # reservations, and the bookings already taken are still honoured.
+      active
+      address {
+        formatted
+      }
+      availability {
+        weekly
+        single
+      }
+      # Slots already taken: "YYYY-MM-DD" -> [{ start, end }]. Same shape as
+      # availability.single, so the picker subtracts one from the other directly.
+      # This replaced a spot_busy query — and before that a booking query that
+      # was a live bug, since a prospective renter can't select booking rows at all.
+      booked
+    }
+    # Still to come, as one indexed comparison. The alternative is folding every
+    # booking's date map client-side, which a GraphQL filter cannot express — hence
+    # ends_at existing at all.
+    bookings(where: { spot_id: { eq: $spotId }, ends_at: { gt: $now } }) {
+      id
+      renter {
+        id
+        firstName: first_name
+        lastName: last_name
+        profilePicture: profile_picture
+      }
+      booked
+      amount
+      status
+      endsAt: ends_at
+    }
+  }
+`;
+
+const EDIT_SPOT = gql`
+  query GetSpot($id: ID!) {
+    spot(id: $id) {
+      id
+      title
+      description
+      pricePerHour: price_per_hour
+      images
+      # The zone the bare dates in "booked" are relative to — without it the edit
+      # screen can't tell which of them are still in the future.
+      timezone
+      address {
+        line1
+        line2
+        city
+        postalCode: postal_code
+        region
+        country
+      }
+      availability {
+        weekly
+        single
+      }
+      # Slots already taken: "YYYY-MM-DD" -> [{ start, end }]. Same shape as
+      # availability.single, so the picker subtracts one from the other directly.
+      # This replaced a spot_busy query — and before that a booking query that
+      # was a live bug, since a prospective renter can't select booking rows at all.
+      booked
+    }
+  }
+`;
+
 const SPOT = gql`
   query GetSpot($id: ID!) {
     spot(id: $id) {
@@ -47,12 +125,16 @@ const SPOT = gql`
 `;
 
 const SPOTS_OWNED = gql`
+  # The owner can select their own inactive spots — that's what the switch is for —
+  # so the list has to exclude deleted ones itself. The row survives only so a
+  # renter's past bookings can still resolve a title and an address.
   query GetOwnedSpots($id: String!) {
-    spots(where: { owner_id: { eq: $id } }) {
+    spots(where: { owner_id: { eq: $id }, deleted: { eq: false } }) {
       id
       title
       images
       price_per_hour
+      active
       address {
         line1
         city
@@ -75,6 +157,10 @@ const SPOTS_IN_RADIUS = gql`
   query SpotsInRadius($lng: Float!, $lat: Float!, $meters: Float!) {
     spots(
       where: {
+        # Table permissions already hide other people's inactive spots, but not the
+        # viewer's own — without this the host keeps seeing a listing they deleted.
+        deleted: { eq: false }
+        active: { eq: true }
         location: {
           call: {
             fn: "fn::spot_distance"
@@ -99,4 +185,11 @@ const SPOTS_IN_RADIUS = gql`
   }
 `;
 
-export { FULL_SPOT, SPOT, SPOTS_OWNED, SPOTS_IN_RADIUS };
+export {
+  FULL_SPOT,
+  MANAGE_SPOT,
+  EDIT_SPOT,
+  SPOT,
+  SPOTS_OWNED,
+  SPOTS_IN_RADIUS,
+};

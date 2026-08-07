@@ -18,7 +18,7 @@ import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImag
 
 import type { Availability } from '@/types/domain/spot'
 import type { CreateSpotRequest } from '@/types/requests/CreateSpotRequest'
-import { createSpot } from '@/api/userApi'
+import { createSpot, spotFormData } from '@/api/spotApi'
 
 const router = useRouter()
 
@@ -54,7 +54,9 @@ const availability = ref<Availability>({
     weekly: { monday: [], tuesday: [], wednesday: [], thursday: [], friday: [], saturday: [], sunday: [] },
     single: {},
 })
-const images = ref<File[]>([])
+// Mixed-type on create too, so the picker is one component: nothing here ever puts
+// a string in it.
+const images = ref<(string | File)[]>([])
 
 const loading = ref(false)
 const slotErrors = ref<string[]>([])
@@ -96,13 +98,9 @@ const submit = handleSubmit(async (values) => {
         availability: availability.value,
     }
 
-    const formData = new FormData()
-    formData.append('data', JSON.stringify(request))
-    for (const image of images.value) formData.append('images', image)
-
     loading.value = true
     try {
-        const response = await createSpot(formData)
+        const response = await createSpot(spotFormData(request, images.value))
         if (!response.ok) {
             showServerErrors(await response.json().catch(() => ({})))
             return

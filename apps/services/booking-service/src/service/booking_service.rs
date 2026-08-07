@@ -10,10 +10,11 @@ use shared::{
     error::myerror::{ContextExt, MyError, MyResult},
     events::{
         Envelope, STREAM_BOOKINGS,
-        booking::{BookingEvent, BookingReserved, ReleaseReason},
+        booking::{BookingEvent, BookingReserved, CancelReason, ReleaseReason},
         booking_subject, user::record_key,
     },
     general_models::booking::Booked,
+    general_models::spot::TimeSlot,
     requests::booking::CreateBookingRequest,
 };
 use tokio::sync::watch;
@@ -147,6 +148,19 @@ impl BookingService {
             // 30-minute grid, so it only bites on a hand-crafted request.
             let amount_cents = minutes * price / 60;
 
+            // Folded here rather than by each projector: the zone is a spot field,
+            // and a projector that had to look it up would be reading state instead
+            // of the event. Fails closed for the same reason cancel does — a booking
+            // whose end can't be placed on a timeline can't be filtered by one.
+            let ends_at = spot
+                .timezone
+                .as_deref()
+                .and_then(|tz| ends_at(&requested, tz))
+                .context_unprocessable_entity((
+                    "Unavailable",
+                    "This spot isn't ready to accept bookings. Try again in a moment.",
+                ))?;
+
             let expires_at = Utc::now() + HOLD;
             let event = BookingEvent::Reserved(BookingReserved {
                 booking_id,
@@ -157,6 +171,7 @@ impl BookingService {
                 booked: requested.clone(),
                 amount_cents,
                 expires_at,
+                ends_at,
             });
 
             match self
@@ -180,6 +195,14 @@ impl BookingService {
     }
 
     /// Payment succeeded. Stands in for the provider callback until one exists.
+    ///
+    // ponytail: this is *pre*-capture — the renter clicked pay and nothing has been
+    // taken yet — which is what makes `transition`'s `recheck` the right guard here.
+    // A real provider webhook is post-capture and must not reuse this path: money
+    // already moved, so refusing would orphan a payment. That one publishes
+    // `Confirmed` unconditionally and lets the reactor in `projector.rs` withdraw the
+    // booking as `SpotUnavailable` if it no longer fits — one refund trigger, no
+    // hanging state.
     pub async fn confirm(&self, booking_id: &str, renter_id: &str) -> MyResult<u64> {
         self.transition(booking_id, renter_id, |id| BookingEvent::Confirmed {
             booking_id: id,
@@ -236,7 +259,10 @@ impl BookingService {
             ));
         }
 
-        let event = BookingEvent::Cancelled { booking_id: id };
+        let event = BookingEvent::Cancelled {
+            booking_id: id,
+            reason: CancelReason::ByRenter,
+        };
         match self
             .publish(&booking.spot_id, &booking.spot_shard, &event, renter_id, None)
             .await
@@ -305,6 +331,16 @@ impl BookingService {
         let Some(spot) = self.repository.spot_for_booking(&booking.spot_id).await? else {
             return Ok(());
         };
+        // A deleted listing can't be confirmed into, even by a hold taken before the
+        // deletion. `active` is deliberately *not* checked: flipping the live switch
+        // off stops new reservations, and a checkout already under way predates it.
+        if spot.deleted {
+            return Err(MyError::api(
+                StatusCode::CONFLICT,
+                "Unavailable",
+                "The host withdrew this spot.",
+            ));
+        }
         let Some(availability) = spot.availability.as_ref() else {
             return Ok(());
         };
@@ -405,18 +441,43 @@ fn in_time(booked: &Booked, timezone: &str, now: DateTime<Utc>) -> Option<bool> 
 /// so the first one iterated is not the first one that happens.
 fn starts_at(booked: &Booked, timezone: &str) -> Option<DateTime<Utc>> {
     let tz: Tz = timezone.parse().ok()?;
-    let first = booked
+    let first = wall_times(booked, |s| &s.start).min()?;
+    instant(first, tz)
+}
+
+/// The last moment a booking occupies, as a UTC instant.
+///
+/// The mirror of `starts_at`, and the field every "is this still to come" filter
+/// reads. Same reason for the fold: a `HashMap` of wall-clock strings has no order
+/// of its own, so the last date iterated is not the last one that happens.
+fn ends_at(booked: &Booked, timezone: &str) -> Option<DateTime<Utc>> {
+    let tz: Tz = timezone.parse().ok()?;
+    let last = wall_times(booked, |s| &s.end).max()?;
+    instant(last, tz)
+}
+
+/// Every `"YYYY-MM-DD HH:MM"` in `booked`, picking one end of each slot.
+fn wall_times<'a>(
+    booked: &'a Booked,
+    pick: impl Fn(&TimeSlot) -> &String + Copy + 'a,
+) -> impl Iterator<Item = NaiveDateTime> + 'a {
+    booked
         .iter()
-        .flat_map(|(date, slots)| slots.iter().map(move |s| format!("{date} {}", s.start)))
+        .flat_map(move |(date, slots)| slots.iter().map(move |s| format!("{date} {}", pick(s))))
         .filter_map(|local| NaiveDateTime::parse_from_str(&local, "%Y-%m-%d %H:%M").ok())
-        .min()?;
-    // A wall time inside a spring-forward gap names no instant at all. The same
-    // time an hour later always does; being an hour stricter one night a year beats
-    // a booking that can never be cancelled. `earliest` also settles the autumn
-    // ambiguity, in the host's favour.
-    tz.from_local_datetime(&first)
+}
+
+/// A wall time in `tz` as an instant.
+///
+/// A wall time inside a spring-forward gap names no instant at all. The same time an
+/// hour later always does; being an hour stricter one night a year beats a booking
+/// that can never be cancelled. `earliest` also settles the autumn ambiguity, in the
+/// host's favour — for an end that means a booking leaves the Upcoming tab up to an
+/// hour early on that one night, which no money depends on.
+fn instant(local: NaiveDateTime, tz: Tz) -> Option<DateTime<Utc>> {
+    tz.from_local_datetime(&local)
         .earliest()
-        .or_else(|| tz.from_local_datetime(&(first + TimeDelta::hours(1))).earliest())
+        .or_else(|| tz.from_local_datetime(&(local + TimeDelta::hours(1))).earliest())
         .map(|dt| dt.with_timezone(&Utc))
 }
 
@@ -498,5 +559,33 @@ mod tests {
         assert_eq!(in_time(&spread, tz, at("2026-08-03T19:00:01Z")), Some(false));
         // Fails closed: an unknown zone can't be proven in time.
         assert_eq!(in_time(&booked, "Not/AZone", at("2026-08-03T05:00:00Z")), None);
+    }
+
+    #[test]
+    fn ends_at_is_the_last_moment_across_every_day_in_the_spots_zone() {
+        // Deliberately out of order, and spanning two days: `booked` is a HashMap, so
+        // "last" has to be a maximum. The 4th's 09:00 iterating first must not win
+        // over the 3rd's 23:00 — nor the other way round.
+        let booked: Booked = HashMap::from([
+            (
+                "2026-08-04".to_string(),
+                vec![slot("08:00", "09:00"), slot("10:00", "11:00")],
+            ),
+            ("2026-08-03".to_string(), vec![slot("22:00", "23:00")]),
+        ]);
+
+        // 11:00 Brussels on the 4th is 09:00Z in summer. Reading the strings as UTC
+        // would answer 11:00Z and keep the booking "upcoming" two hours too long.
+        assert_eq!(
+            ends_at(&booked, "Europe/Brussels"),
+            Some(at("2026-08-04T09:00:00Z"))
+        );
+        // Same map, other end, so a start/end mix-up can't pass both.
+        assert_eq!(
+            starts_at(&booked, "Europe/Brussels"),
+            Some(at("2026-08-03T20:00:00Z"))
+        );
+        assert_eq!(ends_at(&booked, "Not/AZone"), None);
+        assert_eq!(ends_at(&HashMap::new(), "Europe/Brussels"), None);
     }
 }

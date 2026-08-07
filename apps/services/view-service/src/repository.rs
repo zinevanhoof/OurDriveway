@@ -21,6 +21,29 @@ pub struct ViewRepository {
     pub db: Surreal<Client>,
 }
 
+/// Why a booking left its previous status, and so which field records it.
+///
+/// One value rather than two `Option`s because they are mutually exclusive by
+/// construction: a hold that lapsed has no cancel reason, and a paid booking that
+/// was withdrawn has no release reason. `release_reason` and `cancel_reason` stay
+/// separate *fields* so a renter's history can tell "your hold ran out" from "the
+/// host pulled the listing" — the status alone no longer distinguishes them.
+enum Reason<'a> {
+    None,
+    Release(&'a str),
+    Cancel(&'a str),
+}
+
+impl<'a> Reason<'a> {
+    fn fields(self) -> (Option<&'a str>, Option<&'a str>) {
+        match self {
+            Self::None => (None, None),
+            Self::Release(r) => (Some(r), None),
+            Self::Cancel(r) => (None, Some(r)),
+        }
+    }
+}
+
 impl ViewRepository {
     pub async fn last_seq(&self, stream: &str) -> MyResult<u64> {
         let seq: Option<i64> = self
@@ -115,7 +138,11 @@ impl ViewRepository {
         match envelope.payload {
             SpotEvent::Created(e) => self.spot_created(e, at, seq).await,
             SpotEvent::Updated(e) => self.spot_updated(e, at, seq).await,
-            SpotEvent::Deactivated { spot_id } => self.spot_deactivated(spot_id, at, seq).await,
+            SpotEvent::Deactivated { spot_id } => {
+                self.spot_set_active(spot_id, false, at, seq).await
+            }
+            SpotEvent::Activated { spot_id } => self.spot_set_active(spot_id, true, at, seq).await,
+            SpotEvent::Deleted { spot_id } => self.spot_deleted(spot_id, at, seq).await,
         }
     }
 
@@ -212,7 +239,32 @@ impl ViewRepository {
         Ok(())
     }
 
-    async fn spot_deactivated(
+    async fn spot_set_active(
+        &self,
+        spot_id: Uuid,
+        active: bool,
+        at: chrono::DateTime<chrono::Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
+        self.db
+            .query(
+                "BEGIN;
+                 UPDATE type::record('spot', $id) SET active = $active, updated_at = $at;
+                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
+                 COMMIT;",
+            )
+            .bind(("id", record_key(&spot_id)))
+            .bind(("active", active))
+            .bind(("at", Datetime::from(at)))
+            .bind(("seq", seq as i64))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    /// Soft delete. The row stays selectable so `booking.spot` still resolves for a
+    /// renter's past bookings — the lists filter `deleted`, the permission doesn't.
+    async fn spot_deleted(
         &self,
         spot_id: Uuid,
         at: chrono::DateTime<chrono::Utc>,
@@ -221,7 +273,8 @@ impl ViewRepository {
         self.db
             .query(
                 "BEGIN;
-                 UPDATE type::record('spot', $id) SET active = false, updated_at = $at;
+                 UPDATE type::record('spot', $id) SET
+                     active = false, deleted = true, updated_at = $at;
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
@@ -240,7 +293,7 @@ impl ViewRepository {
         match envelope.payload {
             BookingEvent::Reserved(e) => self.booking_reserved(e, at, seq).await,
             BookingEvent::Confirmed { booking_id } => {
-                self.booking_settled(booking_id, "reserved", "confirmed", None, at, seq)
+                self.booking_settled(booking_id, "reserved", "confirmed", Reason::None, at, seq)
                     .await
             }
             BookingEvent::Released { booking_id, reason } => {
@@ -248,15 +301,22 @@ impl ViewRepository {
                     booking_id,
                     "reserved",
                     "released",
-                    Some(reason.as_str()),
+                    Reason::Release(reason.as_str()),
                     at,
                     seq,
                 )
                 .await
             }
-            BookingEvent::Cancelled { booking_id } => {
-                self.booking_settled(booking_id, "confirmed", "cancelled", None, at, seq)
-                    .await
+            BookingEvent::Cancelled { booking_id, reason } => {
+                self.booking_settled(
+                    booking_id,
+                    "confirmed",
+                    "cancelled",
+                    Reason::Cancel(reason.as_str()),
+                    at,
+                    seq,
+                )
+                .await
             }
         }
     }
@@ -277,7 +337,8 @@ impl ViewRepository {
                      renter: (SELECT VALUE id FROM ONLY user WHERE record::id(id) = $renter_uuid LIMIT 1),
                      spot_id: $spot_id, owner_id: $owner_id, renter_id: $renter_id,
                      booked: $booked, amount: $amount, status: 'reserved',
-                     hold_until: $expires_at, release_reason: NONE, created_at: $at
+                     hold_until: $expires_at, ends_at: $ends_at,
+                     release_reason: NONE, cancel_reason: NONE, created_at: $at
                  };",
             )
             .bind(("id", record_key(&e.booking_id)))
@@ -291,6 +352,7 @@ impl ViewRepository {
             .bind(("booked", e.booked))
             .bind(("amount", e.amount_cents))
             .bind(("expires_at", Datetime::from(e.expires_at)))
+            .bind(("ends_at", Datetime::from(e.ends_at)))
             .bind(("at", Datetime::from(at)))
             .await?
             .check()?;
@@ -302,10 +364,11 @@ impl ViewRepository {
         booking_id: Uuid,
         from: &str,
         status: &str,
-        reason: Option<&str>,
+        reason: Reason<'_>,
         at: chrono::DateTime<chrono::Utc>,
         seq: u64,
     ) -> MyResult<()> {
+        let (release_reason, cancel_reason) = reason.fields();
         // Scoped to the status the event is allowed to leave. A payment landing
         // microseconds before the hold lapses, with the sweeper's expiry arriving
         // second, must not undo the confirmation — this WHERE clause is the whole
@@ -317,14 +380,16 @@ impl ViewRepository {
             .query(
                 "UPDATE type::record('booking', $id) SET
                      status = $status, hold_until = NONE,
-                     release_reason = $reason ?? release_reason
+                     release_reason = $release ?? release_reason,
+                     cancel_reason  = $cancel  ?? cancel_reason
                  WHERE status = $from
                  RETURN VALUE spot_id;",
             )
             .bind(("id", record_key(&booking_id)))
             .bind(("from", from.to_string()))
             .bind(("status", status.to_string()))
-            .bind(("reason", reason.map(str::to_string)))
+            .bind(("release", release_reason.map(str::to_string)))
+            .bind(("cancel", cancel_reason.map(str::to_string)))
             .await?
             .take(0)?;
 

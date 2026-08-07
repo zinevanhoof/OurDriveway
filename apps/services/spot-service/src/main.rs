@@ -1,6 +1,10 @@
 use std::sync::{Arc, LazyLock};
 
-use axum::{Router, extract::DefaultBodyLimit, routing::{get, post}};
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    routing::{get, patch, post},
+};
 use shared::env;
 use tower_http::services::ServeDir;
 
@@ -100,22 +104,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
-    // The projector is the only writer to `db`; the service only publishes.
+    // The projector is the only *writer* to `db`. The service shares the handle to
+    // read a spot's owner and shard before it publishes an edit — it still writes
+    // nothing, so the dual-write the split avoids stays avoided.
+    let repository = Arc::new(SpotRepository { db });
+
     tokio::spawn(bus::projector::run(
         js.clone(),
         Arc::new(SpotProjector {
-            repository: SpotRepository { db },
+            repository: repository.clone(),
         }),
         readiness.clone(),
     ));
 
     let state = AppState {
-        spot_service: Arc::new(SpotService { js }),
+        spot_service: Arc::new(SpotService { js, repository }),
     };
 
     let api_router: Router<AppState> = Router::new()
         .route("/api/spot", post(route::spot::create_spot))
         .route("/api/spot/address/suggest", get(route::address::suggest))
+        .route(
+            "/api/spot/{id}",
+            patch(route::spot::update_spot).delete(route::spot::delete_spot),
+        )
+        .route("/api/spot/{id}/active", post(route::spot::set_active))
         .nest_service("/api/spot/uploads", ServeDir::new("uploads"))
         // Was `disable()`, which relied on the ingress to cap uploads — an
         // nginx-only annotation that Traefik has no equivalent of, so swapping
@@ -139,4 +152,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", CONFIG.port)).await?;
     tracing::info!(port = CONFIG.port, "spot-service listening");
     Ok(axum::serve(listener, app).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        Router,
+        routing::{get, patch, post},
+    };
+
+    /// `/api/spot/{id}` sits alongside a static `/api/spot/uploads` and a static
+    /// `/api/spot/address/suggest`. Overlapping paths panic when the router is
+    /// *built*, not when one is requested — so without this the failure mode is a
+    /// service that dies on boot in whatever environment ran it first.
+    ///
+    /// Dummy handlers on purpose: the panic comes from the path set alone, and the
+    /// real ones need a live NATS connection to construct.
+    #[test]
+    fn route_paths_do_not_overlap() {
+        let _: Router = Router::new()
+            .route("/api/spot", post(|| async {}))
+            .route("/api/spot/address/suggest", get(|| async {}))
+            .route(
+                "/api/spot/{id}",
+                patch(|| async {}).delete(|| async {}),
+            )
+            .route("/api/spot/{id}/active", post(|| async {}))
+            .nest_service("/api/spot/uploads", get(|| async {}));
+    }
 }

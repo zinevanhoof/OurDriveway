@@ -53,11 +53,10 @@ export function todayIn(timezone: string | null | undefined): string {
   return wallClock(timezone)?.[0] ?? localToday();
 }
 
-/** A booking with any day still to come, in the spot's zone. Else it is Past. */
-export function isUpcoming(booking: Booking, timezone: string | null | undefined): boolean {
-  const today = todayIn(timezone);
-  return sortedDays(booking).some(([date]) => date >= today);
-}
+// Upcoming-vs-past used to be folded from `booked` here. It is now `ends_at` on the
+// booking itself — folded once, server-side, in the spot's zone — because a fold is
+// not something a GraphQL `where` can express, and the host's list needs the same
+// question answered without loading every booking a spot ever had.
 
 /** `"Today"` for the spot's today, else a short `Mon, Aug 3`. */
 export function formatDay(date: string, timezone: string | null | undefined): string {

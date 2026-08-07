@@ -13,7 +13,6 @@ import {
   formatDay,
   formatSlots,
   isActiveNow,
-  isUpcoming,
   sortedDays,
   todayIn,
 } from "./bookingDates.ts";
@@ -36,9 +35,6 @@ const booking = (date: string, start: string, end: string, status = "confirmed")
 assert.equal(todayIn(TZ), dateThere);
 assert.equal(formatDay(dateThere, TZ), "Today");
 assert.notEqual(formatDay("2026-12-25", TZ), "Today");
-
-assert.equal(isUpcoming(booking(dateThere, "09:00", "10:00"), TZ), true);
-assert.equal(isUpcoming(booking("2020-01-01", "09:00", "10:00"), TZ), false);
 
 // Active now = the spot's wall clock falls inside a slot on the spot's today.
 const spanning = booking(

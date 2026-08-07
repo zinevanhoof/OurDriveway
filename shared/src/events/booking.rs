@@ -25,7 +25,8 @@ pub enum BookingEvent {
         booking_id: Uuid,
         reason: ReleaseReason,
     },
-    /// A paid booking is withdrawn by the renter, up to an hour before it starts.
+    /// A paid booking is withdrawn — by the renter up to an hour before it starts,
+    /// or by the system when the host makes the spot unable to honour it.
     ///
     /// Its own variant rather than a third `ReleaseReason`, because `fold_booked`
     /// keys off the row's *status*: a `Released { reason: Cancelled }` would still
@@ -34,7 +35,34 @@ pub enum BookingEvent {
     /// two branches in two files instead of one straight arm each. It also keeps
     /// "your hold ran out" and "you cancelled a booking you paid for" apart in the
     /// one field a renter's history already reads.
-    Cancelled { booking_id: Uuid },
+    ///
+    /// This is the *only* event that withdraws money already taken, which makes it
+    /// the single trigger a payment service has to subscribe to for refunds.
+    Cancelled {
+        booking_id: Uuid,
+        reason: CancelReason,
+    },
+}
+
+/// Who withdrew a paid booking. The refund rules differ — a host who cancels owes
+/// the full amount back, a renter cancelling inside the window may not — so the
+/// payment service can't be left to guess from an unqualified `cancelled`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelReason {
+    /// The renter withdrew, in time.
+    ByRenter,
+    /// The host deleted the listing or narrowed its hours out from under a booking.
+    SpotUnavailable,
+}
+
+impl CancelReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ByRenter => "by_renter",
+            Self::SpotUnavailable => "spot_unavailable",
+        }
+    }
 }
 
 /// Why a hold ended without becoming a booking. Costs nothing to carry and it's
@@ -81,4 +109,11 @@ pub struct BookingReserved {
     /// projector deriving it from its own clock would give every replica a
     /// different answer.
     pub expires_at: DateTime<Utc>,
+    /// The last moment this booking occupies, as a UTC instant.
+    ///
+    /// `booked` alone can't answer "is this still to come" in a query: it is a map
+    /// of wall-clock strings in the spot's zone, so every reader would have to fold
+    /// it *and* know the zone. Folded once here instead, which is what lets both the
+    /// host's and the renter's list filter on a single indexed field.
+    pub ends_at: DateTime<Utc>,
 }

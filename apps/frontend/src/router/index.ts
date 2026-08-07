@@ -6,10 +6,11 @@ import SearchView from "@/views/SearchView.vue";
 import LoginView from "@/views/LoginView.vue";
 import { useAuthStore } from "@/stores/auth";
 import SpotsView from "@/views/SpotsView.vue";
-import DetailedSpotViewOwned from "@/views/DetailedSpotViewOwned.vue";
 import MobileHomeHeader from "@/components/header/MobileHomeHeader.vue";
 import MobileProfileHeader from "@/components/header/MobileProfileHeader.vue";
 import AddSpotView from "@/views/AddSpotView.vue";
+import ManageSpotView from "@/views/ManageSpotView.vue";
+import EditSpotView from "@/views/EditSpotView.vue";
 
 export type RouteMeta = {
   header: Component | null;
@@ -56,7 +57,17 @@ const routes = [
   {
     path: "/spot/:id",
     name: "spot",
-    component: DetailedSpotViewOwned,
+    component: ManageSpotView,
+    props: true,
+    meta: {
+      header: null,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    path: "/spot/edit/:id",
+    name: "spot-edit",
+    component: EditSpotView,
     props: true,
     meta: {
       header: null,

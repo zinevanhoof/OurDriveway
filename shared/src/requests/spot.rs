@@ -24,6 +24,50 @@ pub struct CreateSpotRequest {
     pub availability: AvailabilityRequest,
 }
 
+/// An edit of an existing listing. Every field the host can still change, all of
+/// them required — the form submits its whole state, so a partial payload would mean
+/// the client silently deciding what "unchanged" is.
+///
+/// No address: a spot's location is fixed at creation, because the coordinates and
+/// the IANA zone derived from them are what every stored `booked` string is relative
+/// to. Moving a spot would reinterpret bookings already made.
+#[derive(Deserialize, Validate)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSpotRequest {
+    #[garde(length(min = 5, max = 32))]
+    pub title: String,
+    #[garde(inner(length(min = 20, max = 100)))]
+    pub description: Option<String>,
+    #[garde(custom(is_positive))]
+    pub price_per_hour_cents: i64,
+    #[garde(dive, custom(has_any_slot))]
+    pub availability: AvailabilityRequest,
+    /// Existing image URLs the host kept, in display order. Newly picked files
+    /// arrive as multipart parts and are appended to these.
+    #[garde(custom(are_uploads))]
+    pub images: Vec<String>,
+}
+
+/// The path prefix this service serves uploads from. Client-supplied image URLs are
+/// only ever kept if they start with it.
+pub const UPLOAD_PREFIX: &str = "/api/spot/uploads/";
+
+/// Kept images have to be paths this service issued.
+///
+/// They come straight back from the client, and land in an event that every renter
+/// then renders as an `<img src>`. Without this a host could point their listing's
+/// photos at any URL they liked.
+fn are_uploads(images: &Vec<String>, _: &()) -> garde::Result {
+    require(
+        images.iter().all(|image| {
+            image
+                .strip_prefix(UPLOAD_PREFIX)
+                .is_some_and(|name| !name.is_empty() && !name.contains(['/', '\\']))
+        }),
+        "Unknown photo.",
+    )
+}
+
 /// Request variant of `Address`: deserializes, no `SurrealValue`. The address is
 /// verified by LocationIQ server-side, so the fields carry no length rules.
 #[derive(Deserialize, Validate)]
@@ -298,6 +342,48 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    fn update(price_cents: i64, weekly_monday: Vec<TimeSlotRequest>) -> UpdateSpotRequest {
+        let create = req(price_cents, weekly_monday);
+        UpdateSpotRequest {
+            title: create.title,
+            description: create.description,
+            price_per_hour_cents: create.price_per_hour_cents,
+            availability: create.availability,
+            images: vec!["/api/spot/uploads/a.jpg".into()],
+        }
+    }
+
+    /// An edit is held to the same rules as a create — the two structs are separate
+    /// only because of the address, so this is what catches them drifting apart.
+    #[test]
+    fn update_applies_the_same_rules_as_create() {
+        assert!(update(500, vec![slot("08:00", "10:00")]).validate().is_ok());
+        assert!(update(0, vec![slot("08:00", "10:00")]).validate().is_err());
+        assert!(update(500, vec![]).validate().is_err());
+        assert!(update(500, vec![slot("08:15", "10:00")]).validate().is_err());
+    }
+
+    /// The kept-image list is client-supplied and ends up in an event every renter
+    /// renders, so only paths this service serves are allowed through.
+    #[test]
+    fn kept_images_must_be_our_own_uploads() {
+        let with = |image: &str| {
+            let mut r = update(500, vec![slot("08:00", "10:00")]);
+            r.images = vec![image.into()];
+            r.validate().is_ok()
+        };
+
+        assert!(with("/api/spot/uploads/019a.jpg"));
+        assert!(!with("https://evil.example/track.png"));
+        assert!(!with("/api/spot/uploads/../../etc/passwd"));
+        assert!(!with("/api/spot/uploads/"));
+        // No photos at all is the *route's* 422, not garde's: an edit that uploads a
+        // replacement legitimately keeps none.
+        let mut none = update(500, vec![slot("08:00", "10:00")]);
+        none.images = vec![];
+        assert!(none.validate().is_ok());
     }
 
     #[test]

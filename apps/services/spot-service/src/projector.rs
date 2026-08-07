@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bus::Projector;
 use shared::{
     error::myerror::{MyError, MyResult},
@@ -12,7 +14,7 @@ use crate::repository::spot_repository::SpotRepository;
 /// non-deterministic (ids, timestamps) comes out of the event rather than being
 /// computed here — otherwise two replicas replaying the same log would diverge.
 pub struct SpotProjector {
-    pub repository: SpotRepository,
+    pub repository: Arc<SpotRepository>,
 }
 
 impl Projector for SpotProjector {

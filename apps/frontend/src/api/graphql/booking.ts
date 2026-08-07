@@ -16,6 +16,13 @@ const BOOKINGS_RENTED = gql`
       status
       amount
       booked
+      # The last moment this booking occupies, folded server-side in the spot's
+      # zone. Upcoming-vs-past is a comparison against it rather than a fold of
+      # "booked" repeated in every client.
+      endsAt: ends_at
+      # 'spot_unavailable' when the host withdrew it — the renter is owed a refund
+      # and an explanation, not a booking that silently disappeared.
+      cancelReason: cancel_reason
       spot {
         id
         title

@@ -12,7 +12,19 @@ use crate::general_models::spot::{Address, Availability};
 pub enum SpotEvent {
     Created(SpotCreated),
     Updated(SpotUpdated),
+    /// Taken off the market by its host. Blocks new reservations and hides the spot
+    /// from search; bookings already made stay valid and are honoured.
     Deactivated { spot_id: Uuid },
+    /// Put back on the market. The mirror of `Deactivated` — the two are a toggle,
+    /// which is why neither is folded into `SpotUpdated`: a host flipping the switch
+    /// isn't editing the listing, and the projector arm for each is one line.
+    Activated { spot_id: Uuid },
+    /// Withdrawn for good. Unlike `Deactivated` this also cancels every booking the
+    /// spot still owes, because the host is saying they cannot provide the space.
+    ///
+    /// A soft delete: the row stays so a renter's past bookings keep resolving their
+    /// spot's title and address. `deleted` is what hides it everywhere else.
+    Deleted { spot_id: Uuid },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

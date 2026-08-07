@@ -1,4 +1,4 @@
-import { getLocalTimeZone } from "@internationalized/date";
+import { getLocalTimeZone, parseDate } from "@internationalized/date";
 import type { TimeSlot } from "@/types/domain/spot";
 
 // Structural date type — both reka-ui's and @internationalized's DateValue satisfy
@@ -72,6 +72,35 @@ export function resolveOpenWindows(
   return availability?.single?.[iso] ?? availability?.weekly?.[weekday] ?? [];
 }
 
+// "HH:MM" strings compare chronologically, so a window fully covers a slot when it
+// starts no later and ends no earlier.
+export const covers = (window: TimeSlot, slot: TimeSlot) =>
+  window.start <= slot.start && window.end >= slot.end;
+
+/**
+ * Booked slots that `availability` would no longer cover, on or after `from`.
+ *
+ * This is the edit screen's warning: the host is about to remove hours somebody
+ * already paid for. It is a courtesy, not the rule — booking-service re-runs the
+ * same question when the event lands and is the one that actually cancels. Past
+ * dates are skipped for the same reason it skips them: a booking that already
+ * happened can't be withdrawn.
+ */
+export function bookedOutside(
+  availability: SpotAvailability | undefined,
+  occupied: Record<string, TimeSlot[]>,
+  from: string,
+): { date: string; slot: TimeSlot }[] {
+  return Object.entries(occupied)
+    .filter(([date]) => date >= from)
+    .flatMap(([date, slots]) => {
+      const open = resolveOpenWindows(availability, parseDate(date));
+      return slots
+        .filter((slot) => !open.some((window) => covers(window, slot)))
+        .map((slot) => ({ date, slot }));
+    });
+}
+
 // What's still bookable on a date: open windows minus what's already taken.
 //
 // `occupied` is the spot's `booked` field verbatim — no reshaping and no
@@ -123,5 +152,26 @@ export function demo() {
     ),
     [{ start: "14:00", end: "16:00" }],
   ); // window fully taken drops, other stays
+
+  // bookedOutside: which paid slots an edit would cancel. 2026-08-03 is a Monday.
+  const monday = { weekly: { monday: [{ start: "08:00", end: "18:00" }] }, single: {} };
+  const at = (slots: TimeSlot[]) => ({ "2026-08-03": slots });
+  const outside = (a: SpotAvailability, slots: TimeSlot[]) =>
+    bookedOutside(a, at(slots), "2026-08-01").length;
+
+  if (outside(monday, [{ start: "09:00", end: "10:00" }]) !== 0)
+    throw new Error("a slot inside the hours must survive");
+  if (outside(monday, [{ start: "17:00", end: "19:00" }]) !== 1)
+    throw new Error("a slot running past closing must be flagged");
+  if (outside({ weekly: {}, single: {} }, [{ start: "09:00", end: "10:00" }]) !== 1)
+    throw new Error("closing the day must flag everything on it");
+  // An empty single entry closes that date even though Monday is open — same
+  // precedence the server applies, and the easiest one to get backwards.
+  if (outside({ ...monday, single: at([]) }, [{ start: "09:00", end: "10:00" }]) !== 1)
+    throw new Error("an empty single entry must close the day");
+  // Already happened: nothing to cancel, so it is never flagged.
+  if (bookedOutside({ weekly: {}, single: {} }, at([{ start: "09:00", end: "10:00" }]), "2026-09-01").length)
+    throw new Error("past dates must be skipped");
+
   return "ok";
 }

@@ -69,6 +69,10 @@ DEFINE FIELD OVERWRITE price_per_hour ON spot TYPE int;          -- EUR cents
 DEFINE FIELD OVERWRITE images         ON spot TYPE array<string>;
 DEFINE FIELD OVERWRITE location       ON spot TYPE geometry<point>;
 DEFINE FIELD OVERWRITE active         ON spot TYPE bool DEFAULT true;
+-- A deleted spot stays selectable on purpose: `booking.spot` still links to it, and
+-- a renter's past booking would otherwise render with no title and no address. It is
+-- the *lists* that filter it out — see SPOTS_OWNED and the radius query.
+DEFINE FIELD OVERWRITE deleted        ON spot TYPE bool DEFAULT false;
 
 DEFINE FIELD OVERWRITE address ON spot TYPE object;
 DEFINE FIELD OVERWRITE address.line1       ON spot TYPE string;
@@ -140,11 +144,20 @@ DEFINE FIELD OVERWRITE status     ON booking TYPE string
 -- renter or the owner; `spot.booked` carries no expiry at all.
 DEFINE FIELD OVERWRITE hold_until     ON booking TYPE option<datetime>;
 DEFINE FIELD OVERWRITE release_reason ON booking TYPE option<string>;
+-- 'spot_unavailable' is how the renter's row can say the *host* withdrew, rather
+-- than showing the same bare "cancelled" they'd see for their own doing.
+DEFINE FIELD OVERWRITE cancel_reason  ON booking TYPE option<string>;
 DEFINE FIELD OVERWRITE rating     ON booking TYPE option<int>;
+
+-- The last moment this booking occupies, folded from `booked` in the spot's zone at
+-- reserve time. Upcoming-vs-past is a filter on this rather than a fold every client
+-- repeats — and a fold is not something a GraphQL `where` can express at all.
+DEFINE FIELD OVERWRITE ends_at    ON booking TYPE datetime;
 DEFINE FIELD OVERWRITE created_at ON booking TYPE datetime;
 
 DEFINE INDEX OVERWRITE booking_spot   ON booking FIELDS spot_id;
 DEFINE INDEX OVERWRITE booking_renter ON booking FIELDS renter_id;
+DEFINE INDEX OVERWRITE booking_ends   ON booking FIELDS ends_at;
 
 -- ─── projector cursors ──────────────────────────────────────────────────────
 -- One row per stream (_projection:USERS, _projection:SPOTS, …), each written in

@@ -44,6 +44,11 @@ DEFINE FIELD OVERWRITE price_per_hour ON spot TYPE int;
 DEFINE FIELD OVERWRITE images ON spot TYPE array<string>;
 DEFINE FIELD OVERWRITE location ON spot TYPE geometry<point>;
 DEFINE FIELD OVERWRITE active ON spot TYPE bool DEFAULT true;
+-- Two different "off" states. `active = false` is the host's live switch: no new
+-- reservations, bookings already taken are still honoured. `deleted` is permanent —
+-- the row survives only so a renter's past bookings can still resolve a title and
+-- an address, and every list filters it out.
+DEFINE FIELD OVERWRITE deleted ON spot TYPE bool DEFAULT false;
 
 DEFINE FIELD OVERWRITE address ON spot TYPE object;
 

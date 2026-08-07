@@ -3,7 +3,7 @@ use shared::{
     error::myerror::MyResult,
     events::{
         Envelope,
-        booking::{BookingEvent, BookingReserved, ReleaseReason},
+        booking::{BookingEvent, BookingReserved, CancelReason, ReleaseReason},
         spot::{SpotCreated, SpotEvent, SpotUpdated},
         user::record_key,
     },
@@ -32,6 +32,10 @@ pub struct SpotForBooking {
     pub price_per_hour: Option<i64>,
     pub availability: Option<Availability>,
     pub active: bool,
+    /// Withdrawn for good. Separate from `active` because the two guard different
+    /// things: the switch stops new reservations, a delete also stops a hold taken
+    /// before it from ever being confirmed.
+    pub deleted: bool,
     pub booked: Booked,
     /// IANA name, e.g. `"Europe/Brussels"`. `booked` is bare wall-clock strings in
     /// this zone, so cancel's deadline can't be placed on a timeline without it.
@@ -51,6 +55,16 @@ pub struct BookingForUpdate {
     pub booked: Booked,
     pub amount: i64,
     pub hold_until: Option<DateTime<Utc>>,
+}
+
+/// A paid booking the cancel reactor may have to withdraw, when the host changes
+/// the spot out from under it.
+#[derive(Debug, Deserialize, SurrealValue)]
+pub struct LiveBooking {
+    /// Bare uuid, same as `LapsedHold` — it goes straight back into an event.
+    pub id: String,
+    pub spot_shard: String,
+    pub booked: Booked,
 }
 
 /// A lapsed hold the sweeper is about to release.
@@ -84,6 +98,7 @@ impl BookingRepository {
                 // created by the BOOKINGS-first ordering, or one written before
                 // these fields existed, has neither, and NONE won't deserialize.
                 "SELECT owner_id, shard, price_per_hour, availability, active, timezone,
+                        deleted ?? false AS deleted,
                         booked ?? {} AS booked, bookings_seq ?? 0 AS bookings_seq
                  FROM ONLY type::record('spot', $id)",
             )
@@ -118,6 +133,28 @@ impl BookingRepository {
             .take(0)?)
     }
 
+    /// Paid bookings on one spot that are still to come, as of `at`.
+    ///
+    /// `at` is the event's `occurred_at`, not a clock read: a replayed SpotDeleted
+    /// then selects the same set it selected the first time, which is what keeps
+    /// the reactor's output a function of the log.
+    pub async fn upcoming_confirmed(
+        &self,
+        spot_id: &str,
+        at: DateTime<Utc>,
+    ) -> MyResult<Vec<LiveBooking>> {
+        Ok(self
+            .db
+            .query(
+                "SELECT record::id(id) AS id, spot_shard, booked FROM booking
+                 WHERE spot_id = $spot_id AND status = 'confirmed' AND ends_at > $at",
+            )
+            .bind(("spot_id", spot_id.to_string()))
+            .bind(("at", Datetime::from(at)))
+            .await?
+            .take(0)?)
+    }
+
     // ─── SPOTS projection ───────────────────────────────────────────────────
 
     pub async fn apply_spot(&self, envelope: Envelope<SpotEvent>, seq: u64) -> MyResult<()> {
@@ -125,7 +162,11 @@ impl BookingRepository {
         match envelope.payload {
             SpotEvent::Created(e) => self.spot_created(e, at, seq).await,
             SpotEvent::Updated(e) => self.spot_updated(e, at, seq).await,
-            SpotEvent::Deactivated { spot_id } => self.spot_deactivated(spot_id, at, seq).await,
+            SpotEvent::Deactivated { spot_id } => {
+                self.spot_set_active(spot_id, false, at, seq).await
+            }
+            SpotEvent::Activated { spot_id } => self.spot_set_active(spot_id, true, at, seq).await,
+            SpotEvent::Deleted { spot_id } => self.spot_deleted(spot_id, at, seq).await,
         }
     }
 
@@ -184,11 +225,34 @@ impl BookingRepository {
         Ok(())
     }
 
-    async fn spot_deactivated(&self, spot_id: Uuid, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
+    async fn spot_set_active(
+        &self,
+        spot_id: Uuid,
+        active: bool,
+        at: DateTime<Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
         self.db
             .query(
                 "BEGIN;
-                 UPSERT type::record('spot', $id) SET active = false;
+                 UPSERT type::record('spot', $id) SET active = $active;
+                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
+                 COMMIT;",
+            )
+            .bind(("id", record_key(&spot_id)))
+            .bind(("active", active))
+            .bind(("at", Datetime::from(at)))
+            .bind(("seq", seq as i64))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn spot_deleted(&self, spot_id: Uuid, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
+        self.db
+            .query(
+                "BEGIN;
+                 UPSERT type::record('spot', $id) SET active = false, deleted = true;
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
@@ -210,7 +274,9 @@ impl BookingRepository {
             BookingEvent::Released { booking_id, reason } => {
                 self.released(booking_id, reason, at, seq).await
             }
-            BookingEvent::Cancelled { booking_id } => self.cancelled(booking_id, at, seq).await,
+            BookingEvent::Cancelled { booking_id, reason } => {
+                self.cancelled(booking_id, reason, at, seq).await
+            }
         }
     }
 
@@ -221,7 +287,8 @@ impl BookingRepository {
                 "UPSERT type::record('booking', $id) CONTENT {
                      spot_id: $spot_id, spot_shard: $spot_shard, owner_id: $owner_id,
                      renter_id: $renter_id, booked: $booked, amount: $amount,
-                     status: 'reserved', hold_until: $expires_at, created_at: $at
+                     status: 'reserved', hold_until: $expires_at, ends_at: $ends_at,
+                     created_at: $at
                  };",
             )
             .bind(("id", record_key(&e.booking_id)))
@@ -232,6 +299,7 @@ impl BookingRepository {
             .bind(("booked", e.booked))
             .bind(("amount", e.amount_cents))
             .bind(("expires_at", Datetime::from(e.expires_at)))
+            .bind(("ends_at", Datetime::from(e.ends_at)))
             .bind(("at", Datetime::from(at)))
             .await?
             .check()?;
@@ -242,7 +310,7 @@ impl BookingRepository {
         // Scoped to 'reserved' so a duplicate delivery can't resurrect a booking
         // that was since released.
         let spot_id = self
-            .status_transition(booking_id, "confirmed", &["reserved"], None)
+            .status_transition(booking_id, "confirmed", &["reserved"], None, None)
             .await?;
         self.refold_opt(spot_id, at, seq).await
     }
@@ -258,30 +326,41 @@ impl BookingRepository {
         // before the hold lapses, with the sweeper's event arriving second, must not
         // undo the confirmation — this WHERE clause is the whole guard.
         let spot_id = self
-            .status_transition(booking_id, "released", &["reserved"], Some(reason.as_str()))
+            .status_transition(booking_id, "released", &["reserved"], Some(reason), None)
             .await?;
         self.refold_opt(spot_id, at, seq).await
     }
 
-    async fn cancelled(&self, booking_id: Uuid, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
+    async fn cancelled(
+        &self,
+        booking_id: Uuid,
+        reason: CancelReason,
+        at: DateTime<Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
         // Only a *confirmed* booking can be cancelled, so a redelivery after the
-        // booking was settled some other way is a no-op. `release_reason` stays
-        // NONE: the status already says which of the two happened, and a value on a
-        // field named *release*_reason would only repeat it.
+        // booking was settled some other way is a no-op — which is also what makes
+        // the reactor safe to re-run on a replayed SpotUpdated.
         let spot_id = self
-            .status_transition(booking_id, "cancelled", &["confirmed"], None)
+            .status_transition(booking_id, "cancelled", &["confirmed"], None, Some(reason))
             .await?;
         self.refold_opt(spot_id, at, seq).await
     }
 
     /// Moves a booking to `to` only if it is currently in one of `from`, returning
     /// its spot id when the transition applied.
+    ///
+    /// The two reasons are separate fields, not one: `release_reason` says why a
+    /// *hold* ended, `cancel_reason` says who withdrew a *paid* booking. Only ever
+    /// one of them is Some, but collapsing them would leave the renter's history
+    /// unable to tell "your hold ran out" from "the host pulled the listing".
     async fn status_transition(
         &self,
         booking_id: Uuid,
         to: &str,
         from: &[&str],
-        reason: Option<&str>,
+        release: Option<ReleaseReason>,
+        cancel: Option<CancelReason>,
     ) -> MyResult<Option<String>> {
         let spot_id: Option<String> = self
             .db
@@ -289,14 +368,16 @@ impl BookingRepository {
                 "UPDATE type::record('booking', $id) SET
                      status = $to,
                      hold_until = NONE,
-                     release_reason = $reason ?? release_reason
+                     release_reason = $release ?? release_reason,
+                     cancel_reason  = $cancel  ?? cancel_reason
                  WHERE status IN $from
                  RETURN VALUE spot_id;",
             )
             .bind(("id", record_key(&booking_id)))
             .bind(("to", to.to_string()))
             .bind(("from", from.iter().map(|s| s.to_string()).collect::<Vec<_>>()))
-            .bind(("reason", reason.map(str::to_string)))
+            .bind(("release", release.map(|r| r.as_str().to_string())))
+            .bind(("cancel", cancel.map(|c| c.as_str().to_string())))
             .await?
             .take(0)?;
         Ok(spot_id)

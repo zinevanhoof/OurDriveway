@@ -75,7 +75,16 @@ onMounted(() => {
                     <img :src="spot.images[0]">
                 </ItemMedia>
                 <ItemContent>
-                    <ItemTitle class="font-bold">{{ spot.title }}</ItemTitle>
+                    <ItemTitle class="font-bold">
+                        {{ spot.title }}
+                        <!-- A paused listing looks identical to a live one otherwise,
+                             and "why am I getting no bookings" is the question that
+                             follows. -->
+                        <span v-if="!spot.active"
+                            class="rounded-full bg-muted px-2 py-0.5 text-xs font-semibold text-muted-foreground">
+                            Paused
+                        </span>
+                    </ItemTitle>
                     <ItemDescription class="flex items-center gap-1 text-muted-foreground text-xs font-medium">
                         <MapPin :size="14" />
                         {{ spot.address.line1 }} - {{ spot.address.city }}

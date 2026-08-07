@@ -30,6 +30,8 @@ const reserved = computed(() => props.booking?.status === "reserved");
 const cancellable = computed(
   () => !props.past && (reserved.value || canCancel(props.booking, timezone.value)),
 );
+/** Nothing to navigate to or cancel once the host has withdrawn it. */
+const showFooter = computed(() => !props.past && !withdrawn.value);
 
 // A booking whose days have all passed reads as "completed", not "confirmed" —
 // "confirmed" is a promise about something still ahead.
@@ -39,9 +41,20 @@ const cancellable = computed(
 // persisting it would mean a sweeper, an event and a projector arm to store a fact
 // we can compute. Add that the day something *else* needs to query it — payouts to
 // the host being the obvious one.
-const statusLabel = computed(() =>
-  props.past && props.booking?.status === "confirmed" ? "completed" : props.booking?.status,
-);
+const statusLabel = computed(() => {
+  if (withdrawn.value) return "cancelled by host";
+  return props.past && props.booking?.status === "confirmed" ? "completed" : props.booking?.status;
+});
+
+/**
+ * The host pulled this booking out from under the renter — by deleting the listing
+ * or by removing the hours it sat in.
+ *
+ * Worth its own state rather than a plain "cancelled": the renter didn't do this,
+ * they are owed their money back, and a card that just says "cancelled" reads like
+ * they did it themselves.
+ */
+const withdrawn = computed(() => props.booking?.cancelReason === "spot_unavailable");
 
 // One colour per status so the state is readable without parsing the word. No
 // `badge` primitive exists in ui/, and a span with a class map is the whole need.
@@ -51,6 +64,7 @@ const STATUS_CLASS: Record<string, string> = {
   completed: "bg-slate-100 text-slate-700",
   released: "bg-red-100 text-red-800",
   cancelled: "bg-red-100 text-red-800",
+  "cancelled by host": "bg-red-100 text-red-800",
 };
 
 function directions() {
@@ -121,6 +135,9 @@ async function cancel() {
           {{ formatCents(booking?.amount ?? 0) }}
           <div class="text-xs text-muted-foreground font-medium">total</div>
         </div>
+        <div v-if="withdrawn" class="text-xs text-destructive font-semibold">
+          The host withdrew this spot. Your refund is on the way.
+        </div>
       </div>
       <span class="shrink-0 rounded-full px-2 py-0.5 text-xs font-semibold capitalize"
         :class="active ? 'bg-primary text-primary-foreground' : STATUS_CLASS[statusLabel] ?? 'bg-muted text-muted-foreground'">
@@ -128,7 +145,7 @@ async function cancel() {
       </span>
     </div>
 
-    <template v-if="!past">
+    <template v-if="showFooter">
       <Separator />
       <div class="flex">
         <button class="flex justify-center flex-1 items-center gap-1 font-medium" @click="directions">

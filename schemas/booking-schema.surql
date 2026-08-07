@@ -58,6 +58,13 @@ DEFINE FIELD OVERWRITE status     ON booking TYPE string DEFAULT 'reserved'
 DEFINE FIELD OVERWRITE hold_until     ON booking TYPE option<datetime>;
 DEFINE FIELD OVERWRITE release_reason ON booking TYPE option<string>
     ASSERT $value = NONE OR $value IN ['abandoned', 'expired'];
+DEFINE FIELD OVERWRITE cancel_reason  ON booking TYPE option<string>
+    ASSERT $value = NONE OR $value IN ['by_renter', 'spot_unavailable'];
+
+-- The last moment this booking occupies, as an instant. `booked` holds wall-clock
+-- strings in the spot's zone, so "is it over yet" can't be asked of it in a query
+-- without knowing that zone — the projector stores the folded answer instead.
+DEFINE FIELD OVERWRITE ends_at ON booking TYPE datetime;
 
 -- renter's score after the trip; feeds rating (rating_avg). NONE until they rate.
 DEFINE FIELD OVERWRITE rating     ON booking TYPE option<int>
@@ -71,6 +78,8 @@ DEFINE INDEX OVERWRITE booking_spot   ON booking FIELDS spot_id;
 DEFINE INDEX OVERWRITE booking_renter ON booking FIELDS renter_id;
 -- The expiry sweeper's query: status = 'reserved' AND hold_until < now.
 DEFINE INDEX OVERWRITE booking_hold   ON booking FIELDS status, hold_until;
+-- The cancel reactor's query: bookings on one spot that are still to come.
+DEFINE INDEX OVERWRITE booking_ends   ON booking FIELDS spot_id, status, ends_at;
 
 -- ─── spot (local projection of the SPOTS stream) ────────────────────────────
 -- booking-service needs price, availability and timezone to authorize and price a
@@ -88,6 +97,10 @@ DEFINE FIELD OVERWRITE shard          ON spot TYPE option<string>;
 DEFINE FIELD OVERWRITE price_per_hour ON spot TYPE option<int>;      -- EUR cents
 DEFINE FIELD OVERWRITE timezone       ON spot TYPE option<string>;
 DEFINE FIELD OVERWRITE active         ON spot TYPE bool DEFAULT true;
+-- Withdrawn for good. Reserve already refuses `active = false`; this additionally
+-- stops a hold taken *before* the deletion from being confirmed, because the host
+-- has said they cannot provide the space at all.
+DEFINE FIELD OVERWRITE deleted        ON spot TYPE bool DEFAULT false;
 
 DEFINE FIELD OVERWRITE availability ON spot TYPE option<object>;
 DEFINE FIELD OVERWRITE availability.weekly ON spot TYPE object;

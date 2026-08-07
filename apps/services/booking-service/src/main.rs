@@ -112,6 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         js.clone(),
         Arc::new(SpotProjector {
             repository: repository.clone(),
+            // This one also publishes: a host's edit can invalidate bookings, and
+            // withdrawing them is this stream's job. See `SpotProjector::react`.
+            js: js.clone(),
         }),
         readiness.clone(),
     ));
