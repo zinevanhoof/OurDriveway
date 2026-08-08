@@ -23,7 +23,7 @@ const initials = computed(() =>
 
 <template>
   <AvatarFallback data-slot="avatar-fallback" v-bind="delegatedProps"
-    :class="cn('bg-primary text-primary-foreground font-bold rounded-full flex size-full items-center justify-center text-sm group-data-[size=sm]/avatar:text-xs', props.class)">
+    :class="cn('bg-primary text-primary-foreground font-bold rounded-full flex size-full items-center justify-center text-sm group-data-[size=sm]/avatar:text-xs group-data-[size=xl]/avatar:text-base group-data-[size=2xl]/avatar:text-lg group-data-[size=3xl]/avatar:text-xl', props.class)">
     <slot>{{ initials }}</slot>
   </AvatarFallback>
 </template>

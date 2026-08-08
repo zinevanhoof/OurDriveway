@@ -11,6 +11,8 @@ import MobileProfileHeader from "@/components/header/MobileProfileHeader.vue";
 import AddSpotView from "@/views/AddSpotView.vue";
 import ManageSpotView from "@/views/ManageSpotView.vue";
 import EditSpotView from "@/views/EditSpotView.vue";
+import EditProfileView from "@/views/EditProfileView.vue";
+import ChangePasswordView from "@/views/ChangePasswordView.vue";
 
 export type RouteMeta = {
   header: Component | null;
@@ -80,6 +82,24 @@ const routes = [
     component: ProfileView,
     meta: {
       header: MobileProfileHeader,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    path: "/profile/edit",
+    name: "profile-edit",
+    component: EditProfileView,
+    meta: {
+      header: null,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    path: "/profile/password",
+    name: "profile-password",
+    component: ChangePasswordView,
+    meta: {
+      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },

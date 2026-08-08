@@ -4,8 +4,11 @@ use shared::error::myerror::{ContextExt, MyError, MyResult};
 use shared::events::session::{
     RefreshTokenIssued, RefreshTokenRevoked, RefreshTokenRotated, SessionEvent,
 };
-use shared::events::user::{UserEvent, UserRegistered, user_claim_id};
+use shared::events::user::{
+    UserEvent, UserPasswordChanged, UserRegistered, UserUpdated, user_claim_id,
+};
 use shared::events::{Envelope, session_subject, shard_of, user_subject};
+use shared::requests::user::UpdateProfileRequest;
 use uuid::Uuid;
 
 use crate::{
@@ -180,6 +183,94 @@ impl UserService {
 
         await_seq(&self.sessions_applied, seq).await;
         Ok((jwt, new_refresh.to_string()))
+    }
+
+    /// Saves the edit-profile form. Returns the log position, which the caller
+    /// answers with so the client can wait for *view-service's* projection —
+    /// `await_seq` below only covers this service's own.
+    ///
+    /// No ownership lookup: the target is always the caller's own record.
+    pub async fn update_profile(&self, uid: &str, req: UpdateProfileRequest) -> MyResult<u64> {
+        let existing = self
+            .user_repository
+            .find_auth_by_id(uid)
+            .await?
+            .context_not_found(("Not Found", "Could not find user"))?;
+        let user_uuid = parse_uuid(&existing.uid)?;
+
+        // Changing the address a password reset would be sent to is an account
+        // takeover if it's left unguarded, and there is no email verification in
+        // this app to catch it afterwards. The rest of the form is harmless, so
+        // only this branch pays for it.
+        if req.email != existing.email {
+            let Some(current) = req.current_password.as_deref() else {
+                return Err(MyError::api(
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "Password required",
+                    "Enter your current password to change your email address.",
+                ));
+            };
+            if !password::verify(&existing.password, current) {
+                return Err(MyError::unauthorized("Unauthorized", "Incorrect password"));
+            }
+            // Same as signup: the unique index is the real guard, this only
+            // turns the common case into a 409 rather than a projector failure
+            // on an event that is already in the log.
+            if self.user_repository.email_taken(&req.email).await? {
+                return Err(MyError::api(
+                    axum::http::StatusCode::CONFLICT,
+                    "Email already registered",
+                    "An account with that email already exists.",
+                ));
+            }
+        }
+
+        let event = UserEvent::Updated(UserUpdated {
+            user_id: user_uuid,
+            first_name: Some(req.first_name),
+            last_name: Some(req.last_name),
+            email: Some(req.email),
+            license_plates: Some(req.license_plates),
+            // No upload route yet, so the form never sends one and this must
+            // stay None — Some("") would blank the picture the user has.
+            // ponytail: wire this once /api/user/uploads exists.
+            profile_picture: None,
+        });
+
+        let seq = self.publish_user(&existing.shard, &user_uuid, event).await?;
+        await_seq(&self.users_applied, seq).await;
+        Ok(seq)
+    }
+
+    pub async fn change_password(&self, uid: &str, current: &str, new: &str) -> MyResult<u64> {
+        let existing = self
+            .user_repository
+            .find_auth_by_id(uid)
+            .await?
+            .context_not_found(("Not Found", "Could not find user"))?;
+
+        if !password::verify(&existing.password, current) {
+            return Err(MyError::unauthorized("Unauthorized", "Incorrect password"));
+        }
+
+        let user_uuid = parse_uuid(&existing.uid)?;
+        let event = UserEvent::PasswordChanged(UserPasswordChanged {
+            user_id: user_uuid,
+            password_hash: password::hash(new)?,
+        });
+
+        let seq = self.publish_user(&existing.shard, &user_uuid, event).await?;
+        await_seq(&self.users_applied, seq).await;
+        Ok(seq)
+    }
+
+    async fn publish_user(&self, shard: &str, user_uuid: &Uuid, event: UserEvent) -> MyResult<u64> {
+        bus::publish(
+            &self.js,
+            user_subject(shard, user_uuid),
+            &Envelope::new(event, Some(user_claim_id(user_uuid))),
+        )
+        .await
     }
 
     /// Returns `(jwt, refresh_expiry, jti)`.

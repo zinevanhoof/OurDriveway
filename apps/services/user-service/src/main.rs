@@ -1,6 +1,9 @@
 use std::sync::{Arc, LazyLock};
 
-use axum::{Router, routing::post};
+use axum::{
+    Router,
+    routing::{patch, post},
+};
 use shared::env;
 
 use crate::{
@@ -143,7 +146,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/user/login", post(route::login::login))
         .route("/api/user/signup", post(route::signup::signup))
         .route("/api/user/refresh/logout", post(route::logout::logout))
-        .route("/api/user/refresh", post(route::refresh::refresh));
+        .route("/api/user/refresh", post(route::refresh::refresh))
+        .route("/api/user/me", patch(route::profile::update_profile))
+        .route(
+            "/api/user/me/password",
+            post(route::profile::change_password),
+        );
 
     // No GraphQL proxy here any more: every client read is served by
     // view-service from the combined projection. This database is private to

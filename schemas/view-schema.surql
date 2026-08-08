@@ -35,14 +35,21 @@ DEFINE FUNCTION OVERWRITE fn::spot_distance($loc: geometry, $lng: float, $lat: f
 };
 
 -- ─── user ───────────────────────────────────────────────────────────────────
--- Public-safe by construction: no password, and NO EMAIL is projected here at
--- all. `WHERE true` is required because spot-owner profiles have to resolve for
--- everyone — which is also why "who am I" can't be a query against this table
--- and is served by GET /api/view/me instead.
+-- No password is projected here, ever. `WHERE true` on the table is required
+-- because spot-owner profiles have to resolve for everyone — which is also why
+-- "who am I" can't be a query against this table and is served by
+-- GET /api/view/me instead.
 --
--- If a sensitive field ever lands here, scope it at FIELD level, e.g.
---   DEFINE FIELD email ON user PERMISSIONS FOR select WHERE id = $token.ID
--- Field permissions blank a value; they do not filter rows.
+-- `email` is the one sensitive field that does land here, so it is scoped at
+-- FIELD level: every row stays selectable, but the email reads as NONE for
+-- anyone who isn't its owner. Field permissions blank a value; they do not
+-- filter rows — which is exactly why the type has to be `option<string>`.
+-- Anything else sensitive added later belongs behind the same clause.
+--
+-- `$auth.id`, NOT `$token.ID`. Both hold this user, but `id` here is a record
+-- and `$token.ID` is the string "user:abc" — comparing them is always false, so
+-- that version silently blanks the field for its owner too. `spot` below can
+-- write `owner_id = $token.ID` only because `owner_id` is a plain string field.
 DEFINE TABLE OVERWRITE user SCHEMAFULL PERMISSIONS
     FOR select WHERE true,
     FOR create, update, delete NONE;
@@ -50,6 +57,13 @@ DEFINE TABLE OVERWRITE user SCHEMAFULL PERMISSIONS
 DEFINE FIELD OVERWRITE first_name      ON user TYPE string;
 DEFINE FIELD OVERWRITE last_name       ON user TYPE string;
 DEFINE FIELD OVERWRITE profile_picture ON user TYPE option<string>;
+DEFINE FIELD OVERWRITE email           ON user TYPE option<string>
+    PERMISSIONS FOR select WHERE id = $auth.id;
+
+-- Deliberately public: a host has to be able to recognise the car that turns up
+-- on their driveway, so this is not scoped the way `email` is.
+DEFINE FIELD OVERWRITE license_plates   ON user TYPE array<string> DEFAULT [];
+DEFINE FIELD OVERWRITE license_plates.* ON user TYPE string;
 
 -- ─── spot ───────────────────────────────────────────────────────────────────
 DEFINE TABLE OVERWRITE spot SCHEMAFULL PERMISSIONS

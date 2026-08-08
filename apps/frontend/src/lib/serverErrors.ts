@@ -1,10 +1,15 @@
 // Backend (MyError) bodies:
 //   422 -> { errors: { field: string[] } }   (garde validation, per field)
 //   4xx -> { detail: string[] }               (context_* errors, form-level)
-// The 422 field keys match the request struct field names, which we keep
-// aligned with the vee-validate field names, so they map straight onto setErrors.
+// The 422 keys are garde's paths, which are the *Rust* field names — snake_case,
+// with array elements as `license_plates[0]`. vee-validate fields are camelCase
+// with the same bracket syntax, so the only translation needed is the case.
 type ValidationBody = { errors?: Record<string, string[]> };
 type ErrorBody = { detail?: string[] };
+
+/** `license_plates[0]` -> `licensePlates[0]`. No-op on names already camelCase. */
+const toCamel = (key: string) =>
+  key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 
 /**
  * Applies a backend 422 validation response to vee-validate field errors.
@@ -19,7 +24,14 @@ export async function applyValidationErrors(
   const body: ValidationBody = await response.json().catch(() => ({}));
   if (!body.errors) return false;
 
-  setErrors(body.errors);
+  setErrors(
+    Object.fromEntries(
+      Object.entries(body.errors).map(([path, messages]) => [
+        toCamel(path),
+        messages,
+      ]),
+    ),
+  );
   return true;
 }
 

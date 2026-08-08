@@ -26,6 +26,9 @@ DEFINE FIELD OVERWRITE email              ON user TYPE string ASSERT string::is_
 DEFINE FIELD OVERWRITE profile_picture    ON user TYPE option<string>;
 DEFINE FIELD OVERWRITE password           ON user TYPE string PERMISSIONS NONE;
 
+DEFINE FIELD OVERWRITE license_plates     ON user TYPE array<string> DEFAULT [];
+DEFINE FIELD OVERWRITE license_plates.*   ON user TYPE string;
+
 DEFINE INDEX OVERWRITE email_idx          ON user FIELDS email UNIQUE;
 
 DEFINE TABLE OVERWRITE refresh_token SCHEMAFULL;

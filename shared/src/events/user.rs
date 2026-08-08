@@ -25,6 +25,7 @@ pub fn record_key(id: &Uuid) -> String {
 pub enum UserEvent {
     Registered(UserRegistered),
     Updated(UserUpdated),
+    PasswordChanged(UserPasswordChanged),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,4 +50,20 @@ pub struct UserUpdated {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub profile_picture: Option<String>,
+    pub email: Option<String>,
+    /// The whole list, or `None`. There is no add/remove event: the edit form
+    /// submits every plate it knows about, so a diff would mean the client
+    /// deciding what "unchanged" is.
+    pub license_plates: Option<Vec<String>>,
+}
+
+/// Its own event rather than a field on [`UserUpdated`]: that one is consumed by
+/// the view projection, and a password hash must never reach a database a
+/// browser identity can read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UserPasswordChanged {
+    pub user_id: Uuid,
+    /// Argon2 PHC string. Hashed on the write side for the same reason as
+    /// [`UserRegistered::password_hash`].
+    pub password_hash: String,
 }

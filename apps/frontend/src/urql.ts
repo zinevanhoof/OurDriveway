@@ -20,15 +20,21 @@ export const urqlClient = new Client({
   // projector has applied it. No-ops once the projector is past that position.
   fetchOptions: () => ({ headers: awaitSeqHeader() }),
   exchanges: [
-    // `address` and `location` are embedded on a spot (no own id), so they
-    // can't be normalized. Return null to embed them on the parent entity
-    // instead of keying them.
+    // `address`, `location` and `availability` are embedded on a spot (no own
+    // id), so they can't be normalized. Return null to embed them on the parent
+    // entity instead of keying them.
+    //
+    // `user` is the opposite case: a real record, so it is keyed by id and one
+    // entry backs every reference to that person (a spot's owner, a booking's
+    // renter, your own profile). The cost is that EVERY `user` selection set has
+    // to include `id` — a keyable type selected without its key degrades
+    // silently rather than erroring.
     cacheExchange({
       keys: {
         spot_address: () => null,
         GeometryPoint: () => null,
         spot_availability: () => null,
-        user: () => null,
+        user: (data) => data.id as string,
       },
     }),
     authExchange(async (utils) => ({

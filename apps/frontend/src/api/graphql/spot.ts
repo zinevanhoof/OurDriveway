@@ -9,6 +9,9 @@ const FULL_SPOT = gql`
     spot(id: $id) {
       id
       owner {
+        # Not read by the template — it is the graphcache key. A user selected
+        # without its id can't normalize, and does so quietly.
+        id
         firstName: first_name
         lastName: last_name
         profilePicture: profile_picture

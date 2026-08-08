@@ -62,7 +62,27 @@ impl ViewRepository {
         match envelope.payload {
             UserEvent::Registered(e) => self.user_registered(e, at, seq).await,
             UserEvent::Updated(e) => self.user_updated(e, at, seq).await,
+            // Nothing to project — the hash never comes near this database. The
+            // cursor still has to move, or a restart replays from before it.
+            UserEvent::PasswordChanged(_) => self.bump_cursor("USERS", at, seq).await,
         }
+    }
+
+    /// Advances a projector cursor for an event that changes no rows here.
+    async fn bump_cursor(
+        &self,
+        stream: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
+        self.db
+            .query("UPSERT type::record('_projection', $s) SET last_seq = $seq, updated_at = $at")
+            .bind(("s", stream.to_string()))
+            .bind(("at", Datetime::from(at)))
+            .bind(("seq", seq as i64))
+            .await?
+            .check()?;
+        Ok(())
     }
 
     async fn user_registered(
@@ -71,9 +91,11 @@ impl ViewRepository {
         at: chrono::DateTime<chrono::Utc>,
         seq: u64,
     ) -> MyResult<()> {
-        // Note what is absent: no email, no password hash. This table is
-        // world-readable, so the projection is the place that decides what can
-        // possibly leak — not a permission clause someone might later relax.
+        // Note what is absent: no password hash, ever. This table is
+        // world-readable, so the projection is the first thing deciding what can
+        // possibly leak. `email` is the one exception and it is projected behind
+        // a field-level `WHERE id = $token.ID` in view-schema.surql — a row stays
+        // selectable by anyone, the address does not.
         //
         // The two UPDATEs are the backfill. Streams have no cross-stream
         // ordering, so a spot may already be sitting here with `owner = NONE`
@@ -84,7 +106,7 @@ impl ViewRepository {
                 "BEGIN;
                  UPSERT type::record('user', $id) CONTENT {
                      first_name: $first_name, last_name: $last_name,
-                     profile_picture: NONE
+                     profile_picture: NONE, email: $email, license_plates: []
                  };
                  UPDATE spot SET owner = type::record('user', $id)
                      WHERE owner_id = $claim AND owner = NONE;
@@ -97,6 +119,7 @@ impl ViewRepository {
             .bind(("claim", user_claim_id(&e.user_id)))
             .bind(("first_name", e.first_name))
             .bind(("last_name", e.last_name))
+            .bind(("email", e.email))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
             .await?
@@ -116,7 +139,9 @@ impl ViewRepository {
                  UPDATE type::record('user', $id) SET
                      first_name      = $first_name      ?? first_name,
                      last_name       = $last_name       ?? last_name,
-                     profile_picture = $profile_picture ?? profile_picture;
+                     profile_picture = $profile_picture ?? profile_picture,
+                     email           = $email           ?? email,
+                     license_plates  = $license_plates  ?? license_plates;
                  UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
@@ -124,6 +149,8 @@ impl ViewRepository {
             .bind(("first_name", e.first_name))
             .bind(("last_name", e.last_name))
             .bind(("profile_picture", e.profile_picture))
+            .bind(("email", e.email))
+            .bind(("license_plates", e.license_plates))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
             .await?

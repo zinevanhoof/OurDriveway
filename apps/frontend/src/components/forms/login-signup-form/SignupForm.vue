@@ -22,6 +22,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { signupUser } from '@/api/userApi'
 import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
+import { passwordRules } from '@/lib/passwordSchema'
 
 const emit = defineEmits<{
     success: []
@@ -32,15 +33,7 @@ const formSchema = toTypedSchema(
         firstName: z.string(),
         lastName: z.string(),
         email: z.string().email(),
-        password: z
-            .string()
-            .min(8, "Password must be at least 8 characters")
-            .max(32, "Password must be at most 32 characters")
-            .regex(/[A-Z]/, "Must contain at least one uppercase letter")
-            .regex(/[a-z]/, "Must contain at least one lowercase letter")
-            .regex(/[0-9]/, "Must contain at least one number")
-            .regex(/[^A-Za-z0-9]/, "Must contain at least one special character"),
-
+        password: passwordRules,
         confirmPassword: z.string(),
     }).refine((data) => data.password === data.confirmPassword, {
         message: "Passwords do not match",
