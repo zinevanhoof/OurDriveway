@@ -34,6 +34,10 @@ export const urqlClient = new Client({
         spot_address: () => null,
         GeometryPoint: () => null,
         spot_availability: () => null,
+        // An aggregate row is a computed sum, not a record — it has no id to key
+        // by. Null embeds it under the query it came from, the same as the
+        // embedded types above, instead of warning about an unkeyable type.
+        booking_aggregate_row: () => null,
         user: (data) => data.id as string,
       },
     }),

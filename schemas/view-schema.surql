@@ -173,6 +173,13 @@ DEFINE INDEX OVERWRITE booking_spot   ON booking FIELDS spot_id;
 DEFINE INDEX OVERWRITE booking_renter ON booking FIELDS renter_id;
 DEFINE INDEX OVERWRITE booking_ends   ON booking FIELDS ends_at;
 
+-- The home screen's "earned this week": SUM(amount) WHERE owner_id = me AND
+-- created_at >= monday. Neither field was indexed, so that query planned as a
+-- TableScan. Composite rather than owner_id alone — same one line, same one index
+-- to maintain, but it range-scans the week instead of every booking the host has
+-- ever had, and owner_id leads, so it still serves a plain owner_id lookup.
+DEFINE INDEX OVERWRITE booking_owner_created ON booking FIELDS owner_id, created_at;
+
 -- ─── projector cursors ──────────────────────────────────────────────────────
 -- One row per stream (_projection:USERS, _projection:SPOTS, …), each written in
 -- the same transaction as the data it describes.

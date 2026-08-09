@@ -13,7 +13,9 @@ import {
   formatDay,
   formatSlots,
   isActiveNow,
+  nextSlot,
   sortedDays,
+  startOfWeek,
   todayIn,
 } from "./bookingDates.ts";
 
@@ -52,6 +54,46 @@ assert.equal(canCancel({ ...faraway, status: "reserved" }, TZ), false);
 assert.equal(canCancel(faraway, "Not/AZone"), false);
 assert.equal(canCancel(faraway, null), false);
 assert.equal(canCancel(booking("2020-01-01", "09:00", "10:00"), TZ), false);
+
+// The soonest slot still ahead — not the booking's first one.
+//
+// The ended slot is built to end at exactly the current minute, so `end > time` is
+// false however the clock happens to fall. The successor runs to 23:59, which only
+// stops being in the future during the final minute of the day there.
+const ended = { start: "00:00", end: timeThere.slice(0, 5) };
+const later = { start: timeThere.slice(0, 5), end: "23:59" };
+assert.deepEqual(nextSlot({ booked: { [dateThere]: [ended, later] } }, TZ), [dateThere, later]);
+
+// Same, but the day is spent: the next day it holds wins outright.
+const tomorrowThere = new Date(`${dateThere}T00:00:00Z`);
+tomorrowThere.setUTCDate(tomorrowThere.getUTCDate() + 1);
+const nextDay = tomorrowThere.toISOString().slice(0, 10);
+const morning = { start: "09:00", end: "10:00" };
+assert.deepEqual(
+  nextSlot({ booked: { [dateThere]: [ended], [nextDay]: [morning] } }, TZ),
+  [nextDay, morning],
+);
+
+// A slot in progress is the next one — the renter is due at it right now.
+assert.deepEqual(nextSlot(spanning, TZ), [dateThere, spanning.booked[dateThere][0]]);
+assert.equal(isActiveNow(spanning, TZ), true);
+
+// Nothing ahead, and out-of-order day keys still resolve to the earliest future one.
+assert.equal(nextSlot(booking("2020-01-01", "09:00", "10:00"), TZ), null);
+assert.equal(nextSlot({ booked: {} }, TZ), null);
+assert.deepEqual(
+  nextSlot({ booked: { "2031-06-02": [morning], "2030-06-01": [morning] } }, TZ),
+  ["2030-06-01", morning],
+);
+
+// startOfWeek is the viewer's Monday midnight, and always within the last week.
+const week = new Date(startOfWeek());
+assert.equal(Number.isNaN(week.getTime()), false);
+assert.equal(week.getDay(), 1);
+assert.equal(week.getHours(), 0);
+assert.equal(week.getMinutes(), 0);
+const sinceWeekStart = Date.now() - week.getTime();
+assert.ok(sinceWeekStart >= 0 && sinceWeekStart < 7 * 24 * 60 * 60 * 1000);
 
 // Ordering is by date, then by start within a day — `booked` is an unordered map.
 assert.deepEqual(

@@ -188,6 +188,47 @@ const SPOTS_IN_RADIUS = gql`
   }
 `;
 
+// The home screen's two "nearby spots" cards. Same `call` filter as
+// SPOTS_IN_RADIUS, but a separate document on purpose: that one refires on every
+// debounced map pan, and widening it would put every spot's `images` array on the
+// wire each time to serve a screen that draws two cards once. This one drops
+// `availability` in return (nothing filters client-side here). graphcache keys
+// `spot` by id, so both still share the same cached entities.
+//
+// `owner_id: { ne }` server-side rather than a filter here — "somewhere to park"
+// never means your own driveway, and excluding it client-side could leave one card.
+//
+// No ordering by distance: auto GraphQL's `order` argument takes an enum of defined
+// field names, so it cannot order by a function at all. The caller sorts the handful
+// this returns with `nearer()` and keeps two.
+const SPOTS_NEARBY = gql`
+  query SpotsNearby($lng: Float!, $lat: Float!, $meters: Float!, $me: String!) {
+    spots(
+      where: {
+        deleted: { eq: false }
+        active: { eq: true }
+        owner_id: { ne: $me }
+        location: {
+          call: {
+            fn: "fn::spot_distance"
+            args: [$lng, $lat]
+            op: lt
+            value: $meters
+          }
+        }
+      }
+    ) {
+      id
+      title
+      price_per_hour
+      images
+      location {
+        coordinates
+      }
+    }
+  }
+`;
+
 export {
   FULL_SPOT,
   MANAGE_SPOT,
@@ -195,4 +236,5 @@ export {
   SPOT,
   SPOTS_OWNED,
   SPOTS_IN_RADIUS,
+  SPOTS_NEARBY,
 };

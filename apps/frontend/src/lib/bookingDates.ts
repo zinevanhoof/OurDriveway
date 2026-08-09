@@ -50,7 +50,51 @@ export function sortedDays(booking: Booking): [string, Slot[]][] {
  * from both tabs. `canCancel` fails closed instead, because that one guards money.
  */
 export function todayIn(timezone: string | null | undefined): string {
-  return wallClock(timezone)?.[0] ?? localToday();
+  return wallClock(timezone)?.[0] ?? localNow()[0];
+}
+
+/**
+ * The soonest slot this booking still has ahead of it, as `[date, slot]`, or null
+ * once every slot it holds has ended.
+ *
+ * A slot in progress counts as next: at 14:30 the renter is due at the 14:00–16:00
+ * slot, not at tomorrow's. That is the whole reason this exists next to
+ * `firstSlot`, which answers the different question of what a booking *starts*
+ * with — a 09:00 slot that ended hours ago is still its first.
+ *
+ * Unknown zone falls back to the viewer's clock, like `todayIn`: a spot whose
+ * projection hasn't landed yet shouldn't make the booking vanish from the screen.
+ */
+export function nextSlot(
+  booking: Booking,
+  timezone: string | null | undefined,
+): [string, Slot] | null {
+  const [today, time] = wallClock(timezone) ?? localNow();
+  for (const [date, slots] of sortedDays(booking)) {
+    if (date < today) continue;
+    const slot = [...slots]
+      .sort((a, b) => a.start.localeCompare(b.start))
+      .find((s) => date > today || s.end > time);
+    if (slot) return [date, slot];
+  }
+  return null;
+}
+
+/**
+ * Monday 00:00 of the current week, as an ISO instant.
+ *
+ * The one thing here deliberately answered in the *viewer's* zone rather than a
+ * spot's. "Earned this week" is a question a host asks about their own calendar,
+ * and their spots can sit in several zones at once — there is no single right one
+ * to pick. The cost is that a booking made just after midnight somewhere ahead of
+ * the viewer lands in what that renter would call last week.
+ */
+export function startOfWeek(): string {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  // getDay() is Sunday-based, so Sunday walks back 6 days, not forward 1.
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return d.toISOString();
 }
 
 // Upcoming-vs-past used to be folded from `booked` here. It is now `ends_at` on the
@@ -118,9 +162,13 @@ function wallClock(timezone: string | null | undefined): [string, string] | null
   }
 }
 
-function localToday(): string {
+/** The viewer's own wall clock, in the same shape `wallClock` returns. */
+function localNow(): [string, string] {
   const d = new Date();
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return [
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+    `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+  ];
 }
 
 // ponytail: both wall clocks are treated as being on one offset, so a span

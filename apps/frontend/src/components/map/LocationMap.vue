@@ -13,7 +13,7 @@ import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import type { SpotFilter } from "@/types/SpotFilter";
 import { spotMatches } from "@/lib/spotFilter";
 import { recordId } from "@/lib/utils";
-import { native } from "@/api/http";
+import { locateUser } from "@/lib/geo";
 import MapPinComponent from "./MapPinComponent.vue";
 import MapSearchComponent from "./MapSearchComponent.vue";
 import SpotDetailDrawer from "../spot/SpotDetailDrawer.vue";
@@ -208,33 +208,6 @@ watch(matchedSpots, (spots) => {
 watch([selectedId, openCluster], () => {
   for (const p of pins.values()) renderPin(p);
 });
-
-// One-shot user position for the initial center. The webview's geolocation works
-// on both mobile and web, but on native we prefer the platform's native
-// geolocation (via the permission flow) since it's much more accurate.
-async function locateUser(): Promise<[number, number] | null> {
-  try {
-    if (native) {
-      const geo = await import("@tauri-apps/plugin-geolocation");
-      let perms = await geo.checkPermissions();
-      if (perms.location === "prompt" || perms.location === "prompt-with-rationale") {
-        perms = await geo.requestPermissions(["location"]);
-      }
-      if (perms.location !== "granted") return null;
-      const pos = await geo.getCurrentPosition();
-      return [pos.coords.longitude, pos.coords.latitude];
-    }
-    if (!navigator.geolocation) return null;
-    return await new Promise((resolve) => {
-      navigator.geolocation.getCurrentPosition(
-        (p) => resolve([p.coords.longitude, p.coords.latitude]),
-        () => resolve(null),
-      );
-    });
-  } catch {
-    return null;
-  }
-}
 
 onMounted(async () => {
   map = new maplibregl.Map({
