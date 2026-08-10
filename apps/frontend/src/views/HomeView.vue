@@ -12,6 +12,7 @@ import { FULL_SPOT, SPOTS_NEARBY } from '@/api/graphql/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import BookingFormComponent from '@/components/BookingFormComponent.vue';
 import { CarFront, ChevronRight, CirclePlus, MapPin, Search, Star, Wallet } from '@lucide/vue';
+import { imageUrl } from '@/lib/media'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -215,7 +216,7 @@ const openBooking = () => {
             <div v-else class="flex gap-2">
                 <div v-for="spot in nearest" :key="spot.id" @click="openSpot(spot.id)"
                     class="relative flex-1 min-w-0 bg-card border border-border shadow-xs rounded-md overflow-hidden">
-                    <img v-if="spot.images?.[0]" class="w-full h-28 object-cover" :src="spot.images[0]">
+                    <img v-if="spot.images?.[0]" class="w-full h-28 object-cover" :src="imageUrl(spot.images[0])">
                     <div v-else class="w-full h-28 bg-accent"></div>
                     <div class="p-2">
                         <div class="text-sm font-semibold truncate">{{ spot.title }}</div>

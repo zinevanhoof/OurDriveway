@@ -6,7 +6,7 @@
 # + ACME), which also unblocks Android release builds — they block cleartext. Bare
 # `:80` avoids auto-HTTPS and doesn't hardcode the IP.
 #
-# Same /readyz health checks as docker/Caddyfile — see the note there.
+# Same /readyz health checks as apps/frontend/Caddyfile — see the note there.
 (api_upstream) {
 	health_uri /readyz
 	health_interval 5s
@@ -31,6 +31,14 @@
 	}
 	handle /api/booking* {
 		reverse_proxy localhost:3001 {
+			import api_upstream
+		}
+	}
+	# media-service mints presigned R2 upload URLs. It holds no state, so unlike
+	# the others its /readyz answers immediately — the shared health check still
+	# applies, it just never has a replay to wait through.
+	handle /api/media/* {
+		reverse_proxy localhost:3004 {
 			import api_upstream
 		}
 	}

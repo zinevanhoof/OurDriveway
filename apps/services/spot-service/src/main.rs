@@ -2,11 +2,9 @@ use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
     routing::{get, patch, post},
 };
 use shared::env;
-use tower_http::services::ServeDir;
 
 use crate::{
     projector::SpotProjector, repository::spot_repository::SpotRepository,
@@ -17,11 +15,6 @@ mod projector;
 mod repository;
 mod route;
 mod service;
-
-/// Ceiling for a whole create-spot request — several phone photos in one
-/// multipart body, not one image. Matches the 20m the nginx ingress used to
-/// enforce, so nothing that worked before starts failing.
-const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
 /// `SpotService` is built once at boot, not per request. It used to be assembled
 /// inside the `DbAuthenticated` extractor on every call, purely so the connection
@@ -128,14 +121,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "/api/spot/{id}",
             patch(route::spot::update_spot).delete(route::spot::delete_spot),
         )
-        .route("/api/spot/{id}/active", post(route::spot::set_active))
-        .nest_service("/api/spot/uploads", ServeDir::new("uploads"))
-        // Was `disable()`, which relied on the ingress to cap uploads — an
-        // nginx-only annotation that Traefik has no equivalent of, so swapping
-        // controllers would have quietly made this unbounded. The limit belongs
-        // to the service that owns the upload, where it holds no matter what is
-        // proxying in front of it.
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES));
+        .route("/api/spot/{id}/active", post(route::spot::set_active));
+    // No upload route and no body limit any more: photos go straight from the
+    // browser to R2 against a presigned URL, and the per-image ceiling is signed
+    // into that URL by media-service. Nothing image-sized reaches this service.
 
     // No GraphQL proxy here any more: every client read is served by
     // view-service from the combined projection. This database is private to
@@ -161,10 +150,10 @@ mod tests {
         routing::{get, patch, post},
     };
 
-    /// `/api/spot/{id}` sits alongside a static `/api/spot/uploads` and a static
-    /// `/api/spot/address/suggest`. Overlapping paths panic when the router is
-    /// *built*, not when one is requested — so without this the failure mode is a
-    /// service that dies on boot in whatever environment ran it first.
+    /// `/api/spot/{id}` sits alongside a static `/api/spot/address/suggest`.
+    /// Overlapping paths panic when the router is *built*, not when one is
+    /// requested — so without this the failure mode is a service that dies on boot
+    /// in whatever environment ran it first.
     ///
     /// Dummy handlers on purpose: the panic comes from the path set alone, and the
     /// real ones need a live NATS connection to construct.
@@ -173,11 +162,7 @@ mod tests {
         let _: Router = Router::new()
             .route("/api/spot", post(|| async {}))
             .route("/api/spot/address/suggest", get(|| async {}))
-            .route(
-                "/api/spot/{id}",
-                patch(|| async {}).delete(|| async {}),
-            )
-            .route("/api/spot/{id}/active", post(|| async {}))
-            .nest_service("/api/spot/uploads", get(|| async {}));
+            .route("/api/spot/{id}", patch(|| async {}).delete(|| async {}))
+            .route("/api/spot/{id}/active", post(|| async {}));
     }
 }

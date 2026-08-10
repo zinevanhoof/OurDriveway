@@ -18,7 +18,8 @@ import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImag
 
 import type { Availability } from '@/types/domain/spot'
 import type { CreateSpotRequest } from '@/types/requests/CreateSpotRequest'
-import { createSpot, spotFormData } from '@/api/spotApi'
+import { createSpot } from '@/api/spotApi'
+import { uploadNewImages } from '@/api/mediaApi'
 
 const router = useRouter()
 
@@ -80,33 +81,43 @@ const submit = handleSubmit(async (values) => {
     if (slotErrors.value.length || imageErrors.value.length)
         return
 
-    const { pricePerHour, ...rest } = values
-    const request: CreateSpotRequest = {
-        ...rest,
-        // The only place euros become cents. Everything server-side is integer.
-        pricePerHourCents: eurosToCents(pricePerHour),
-        address: {
-            ...values.address,
-            formatted: [
-                values.address.line1,
-                values.address.line2,
-                [values.address.postalCode, values.address.city].filter(Boolean).join(' '),
-                values.address.region,
-                values.address.country,
-            ].filter(Boolean).join(', '),
-        },
-        availability: availability.value,
-    }
-
     loading.value = true
     try {
-        const response = await createSpot(spotFormData(request, images.value))
+        // Photos go to R2 first, and only their keys are sent below — no image
+        // bytes reach the backend at all. Uploading before the create means a
+        // failure here costs nothing: no spot exists yet to be left half-made.
+        const imageKeys = await uploadNewImages(images.value, 'spot')
+
+        const { pricePerHour, ...rest } = values
+        const request: CreateSpotRequest = {
+            ...rest,
+            // The only place euros become cents. Everything server-side is integer.
+            pricePerHourCents: eurosToCents(pricePerHour),
+            address: {
+                ...values.address,
+                formatted: [
+                    values.address.line1,
+                    values.address.line2,
+                    [values.address.postalCode, values.address.city].filter(Boolean).join(' '),
+                    values.address.region,
+                    values.address.country,
+                ].filter(Boolean).join(', '),
+            },
+            availability: availability.value,
+            images: imageKeys,
+        }
+
+        const response = await createSpot(request)
         if (!response.ok) {
             showServerErrors(await response.json().catch(() => ({})))
             return
         }
         // `refreshSpots` tells SpotsView to refetch instead of serving the cached list.
         router.replace({ name: 'spots', state: { refreshSpots: true } })
+    } catch (error) {
+        // An upload that never reached R2 leaves nothing behind, so the only thing
+        // to do is say so and let them press save again.
+        imageErrors.value.push(error instanceof Error ? error.message : 'Upload failed.')
     } finally {
         loading.value = false
     }

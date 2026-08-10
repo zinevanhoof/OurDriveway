@@ -15,6 +15,7 @@ import Avatar from "../ui/avatar/Avatar.vue";
 import AvatarImage from "../ui/avatar/AvatarImage.vue";
 import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
 import Button from "../ui/button/Button.vue";
+import { imageUrl } from "@/lib/media";
 
 const props = defineProps<{
   spotId: string | null;
@@ -53,7 +54,7 @@ const days = computed(() => sortedDays(props.booking));
       <div class="m-4 space-y-4">
         <div class="flex h-40 gap-4 overflow-x-auto snap-x snap-mandatory no-scrollbar">
           <!-- `only:` = the sole image, so it fills the row instead of leaving a gap. -->
-          <img v-for="url in spot?.images" :key="url" :src="url"
+          <img v-for="key in spot?.images" :key="key" :src="imageUrl(key)"
             class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md border-border" />
         </div>
         <div>
@@ -96,7 +97,7 @@ const days = computed(() => sortedDays(props.booking));
 
         <div class="flex items-center gap-2">
           <Avatar size="lg">
-            <AvatarImage v-if="spot?.owner?.profilePicture" :src="spot?.owner.profilePicture" />
+            <AvatarImage v-if="spot?.owner?.profilePicture" :src="imageUrl(spot?.owner.profilePicture)" />
             <AvatarFallback
               :name="{ firstName: spot?.owner?.firstName, lastName: spot?.owner?.lastName }" />
           </Avatar>

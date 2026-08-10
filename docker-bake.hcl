@@ -22,7 +22,7 @@ variable "REGISTRY" {
 // `builder` is deliberately absent: it carries no tags and is never pushed, it
 // only exists to be consumed by the service targets.
 group "default" {
-  targets = ["user-service", "booking-service", "spot-service", "view-service", "frontend"]
+  targets = ["user-service", "booking-service", "spot-service", "view-service", "media-service", "frontend"]
 }
 
 target "builder" {
@@ -53,8 +53,14 @@ target "view-service" {
   tags       = ["${REGISTRY}/ourdriveway-view-service:${TAG}"]
 }
 
-// Context is still the repo root, even though the Dockerfile sits in apps/frontend:
-// the SPA lives there but the Caddyfile it ships with is in docker/.
+target "media-service" {
+  dockerfile = "apps/services/media-service/Dockerfile"
+  contexts   = { builder = "target:builder" }
+  tags       = ["${REGISTRY}/ourdriveway-media-service:${TAG}"]
+}
+
+// Context is still the repo root, even though everything this target needs now
+// sits under apps/frontend/ — it is bake's default and the COPY paths assume it.
 target "frontend" {
   dockerfile = "apps/frontend/Dockerfile"
   tags       = ["${REGISTRY}/ourdriveway-frontend:${TAG}"]

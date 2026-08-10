@@ -231,10 +231,10 @@ impl UserService {
             last_name: Some(req.last_name),
             email: Some(req.email),
             license_plates: Some(req.license_plates),
-            // No upload route yet, so the form never sends one and this must
-            // stay None — Some("") would blank the picture the user has.
-            // ponytail: wire this once /api/user/uploads exists.
-            profile_picture: None,
+            // Straight through: the form only sends this when the user picked a
+            // new picture, and `None` already means "unchanged" both in the event
+            // and in the projection's `?? profile_picture`.
+            profile_picture: req.profile_picture,
         });
 
         let seq = self.publish_user(&existing.shard, &user_uuid, event).await?;

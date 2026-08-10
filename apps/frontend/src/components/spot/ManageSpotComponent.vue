@@ -17,6 +17,7 @@ import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
 import Switch from '../ui/switch/Switch.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer'
 import { FieldError } from '@/components/ui/field'
+import { imageUrl } from '@/lib/media'
 
 const { id } = defineProps<{ id: string }>()
 
@@ -166,7 +167,7 @@ const bookingWhen = (booking: any) => {
     </header>
     <div class="space-y-3 px-4 overflow-y-auto no-scrollbar">
         <div class="flex h-40 gap-2 overflow-x-auto snap-x snap-mandatory no-scrollbar">
-            <img v-for="url in data?.spot?.images" :key="url" :src="url"
+            <img v-for="key in data?.spot?.images" :key="key" :src="imageUrl(key)"
                 class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
         </div>
         <div class="flex">
@@ -248,7 +249,7 @@ const bookingWhen = (booking: any) => {
                 <div v-for="booking in visibleBookings" :key="booking.id"
                     class="flex items-center gap-2 px-4 py-3 border border-border rounded-md bg-card">
                     <Avatar size="lg">
-                        <AvatarImage v-if="booking?.renter?.profilePicture" :src="booking?.renter?.profilePicture" />
+                        <AvatarImage v-if="booking?.renter?.profilePicture" :src="imageUrl(booking?.renter?.profilePicture)" />
                         <AvatarFallback
                             :name="{ firstName: booking?.renter?.firstName, lastName: booking?.renter?.lastName }" />
                     </Avatar>

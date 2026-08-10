@@ -70,6 +70,12 @@ export type UpdateProfileRequest = {
   licensePlates: string[];
   /** Only required when `email` differs from the stored one; the server decides. */
   currentPassword?: string;
+  /**
+   * A media key under `avatars/`, or omitted for "unchanged" — which is what most
+   * saves send, since the picture only changes when the user picks a new one.
+   * There is no way to express "remove", because there is no UI for it.
+   */
+  profilePicture?: string;
 };
 
 export type ChangePasswordRequest = {

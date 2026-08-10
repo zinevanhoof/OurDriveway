@@ -11,17 +11,17 @@ import { readErrorDetail } from "@/lib/serverErrors";
  * projections that answer reads are still catching up, and recording the seq is
  * what makes the next query wait for this write.
  */
-export async function createSpot(formData: FormData): Promise<Response> {
-  return record(await apiFetch("/api/spot", { method: "POST", body: formData }));
+export async function createSpot(request: object): Promise<Response> {
+  return record(await apiFetch("/api/spot", json("POST", request)));
 }
 
 /**
- * Saves an edit. Same multipart shape as create: `data` holds the JSON, `images`
- * holds only the *newly* picked files — the ones the host kept are URLs inside the
- * JSON, so the server can tell "unchanged" from "removed" without diffing.
+ * Saves an edit. Same shape as create: `images` is the host's whole list of media
+ * keys, kept and newly uploaded alike, already in display order — so the server
+ * never has to diff anything to tell "unchanged" from "removed".
  */
-export async function updateSpot(spotId: string, formData: FormData): Promise<Response> {
-  return record(await apiFetch(`/api/spot/${spotId}`, { method: "PATCH", body: formData }));
+export async function updateSpot(spotId: string, request: object): Promise<Response> {
+  return record(await apiFetch(`/api/spot/${spotId}`, json("PATCH", request)));
 }
 
 /**
@@ -48,24 +48,12 @@ export async function deleteSpot(spotId: string): Promise<void> {
   recordSeq((await res.json()).seq);
 }
 
-/**
- * Builds the multipart body both create and edit send.
- *
- * The image list is mixed — URLs for photos already uploaded, `File`s for ones just
- * picked — and this is where it splits: URLs ride along inside the JSON so the
- * server knows which existing photos survived, files become parts. Create sends an
- * `images` array too; it is simply always empty, and the server ignores the field.
- */
-export function spotFormData(data: object, images: (string | File)[]): FormData {
-  const form = new FormData();
-  form.append(
-    "data",
-    JSON.stringify({ ...data, images: images.filter((i) => typeof i === "string") }),
-  );
-  for (const image of images) {
-    if (image instanceof File) form.append("images", image);
-  }
-  return form;
+function json(method: string, body: object): RequestInit {
+  return {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
 }
 
 async function record(response: Response): Promise<Response> {

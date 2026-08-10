@@ -10,11 +10,14 @@ ingress:
     enabled: true
 
 services:
-  spot:
-    # Pinned to one. Uploaded images sit on this pod's emptyDir, so a second
-    # replica would serve 404s for every image the first one received. This is
-    # the constraint that lifts the day uploads move to an object store.
-    replicas: 1
+  # spot is no longer pinned to `replicas: 1`. It used to be, because uploaded
+  # images sat on the pod's emptyDir and a second replica would serve 404s for
+  # every image the first one received. The images are in R2 now, so it scales
+  # with everything else.
+  media:
+    env:
+      S3_ENDPOINT: https://REPLACE-ME.r2.cloudflarestorage.com
+      S3_BUCKET: ourdriveway
 
 nats:
   config:

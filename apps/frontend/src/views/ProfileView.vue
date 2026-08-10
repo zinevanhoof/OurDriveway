@@ -14,6 +14,7 @@ import { Camera, ChevronRight, Lock, LogOut, UserRound } from '@lucide/vue';
 import { formatCents } from '@/lib/money';
 import { useRouter } from 'vue-router';
 import { logoutUser } from '@/api/userApi';
+import { imageUrl } from '@/lib/media'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -42,14 +43,22 @@ const logout = async () => {
     <div class="px-4 space-y-2">
         <div v-if="me" class="p-4 border border-border rounded-md shadow-xs space-y-2 bg-card">
             <div class="flex items-center gap-3">
-                <Avatar size="3xl" class="relative">
-                    <AvatarImage v-if="me.profilePicture" :src="me.profilePicture" />
-                    <AvatarFallback :name="{ firstName: me.firstName, lastName: me.lastName }" />
-                    <div
-                        class="absolute flex justify-center items-center right-0 bottom-0 bg-card rounded-full w-6 h-6 border border-border shadow-xs">
+                <!-- Goes to the edit screen rather than opening a picker here. This
+                     view is read-only — every other control on it is a row that
+                     navigates — and a second upload path would need its own PATCH
+                     and its own error handling for one shortcut. -->
+                <button type="button" class="relative cursor-pointer"
+                    @click="router.push({ name: 'profile-edit' })">
+                    <Avatar size="3xl">
+                        <AvatarImage v-if="me.profilePicture" :src="imageUrl(me.profilePicture)" />
+                        <AvatarFallback :name="{ firstName: me.firstName, lastName: me.lastName }" />
+                    </Avatar>
+                    <span
+                        class="absolute z-10 flex justify-center items-center right-0 bottom-0 bg-card rounded-full w-6 h-6 border border-border shadow-xs">
                         <Camera :size="16" class="text-primary" />
-                    </div>
-                </Avatar>
+                    </span>
+                    <span class="sr-only">Change profile picture</span>
+                </button>
                 <div>
                     <div class="text-lg font-bold">{{ me.firstName }} {{ me.lastName }}</div>
                     <div class="text-xs text-muted-foreground font-medium">{{ me.email }}</div>

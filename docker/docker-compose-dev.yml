@@ -1,18 +1,16 @@
-# Dev topology: just the databases. Services run natively via the "run-all-services"
-# VS Code task (cargo build --workspace, then exec the binaries from the repo root —
-# `cargo run -p <svc>` resolves features differently and rebuilds the world), the
-# frontend via `npm run dev` (vite proxies /api/* to localhost:3000/3001/3002).
+# The only compose topology left: the databases plus Caddy on the host network,
+# so a phone on the LAN reaches one origin. The Rust services run natively on the
+# host (the "run-all-services" VS Code task), which is why none of them appear
+# below — including media-service, which is reached on :3004 through the Caddy
+# route in Caddyfile-dev.
 #
-# Same DB config as docker-compose-prod.yml, deliberately — dev/prod parity on
-# the database version and storage engine matters more than anywhere else here.
-x-surrealdb: &surrealdb
-  # Pinned to match the `surrealdb` crate version in Cargo.toml.
+# Production is Kubernetes, not compose. See k8s/.
+x-surrealdb:
+  &surrealdb # Pinned to match the `surrealdb` crate version in Cargo.toml.
   image: surrealdb/surrealdb:v3.2.4
   restart: unless-stopped
-  # ponytail: the image runs as `nonroot`, but a fresh named volume is created
-  # root-owned, so the datastore can't be written. Running the DB process as root
-  # *inside its own container* is the cheap fix. Upgrade path if it ever matters:
-  # an init container that chowns the volume to uid 65532 first.
+  # Still root: with no volume the datastore goes in the container's own writable
+  # layer, and `nonroot` cannot mkdir /data at the filesystem root.
   user: "0:0"
   command:
     - start
@@ -21,8 +19,10 @@ x-surrealdb: &surrealdb
     - --pass=root
     - --import-file
     - /schema.surql
-    # Persistent datastore — without this every restart wipes your dev data.
-    # Requires every DEFINE in the schema to be OVERWRITE.
+    # surrealkv in the container's own layer — a real on-disk datastore that dies
+    # with the container. Disk-backed like production, disposable like a cache,
+    # which is exactly what k8s gets from its emptyDir. Requires every DEFINE in
+    # the schema to be OVERWRITE, since --import-file re-runs on each boot.
     - surrealkv:/data/db
   healthcheck:
     # Distroless image (no shell), so exec form only. Subcommand is `is-ready`.
@@ -42,8 +42,6 @@ services:
     ports:
       - "4222:4222"
       - "8222:8222"
-    volumes:
-      - nats-data:/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
       interval: 5s
@@ -56,7 +54,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - user-db-data:/data
       - ../schemas/user-schema.surql:/schema.surql:ro
 
   booking-service-db:
@@ -64,7 +61,6 @@ services:
     ports:
       - "8001:8000"
     volumes:
-      - booking-db-data:/data
       - ../schemas/booking-schema.surql:/schema.surql:ro
 
   spot-service-db:
@@ -72,7 +68,6 @@ services:
     ports:
       - "8002:8000"
     volumes:
-      - spot-db-data:/data
       - ../schemas/spot-schema.surql:/schema.surql:ro
 
   # The combined read model. Rebuildable from the log, so losing this volume
@@ -82,12 +77,18 @@ services:
     ports:
       - "8003:8000"
     volumes:
-      - view-db-data:/data
       - ../schemas/view-schema.surql:/schema.surql:ro
 
-volumes:
-  nats-data:
-  user-db-data:
-  booking-db-data:
-  spot-db-data:
-  view-db-data:
+  # Single origin for every client (browser + tauri): serves the built SPA and
+  # reverse-proxies /api/* to the 5 Rust services running on the host. Same-origin
+  # is what keeps the SameSite=Strict refresh cookie working and CORS unnecessary
+  # — the one deliberate exception is the PUT straight to R2, which carries a
+  # signature instead of a cookie.
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: "host"
+    volumes:
+      - ./Caddyfile-dev:/etc/caddy/Caddyfile:ro
+      - ../apps/frontend/dist:/srv/dist:ro
+

@@ -36,6 +36,7 @@ export default defineConfig(async () => ({
       "/api/booking": "http://localhost:3001",
       "/api/spot": "http://localhost:3002",
       "/api/view": "http://localhost:3003",
+      "/api/media": "http://localhost:3004",
     },
     hmr: host
       ? {

@@ -1,5 +1,5 @@
 # Caddy, reduced to a file server. It used to reverse-proxy /api/* as well; that
-# moved into the Ingress so routing is declared once. See docker/Caddyfile.
+# moved into the Ingress so routing is declared once. See apps/frontend/Caddyfile.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

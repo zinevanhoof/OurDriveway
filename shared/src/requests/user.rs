@@ -49,6 +49,27 @@ pub struct UpdateProfileRequest {
     pub license_plates: Vec<String>,
     #[garde(skip)]
     pub current_password: Option<String>,
+    /// A media key the browser just uploaded to R2, or `None` for "unchanged" —
+    /// the one field here that isn't required, because the form only sends it when
+    /// the user actually picked a new picture.
+    ///
+    /// `None` is not "clear": that matches `UserUpdated`'s semantics and the
+    /// repository's `?? profile_picture` coalescing. There is no remove-picture UI,
+    /// so there is nothing that needs to mean "clear".
+    #[garde(inner(custom(is_avatar)))]
+    pub profile_picture: Option<String>,
+}
+
+/// The picture has to be a key media-service minted under the avatar prefix.
+///
+/// Same trust boundary as a spot's photos: it comes straight back from the client
+/// and is rendered as an `<img src>` anywhere this user appears — on their own
+/// profile, in a spot's owner card, on a booking row.
+fn is_avatar(key: &String, _: &()) -> garde::Result {
+    require(
+        crate::media::is_media_key(key, crate::media::PREFIX_AVATARS),
+        "Unknown picture.",
+    )
 }
 
 /// Mirrors the change-password zod schema. The new password gets the signup
@@ -202,6 +223,7 @@ mod tests {
             email: "a@b.com".into(),
             license_plates: plates.into_iter().map(Into::into).collect(),
             current_password: None,
+            profile_picture: None,
         }
         .validate();
 
@@ -218,10 +240,38 @@ mod tests {
                 email: "a@b.com".into(),
                 license_plates: vec![],
                 current_password: None,
+                profile_picture: None,
             }
             .validate()
             .is_err()
         );
+    }
+
+    /// The picture is client-supplied and rendered as an `<img src>` wherever this
+    /// user appears, so only keys media-service minted get through. `None` has to
+    /// stay valid — it is what the form sends whenever the picture is unchanged,
+    /// which is most saves.
+    #[test]
+    fn profile_picture_must_be_our_own_media_key() {
+        let with = |picture: Option<&str>| {
+            UpdateProfileRequest {
+                first_name: "Zine".into(),
+                last_name: "Van Hoof".into(),
+                email: "a@b.com".into(),
+                license_plates: vec![],
+                current_password: None,
+                profile_picture: picture.map(Into::into),
+            }
+            .validate()
+            .is_ok()
+        };
+
+        assert!(with(None), "unchanged is the common case");
+        assert!(with(Some("avatars/019fd9a1a3cb7d12b96249db33e2a909.jpeg")));
+        // A spot photo is not an avatar — the prefixes are not interchangeable.
+        assert!(!with(Some("spots/019fd9a1a3cb7d12b96249db33e2a909.jpeg")));
+        assert!(!with(Some("https://evil.example/track.png")));
+        assert!(!with(Some("")));
     }
 
     #[test]

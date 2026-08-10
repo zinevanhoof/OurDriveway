@@ -1,5 +1,5 @@
 {{/*
-One template for all four backends. Each pod is a service plus its OWN SurrealDB
+One template for every backend. A pod is a service plus its OWN SurrealDB
 sidecar — that pairing is not an optimisation, it is what bus/src/projector.rs
 requires: every instance creates an *ephemeral* consumer and replays the whole
 stream into its own database, keeping its cursor in that same database. Point two
@@ -7,6 +7,11 @@ replicas at one shared DB and you get two projectors racing over one cursor.
 
 Sidecar-per-pod makes "a database per replica" fall out of `replicas: N` for free,
 and the DB is reachable only from inside its own pod.
+
+`stateless: true` in values.yaml opts a service out of all of it — no sidecar, no
+schema, no NATS wait, no data volume. media-service is the only one: it mints
+presigned R2 upload URLs and stores nothing, so there is no projection to build
+and nothing for a second replica to race over.
 */}}
 {{- range $name, $svc := .Values.services }}
 ---
@@ -31,6 +36,7 @@ spec:
         # effect at the next unrelated restart — a 3am kind of bug.
         checksum/schemas: {{ $.Values.schemas | toYaml | sha256sum }}
     spec:
+      {{- if not $svc.stateless }}
       securityContext:
         # The SurrealDB image runs as uid 65532 (nonroot) and a fresh emptyDir is
         # root-owned, so without this the datastore cannot be written. fsGroup
@@ -96,6 +102,7 @@ spec:
               command: ["/surreal", "is-ready", "--endpoint", "http://127.0.0.1:8000"]
             periodSeconds: 2
             failureThreshold: 30
+      {{- end }}
       containers:
         - name: app
           image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
@@ -109,6 +116,7 @@ spec:
           env:
             - name: PORT
               value: {{ $.Values.port | quote }}
+            {{- if not $svc.stateless }}
             # The sidecar in this same pod, on loopback.
             - name: SURREALDB_ADDR
               value: "127.0.0.1:8000"
@@ -120,11 +128,13 @@ spec:
               value: "nats://{{ $.Release.Name }}-nats:4222"
             - name: SNAPSHOT_INTERVAL_SECS
               value: {{ $.Values.snapshotIntervalSecs | quote }}
+            {{- end }}
             {{- range $k, $v := $svc.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
-          # JWT_SECRET for all four, plus LOCATIONIQ_API_KEY. See secrets.env.example.
+          # JWT_SECRET for every service, plus LOCATIONIQ_API_KEY and the R2
+          # credentials. See secrets.env.example.
 
           envFrom:
             - secretRef:
@@ -134,6 +144,9 @@ spec:
           # replaces the `health_uri /readyz` checks Caddy used to run, and does
           # it better: Caddy probing a ClusterIP hits a random pod and learns
           # nothing about the one it is about to dial.
+          #
+          # A stateless service answers both unconditionally — it has no
+          # projection, so alive IS ready. Same probes, so the template stays one.
           readinessProbe:
             httpGet:
               path: /readyz
@@ -150,11 +163,7 @@ spec:
               path: /healthz
               port: http
             periodSeconds: 10
-          volumeMounts:
-            {{- if $svc.uploads }}
-            - name: uploads
-              mountPath: /app/uploads
-            {{- end }}
+      {{- if not $svc.stateless }}
       volumes:
         - name: data
           emptyDir:
@@ -162,10 +171,7 @@ spec:
         - name: schemas
           configMap:
             name: {{ $.Values.schemaConfigMap }}
-        {{- if $svc.uploads }}
-        - name: uploads
-          emptyDir: {}
-        {{- end }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

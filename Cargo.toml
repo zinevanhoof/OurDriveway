@@ -4,6 +4,7 @@ members = [
     "apps/services/booking-service",
     "apps/services/spot-service",
     "apps/services/view-service",
+    "apps/services/media-service",
     "bus",
     "shared"
 ]
@@ -19,8 +20,7 @@ resolver = "2"
 edition = "2024"
 
 [workspace.dependencies]
-axum = { version = "0.8.9", features = ["macros", "multipart"] }
-tower-http = { version = "0.7.0", features = ["fs"] }
+axum = { version = "0.8.9", features = ["macros"] }
 tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -55,3 +55,7 @@ sha2 = "0.10.9"
 hex = "0.4.3"
 bytes = "1.12.0"
 tokio-util = { version = "0.7.18", features = ["io"] }
+# media-service only. Presigning is a local computation, but the SDK still wants a
+# client to hang it off, so the default HTTP stack comes along — it shares the
+# aws-lc-rs rustls provider the rest of the workspace already installs.
+aws-sdk-s3 = "1.141.0"

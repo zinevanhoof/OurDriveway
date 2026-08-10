@@ -18,7 +18,8 @@ import CreateSpotAvailability from '@/components/forms/create-spot-form/CreateSp
 import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImages.vue';
 
 import { EDIT_SPOT } from '@/api/graphql/spot';
-import { deleteSpot, spotFormData, updateSpot } from '@/api/spotApi';
+import { deleteSpot, updateSpot } from '@/api/spotApi';
+import { uploadNewImages } from '@/api/mediaApi';
 import { bookedOutside } from '@/lib/bookingAvailability';
 import { formatDay, formatSlots, todayIn } from '@/lib/bookingDates';
 import { centsToEuros, eurosToCents } from '@/lib/money';
@@ -128,24 +129,28 @@ const submit = handleSubmit(async (values) => {
     if (slotErrors.value.length || imageErrors.value.length)
         return
 
-    const { pricePerHour, ...rest } = values
-    const request = {
-        ...rest,
-        pricePerHourCents: eurosToCents(pricePerHour),
-        availability: availability.value,
-    }
-
     loading.value = true
     try {
-        const response = await updateSpot(
-            recordId(id)!,
-            spotFormData(request, images.value),
-        )
+        // Kept photos are already keys and pass straight through; only the newly
+        // picked Files are uploaded. One list, in the host's display order, so the
+        // server never has to work out what changed.
+        const imageKeys = await uploadNewImages(images.value, 'spot')
+
+        const { pricePerHour, ...rest } = values
+        const response = await updateSpot(recordId(id)!, {
+            ...rest,
+            pricePerHourCents: eurosToCents(pricePerHour),
+            availability: availability.value,
+            images: imageKeys,
+        })
         if (!response.ok) {
             showServerErrors(await response.json().catch(() => ({})))
             return
         }
         router.back()
+    } catch (error) {
+        // A failed upload leaves the listing exactly as it was — nothing was saved.
+        imageErrors.value.push(error instanceof Error ? error.message : 'Upload failed.')
     } finally {
         loading.value = false
     }

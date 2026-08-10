@@ -3,6 +3,7 @@
 .claude
 CLAUDE.md
 *.env
+.env.*
 /uploads
 # Vendored Helm subchart tarballs. Chart.lock IS committed — it pins the
 # resolved NATS version, so `helm dependency update` is reproducible.

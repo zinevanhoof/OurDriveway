@@ -1,7 +1,7 @@
 # Static SPA delivery, nothing else.
 #
 # The reverse_proxy blocks that used to live here moved into the Ingress in
-# k8s/30-frontend.yaml: it routes /api/* to the four services and everything else
+# k8s/30-frontend.yaml: it routes /api/* to the five services and everything else
 # to this pod, so the browser still sees ONE origin — which is what keeps the
 # SameSite=Strict refresh cookie working and CORS unnecessary. Routing declared in
 # two places is just two places to forget.

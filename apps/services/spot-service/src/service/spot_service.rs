@@ -50,7 +50,6 @@ impl SpotService {
         &self,
         request: CreateSpotRequest,
         owner_id: String,
-        images: Vec<String>,
     ) -> MyResult<Created> {
         // Independently geocode the submitted address (never trust client coords).
         // No confident match -> reject; the frontend renders `detail` from 422s.
@@ -74,7 +73,7 @@ impl SpotService {
             title: request.title,
             description: request.description,
             price_per_hour_cents: request.price_per_hour_cents,
-            images,
+            images: request.images,
             lng: point.x(),
             lat: point.y(),
             address: request.address.into(),
@@ -101,7 +100,6 @@ impl SpotService {
         spot_id: &str,
         request: UpdateSpotRequest,
         owner_id: String,
-        images: Vec<String>,
     ) -> MyResult<u64> {
         let (id, shard) = self.owned(spot_id, &owner_id).await?;
 
@@ -110,7 +108,7 @@ impl SpotService {
             title: Some(request.title),
             description: request.description,
             price_per_hour_cents: Some(request.price_per_hour_cents),
-            images: Some(images),
+            images: Some(request.images),
             availability: Some(request.availability.into()),
         });
 

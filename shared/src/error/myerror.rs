@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::multipart::MultipartError;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -31,8 +30,6 @@ pub enum MyError {
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Multipart(#[from] MultipartError),
     /// Publishing to, or reading from, the event log failed.
     ///
     /// A write handler that hits this has NOT written anything — the publish is

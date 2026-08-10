@@ -22,6 +22,11 @@ pub struct CreateSpotRequest {
     pub address: AddressRequest,
     #[garde(dive, custom(has_any_slot))]
     pub availability: AvailabilityRequest,
+    /// Media keys, in display order. The browser uploads each photo straight to
+    /// R2 first and sends back the keys media-service minted for them — no image
+    /// bytes reach this service at all.
+    #[garde(custom(are_spot_images))]
+    pub images: Vec<String>,
 }
 
 /// An edit of an existing listing. Every field the host can still change, all of
@@ -42,28 +47,28 @@ pub struct UpdateSpotRequest {
     pub price_per_hour_cents: i64,
     #[garde(dive, custom(has_any_slot))]
     pub availability: AvailabilityRequest,
-    /// Existing image URLs the host kept, in display order. Newly picked files
-    /// arrive as multipart parts and are appended to these.
-    #[garde(custom(are_uploads))]
+    /// Media keys, in display order — the ones the host kept and the ones they
+    /// just uploaded, already merged by the client. Same rules as create.
+    #[garde(custom(are_spot_images))]
     pub images: Vec<String>,
 }
 
-/// The path prefix this service serves uploads from. Client-supplied image URLs are
-/// only ever kept if they start with it.
-pub const UPLOAD_PREFIX: &str = "/api/spot/uploads/";
-
-/// Kept images have to be paths this service issued.
+/// A listing needs at least one photo, and every photo has to be one of ours.
 ///
-/// They come straight back from the client, and land in an event that every renter
-/// then renders as an `<img src>`. Without this a host could point their listing's
-/// photos at any URL they liked.
-fn are_uploads(images: &Vec<String>, _: &()) -> garde::Result {
+/// Both halves are here rather than in the route because there is now a single
+/// image list. It used to be split — kept URLs inside the JSON, new files as
+/// multipart parts — so "at least one" could only be judged after merging them,
+/// and lived in the handler as a hand-rolled 422.
+///
+/// The membership half is a trust boundary: these strings come straight back from
+/// the client and land in an event that every renter renders as an `<img src>`.
+/// See [`crate::media::is_media_key`].
+fn are_spot_images(images: &Vec<String>, _: &()) -> garde::Result {
+    require(!images.is_empty(), "Add at least one photo.")?;
     require(
-        images.iter().all(|image| {
-            image
-                .strip_prefix(UPLOAD_PREFIX)
-                .is_some_and(|name| !name.is_empty() && !name.contains(['/', '\\']))
-        }),
+        images
+            .iter()
+            .all(|image| crate::media::is_media_key(image, crate::media::PREFIX_SPOTS)),
         "Unknown photo.",
     )
 }
@@ -300,8 +305,12 @@ mod tests {
                 },
                 single: HashMap::new(),
             },
+            images: vec![IMAGE_KEY.into()],
         }
     }
+
+    /// Shaped exactly like what media-service mints — see `shared::media`.
+    const IMAGE_KEY: &str = "spots/019fd9a1a3cb7d12b96249db33e2a909.jpeg";
 
     #[test]
     fn valid_request_passes() {
@@ -351,7 +360,7 @@ mod tests {
             description: create.description,
             price_per_hour_cents: create.price_per_hour_cents,
             availability: create.availability,
-            images: vec!["/api/spot/uploads/a.jpg".into()],
+            images: create.images,
         }
     }
 
@@ -365,25 +374,30 @@ mod tests {
         assert!(update(500, vec![slot("08:15", "10:00")]).validate().is_err());
     }
 
-    /// The kept-image list is client-supplied and ends up in an event every renter
-    /// renders, so only paths this service serves are allowed through.
+    /// The image list is client-supplied and ends up in an event every renter
+    /// renders, so only keys media-service minted are allowed through.
+    ///
+    /// `shared::media` covers the key grammar itself; this is about the list being
+    /// wired into both request types.
     #[test]
-    fn kept_images_must_be_our_own_uploads() {
-        let with = |image: &str| {
+    fn images_must_be_our_own_media_keys() {
+        let with = |images: Vec<&str>| {
             let mut r = update(500, vec![slot("08:00", "10:00")]);
-            r.images = vec![image.into()];
+            r.images = images.into_iter().map(Into::into).collect();
             r.validate().is_ok()
         };
 
-        assert!(with("/api/spot/uploads/019a.jpg"));
-        assert!(!with("https://evil.example/track.png"));
-        assert!(!with("/api/spot/uploads/../../etc/passwd"));
-        assert!(!with("/api/spot/uploads/"));
-        // No photos at all is the *route's* 422, not garde's: an edit that uploads a
-        // replacement legitimately keeps none.
-        let mut none = update(500, vec![slot("08:00", "10:00")]);
-        none.images = vec![];
-        assert!(none.validate().is_ok());
+        assert!(with(vec![IMAGE_KEY]));
+        assert!(!with(vec!["https://evil.example/track.png"]));
+        assert!(!with(vec!["spots/../../etc/passwd"]));
+        // The old scheme. Anything still holding one of these is stale data, not a
+        // photo this app can serve.
+        assert!(!with(vec!["/api/spot/uploads/019a.jpg"]));
+        // One bad key poisons the list — an event is all-or-nothing.
+        assert!(!with(vec![IMAGE_KEY, "https://evil.example/track.png"]));
+        // Now garde's, not the route's: with one merged list there is no longer a
+        // case where zero images is legitimate.
+        assert!(!with(vec![]));
     }
 
     #[test]

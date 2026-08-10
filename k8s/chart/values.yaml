@@ -1,11 +1,11 @@
-# The four backends differ in two facts: some extra env, and whether they hold
-# uploads. Everything else about them is identical, so they are data here and one
-# template in templates/services.yaml — not four near-copies that drift the first
+# The backends differ in two facts: some extra env, and whether they carry state
+# at all. Everything else about them is identical, so they are data here and one
+# template in templates/services.yaml — not five near-copies that drift the first
 # time a probe changes.
 registry: ghcr.io/zinevanhoof
 
 # Every service listens on 80 in a container. Locally they need distinct ports to
-# share one host (3000-3003, in each service's .env); here each one has its own
+# share one host (3000-3004, in each service's .env); here each one has its own
 # Service and DNS name, so there is nothing left to disambiguate.
 port: 80
 
@@ -30,15 +30,29 @@ services:
       # DAYS — Duration::days.
       REFRESH_TOKEN_EXPIRATION: "15"
   booking: {}
-  spot:
-    # ponytail: emptyDir, so uploaded images die with the pod and every spot keeps
-    # a /api/spot/uploads/… URL that now 404s. Accepted deliberately: this is the
-    # one piece of state NATS cannot rebuild, and a portfolio app can wear it.
-    # Upgrade path is the NATS object store (already a dependency, used by the
-    # snapshotter) or S3 — at which point spot-service can also scale past one
-    # replica, which local disk prevents today.
-    uploads: true
+  spot: {}
   view: {}
+  # The one service with no database, no NATS consumer and no schema: it mints
+  # presigned R2 upload URLs and holds nothing. `stateless` is what strips the
+  # SurrealDB sidecar, the schema mount and the wait-for-nats init container from
+  # its pod — see templates/services.yaml.
+  #
+  # This is also what removed the uploads emptyDir that used to pin spot-service
+  # to one replica: images now live in R2 rather than on a pod's local disk.
+  media:
+    stateless: true
+    env:
+      # Not secret, and visible in review where it belongs. The credentials for
+      # this bucket come from secrets.env instead.
+      S3_ENDPOINT: https://REPLACE-ME.r2.cloudflarestorage.com
+      S3_BUCKET: ourdriveway
+      # R2 has one region and it is called `auto`. Still signed, so it must match.
+      S3_REGION: auto
+      # Seconds a minted upload URL stays usable.
+      PRESIGN_EXPIRY_SECS: "900"
+      # Per-image ceiling in bytes (20 MiB), signed into the URL so it holds no
+      # matter what is proxying in front of the service.
+      MAX_UPLOAD_BYTES: "20971520"
 
 replicas: 1
 
@@ -98,8 +112,9 @@ ingress:
   # is not something to build on.
   className: traefik
   # Controller-specific annotations, if you ever need any. Deliberately empty:
-  # this app's only such dependency was nginx's proxy-body-size, and that limit
-  # now lives in spot-service (MAX_UPLOAD_BYTES) where no controller can lose it.
+  # this app's only such dependency was nginx's proxy-body-size, and nothing
+  # image-sized passes through the ingress at all any more — the browser PUTs
+  # photos straight to R2, capped by a signature media-service mints.
   annotations: {}
   # One host for the SPA and the API. Not cosmetic: the refresh cookie is
   # SameSite=Strict, so the moment /api lives on another origin, login breaks.

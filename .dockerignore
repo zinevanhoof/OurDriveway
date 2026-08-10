@@ -6,7 +6,7 @@ apps/frontend/dist/
 # The whole Tauri crate, not just gen/: it's its own workspace, so the Rust builder
 # never compiles it, and the frontend image has no use for 448K of Rust source.
 apps/frontend/src-tauri/
+# Nothing in here is ever built into an image: the dev compose file mounts what it
+# needs from the host at run time, and the Caddyfile the frontend image bakes in
+# now lives next to the SPA it serves, in apps/frontend/.
 docker/
-# ...except the Caddyfile, which Dockerfile.frontend bakes into the image so the
-# VPS needs nothing on disk but the compose file.
-!docker/Caddyfile

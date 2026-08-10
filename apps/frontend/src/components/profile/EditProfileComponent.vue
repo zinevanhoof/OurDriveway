@@ -18,10 +18,12 @@ import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue'
 
 import { ME } from '@/api/graphql/user'
 import { updateProfile } from '@/api/userApi'
+import { uploadImage } from '@/api/mediaApi'
 import { fetchMe } from '@/api/me'
 import { useAuthStore } from '@/stores/auth'
 import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
 import { recordId } from '@/lib/utils'
+import { imageUrl } from '@/lib/media'
 
 const router = useRouter()
 const auth = useAuthStore()
@@ -89,10 +91,10 @@ watch(me, (user) => {
     })
 }, { immediate: true })
 
-// ponytail: preview only — there is no upload route yet, so the picked file is
-// never sent and the server is told nothing about the picture. Wire this to a
-// multipart PATCH once /api/user/uploads exists (mirror spot-service's
-// parse_spot_form). Until then the camera is honest about doing nothing on save.
+// The picked file is held until save, then uploaded to R2 — so choosing a picture
+// and then abandoning the form leaves no object behind. `preview` is only what the
+// avatar shows in the meantime.
+const pickedFile = ref<File | null>(null)
 const picked = ref<string | null>(null)
 const revoke = () => picked.value && URL.revokeObjectURL(picked.value)
 
@@ -100,6 +102,7 @@ const onSelectPicture = (event: Event) => {
     const file = (event.target as HTMLInputElement).files?.[0]
     if (!file) return
     revoke()
+    pickedFile.value = file
     picked.value = URL.createObjectURL(file)
 }
 
@@ -115,6 +118,12 @@ const submit = handleSubmit(async (form) => {
             // zod's .trim() doesn't rewrite the value bound to the input.
             licensePlates: form.licensePlates.map(p => p.trim()),
             currentPassword: form.currentPassword || undefined,
+            // Omitted entirely when they didn't pick one: `undefined` means
+            // "unchanged" all the way through to the projection, and sending a
+            // value here would be the client deciding what changed.
+            profilePicture: pickedFile.value
+                ? await uploadImage(pickedFile.value, 'avatar')
+                : undefined,
         })
 
         if (!response.ok) {
@@ -131,6 +140,9 @@ const submit = handleSubmit(async (form) => {
         // The header reads the store, not the query.
         auth.setUser(await fetchMe())
         router.back()
+    } catch (error) {
+        // The upload runs before the PATCH, so a failure here saved nothing.
+        formErrors.value = [error instanceof Error ? error.message : 'Upload failed.']
     } finally {
         loading.value = false
     }
@@ -143,17 +155,26 @@ const submit = handleSubmit(async (form) => {
         <template #main>
             <form id="edit-profile-form" @submit="submit" class="space-y-4">
                 <div class="flex justify-center py-2">
-                    <Avatar size="3xl" class="relative">
-                        <AvatarImage v-if="picked || me?.profilePicture" :src="picked ?? me!.profilePicture" />
-                        <AvatarFallback v-if="me"
-                            :name="{ firstName: values.firstName || me.firstName, lastName: values.lastName || me.lastName }" />
-                        <label
-                            class="absolute flex justify-center items-center right-0 bottom-0 bg-card rounded-full w-6 h-6 border border-border shadow-xs cursor-pointer">
+                    <!-- The label wraps the whole avatar, so the picture itself is the
+                         target and not just the 24px badge. The badge sits outside
+                         <Avatar> deliberately: avatarVariants draws a decorative ring
+                         as an ::after covering inset-0, which paints over any
+                         positioned child and ate the click when the label lived
+                         inside. AvatarBadge works around the same thing with z-10. -->
+                    <label class="relative cursor-pointer">
+                        <Avatar size="3xl">
+                            <AvatarImage v-if="picked || me?.profilePicture"
+                                :src="picked ?? imageUrl(me!.profilePicture)" />
+                            <AvatarFallback v-if="me"
+                                :name="{ firstName: values.firstName || me.firstName, lastName: values.lastName || me.lastName }" />
+                        </Avatar>
+                        <span
+                            class="absolute z-10 flex justify-center items-center right-0 bottom-0 bg-card rounded-full w-6 h-6 border border-border shadow-xs">
                             <Camera :size="16" class="text-primary" />
-                            <span class="sr-only">Change profile picture</span>
-                            <input type="file" accept="image/*" class="sr-only" @change="onSelectPicture" />
-                        </label>
-                    </Avatar>
+                        </span>
+                        <span class="sr-only">Change profile picture</span>
+                        <input type="file" accept="image/*" class="sr-only" @change="onSelectPicture" />
+                    </label>
                 </div>
 
                 <FieldGroup class="gap-4">

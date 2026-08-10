@@ -5,6 +5,7 @@ import { Bell } from '@lucide/vue';
 import Avatar from '../ui/avatar/Avatar.vue';
 import AvatarImage from '../ui/avatar/AvatarImage.vue';
 import AvatarFallback from '../ui/avatar/AvatarFallback.vue';
+import { imageUrl } from '@/lib/media'
 
 // Already fetched once at boot by fetchMe(); no reason for a second round trip.
 const user = computed(() => useAuthStore().user);
@@ -29,7 +30,7 @@ const greeting = computed(() => {
                 <bell :size="20" />
             </div>
             <Avatar size="lg">
-                <AvatarImage v-if="user?.profilePicture" :src="user.profilePicture" />
+                <AvatarImage v-if="user?.profilePicture" :src="imageUrl(user.profilePicture)" />
                 <AvatarFallback :name="{ firstName: user?.firstName ?? '', lastName: user?.lastName ?? '' }" />
             </Avatar>
         </div>

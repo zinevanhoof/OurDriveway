@@ -11,6 +11,7 @@ pub mod events;
 pub mod extract;
 pub mod extractors;
 pub mod general_models;
+pub mod media;
 pub mod requests;
 pub mod responses;
 
