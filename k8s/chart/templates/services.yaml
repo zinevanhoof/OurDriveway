@@ -9,11 +9,24 @@ Sidecar-per-pod makes "a database per replica" fall out of `replicas: N` for fre
 and the DB is reachable only from inside its own pod.
 
 `stateless: true` in values.yaml opts a service out of all of it — no sidecar, no
-schema, no NATS wait, no data volume. media-service is the only one: it mints
-presigned R2 upload URLs and stores nothing, so there is no projection to build
-and nothing for a second replica to race over.
+schema, no data volume.
+
+Three properties, three flags, because they stopped coinciding. `stateless` used
+to also imply "no NATS", which held only while media-service was the sole
+stateless service: it mints presigned R2 upload URLs and touches neither a
+database nor the broker. notification-service is stateless too but consumes the
+log — its consumer cursor lives in NATS instead of a projection — so:
+
+  stateless: true   no SurrealDB sidecar, no schema, no data volume
+  nats: false       no NATS_URL and no wait-for-nats init container (media only)
+  api: false        no ingress path (notification only — it exposes only health)
+
+All three default to the common case, so an ordinary service still declares
+nothing.
 */}}
 {{- range $name, $svc := .Values.services }}
+{{- $needsNats := true }}
+{{- if hasKey $svc "nats" }}{{- $needsNats = $svc.nats }}{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -43,7 +56,10 @@ spec:
         # makes the kubelet chown it — the clean version of the `user: "0:0"`
         # workaround the compose file needed.
         fsGroup: 65532
+      {{- end }}
+      {{- if or $needsNats (not $svc.stateless) }}
       initContainers:
+        {{- if $needsNats }}
         # Kubernetes has no `depends_on`, so the compose file's
         # `nats: condition: service_healthy` becomes this: a plain init container
         # that blocks until the broker answers. bus/src/connect.rs dials once and
@@ -63,6 +79,8 @@ spec:
             - -c
             # Quoted: unquoted, `until : <…` is a YAML mapping key, not a string.
             - 'until : </dev/tcp/{{ $.Release.Name }}-nats/4222; do echo "waiting for nats"; sleep 2; done'
+        {{- end }}
+        {{- if not $svc.stateless }}
         # A native sidecar (initContainer + restartPolicy: Always), not a plain
         # container. shared/src/db.rs connects once at boot and does NOT retry, so
         # the app must not start until the socket is accepting. Only a native
@@ -102,6 +120,7 @@ spec:
               command: ["/surreal", "is-ready", "--endpoint", "http://127.0.0.1:8000"]
             periodSeconds: 2
             failureThreshold: 30
+        {{- end }}
       {{- end }}
       containers:
         - name: app
@@ -124,10 +143,12 @@ spec:
               value: {{ $.Values.surrealdb.user | quote }}
             - name: SURREALDB_PASS
               value: {{ $.Values.surrealdb.pass | quote }}
-            - name: NATS_URL
-              value: "nats://{{ $.Release.Name }}-nats:4222"
             - name: SNAPSHOT_INTERVAL_SECS
               value: {{ $.Values.snapshotIntervalSecs | quote }}
+            {{- end }}
+            {{- if $needsNats }}
+            - name: NATS_URL
+              value: "nats://{{ $.Release.Name }}-nats:4222"
             {{- end }}
             {{- range $k, $v := $svc.env }}
             - name: {{ $k }}

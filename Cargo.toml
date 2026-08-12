@@ -5,6 +5,7 @@ members = [
     "apps/services/spot-service",
     "apps/services/view-service",
     "apps/services/media-service",
+    "apps/services/notification-service",
     "bus",
     "shared"
 ]
@@ -59,3 +60,13 @@ tokio-util = { version = "0.7.18", features = ["io"] }
 # client to hang it off, so the default HTTP stack comes along — it shares the
 # aws-lc-rs rustls provider the rest of the workspace already installs.
 aws-sdk-s3 = "1.141.0"
+# notification-service only. Thin wrapper over one POST, but it carries the
+# idempotency-key and template plumbing that would otherwise be hand-rolled
+# against a JSON shape with no compiler checking it.
+#
+# default-features = false is not optional: the crate defaults to `native-tls`,
+# which links OpenSSL. That drags a system library into an image built on
+# distroless and splits the workspace across two TLS stacks — everything else
+# here runs on rustls with the aws-lc-rs provider that
+# `shared::install_default_crypto_provider` installs.
+resend-rs = { version = "0.29.0", default-features = false, features = ["rustls-tls"] }

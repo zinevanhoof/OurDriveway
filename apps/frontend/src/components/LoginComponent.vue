@@ -26,9 +26,11 @@ const login = async (response: AuthResponse) => {
     router.push({ name: 'home' })
 }
 
+// No session is issued at signup and login will refuse until the address is
+// confirmed, so this has to say what happens next rather than "you're in".
 const signup = () => {
     tab.value = 'login'
-    toast.success("Successfully signed up.")
+    toast.success('Check your email to verify your address, then log in.')
 }
 </script>
 

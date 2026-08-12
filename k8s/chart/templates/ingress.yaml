@@ -35,6 +35,7 @@ spec:
       http:
         paths:
           {{- range $name, $svc := .Values.services }}
+          {{- if ne $svc.api false }}
           - path: /api/{{ $name }}
             pathType: Prefix
             backend:
@@ -42,6 +43,7 @@ spec:
                 name: {{ $name }}-service
                 port:
                   number: {{ $.Values.port }}
+          {{- end }}
           {{- end }}
           # Last, and shortest: the controller matches longest prefix first, so
           # every /api/* rule above wins before the SPA catch-all.

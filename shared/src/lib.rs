@@ -5,6 +5,7 @@ use jsonwebtoken::DecodingKey;
 pub mod claims;
 pub mod db;
 pub mod domain_models;
+pub mod email_token;
 pub mod env;
 pub mod error;
 pub mod events;
@@ -12,6 +13,7 @@ pub mod extract;
 pub mod extractors;
 pub mod general_models;
 pub mod media;
+pub mod notification;
 pub mod requests;
 pub mod responses;
 

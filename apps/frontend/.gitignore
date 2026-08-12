@@ -1,2 +1,9 @@
 /node_modules
-/dist
+
+# Contents ignored, directory tracked — the .gitkeep is load-bearing.
+# docker/docker-compose-dev.yml bind-mounts this into Caddy. Docker creates a
+# missing bind-mount source itself, as root, and then `npm run build` fails with
+# EACCES on the first file it tries to write. Keeping the directory in the repo
+# means it always exists and always belongs to whoever cloned it.
+/dist/*
+!/dist/.gitkeep

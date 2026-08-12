@@ -65,6 +65,13 @@ impl ViewRepository {
             // Nothing to project — the hash never comes near this database. The
             // cursor still has to move, or a restart replays from before it.
             UserEvent::PasswordChanged(_) => self.bump_cursor("USERS", at, seq).await,
+            // Verification state is an authentication concern and stays in
+            // user-service's private projection. This table is world-readable, so
+            // adding `email_verified` here would publish which addresses are
+            // unconfirmed to every client that can read a spot owner's profile.
+            UserEvent::EmailVerified { .. } | UserEvent::VerificationRequested(_) => {
+                self.bump_cursor("USERS", at, seq).await
+            }
         }
     }
 

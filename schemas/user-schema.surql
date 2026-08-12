@@ -23,6 +23,12 @@ DEFINE FIELD OVERWRITE shard              ON user TYPE string;
 DEFINE FIELD OVERWRITE first_name         ON user TYPE string;
 DEFINE FIELD OVERWRITE last_name          ON user TYPE string;
 DEFINE FIELD OVERWRITE email              ON user TYPE string ASSERT string::is_email($value);
+-- Proven reachable: somebody opened a link only this mailbox received. Login
+-- refuses while this is false, so it is an authentication field and lives only
+-- here — view-service's `user` table is world-readable and must not carry it.
+-- Reset to false whenever the address changes, or the flag would still be
+-- describing the previous one.
+DEFINE FIELD OVERWRITE email_verified     ON user TYPE bool DEFAULT false;
 DEFINE FIELD OVERWRITE profile_picture    ON user TYPE option<string>;
 DEFINE FIELD OVERWRITE password           ON user TYPE string PERMISSIONS NONE;
 

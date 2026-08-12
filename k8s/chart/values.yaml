@@ -41,6 +41,9 @@ services:
   # to one replica: images now live in R2 rather than on a pod's local disk.
   media:
     stateless: true
+    # The only service that talks to neither a database nor the broker: it mints
+    # presigned R2 upload URLs and holds nothing.
+    nats: false
     env:
       # Not secret, and visible in review where it belongs. The credentials for
       # this bucket come from secrets.env instead.
@@ -53,6 +56,24 @@ services:
       # Per-image ceiling in bytes (20 MiB), signed into the URL so it holds no
       # matter what is proxying in front of the service.
       MAX_UPLOAD_BYTES: "20971520"
+  # Stateless like media, but it does consume the log — its consumer cursor lives
+  # in NATS rather than in a projection, which is why it needs no SurrealDB and no
+  # schema. `api: false` keeps it off the ingress: it exposes only /healthz and
+  # /readyz, so there is nothing outside the cluster should be able to reach.
+  notification:
+    stateless: true
+    api: false
+    env:
+      # Not secret and better off visible in review. RESEND_API_KEY and
+      # EMAIL_TOKEN_SECRET come from secrets.env instead.
+      MAIL_FROM: OurDriveway <noreply@mail.ourdriveway.com>
+      APP_BASE_URL: https://ourdriveway.com
+      COMPANY_NAME: OurDriveway
+      # 24h. Long enough to survive a night's sleep, short enough that a link left
+      # in an old inbox goes stale.
+      VERIFY_TOKEN_TTL_SECS: "86400"
+      # Resend template alias, not the UUID — it survives editing the template.
+      TEMPLATE_EMAIL_VERIFICATION: email-verification
 
 replicas: 1
 

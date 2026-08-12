@@ -5,7 +5,8 @@ use shared::events::session::{
     RefreshTokenIssued, RefreshTokenRevoked, RefreshTokenRotated, SessionEvent,
 };
 use shared::events::user::{
-    UserEvent, UserPasswordChanged, UserRegistered, UserUpdated, user_claim_id,
+    UserEvent, UserPasswordChanged, UserRegistered, UserUpdated, VerificationRequested,
+    user_claim_id,
 };
 use shared::events::{Envelope, session_subject, shard_of, user_subject};
 use shared::requests::user::UpdateProfileRequest;
@@ -93,6 +94,22 @@ impl UserService {
             return Err(MyError::unauthorized("Unauthorized", "Invalid credentials"));
         }
         let user = found.expect("checked above");
+
+        // After the password check, never before. Answering "verify your email"
+        // to an unauthenticated caller would confirm the address is registered,
+        // turning the login form into an account-enumeration oracle — the whole
+        // reason the branch above burns a hash on a missing user.
+        //
+        // Distinct title so the client can tell this apart from a wrong password
+        // and offer to re-send instead of "check your credentials".
+        if !user.email_verified {
+            return Err(MyError::api(
+                axum::http::StatusCode::FORBIDDEN,
+                "Email not verified",
+                "Check your inbox for the verification link before logging in.",
+            ));
+        }
+
         let user_uuid = parse_uuid(&user.uid)?;
 
         let refresh_token = Uuid::new_v4();
@@ -117,6 +134,82 @@ impl UserService {
 
         await_seq(&self.sessions_applied, seq).await;
         Ok((jwt, refresh_token.to_string()))
+    }
+
+    /// Marks an address confirmed, given a token only that mailbox received.
+    ///
+    /// Unauthenticated on purpose: the token *is* the credential. It is verified
+    /// under `EMAIL_TOKEN_SECRET` and `Purpose::VerifyEmail`, so it cannot be a
+    /// repurposed access token and cannot be a password-reset link.
+    ///
+    /// **Deliberately idempotent.** Mail scanners prefetch links, and a user who
+    /// clicks twice is not an error. Publishing `EmailVerified` a second time is
+    /// a no-op in the projection, so there is nothing to guard against — and a
+    /// "already used" check here would be the bug, not the fix.
+    ///
+    /// Mints no session. Proving an address is reachable and authenticating a
+    /// person are different claims; a link that logs someone in is exactly what
+    /// scanner prefetch turns into an account compromise.
+    pub async fn verify_email(&self, token: &str) -> MyResult<()> {
+        let user_id = shared::email_token::verify(
+            &CONFIG.email_token_secret,
+            token,
+            shared::email_token::Purpose::VerifyEmail,
+        )?;
+
+        // The token proves which account, but not which shard — and events for a
+        // user must stay on the subject their history already lives on.
+        let user = self
+            .user_repository
+            .find_auth_by_id(&user_id.simple().to_string())
+            .await?
+            .context_not_found(("Not Found", "Could not find user"))?;
+
+        let seq = self
+            .publish_user(&user.shard, &user_id, UserEvent::EmailVerified { user_id })
+            .await?;
+
+        await_seq(&self.users_applied, seq).await;
+        Ok(())
+    }
+
+    /// Asks notification-service to send the verification link again.
+    ///
+    /// Returns `Ok(())` whether or not the address exists, and whether or not it
+    /// is already verified. Anything else makes this an account-enumeration
+    /// oracle for an endpoint that needs no credentials at all — the same reason
+    /// `logout` shrugs at an unknown token.
+    ///
+    // ponytail: no rate limit. One event per request, and the event is what costs
+    // money to deliver. Add a per-user cooldown (last-sent timestamp on the row,
+    // checked here) if this ever gets pointed at.
+    pub async fn resend_verification(&self, email: &str) -> MyResult<()> {
+        let Some(user) = self.user_repository.find_for_login(email).await? else {
+            return Ok(());
+        };
+        if user.email_verified {
+            return Ok(());
+        }
+        let user_uuid = parse_uuid(&user.uid)?;
+
+        // First name comes off the projection rather than the token, because the
+        // template greets the reader by it and the token carries only an id.
+        let first_name = self.user_repository.first_name(&user.uid).await?;
+
+        let seq = self
+            .publish_user(
+                &user.shard,
+                &user_uuid,
+                UserEvent::VerificationRequested(VerificationRequested {
+                    user_id: user_uuid,
+                    email: user.email,
+                    first_name,
+                }),
+            )
+            .await?;
+
+        await_seq(&self.users_applied, seq).await;
+        Ok(())
     }
 
     pub async fn logout(&self, refresh_token: Uuid) -> MyResult<()> {
@@ -199,9 +292,12 @@ impl UserService {
         let user_uuid = parse_uuid(&existing.uid)?;
 
         // Changing the address a password reset would be sent to is an account
-        // takeover if it's left unguarded, and there is no email verification in
-        // this app to catch it afterwards. The rest of the form is harmless, so
-        // only this branch pays for it.
+        // takeover if it's left unguarded. Verification now catches it afterwards
+        // too — the projector clears `email_verified` on any address change, so
+        // the account is locked out of login until the new one is confirmed — but
+        // this check stays: it stops the takeover instead of merely stranding the
+        // victim's account behind a link sent to the attacker. The rest of the
+        // form is harmless, so only this branch pays for it.
         if req.email != existing.email {
             let Some(current) = req.current_password.as_deref() else {
                 return Err(MyError::api(

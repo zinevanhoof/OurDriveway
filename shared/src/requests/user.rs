@@ -30,6 +30,24 @@ pub struct SignupRequest {
     pub password: String,
 }
 
+/// The token out of a verification link.
+///
+/// No `garde` rule beyond presence: `shared::email_token::verify` checks the
+/// signature, issuer, expiry and purpose, and a shape check here would only
+/// reject some invalid tokens slightly earlier while implying the rest are fine.
+#[derive(Deserialize, Validate)]
+pub struct VerifyEmailRequest {
+    #[garde(length(min = 1))]
+    pub token: String,
+}
+
+/// "Send me that link again."
+#[derive(Deserialize, Validate)]
+pub struct ResendVerificationRequest {
+    #[garde(email)]
+    pub email: String,
+}
+
 /// The edit-profile form's whole state — every field is required, so a partial
 /// payload can't mean the client silently deciding what "unchanged" is.
 ///

@@ -13,6 +13,7 @@ import ManageSpotView from "@/views/ManageSpotView.vue";
 import EditSpotView from "@/views/EditSpotView.vue";
 import EditProfileView from "@/views/EditProfileView.vue";
 import ChangePasswordView from "@/views/ChangePasswordView.vue";
+import VerifyEmailView from "@/views/VerifyEmailView.vue";
 
 export type RouteMeta = {
   header: Component | null;
@@ -101,6 +102,17 @@ const routes = [
     meta: {
       header: null,
       requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    // Reached from a link in an email, so it must work for someone who cannot log
+    // in yet — being unverified is precisely why they can't.
+    path: "/verify",
+    name: "verify-email",
+    component: VerifyEmailView,
+    meta: {
+      header: null,
+      requiresAuth: false,
     } satisfies RouteMeta,
   },
   {

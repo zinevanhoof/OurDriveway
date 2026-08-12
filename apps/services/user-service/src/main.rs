@@ -34,6 +34,11 @@ pub struct Config {
     /// 0 disables snapshots entirely — see `bus::snapshot::install`.
     pub snapshot_interval_secs: u64,
     pub jwt_secret: String,
+    /// Verification links only, and deliberately NOT `jwt_secret`. `JwtClaims`
+    /// carries no purpose or audience field, so a link signed with the access
+    /// token key would be accepted by `AuthedJwt` as a full session — see the
+    /// test in `shared::email_token`.
+    pub email_token_secret: String,
     /// Minutes.
     pub jwt_expiration: i64,
     /// Days.
@@ -48,6 +53,7 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     port: env::require_parsed("PORT"),
     snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
     jwt_secret: env::require("JWT_SECRET"),
+    email_token_secret: env::require("EMAIL_TOKEN_SECRET"),
     jwt_expiration: env::require_parsed("JWT_EXPIRATION"),
     refresh_token_expiration: env::require_parsed("REFRESH_TOKEN_EXPIRATION"),
 });
@@ -147,6 +153,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/user/signup", post(route::signup::signup))
         .route("/api/user/refresh/logout", post(route::logout::logout))
         .route("/api/user/refresh", post(route::refresh::refresh))
+        // Both unauthenticated: the token in the link is the credential, and a
+        // user who cannot log in yet is exactly who needs these.
+        .route(
+            "/api/user/verify-email",
+            post(route::verify::verify_email),
+        )
+        .route(
+            "/api/user/verify-email/resend",
+            post(route::verify::resend_verification),
+        )
         .route("/api/user/me", patch(route::profile::update_profile))
         .route(
             "/api/user/me/password",

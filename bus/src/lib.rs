@@ -8,9 +8,11 @@ pub mod health;
 pub mod projector;
 pub mod publisher;
 pub mod snapshot;
+pub mod worker;
 
 pub use connect::{connect, ensure_streams};
 pub use health::Readiness;
 pub use projector::Projector;
 pub use publisher::{PublishError, publish, publish_expecting, subject_head};
 pub use snapshot::{SnapshotConfig, Snapshotter};
+pub use worker::Worker;

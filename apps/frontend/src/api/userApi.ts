@@ -43,6 +43,34 @@ const signupUser = async ({
   return response;
 };
 
+/**
+ * Confirms an address from the token in a mailed link.
+ *
+ * A POST, not a GET, even though it is reached by clicking a link: mail scanners
+ * prefetch links, so the link itself goes to a page and only this call has an
+ * effect. Safe to run twice — the backend treats re-verification as a no-op
+ * rather than an error, which is what makes a prefetch harmless.
+ */
+const verifyEmail = async (token: string): Promise<Response> =>
+  apiFetch("/api/user/verify-email", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+    headers: { "Content-Type": "application/json" },
+  });
+
+/**
+ * Asks for the verification link again.
+ *
+ * Always 204, even for an address with no account — the backend refuses to say
+ * which addresses are registered, so there is nothing here to branch on.
+ */
+const resendVerification = async (email: string): Promise<Response> =>
+  apiFetch("/api/user/verify-email/resend", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+    headers: { "Content-Type": "application/json" },
+  });
+
 const logoutUser = async () => {
   await apiFetch("/api/user/refresh/logout", {
     method: "POST",
@@ -128,4 +156,6 @@ export {
   refreshUser,
   updateProfile,
   changePassword,
+  verifyEmail,
+  resendVerification,
 };

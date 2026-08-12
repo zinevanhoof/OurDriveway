@@ -20,9 +20,10 @@ import {
 } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { loginUser } from '@/api/userApi'
+import { loginUser, resendVerification } from '@/api/userApi'
 import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
 import { AuthResponse } from '@/types/response/AuthResponse'
+import { toast } from 'vue-sonner'
 
 const emit = defineEmits<{
     success: [AuthResponse]
@@ -35,7 +36,7 @@ const formSchema = toTypedSchema(
     })
 )
 
-const { handleSubmit, setErrors, isSubmitting } = useForm({
+const { handleSubmit, setErrors, isSubmitting, values } = useForm({
     validationSchema: formSchema,
     initialValues: {
         email: '',
@@ -45,8 +46,16 @@ const { handleSubmit, setErrors, isSubmitting } = useForm({
 
 const serverErrors = ref<string[]>([])
 
+// A 403 means the password was right but the address was never confirmed. That
+// is a different conversation from "wrong credentials" — the fix is a link in
+// their inbox, not another guess — so it gets its own state and a resend button
+// instead of a red message under the form.
+const unverified = ref(false)
+const resending = ref(false)
+
 const onSubmit = handleSubmit(async (data) => {
     serverErrors.value = []
+    unverified.value = false
     const response = await loginUser(data)
 
     if (response.ok) {
@@ -55,10 +64,22 @@ const onSubmit = handleSubmit(async (data) => {
         return
     }
 
+    if (response.status === 403) {
+        unverified.value = true
+        return
+    }
+
     // 422 -> per-field errors; anything else (e.g. 401 invalid credentials) -> form-level detail
     if (await applyValidationErrors(response, setErrors)) return
     serverErrors.value = await readErrorDetail(response)
 })
+
+const resend = async () => {
+    resending.value = true
+    await resendVerification(values.email ?? '')
+    resending.value = false
+    toast.success('New link sent. Check your inbox.')
+}
 </script>
 
 <template>
@@ -98,10 +119,19 @@ const onSubmit = handleSubmit(async (data) => {
                 </FieldGroup>
             </form>
         </CardContent>
-        <CardFooter>
-            <Button class="flex-1" type="submit" form="form-login" :disabled="isSubmitting">
+        <CardFooter class="flex-col gap-2">
+            <Button class="w-full" type="submit" form="form-login" :disabled="isSubmitting">
                 Login
             </Button>
+
+            <template v-if="unverified">
+                <p class="text-sm text-muted-foreground text-center">
+                    Verify your email address before logging in. Check your inbox.
+                </p>
+                <Button class="w-full" variant="outline" :disabled="resending" @click="resend">
+                    Send the link again
+                </Button>
+            </template>
         </CardFooter>
     </Card>
 </template>

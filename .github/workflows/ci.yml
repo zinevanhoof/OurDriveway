@@ -87,7 +87,7 @@ jobs:
       # above leaves the previous release as :latest. Manifest copy, no rebuild.
       - name: Point :latest at this commit
         run: |
-          for p in user-service booking-service spot-service view-service media-service frontend; do
+          for p in user-service booking-service spot-service view-service media-service notification-service frontend; do
             docker buildx imagetools create \
               -t "$REGISTRY/ourdriveway-$p:latest" \
               "$REGISTRY/ourdriveway-$p:${{ github.sha }}"
@@ -107,6 +107,7 @@ jobs:
           - ourdriveway-spot-service
           - ourdriveway-view-service
           - ourdriveway-media-service
+          - ourdriveway-notification-service
           - ourdriveway-frontend
     steps:
       - uses: actions/delete-package-versions@v5

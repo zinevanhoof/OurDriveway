@@ -26,6 +26,24 @@ pub enum UserEvent {
     Registered(UserRegistered),
     Updated(UserUpdated),
     PasswordChanged(UserPasswordChanged),
+    /// The address was proven reachable — somebody opened a link only that
+    /// mailbox received. Published by user-service after checking the token.
+    EmailVerified { user_id: Uuid },
+    /// "Send that link again." Raised by user-service when a user asks for a new
+    /// verification email, and consumed only by notification-service — nothing
+    /// projects it.
+    ///
+    /// Carries the address and name rather than just an id so notification-service
+    /// never has to look a user up, which is what lets it own no database at all.
+    /// `PasswordResetRequested` will be this same shape.
+    VerificationRequested(VerificationRequested),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VerificationRequested {
+    pub user_id: Uuid,
+    pub email: String,
+    pub first_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
