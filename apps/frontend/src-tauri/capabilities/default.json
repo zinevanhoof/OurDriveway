@@ -24,6 +24,10 @@
     },
     "geolocation:allow-check-permissions",
     "geolocation:allow-request-permissions",
-    "geolocation:allow-get-current-position"
+    "geolocation:allow-get-current-position",
+    {
+      "identifier": "deep-link:default",
+      "comment": "Only `onOpenUrl` is used, so the app can be brought back after a redirect payment. The scheme is declared in tauri.conf.json under plugins.deep-link.mobile — desktop registers nothing, since a redirect there returns to the web origin instead."
+    }
   ]
 }

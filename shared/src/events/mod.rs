@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod booking;
+pub mod payment;
 pub mod session;
 pub mod spot;
 pub mod user;
@@ -50,6 +51,7 @@ pub const STREAM_USERS: &str = "USERS";
 pub const STREAM_SESSIONS: &str = "SESSIONS";
 pub const STREAM_SPOTS: &str = "SPOTS";
 pub const STREAM_BOOKINGS: &str = "BOOKINGS";
+pub const STREAM_PAYMENTS: &str = "PAYMENTS";
 
 /// `(stream, subject filter, max_age)`. `max_age` is `None` for streams that are
 /// the source of truth and must never expire.
@@ -64,6 +66,9 @@ pub const STREAMS: &[(&str, &str, Option<std::time::Duration>)] = &[
     ),
     (STREAM_SPOTS, "spots.*.>", None),
     (STREAM_BOOKINGS, "bookings.*.>", None),
+    // Money. Never expires for the same reason bookings don't, and then some: this
+    // log is the only record of what was charged and refunded that we control.
+    (STREAM_PAYMENTS, "payments.*.>", None),
 ];
 
 // ─── Sharding ───────────────────────────────────────────────────────────────
@@ -109,6 +114,45 @@ pub fn booking_subject(spot_shard: &str, spot_id: &Uuid) -> String {
     format!("bookings.{spot_shard}.spot.{}", user::record_key(spot_id))
 }
 
+/// Payments shard by **booking**, unlike bookings which shard by spot.
+///
+/// The spot-keyed subject exists to give every booking on one spot a total order,
+/// because that ordering is what prevents a double booking. Payments need no such
+/// invariant — a payment concerns exactly one booking and races nothing — so the
+/// booking is the natural grain, and it keeps one booking's payment history
+/// (created, succeeded, refunded) on a single subject where it can be read back in
+/// order.
+///
+/// `booking_shard` is `shard_of(&booking_id)`, computed once when the payment is
+/// created and echoed on every later event, for the same reason `spot_shard` is
+/// carried on `BookingReserved`: recomputing it would move the subject the moment
+/// SHARD_COUNT changed and split one payment's history in two.
+pub fn payment_subject(booking_shard: &str, booking_id: &Uuid) -> String {
+    format!(
+        "payments.{booking_shard}.booking.{}",
+        user::record_key(booking_id)
+    )
+}
+
+/// A host withdrawing their balance, on the same stream but a different entity.
+///
+/// The grammar is `<domain>.<shard>.<entity>.<id>`, so a payout is not forced onto a
+/// booking-keyed subject it has nothing to do with — it concerns a host and an amount,
+/// no booking at all. Both subjects match `payments.*.>` and land in the same stream,
+/// which is what keeps one projector able to see the whole money history in order.
+///
+/// Keyed by **host**, not by payout, and for the same reason bookings are keyed by
+/// spot: it puts every one of a host's withdrawals on a single subject, which is what
+/// makes a compare-and-swap possible. Two withdraw requests racing — a double-clicked
+/// button — both read the same balance and both look affordable; the CAS is what makes
+/// exactly one of them win instead of paying out twice.
+pub fn payout_subject(owner_shard: &str, owner_id: &Uuid) -> String {
+    format!(
+        "payments.{owner_shard}.payout.{}",
+        user::record_key(owner_id)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +183,8 @@ mod tests {
             (session_subject(&sh, &id), STREAM_SESSIONS),
             (spot_subject(&sh, &id), STREAM_SPOTS),
             (booking_subject(&sh, &id), STREAM_BOOKINGS),
+            (payment_subject(&sh, &id), STREAM_PAYMENTS),
+            (payout_subject(&sh, &id), STREAM_PAYMENTS),
         ] {
             let matched: Vec<_> = STREAMS
                 .iter()

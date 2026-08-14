@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
-# Compiles the whole workspace once and exposes the five binaries at /out.
+# Compiles the whole workspace once and exposes the seven binaries at /out.
 # Not a deployable image — the per-service Dockerfiles consume it as a named
 # build context (see docker-bake.hcl), so bake resolves it a single time for
-# all five and the Rust workspace compiles once.
+# all of them and the Rust workspace compiles once.
 FROM rust:bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
@@ -20,7 +20,8 @@ RUN --mount=type=cache,target=/app/target,sharing=locked \
     && mkdir /out \
     && cp target/release/user-service target/release/booking-service \
           target/release/spot-service target/release/view-service \
-          target/release/media-service target/release/notification-service /out/
+          target/release/media-service target/release/notification-service \
+          target/release/payment-service /out/
 # ^ the cp is required: /app/target is a cache mount, scratch space that never
 # lands in a layer. Only what reaches /out is visible to COPY --from=builder.
 

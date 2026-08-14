@@ -180,6 +180,31 @@ DEFINE INDEX OVERWRITE booking_ends   ON booking FIELDS ends_at;
 -- ever had, and owner_id leads, so it still serves a plain owner_id lookup.
 DEFINE INDEX OVERWRITE booking_owner_created ON booking FIELDS owner_id, created_at;
 
+-- ─── payout ─────────────────────────────────────────────────────────────────
+-- A host's withdrawal history, and nothing else about money.
+--
+-- Payments themselves are deliberately absent from this read model. What a renter was
+-- charged and what a host has available are payment-service's to answer, and a second
+-- copy here would eventually disagree with the balance shown next to the withdraw
+-- button. This table exists so the *list* of withdrawals can be queried alongside the
+-- rest of a profile, like everything else on this screen.
+--
+-- Nothing real moves when one of these is created — see the note on `payout` in
+-- payment-schema.surql.
+DEFINE TABLE OVERWRITE payout SCHEMAFULL PERMISSIONS
+    FOR select WHERE owner_id = $token.ID,
+    FOR create, update, delete NONE;
+
+-- `owner` is the link that makes nested GraphQL work; `owner_id` is the plain string
+-- the permission clause above compares against. Same pairing as booking.renter.
+DEFINE FIELD OVERWRITE owner      ON payout TYPE option<record<user>>;
+DEFINE FIELD OVERWRITE owner_id   ON payout TYPE string;
+DEFINE FIELD OVERWRITE amount     ON payout TYPE int;           -- EUR cents
+DEFINE FIELD OVERWRITE created_at ON payout TYPE datetime;
+
+-- The history list: a host's own withdrawals, newest first.
+DEFINE INDEX OVERWRITE payout_owner ON payout FIELDS owner_id, created_at;
+
 -- ─── projector cursors ──────────────────────────────────────────────────────
 -- One row per stream (_projection:USERS, _projection:SPOTS, …), each written in
 -- the same transaction as the data it describes.

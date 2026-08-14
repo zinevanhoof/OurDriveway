@@ -36,10 +36,10 @@ export async function reserve(draft: BookingDraft): Promise<Reservation> {
   };
 }
 
-/** Payment succeeded. Stands in for the provider callback until one exists. */
-export async function confirm(bookingId: string): Promise<void> {
-  await settle(`/api/booking/${bookingId}/confirm`, "POST");
-}
+// There is no `confirm`. A booking becomes confirmed when Stripe's webhook reaches
+// payment-service, which publishes the event booking-service acts on — see
+// paymentApi.createIntent. A client that could confirm its own booking would not have
+// to pay for it, so the endpoint was removed rather than left behind a guard.
 
 /**
  * Gives the slots back now rather than making the next renter wait out the hold.

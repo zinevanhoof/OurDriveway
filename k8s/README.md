@@ -9,7 +9,7 @@ generator hash.
 
 ```
 k8s/
-  chart/              the chart — four backends are data in values.yaml,
+  chart/              the chart — every backend is data in values.yaml,
                       one template in templates/services.yaml
   values-local.yaml   dev cluster: no TLS, 1 replica each
   values-prod.yaml    TLS, 2 replicas (spot stays at 1 — see below)
@@ -73,7 +73,8 @@ k3d cluster create ourdriveway -p "80:80@loadbalancer" -p "443:443@loadbalancer"
 # 2. Your own images. ghcr only has what CI published from main, so build the
 #    working tree and hand the results straight to the cluster.
 docker buildx bake --load
-for i in user-service booking-service spot-service view-service frontend; do
+for i in user-service booking-service spot-service view-service media-service \
+         notification-service payment-service frontend; do
   k3d image import ghcr.io/zinevanhoof/ourdriveway-$i:latest -c ourdriveway
 done
 
@@ -126,9 +127,13 @@ pod that is still replaying the log out of that endpoint list — the job the ol
 `health_uri /readyz` checks in the Caddyfile were doing, done a layer lower where
 it actually works.
 
-The Ingress owns all routing: `/api/*` to the four services, everything else to
-Caddy. One host, so the browser stays on one origin and the `SameSite=Strict`
-refresh cookie keeps working.
+The Ingress owns all routing: one `/api/<name>` prefix per service that declares
+`api` (every one but notification), everything else to Caddy. One host, so the
+browser stays on one origin and the `SameSite=Strict` refresh cookie keeps working.
+
+One exception worth knowing: Stripe's webhook arrives at `/api/payment/webhook`
+through this same Ingress, and it is the only route in the system that carries no
+JWT. It authenticates by signature instead — see `route/webhook.rs`.
 
 ## Why every pod carries its own database
 

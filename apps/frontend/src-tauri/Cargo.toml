@@ -29,4 +29,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tauri-plugin-http = "2"
 tauri-plugin-geolocation = "2"
+# Mobile only, and only for one thing: bringing the app back after a redirect payment.
+# Bancontact leaves for the customer's bank, and Stripe's return_url would otherwise land
+# in the system browser — where the session doesn't exist, because plugin-http keeps the
+# refresh cookie in reqwest's jar inside this process. A `ourdriveway://` link hands the
+# return to the app instead, with its session intact.
+tauri-plugin-deep-link = "2"
 

@@ -4,6 +4,9 @@
 # below — including media-service, which is reached on :3004 through the Caddy
 # route in Caddyfile-dev.
 #
+# The one container here that is neither a database nor a proxy is stripe-cli, which
+# forwards webhooks *inward* to payment-service on :3006 — see the note on it below.
+#
 # Production is Kubernetes, not compose. See k8s/.
 x-surrealdb:
   &surrealdb # Pinned to match the `surrealdb` crate version in Cargo.toml.
@@ -79,8 +82,60 @@ services:
     volumes:
       - ../schemas/view-schema.surql:/schema.surql:ro
 
+  payment-service-db:
+    <<: *surrealdb
+    ports:
+      - "8004:8000"
+    volumes:
+      - ../schemas/payment-schema.surql:/schema.surql:ro
+
+  # Delivers Stripe webhooks to payment-service without a public URL.
+  #
+  # This is NOT offline: the CLI opens an outbound WebSocket to Stripe, authenticated
+  # as the sandbox below, and Stripe pushes that sandbox's events down it. What it
+  # removes is the need for a public *inbound* URL — an ngrok or a tunnel — not the
+  # dependency on Stripe itself.
+  #
+  # `network_mode: host` for the same reason caddy uses it: the Rust services run
+  # natively on the host, so a bridged container could not reach :3006 at all.
+  #
+  # `--api-key` instead of `stripe login`: no browser pairing, and it makes the sandbox
+  # explicit rather than whatever the stored config happens to point at. It must be the
+  # SAME sandbox as STRIPE_SECRET_KEY in apps/services/payment-service/.env — mismatched
+  # sandboxes is the usual cause of "the payment succeeded but no webhook arrived".
+  #
+  # `--events` because a sandbox is shared: without it every event type on the account
+  # arrives, including other projects' payments.
+  #
+  # The signing secret this session verifies against is NOT the one in the dashboard.
+  # `listen` prints it on startup, so read it from this container's own logs:
+  #
+  #   docker compose -f docker/docker-compose-dev.yml logs stripe-cli | grep -i whsec
+  #
+  # then put it in STRIPE_WEBHOOK_SECRET in apps/services/payment-service/.env. That is
+  # read once at boot, so it has to be set before payment-service starts — not before
+  # compose does.
+  stripe-cli:
+    image: stripe/stripe-cli:latest
+    restart: unless-stopped
+    network_mode: "host"
+    # From docker/.env, which the repo's `*.env` gitignore rule already covers.
+    #
+    # `required: false` so that a checkout without Stripe configured still brings the
+    # databases and Caddy up — only this container fails, loudly, instead of blocking
+    # the whole stack on an unconfigured payment provider. Copy .env.example to .env to
+    # make it work.
+    env_file:
+      - path: .env
+        required: false
+    command:
+      - listen
+      - --api-key=${STRIPE_SECRET_KEY}
+      - --forward-to=localhost:3006/api/payment/webhook
+      - --events=payment_intent.succeeded,payment_intent.payment_failed
+
   # Single origin for every client (browser + tauri): serves the built SPA and
-  # reverse-proxies /api/* to the 5 Rust services running on the host. Same-origin
+  # reverse-proxies /api/* to the Rust services running on the host. Same-origin
   # is what keeps the SameSite=Strict refresh cookie working and CORS unnecessary
   # — the one deliberate exception is the PUT straight to R2, which carries a
   # signature instead of a cookie.

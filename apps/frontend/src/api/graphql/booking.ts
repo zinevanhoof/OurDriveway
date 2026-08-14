@@ -38,34 +38,23 @@ const BOOKINGS_RENTED = gql`
   }
 `;
 
-// "Earned this week" on the home screen, summed by the database rather than by
-// shipping a week of bookings to add up here.
+// One booking's status, for the screen a payment redirect lands on.
 //
-// `filter`, not `where`: the aggregate field is the one place that takes only the
-// former — the list fields accept both. It always returns exactly one row, holding
-// `{ amount_sum: 0 }` when nothing matches, so the caller reads [0] and never has
-// an empty list to handle.
+// Just the status: that screen is waiting for a single transition and has no use for
+// the spot, the slots or the price. `booking`'s select permission is
+// `renter_id = $token.ID OR owner_id = $token.ID`, so this cannot be used to watch
+// somebody else's booking — it returns null instead.
 //
-// `owner_id` is load-bearing, not a convenience. Aggregates respect table
-// permissions, and booking's clause is `renter_id = $token.ID OR owner_id =
-// $token.ID` — drop this and the sum quietly adds everything this person SPENT as
-// a renter to what they EARNED as a host.
-//
-// Windowed on `created_at` (money booked this week), which with `owner_id` is what
-// the booking_owner_created index exists for. No upper bound: nothing is created in
-// the future, and one open end is a cleaner range scan.
-const WEEK_EARNINGS = gql`
-  query GetWeekEarnings($ownerId: String!, $since: datetime!) {
-    bookings_aggregate(
-      filter: {
-        owner_id: { eq: $ownerId }
-        status: { eq: "confirmed" }
-        created_at: { gte: $since }
-      }
-    ) {
-      amount_sum
+// There is deliberately no earnings aggregate in this file any more. Money figures come
+// from payment-service, which owns them; a second total derived here would sooner or
+// later disagree with the balance the withdraw button spends.
+const BOOKING_STATUS = gql`
+  query GetBookingStatus($id: ID!) {
+    booking(id: $id) {
+      id
+      status
     }
   }
 `;
 
-export { BOOKINGS_RENTED, WEEK_EARNINGS };
+export { BOOKINGS_RENTED, BOOKING_STATUS };

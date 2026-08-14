@@ -3,7 +3,7 @@
 #
 # Exists for one reason: Helm templates cannot read files outside the chart, and
 # the SurrealDB schemas live in schemas/ where the Rust build already uses them.
-# `--set-file` carries them across, and four flags is more than fits comfortably
+# `--set-file` carries them across, and that many flags is more than fits comfortably
 # in a README line. Everything else here is plain helm.
 set -euo pipefail
 
@@ -35,7 +35,7 @@ kubectl create secret generic app-secrets \
 # `kubectl rollout restart deployment -n ourdriveway`; a schema change rolls
 # itself via checksum/schemas in services.yaml.
 SET_FILES=()
-for s in user booking spot view; do
+for s in user booking spot view payment; do
   SET_FILES+=(--set-file "schemas.$s=schemas/$s-schema.surql")
 done
 

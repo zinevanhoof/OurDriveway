@@ -13,12 +13,18 @@ import BookedSpotRow from './BookedSpotRow.vue';
 
 const auth = useAuthStore()
 
+// `network-only`, and not as an optimisation to skip: a booking's status changes
+// underneath this list constantly and never through a GraphQL mutation. A webhook
+// confirms it, the expiry sweeper releases it, the host withdraws the spot — every one of
+// those is an event on the log, so graphcache has nothing to invalidate on and would keep
+// serving whatever the tab saw last. Cached, this list shows holds that lapsed hours ago.
 const { data, executeQuery } = useQuery({
     query: BOOKINGS_RENTED,
     variables: computed(() => ({ renterId: auth.user?.id })),
     // Otherwise this fires once with renterId: undefined, before main.ts has
     // rehydrated the session.
     pause: computed(() => !auth.user?.id),
+    requestPolicy: 'network-only',
 })
 
 // A booking that ended without happening is not history the renter wants a tab

@@ -14,6 +14,7 @@ import EditSpotView from "@/views/EditSpotView.vue";
 import EditProfileView from "@/views/EditProfileView.vue";
 import ChangePasswordView from "@/views/ChangePasswordView.vue";
 import VerifyEmailView from "@/views/VerifyEmailView.vue";
+import CheckoutView from "@/views/CheckoutView.vue";
 
 export type RouteMeta = {
   header: Component | null;
@@ -113,6 +114,20 @@ const routes = [
     meta: {
       header: null,
       requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    // Paying for a held booking, and where Stripe sends the renter back after a redirect
+    // method (Bancontact, iDEAL). Entry, reload, return and retry are all this one URL —
+    // `?session_id=` is the only thing it needs, which is what makes a redirect
+    // survivable. Requires auth: the session belongs to a renter and the endpoint
+    // answers 404 to anyone else.
+    path: "/checkout",
+    name: "checkout",
+    component: CheckoutView,
+    meta: {
+      header: null,
+      requiresAuth: true,
     } satisfies RouteMeta,
   },
   {

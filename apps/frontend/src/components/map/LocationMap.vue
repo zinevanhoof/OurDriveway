@@ -59,10 +59,20 @@ const { data: spotsInRadius } = useQuery({
 // Full detail for the selected pin, fetched on click (paused until then) so nothing
 // runs at render time and there's one query total, not one per pin. The owner's
 // profile nests in the same query — the view's `spot.owner` record link resolves it.
+// `network-only` because this is the one query whose `booked` map someone books against,
+// and a cached availability map is stale by construction: every write in this app goes
+// through REST, so there are no GraphQL mutations for graphcache to invalidate on. The
+// radius query stays cached — it selects `booked` too, but only for a "days booked"
+// count, and it re-runs on every pan.
+//
+// Freshness, not correctness. The authority is the server's availability check, published
+// under compare-and-swap; this only stops the picker offering slots it then has to
+// retract.
 const { data: selectedSpot, executeQuery: reexecuteSpot } = useQuery({
   query: FULL_SPOT,
   variables: computed(() => ({ id: recordId(selectedId.value) })),
-  pause: computed(() => selectedId.value === null)
+  pause: computed(() => selectedId.value === null),
+  requestPolicy: "network-only",
 });
 
 // The map filter is applied client-side (availability is selectable but not filterable
@@ -89,6 +99,14 @@ const detailOpen = computed({
 });
 
 const bookingOpen = ref(false);
+
+// The policy alone is not enough: `selectedId` is never cleared on close, so reopening
+// the *same* pin changes neither variables nor pause state and urql does not re-execute —
+// the picker would keep whatever it read the first time, including slots this renter has
+// since held and abandoned. Opening the form is therefore an explicit refetch.
+watch(bookingOpen, (isOpen) => {
+  if (isOpen) reexecuteSpot({ requestPolicy: "network-only" });
+});
 
 // ─── Clustering ────────────────────────────────────────────────────────────────
 // Several spots can share one address (an apartment block's parking, a house with

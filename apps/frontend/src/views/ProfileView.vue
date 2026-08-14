@@ -15,6 +15,7 @@ import { formatCents } from '@/lib/money';
 import { useRouter } from 'vue-router';
 import { logoutUser } from '@/api/userApi';
 import { imageUrl } from '@/lib/media'
+import PayoutsComponent from '@/components/profile/PayoutsComponent.vue';
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -82,6 +83,8 @@ const logout = async () => {
                 </div>
             </div>
         </div>
+        <PayoutsComponent />
+
         <div class="bg-card border border-border rounded-md">
             <button type="button" class="flex gap-3 items-center p-3 w-full text-left"
                 @click="router.push({ name: 'profile-edit' })">

@@ -3,6 +3,7 @@ use shared::{
     events::{
         Envelope,
         booking::{BookingEvent, BookingReserved},
+        payment::PaymentEvent,
         spot::{SpotCreated, SpotEvent, SpotUpdated},
         user::{UserEvent, UserRegistered, UserUpdated, record_key, user_claim_id},
     },
@@ -353,6 +354,72 @@ impl ViewRepository {
                 .await
             }
         }
+    }
+
+    /// PAYMENTS, of which only payouts land in the read model.
+    ///
+    /// Every other variant advances the cursor and stores nothing. That is not a gap:
+    /// what a renter was charged is payment-service's to answer, and duplicating it
+    /// here would create a second version of the same money.
+    pub async fn apply_payment(&self, envelope: Envelope<PaymentEvent>, seq: u64) -> MyResult<()> {
+        let at = envelope.occurred_at;
+        match envelope.payload {
+            PaymentEvent::PayoutRequested {
+                payout_id,
+                owner_id,
+                amount_cents,
+                requested_at,
+            } => {
+                self.payout(payout_id, owner_id, amount_cents, requested_at, at, seq)
+                    .await
+            }
+
+            // Cursor only. Storing nothing is right, but skipping the *cursor* would
+            // replay every payment event forever.
+            _ => {
+                self.db
+                    .query("UPSERT _projection:PAYMENTS SET last_seq = $seq, updated_at = $at;")
+                    .bind(("at", Datetime::from(at)))
+                    .bind(("seq", seq as i64))
+                    .await?
+                    .check()?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn payout(
+        &self,
+        payout_id: Uuid,
+        owner_id: String,
+        amount_cents: i64,
+        requested_at: chrono::DateTime<chrono::Utc>,
+        at: chrono::DateTime<chrono::Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
+        self.db
+            .query(
+                "BEGIN;
+                 UPSERT type::record('payout', $id) CONTENT {
+                     owner: (SELECT VALUE id FROM ONLY user WHERE record::id(id) = $owner_uuid LIMIT 1),
+                     owner_id: $owner_id, amount: $amount, created_at: $created_at
+                 };
+                 UPSERT _projection:PAYMENTS SET last_seq = $seq, updated_at = $at;
+                 COMMIT;",
+            )
+            .bind(("id", record_key(&payout_id)))
+            .bind((
+                "owner_uuid",
+                owner_id.strip_prefix("user:").unwrap_or("").to_string(),
+            ))
+            .bind(("owner_id", owner_id))
+            .bind(("amount", amount_cents))
+            .bind(("created_at", Datetime::from(requested_at)))
+            .bind(("seq", seq as i64))
+            .bind(("at", Datetime::from(at)))
+            .await?
+            .check()?;
+        Ok(())
     }
 
     async fn booking_reserved(

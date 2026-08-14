@@ -1,0 +1,30 @@
+[package]
+name = "payment-service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+surrealdb = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+garde = { workspace = true }
+
+async-stripe = { workspace = true }
+async-stripe-checkout = { workspace = true }
+async-stripe-core = { workspace = true }
+async-stripe-webhook = { workspace = true }
+async-stripe-types = { workspace = true }
+
+async-nats = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+dotenvy = { workspace = true }
+
+bus = { path = "../../../bus" }
+shared = { path = "../../../shared" }

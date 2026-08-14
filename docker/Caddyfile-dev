@@ -34,6 +34,19 @@
 			import api_upstream
 		}
 	}
+	# Glob without the slash, like /api/booking* above: the routes are /api/payment/…
+	# but a bare /api/payment must not fall through to the SPA either.
+	#
+	# Note that Stripe's webhook does NOT arrive through here. The stripe-cli container
+	# forwards straight to localhost:3006, bypassing this proxy on purpose — the
+	# api_upstream health check answers 502 while a service is still replaying the log,
+	# and a webhook bounced for that reason would be retried by Stripe rather than
+	# handled.
+	handle /api/payment* {
+		reverse_proxy localhost:3006 {
+			import api_upstream
+		}
+	}
 	# media-service mints presigned R2 upload URLs. It holds no state, so unlike
 	# the others its /readyz answers immediately — the shared health check still
 	# applies, it just never has a replay to wait through.

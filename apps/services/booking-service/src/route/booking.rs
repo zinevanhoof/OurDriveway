@@ -52,16 +52,10 @@ pub async fn reserve(
     ))
 }
 
-/// Payment succeeded. Stands in for the provider's callback until one exists —
-/// swapping in a webhook later changes only how the caller is authenticated.
-pub async fn confirm(
-    AuthedJwt { user_id, .. }: AuthedJwt,
-    State(state): State<AppState>,
-    Path(booking_id): Path<String>,
-) -> MyResult<impl IntoResponse> {
-    let seq = state.booking_service.confirm(&booking_id, &user_id).await?;
-    Ok(accepted(seq))
-}
+// There is no confirm endpoint. Confirmation is not something a client can ask for:
+// it happens when payment-service publishes `PaymentEvent::Succeeded` off a
+// signature-verified Stripe webhook, and `worker::PaymentWorker` picks it up. A renter
+// able to confirm their own booking would not have to pay for it.
 
 /// The renter backed out of checkout. Frees the slots now rather than making the
 /// next renter wait out the hold.

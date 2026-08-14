@@ -12,13 +12,25 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "our-driveway",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "create": false
       }
     ],
     "security": {
       "csp": null
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "mobile": [
+        {
+          "scheme": ["ourdriveway"],
+          "appLink": false
+        }
+      ]
     }
   },
   "bundle": {

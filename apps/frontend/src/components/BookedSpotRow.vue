@@ -3,9 +3,11 @@
 // footer and the tap target, which is why this is one component with a flag and
 // not two near-identical blocks that drift the first time a class changes.
 import { computed, ref } from "vue";
-import { Clock, MapPin, Navigation, X } from "@lucide/vue";
+import { useRouter } from "vue-router";
+import { Clock, CreditCard, MapPin, Navigation, X } from "@lucide/vue";
 import { toast } from "vue-sonner";
 import * as bookingApi from "@/api/bookingApi";
+import * as paymentApi from "@/api/paymentApi";
 import { native } from "@/api/http";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import Button from "@/components/ui/button/Button.vue";
@@ -19,9 +21,12 @@ import { imageUrl } from "@/lib/media";
 const props = defineProps<{ booking: any; past?: boolean }>();
 const emit = defineEmits<{ changed: [] }>();
 
+const router = useRouter();
+
 const detailOpen = ref(false);
 const confirmOpen = ref(false);
 const cancelling = ref(false);
+const resuming = ref(false);
 
 const timezone = computed(() => props.booking?.spot?.timezone);
 const days = computed(() => sortedDays(props.booking));
@@ -91,6 +96,27 @@ function directions() {
   else window.open(url, "_blank", "noopener");
 }
 
+/**
+ * Reopens the checkout for a hold that was never paid.
+ *
+ * Creates the session rather than linking straight at a URL, because the session id is
+ * the only thing `/checkout` takes and this row doesn't have one. That is safe to call
+ * repeatedly: creation is idempotent per booking, so an abandoned checkout resumes on the
+ * *same* Stripe session rather than opening a second payable one.
+ */
+async function resume() {
+  resuming.value = true;
+  try {
+    const id = recordId(props.booking.id)!;
+    const session = await paymentApi.createSession(id);
+    void router.push({ path: "/checkout", query: { session_id: session.sessionId } });
+  } catch (e: any) {
+    toast.error("Couldn't reopen that checkout", { description: e.message });
+  } finally {
+    resuming.value = false;
+  }
+}
+
 async function cancel() {
   cancelling.value = true;
   try {
@@ -153,12 +179,23 @@ async function cancel() {
           <Navigation :size="16" />
           Directions
         </button>
+        <!-- A hold is an unfinished checkout, not a booking. Now that paying has its own
+             URL there is a way back into it, which is the difference between "I closed the
+             tab" and "I lose these slots for fifteen minutes". -->
+        <template v-if="reserved && !past">
+          <Separator orientation="vertical" />
+          <button class="flex justify-center flex-1 items-center gap-1 font-medium text-primary"
+            :disabled="resuming" @click="resume">
+            <CreditCard :size="16" />
+            {{ resuming ? "Opening…" : "Continue payment" }}
+          </button>
+        </template>
         <template v-if="cancellable">
           <Separator orientation="vertical" />
           <button class="flex justify-center flex-1 items-center gap-1 font-medium text-destructive"
             @click="confirmOpen = true">
             <X :size="16" />
-            Cancel
+            {{ reserved ? "Give up" : "Cancel" }}
           </button>
         </template>
       </div>
@@ -176,20 +213,26 @@ async function cancel() {
       <DrawerContent @close-auto-focus.prevent
         class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
         <div class="m-4 space-y-4">
+          <!-- A hold and a paid booking are different things to give up, and the copy
+               says so: nothing has been charged for a hold, so "cancel" would overstate
+               what is happening. -->
           <div>
-            <div class="text-lg font-bold">Cancel this booking?</div>
+            <div class="text-lg font-bold">
+              {{ reserved ? "Give up these times?" : "Cancel this booking?" }}
+            </div>
             <div class="text-sm text-muted-foreground font-medium">
               {{ booking?.spot?.title }} —
               <span v-if="days.length">{{ formatDay(days[0][0], timezone) }}</span>.
               The slots go straight back on the market.
+              <template v-if="reserved">You haven't been charged.</template>
             </div>
           </div>
           <div class="space-y-2">
             <Button variant="destructive" class="w-full h-11 font-bold" :disabled="cancelling" @click="cancel">
-              {{ cancelling ? "Cancelling…" : "Yes, cancel it" }}
+              {{ cancelling ? "Releasing…" : reserved ? "Yes, give them up" : "Yes, cancel it" }}
             </Button>
             <Button variant="outline" class="w-full h-11 font-bold" @click="confirmOpen = false">
-              Keep booking
+              {{ reserved ? "Keep them" : "Keep booking" }}
             </Button>
           </div>
         </div>

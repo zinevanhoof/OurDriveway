@@ -32,6 +32,18 @@ services:
   booking: {}
   spot: {}
   view: {}
+  payment:
+    env:
+      # SECONDS. How long after a booking ends its money becomes withdrawable by the
+      # host — one day. Not secret and better off visible in review; the Stripe keys
+      # come from secrets.env instead.
+      #
+      # A renter cannot cancel inside an hour of the start and the host-side withdrawal
+      # only touches bookings that haven't ended, so a confirmed booking with a past
+      # `ends_at` is already safe to pay out today. This is the margin that keeps it
+      # safe if those rules are ever relaxed. payment-service's .env sets 0 so a payout
+      # is testable locally without waiting a day.
+      SETTLEMENT_SECS: "86400"
   # The one service with no database, no NATS consumer and no schema: it mints
   # presigned R2 upload URLs and holds nothing. `stateless` is what strips the
   # SurrealDB sidecar, the schema mount and the wait-for-nats init container from

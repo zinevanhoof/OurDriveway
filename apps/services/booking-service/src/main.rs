@@ -16,6 +16,7 @@ mod projector;
 mod repository;
 mod route;
 mod service;
+mod worker;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -130,16 +131,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // reader can filter one out. See service/expiry.rs.
     service::expiry::spawn(js.clone(), repository.clone());
 
-    let state = AppState {
-        booking_service: Arc::new(BookingService::new(js, repository, &readiness)),
-    };
+    let booking_service = Arc::new(BookingService::new(js.clone(), repository, &readiness));
+
+    // Payment confirms bookings. A worker rather than a projector, and this service
+    // keeps no PAYMENTS projection — see worker.rs. Deliberately not registered with
+    // `Readiness`: it builds nothing, so there is nothing for /readyz to wait on, and
+    // listing PAYMENTS there would hold the instance at 503 until a stream that may be
+    // empty had been "replayed".
+    tokio::spawn(bus::worker::run(
+        js,
+        Arc::new(worker::PaymentWorker {
+            booking_service: booking_service.clone(),
+        }),
+    ));
+
+    let state = AppState { booking_service };
 
     // No GraphQL proxy here: every client read is served by view-service from the
     // combined projection. This database is private to this service — no browser
     // identity can reach it at all.
     let api_router: Router<AppState> = Router::new()
         .route("/api/booking", post(route::booking::reserve))
-        .route("/api/booking/{id}/confirm", post(route::booking::confirm))
         .route("/api/booking/{id}", delete(route::booking::release))
         .route("/api/booking/{id}/cancel", post(route::booking::cancel));
 

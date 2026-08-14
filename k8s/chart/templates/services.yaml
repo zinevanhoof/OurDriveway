@@ -154,8 +154,8 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
-          # JWT_SECRET for every service, plus LOCATIONIQ_API_KEY and the R2
-          # credentials. See secrets.env.example.
+          # JWT_SECRET for every service, plus LOCATIONIQ_API_KEY, the R2
+          # credentials and the Stripe keys. See secrets.env.example.
 
           envFrom:
             - secretRef:

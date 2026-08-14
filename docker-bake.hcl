@@ -22,7 +22,7 @@ variable "REGISTRY" {
 // `builder` is deliberately absent: it carries no tags and is never pushed, it
 // only exists to be consumed by the service targets.
 group "default" {
-  targets = ["user-service", "booking-service", "spot-service", "view-service", "media-service", "notification-service", "frontend"]
+  targets = ["user-service", "booking-service", "spot-service", "view-service", "media-service", "notification-service", "payment-service", "frontend"]
 }
 
 target "builder" {
@@ -63,6 +63,12 @@ target "notification-service" {
   dockerfile = "apps/services/notification-service/Dockerfile"
   contexts   = { builder = "target:builder" }
   tags       = ["${REGISTRY}/ourdriveway-notification-service:${TAG}"]
+}
+
+target "payment-service" {
+  dockerfile = "apps/services/payment-service/Dockerfile"
+  contexts   = { builder = "target:builder" }
+  tags       = ["${REGISTRY}/ourdriveway-payment-service:${TAG}"]
 }
 
 // Context is still the repo root, even though everything this target needs now

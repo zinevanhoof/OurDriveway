@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useQuery } from '@urql/vue';
 import { formatCents } from '@/lib/money';
-import { formatDay, formatSlots, isActiveNow, nextSlot, startOfWeek } from '@/lib/bookingDates';
+import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDates';
 import { locateUser, nearer, type Position } from '@/lib/geo';
 import { recordId } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth';
-import { BOOKINGS_RENTED, WEEK_EARNINGS } from '@/api/graphql/booking';
+import { BOOKINGS_RENTED } from '@/api/graphql/booking';
+import * as paymentApi from '@/api/paymentApi';
 import { FULL_SPOT, SPOTS_NEARBY } from '@/api/graphql/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import BookingFormComponent from '@/components/BookingFormComponent.vue';
@@ -23,15 +24,22 @@ const paused = computed(() => !auth.user?.id)
 
 // ─── the soonest booking ────────────────────────────────────────────────────
 //
-// ponytail: this pulls the renter's ENTIRE booking history to render one card. It
-// is the same document and variables the bookings tab uses, so graphcache serves
-// it without a second round trip — worth more than the rows saved. Give it its own
+// `network-only` for the same reason the bookings tab is: statuses move through the
+// event log, never through a GraphQL mutation, so graphcache has nothing to invalidate
+// on and a cached read would show a hold that lapsed or miss a booking a webhook just
+// confirmed. This card saying something different from the tab is worse than the extra
+// request.
+//
+// ponytail: this pulls the renter's ENTIRE booking history to render one card. It shares
+// the document and variables with the bookings tab, so the two still share one cache
+// entry — they just no longer share one *request*. Give it its own
 // `where: { ends_at: { gt: $now } }, limit: 1` document (booking_ends is already
 // indexed) the day someone has hundreds of bookings.
 const { data: bookings } = useQuery({
     query: BOOKINGS_RENTED,
     variables: computed(() => ({ renterId: auth.user?.id })),
     pause: paused,
+    requestPolicy: 'network-only',
 })
 
 // Confirmed only: a 'reserved' hold is an unfinished checkout, not somewhere you
@@ -54,21 +62,24 @@ const next = computed(() => {
 const nextTimezone = computed(() => next.value?.booking?.spot?.timezone)
 const happeningNow = computed(() => isActiveNow(next.value?.booking, nextTimezone.value))
 
-// ─── earned this week ───────────────────────────────────────────────────────
+// ─── available to withdraw ──────────────────────────────────────────────────
 //
-// Read once at setup, not per render: the boundary only moves at Monday midnight,
-// and a tab left open across it is not a case worth a timer.
-const since = startOfWeek()
-
-const { data: earnings } = useQuery({
-    query: WEEK_EARNINGS,
-    variables: computed(() => ({ ownerId: auth.user?.id, since })),
-    pause: paused,
+// From payment-service, not from the booking read model. It used to be a GraphQL
+// aggregate over bookings windowed on `created_at` — which was the wrong field (when
+// the booking was *made*, not when the money was earned) and, worse, a second answer to
+// "what have I earned" sitting next to a withdraw button that spends the first one.
+//
+// One source now: the same endpoint the payout section reads, so the figure here and
+// the amount that button withdraws cannot disagree.
+const available = ref(0)
+onMounted(async () => {
+    if (paused.value) return
+    try {
+        available.value = (await paymentApi.earnings()).availableCents
+    } catch {
+        // A tile that can't load its number shows zero rather than breaking the screen.
+    }
 })
-
-// ponytail: gross. No platform fee is modelled anywhere in the backend yet, so this
-// is what renters paid, not what the host is owed. Subtract it here once one exists.
-const earned = computed(() => earnings.value?.bookings_aggregate?.[0]?.amount_sum ?? 0)
 
 // ─── nearby spots ───────────────────────────────────────────────────────────
 const here = ref<Position | null>(null)
@@ -123,10 +134,29 @@ const openSpot = (id: string) => {
 
 // Feeds the booking form the drawer hands off to. urql dedupes it against the
 // drawer's identical query, so this is still one request.
+//
+// `network-only` because this is the one query whose `booked` map someone books
+// against, and a cached availability map is stale by construction: every write in this
+// app goes through REST, so there are no GraphQL mutations for graphcache to invalidate
+// on. The list queries stay cached — they select `booked` too, but only to show a "days
+// booked" count, and they re-run on every pan.
+//
+// Freshness, not correctness. A map that landed a moment ago can already be wrong; the
+// authority is the server's availability check, published under compare-and-swap. This
+// only stops the picker offering slots it then has to retract.
 const { data: selectedSpot, executeQuery: reexecuteSpot } = useQuery({
     query: FULL_SPOT,
     variables: computed(() => ({ id: recordId(selectedId.value) })),
     pause: computed(() => selectedId.value === null),
+    requestPolicy: 'network-only',
+})
+
+// The policy alone is not enough: `selectedId` is never cleared on close, so reopening
+// the *same* spot changes neither variables nor pause state and urql does not re-execute
+// — the picker would keep whatever it read the first time, including slots this renter
+// has since held and abandoned. Opening the form is therefore an explicit refetch.
+watch(bookingOpen, (isOpen) => {
+    if (isOpen) reexecuteSpot({ requestPolicy: 'network-only' })
 })
 
 const openBooking = () => {
@@ -184,8 +214,8 @@ const openBooking = () => {
                 <Wallet :size="22" />
             </div>
             <div class=flex-1>
-                <div class="text-xs text-muted-foreground font-medium">Earned this week</div>
-                <div class="text-xl font-bold">{{ formatCents(earned) }}</div>
+                <div class="text-xs text-muted-foreground font-medium">Available to withdraw</div>
+                <div class="text-xl font-bold">{{ formatCents(available) }}</div>
             </div>
             <div class="flex items-center gap-1 text-primary text-sm font-semibold"
                 @click="router.push({ name: 'spots' })">

@@ -194,20 +194,50 @@ impl BookingService {
         Err(taken_now())
     }
 
-    /// Payment succeeded. Stands in for the provider callback until one exists.
+    /// Payment succeeded, as reported by a signature-verified Stripe webhook.
     ///
-    // ponytail: this is *pre*-capture — the renter clicked pay and nothing has been
-    // taken yet — which is what makes `transition`'s `recheck` the right guard here.
-    // A real provider webhook is post-capture and must not reuse this path: money
-    // already moved, so refusing would orphan a payment. That one publishes
-    // `Confirmed` unconditionally and lets the reactor in `projector.rs` withdraw the
-    // booking as `SpotUnavailable` if it no longer fits — one refund trigger, no
-    // hanging state.
-    pub async fn confirm(&self, booking_id: &str, renter_id: &str) -> MyResult<u64> {
-        self.transition(booking_id, renter_id, |id| BookingEvent::Confirmed {
-            booking_id: id,
-        })
-        .await
+    /// Called only by `worker::PaymentWorker`, never from a request. There is
+    /// deliberately no renter-facing confirm endpoint: a renter who could confirm their
+    /// own booking would not have to pay for it.
+    ///
+    /// This is *post*-capture, which is what makes it the opposite of `transition` in
+    /// every respect that matters — no `authorize`, no `recheck`, no compare-and-swap:
+    ///
+    /// - Money has already moved. Refusing here would leave a captured payment with no
+    ///   booking attached, which is worse than any state this could produce.
+    /// - So it publishes unconditionally, and if the booking no longer fits the spot's
+    ///   hours, `SpotProjector::react` withdraws it as `SpotUnavailable` — and
+    ///   payment-service refunds off that one trigger. One path for money coming back,
+    ///   not a second decision made here with half the picture.
+    /// - The projector's `WHERE status IN ['reserved']` is what keeps this idempotent:
+    ///   a redelivery, or a payment landing after the hold lapsed, applies to nothing.
+    ///
+    /// `payment_id` only names the event, so a redelivered webhook is discarded by the
+    /// stream's duplicate window instead of appending a second `Confirmed`.
+    pub async fn confirm_paid(&self, booking_id: Uuid, payment_id: Uuid) -> MyResult<u64> {
+        let key = record_key(&booking_id);
+        let booking = self
+            .repository
+            .booking_for_update(&key)
+            .await?
+            .context_not_found(("Not Found", "That booking doesn't exist."))?;
+
+        let event = BookingEvent::Confirmed { booking_id };
+
+        // `actor_id: None` — Stripe acted, not a user holding a token.
+        let mut envelope = Envelope::new(event, None);
+        envelope.event_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("payment-confirm:{payment_id}").as_bytes(),
+        );
+
+        let spot_id = parse_uuid(&booking.spot_id)?;
+        Ok(bus::publish(
+            &self.js,
+            booking_subject(&booking.spot_shard, &spot_id),
+            &envelope,
+        )
+        .await?)
     }
 
     /// The renter backed out of checkout. Frees the slots immediately rather than

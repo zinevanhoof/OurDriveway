@@ -7,12 +7,12 @@ use axum::{Router, routing::get};
 use axum_reverse_proxy::ReverseProxy;
 use shared::{
     env,
-    events::{STREAM_BOOKINGS, STREAM_SPOTS, STREAM_USERS},
+    events::{STREAM_BOOKINGS, STREAM_PAYMENTS, STREAM_SPOTS, STREAM_USERS},
 };
 
 use crate::{
     await_seq::AppliedSeqs,
-    projector::{BookingProjector, SpotProjector, UserProjector},
+    projector::{BookingProjector, PaymentProjector, SpotProjector, UserProjector},
     repository::ViewRepository,
 };
 
@@ -86,8 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
-    let readiness =
-        bus::Readiness::new(js.client().clone(), &[STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS]);
+    let readiness = bus::Readiness::new(
+        js.client().clone(),
+        &[STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
+    );
 
     // No-op when SNAPSHOT_INTERVAL_SECS=0, which is how this runs with a
     // disposable projection store: every start replays from sequence 1.
@@ -98,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             db_user: &CONFIG.surrealdb_user,
             db_pass: &CONFIG.surrealdb_pass,
             service: "view-service",
-            streams: vec![STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS],
+            streams: vec![STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
             every_secs: CONFIG.snapshot_interval_secs,
         },
     )
@@ -110,6 +112,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (
             STREAM_BOOKINGS,
             readiness.applied_rx(STREAM_BOOKINGS).unwrap(),
+        ),
+        (
+            STREAM_PAYMENTS,
+            readiness.applied_rx(STREAM_PAYMENTS).unwrap(),
         ),
     ])));
 
@@ -128,8 +134,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
-        js,
+        js.clone(),
         Arc::new(BookingProjector {
+            repository: repository.clone(),
+        }),
+        readiness.clone(),
+    ));
+    tokio::spawn(bus::projector::run(
+        js,
+        Arc::new(PaymentProjector {
             repository: repository.clone(),
         }),
         readiness.clone(),
