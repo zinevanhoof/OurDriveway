@@ -46,10 +46,12 @@ DEFINE FUNCTION OVERWRITE fn::spot_distance($loc: geometry, $lng: float, $lat: f
 -- filter rows — which is exactly why the type has to be `option<string>`.
 -- Anything else sensitive added later belongs behind the same clause.
 --
--- `$auth.id`, NOT `$token.ID`. Both hold this user, but `id` here is a record
--- and `$token.ID` is the string "user:abc" — comparing them is always false, so
--- that version silently blanks the field for its owner too. `spot` below can
--- write `owner_id = $token.ID` only because `owner_id` is a plain string field.
+-- `$auth.id` compares record id to record id. Every key in this database is a
+-- uuid and the JWT claim is `user:u'<uuid>'`, so `$auth` resolves to this very
+-- row — which also means this clause hits SurrealDB's self-reference guard and
+-- costs no extra read. The sibling tables below compare `record::id($auth)`
+-- against a plain `uuid` field instead; do NOT reach for `$auth.<field>` there,
+-- as that dereference fetches the whole user record per row.
 DEFINE TABLE OVERWRITE user SCHEMAFULL PERMISSIONS
     FOR select WHERE true,
     FOR create, update, delete NONE;
@@ -67,16 +69,16 @@ DEFINE FIELD OVERWRITE license_plates.* ON user TYPE string;
 
 -- ─── spot ───────────────────────────────────────────────────────────────────
 DEFINE TABLE OVERWRITE spot SCHEMAFULL PERMISSIONS
-    FOR select WHERE active = true OR owner_id = $token.ID,
+    FOR select WHERE active = true OR owner_id = record::id($auth),
     FOR create, update, delete NONE;
 
 -- `owner` is the link that makes nested GraphQL work; `owner_id` is the plain
--- string everything actually *depends* on. Permissions and GraphQL filters use
--- the string, never the link: streams have no cross-stream ordering, so a spot
--- can arrive before the user it references and the link is NONE until backfilled.
+-- uuid everything actually *depends* on. Permissions and GraphQL filters use the
+-- uuid, never the link: streams have no cross-stream ordering, so a spot can
+-- arrive before the user it references and the link is NONE until backfilled.
 -- A permission traversing `owner.…` would silently deny access during that gap.
 DEFINE FIELD OVERWRITE owner          ON spot TYPE option<record<user>>;
-DEFINE FIELD OVERWRITE owner_id       ON spot TYPE string;
+DEFINE FIELD OVERWRITE owner_id       ON spot TYPE uuid;
 DEFINE FIELD OVERWRITE title          ON spot TYPE string;
 DEFINE FIELD OVERWRITE description    ON spot TYPE option<string>;
 DEFINE FIELD OVERWRITE price_per_hour ON spot TYPE int;          -- EUR cents
@@ -139,14 +141,14 @@ DEFINE INDEX OVERWRITE spot_active ON spot FIELDS active;
 -- here — a prospective renter can't select these rows at all — it comes from
 -- `spot.booked` above.
 DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS
-    FOR select WHERE renter_id = $token.ID OR owner_id = $token.ID,
+    FOR select WHERE renter_id = record::id($auth) OR owner_id = record::id($auth),
     FOR create, update, delete NONE;
 
 DEFINE FIELD OVERWRITE spot      ON booking TYPE option<record<spot>>;
 DEFINE FIELD OVERWRITE renter    ON booking TYPE option<record<user>>;
-DEFINE FIELD OVERWRITE spot_id   ON booking TYPE string;
-DEFINE FIELD OVERWRITE owner_id  ON booking TYPE string;
-DEFINE FIELD OVERWRITE renter_id ON booking TYPE string;
+DEFINE FIELD OVERWRITE spot_id   ON booking TYPE uuid;
+DEFINE FIELD OVERWRITE owner_id  ON booking TYPE uuid;
+DEFINE FIELD OVERWRITE renter_id ON booking TYPE uuid;
 DEFINE FIELD OVERWRITE booked           ON booking TYPE object;
 DEFINE FIELD OVERWRITE booked.*         ON booking TYPE array<object>;
 DEFINE FIELD OVERWRITE booked.*.*.start ON booking TYPE string;
@@ -192,13 +194,13 @@ DEFINE INDEX OVERWRITE booking_owner_created ON booking FIELDS owner_id, created
 -- Nothing real moves when one of these is created — see the note on `payout` in
 -- payment-schema.surql.
 DEFINE TABLE OVERWRITE payout SCHEMAFULL PERMISSIONS
-    FOR select WHERE owner_id = $token.ID,
+    FOR select WHERE owner_id = record::id($auth),
     FOR create, update, delete NONE;
 
--- `owner` is the link that makes nested GraphQL work; `owner_id` is the plain string
+-- `owner` is the link that makes nested GraphQL work; `owner_id` is the plain uuid
 -- the permission clause above compares against. Same pairing as booking.renter.
 DEFINE FIELD OVERWRITE owner      ON payout TYPE option<record<user>>;
-DEFINE FIELD OVERWRITE owner_id   ON payout TYPE string;
+DEFINE FIELD OVERWRITE owner_id   ON payout TYPE uuid;
 DEFINE FIELD OVERWRITE amount     ON payout TYPE int;           -- EUR cents
 DEFINE FIELD OVERWRITE created_at ON payout TYPE datetime;
 

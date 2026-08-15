@@ -3,7 +3,7 @@ import { useQuery } from '@urql/vue';
 import Button from '../ui/button/Button.vue';
 import { MANAGE_SPOT } from '@/api/graphql/spot.ts';
 import { computed, ref } from 'vue';
-import { recordId } from '@/lib/utils.ts';
+import { gqlRecordId, plainUuid } from '@/lib/utils.ts';
 import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
 import { formatCents } from '@/lib/money.ts';
@@ -17,7 +17,6 @@ import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
 import Switch from '../ui/switch/Switch.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer'
 import { FieldError } from '@/components/ui/field'
-import { imageUrl } from '@/lib/media'
 
 const { id } = defineProps<{ id: string }>()
 
@@ -27,7 +26,11 @@ const { data, executeQuery } = useQuery({
     query: MANAGE_SPOT,
     // Read once per mount, not per render: a reactive clock here would refetch on
     // every tick, and "upcoming" doesn't change meaningfully within a visit.
-    variables: computed(() => ({ spotId: recordId(id), now: new Date().toISOString() })),
+    variables: computed(() => ({
+        spotId: gqlRecordId(id),
+        spotUuid: plainUuid(id),
+        now: new Date().toISOString(),
+    })),
 })
 
 const routeToSpotEdit = () => router.push({ name: 'spot-edit', params: { id } })
@@ -47,7 +50,7 @@ const toggleLive = async (active: boolean) => {
     pending.value = active
     errors.value = []
     try {
-        await setSpotActive(recordId(id)!, active)
+        await setSpotActive(plainUuid(id)!, active)
         await executeQuery({ requestPolicy: 'network-only' })
     } catch (e) {
         errors.value = [e instanceof Error ? e.message : 'Could not change the listing.']
@@ -64,7 +67,7 @@ const deleting = ref(false)
 const remove = async () => {
     deleting.value = true
     try {
-        await deleteSpot(recordId(id)!)
+        await deleteSpot(plainUuid(id)!)
         router.replace({ name: 'spots', state: { refreshSpots: true } })
     } catch (e) {
         confirmOpen.value = false
@@ -167,7 +170,7 @@ const bookingWhen = (booking: any) => {
     </header>
     <div class="space-y-3 px-4 overflow-y-auto no-scrollbar">
         <div class="flex h-40 gap-2 overflow-x-auto snap-x snap-mandatory no-scrollbar">
-            <img v-for="key in data?.spot?.images" :key="key" :src="imageUrl(key)"
+            <img v-for="key in data?.spot?.images" :key="key" :src="key"
                 class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
         </div>
         <div class="flex">
@@ -249,7 +252,7 @@ const bookingWhen = (booking: any) => {
                 <div v-for="booking in visibleBookings" :key="booking.id"
                     class="flex items-center gap-2 px-4 py-3 border border-border rounded-md bg-card">
                     <Avatar size="lg">
-                        <AvatarImage v-if="booking?.renter?.profilePicture" :src="imageUrl(booking?.renter?.profilePicture)" />
+                        <AvatarImage v-if="booking?.renter?.profilePicture" :src="booking?.renter?.profilePicture" />
                         <AvatarFallback
                             :name="{ firstName: booking?.renter?.firstName, lastName: booking?.renter?.lastName }" />
                     </Avatar>

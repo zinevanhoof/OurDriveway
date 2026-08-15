@@ -25,14 +25,14 @@ pub struct Envelope<T> {
     pub event_id: Uuid,
     /// The only clock a projector may read.
     pub occurred_at: DateTime<Utc>,
-    /// `"user:abc"` — whoever caused this, from a verified JWT claim. `None` for
-    /// events raised by a service rather than a request.
-    pub actor_id: Option<String>,
+    /// Whoever caused this, from a verified JWT claim. `None` for events raised by
+    /// a service rather than a request.
+    pub actor_id: Option<Uuid>,
     pub payload: T,
 }
 
 impl<T> Envelope<T> {
-    pub fn new(payload: T, actor_id: Option<String>) -> Self {
+    pub fn new(payload: T, actor_id: Option<Uuid>) -> Self {
         Self {
             event_id: Uuid::now_v7(),
             occurred_at: Utc::now(),
@@ -96,22 +96,22 @@ pub fn shard_of(id: &Uuid) -> String {
 // `>` and whitespace are special).
 
 pub fn user_subject(shard: &str, user_id: &Uuid) -> String {
-    format!("users.{shard}.user.{}", user::record_key(user_id))
+    format!("users.{shard}.user.{user_id}")
 }
 
 pub fn session_subject(shard: &str, user_id: &Uuid) -> String {
-    format!("sessions.{shard}.user.{}", user::record_key(user_id))
+    format!("sessions.{shard}.user.{user_id}")
 }
 
 pub fn spot_subject(shard: &str, spot_id: &Uuid) -> String {
-    format!("spots.{shard}.spot.{}", user::record_key(spot_id))
+    format!("spots.{shard}.spot.{spot_id}")
 }
 
 /// Bookings shard by **spot**, not by booking: it puts every booking for one spot
 /// on a single subject, which is what makes a per-spot compare-and-swap possible
 /// (`Nats-Expected-Last-Subject-Sequence`) when the booking write path lands.
 pub fn booking_subject(spot_shard: &str, spot_id: &Uuid) -> String {
-    format!("bookings.{spot_shard}.spot.{}", user::record_key(spot_id))
+    format!("bookings.{spot_shard}.spot.{spot_id}")
 }
 
 /// Payments shard by **booking**, unlike bookings which shard by spot.
@@ -128,10 +128,7 @@ pub fn booking_subject(spot_shard: &str, spot_id: &Uuid) -> String {
 /// carried on `BookingReserved`: recomputing it would move the subject the moment
 /// SHARD_COUNT changed and split one payment's history in two.
 pub fn payment_subject(booking_shard: &str, booking_id: &Uuid) -> String {
-    format!(
-        "payments.{booking_shard}.booking.{}",
-        user::record_key(booking_id)
-    )
+    format!("payments.{booking_shard}.booking.{booking_id}")
 }
 
 /// A host withdrawing their balance, on the same stream but a different entity.
@@ -147,10 +144,7 @@ pub fn payment_subject(booking_shard: &str, booking_id: &Uuid) -> String {
 /// button — both read the same balance and both look affordable; the CAS is what makes
 /// exactly one of them win instead of paying out twice.
 pub fn payout_subject(owner_shard: &str, owner_id: &Uuid) -> String {
-    format!(
-        "payments.{owner_shard}.payout.{}",
-        user::record_key(owner_id)
-    )
+    format!("payments.{owner_shard}.payout.{owner_id}")
 }
 
 #[cfg(test)]
@@ -194,7 +188,11 @@ mod tests {
                 })
                 .map(|(name, _, _)| *name)
                 .collect();
-            assert_eq!(matched, vec![expected], "subject {subject} matched {matched:?}");
+            assert_eq!(
+                matched,
+                vec![expected],
+                "subject {subject} matched {matched:?}"
+            );
         }
     }
 }

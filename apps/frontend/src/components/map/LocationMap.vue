@@ -12,7 +12,7 @@ import { FULL_SPOT, SPOTS_IN_RADIUS } from "@/api/graphql/spot";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import type { SpotFilter } from "@/types/SpotFilter";
 import { spotMatches } from "@/lib/spotFilter";
-import { recordId } from "@/lib/utils";
+import { gqlRecordId } from "@/lib/utils";
 import { locateUser } from "@/lib/geo";
 import MapPinComponent from "./MapPinComponent.vue";
 import MapSearchComponent from "./MapSearchComponent.vue";
@@ -70,7 +70,7 @@ const { data: spotsInRadius } = useQuery({
 // retract.
 const { data: selectedSpot, executeQuery: reexecuteSpot } = useQuery({
   query: FULL_SPOT,
-  variables: computed(() => ({ id: recordId(selectedId.value) })),
+  variables: computed(() => ({ id: gqlRecordId(selectedId.value) })),
   pause: computed(() => selectedId.value === null),
   requestPolicy: "network-only",
 });

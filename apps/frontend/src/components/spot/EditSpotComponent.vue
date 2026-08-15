@@ -23,7 +23,7 @@ import { uploadNewImages } from '@/api/mediaApi';
 import { bookedOutside } from '@/lib/bookingAvailability';
 import { formatDay, formatSlots, todayIn } from '@/lib/bookingDates';
 import { centsToEuros, eurosToCents } from '@/lib/money';
-import { recordId } from '@/lib/utils';
+import { gqlRecordId, plainUuid } from '@/lib/utils';
 import type { Availability } from '@/types/domain/spot'
 
 const { id } = defineProps<{ id: string }>()
@@ -32,7 +32,7 @@ const router = useRouter()
 
 const { data } = useQuery({
     query: EDIT_SPOT,
-    variables: computed(() => ({ id: recordId(id) })),
+    variables: computed(() => ({ id: gqlRecordId(id) })),
 })
 
 // Same rules as the create form, minus the address: a spot's location is fixed at
@@ -137,7 +137,7 @@ const submit = handleSubmit(async (values) => {
         const imageKeys = await uploadNewImages(images.value, 'spot')
 
         const { pricePerHour, ...rest } = values
-        const response = await updateSpot(recordId(id)!, {
+        const response = await updateSpot(plainUuid(id)!, {
             ...rest,
             pricePerHourCents: eurosToCents(pricePerHour),
             availability: availability.value,
@@ -159,7 +159,7 @@ const submit = handleSubmit(async (values) => {
 const remove = async () => {
     deleting.value = true
     try {
-        await deleteSpot(recordId(id)!)
+        await deleteSpot(plainUuid(id)!)
         // Past the manage screen, which is about to 404 on a spot that no longer
         // lists. `refreshSpots` makes the list refetch instead of serving its cache.
         router.replace({ name: 'spots', state: { refreshSpots: true } })

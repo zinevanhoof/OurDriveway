@@ -14,7 +14,7 @@ import { DateFormatter, DateValue, getLocalTimeZone, today } from "@internationa
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 
-import { recordId } from "@/lib/utils";
+import { plainUuid } from "@/lib/utils";
 import * as bookingApi from "@/api/bookingApi";
 import * as paymentApi from "@/api/paymentApi";
 import type { TimeSlot } from "@/types/domain/spot";
@@ -167,7 +167,7 @@ async function submit() {
     busy.value = true;
     try {
         const reservation = await bookingApi.reserve({
-            spotId: recordId(props.spot.id)!,
+            spotId: plainUuid(props.spot.id)!,
             booked,
             amountCents: totals.value.amountCents,
         });

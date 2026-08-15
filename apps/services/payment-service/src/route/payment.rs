@@ -9,6 +9,7 @@ use shared::{
     error::myerror::MyResult, events::STREAM_PAYMENTS, extract::Valid,
     extractors::authed_jwt::AuthedJwt, requests::payment::CreateSessionRequest,
 };
+use uuid::Uuid;
 
 use crate::{AppState, service::stripe::SessionStatus};
 
@@ -36,7 +37,7 @@ pub struct SessionStateResponse {
     /// Element knowing nothing but the id in its URL.
     pub client_secret: Option<String>,
     /// So the screen can release the hold without the booking id ever being in the URL.
-    pub booking_id: String,
+    pub booking_id: Uuid,
 }
 
 #[derive(Serialize)]

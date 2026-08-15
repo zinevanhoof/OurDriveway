@@ -1,12 +1,12 @@
+use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     events::{
         Envelope,
         spot::{SpotCreated, SpotEvent, SpotUpdated},
-        user::record_key,
     },
+    rpc::spot::SpotCard,
 };
-use serde::Deserialize;
 use surrealdb::{
     Surreal,
     engine::remote::ws::Client,
@@ -24,7 +24,7 @@ pub struct SpotRepository {
 /// What an edit, a live toggle, or a delete has to know before it may publish.
 #[derive(Debug, Deserialize, SurrealValue)]
 pub struct SpotForUpdate {
-    pub owner_id: String,
+    pub owner_id: Uuid,
     /// Read, never recomputed. `shard_of` would agree today, but it selects the
     /// subject this spot's whole history lives on, so a changed SHARD_COUNT would
     /// send its next event somewhere no reader is looking.
@@ -36,7 +36,7 @@ impl SpotRepository {
     /// The spot as the write path needs it, or `None` if this instance hasn't
     /// projected it yet — which the caller must treat as "not found" rather than
     /// "not yours".
-    pub async fn spot_for_update(&self, spot_id: &str) -> MyResult<Option<SpotForUpdate>> {
+    pub async fn spot_for_update(&self, spot_id: &Uuid) -> MyResult<Option<SpotForUpdate>> {
         Ok(self
             .db
             .query(
@@ -46,7 +46,28 @@ impl SpotRepository {
                 "SELECT owner_id, shard, deleted ?? false AS deleted
                  FROM ONLY type::record('spot', $id)",
             )
-            .bind(("id", spot_id.to_string()))
+            .bind(("id", *spot_id))
+            .await?
+            .take(0)?)
+    }
+
+    /// The spot as somebody else's screen needs it — see [`shared::rpc::spot`].
+    ///
+    /// Answers for **deleted and deactivated spots too**, deliberately. The caller is
+    /// labelling something that already happened: a booking made months ago against a
+    /// listing since taken down still has to say what it was for, and a delisted spot
+    /// suddenly rendering as "Booking 019fa…" on a renter's receipt would be a bug.
+    /// Nothing here is a permission to act, so there is nothing to withhold.
+    pub async fn card(&self, spot_id: &Uuid) -> MyResult<Option<SpotCard>> {
+        Ok(self
+            .db
+            .query(
+                // `images` is returned exactly as stored — bare keys, never URLs. The
+                // hostname belongs to whoever renders them; see shared::media.
+                "SELECT title, address.formatted AS address, images ?? [] AS images
+                 FROM ONLY type::record('spot', $id)",
+            )
+            .bind(("id", *spot_id))
             .await?
             .take(0)?)
     }
@@ -94,7 +115,7 @@ impl SpotRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.spot_id)))
+            .bind(("id", e.spot_id))
             .bind(("owner_id", e.owner_id))
             .bind(("shard", e.shard))
             .bind(("title", e.title))
@@ -134,7 +155,7 @@ impl SpotRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.spot_id)))
+            .bind(("id", e.spot_id))
             .bind(("title", e.title))
             .bind(("description", e.description))
             .bind(("price", e.price_per_hour_cents))
@@ -162,7 +183,7 @@ impl SpotRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&spot_id)))
+            .bind(("id", spot_id))
             .bind(("active", active))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
@@ -187,7 +208,7 @@ impl SpotRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&spot_id)))
+            .bind(("id", spot_id))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
             .await?

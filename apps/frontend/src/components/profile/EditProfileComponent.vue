@@ -22,15 +22,14 @@ import { uploadImage } from '@/api/mediaApi'
 import { fetchMe } from '@/api/me'
 import { useAuthStore } from '@/stores/auth'
 import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
-import { recordId } from '@/lib/utils'
-import { imageUrl } from '@/lib/media'
+import { gqlRecordId } from '@/lib/utils'
 
 const router = useRouter()
 const auth = useAuthStore()
 
 const { data, executeQuery } = useQuery({
     query: ME,
-    variables: computed(() => ({ id: recordId(auth.user?.id) })),
+    variables: computed(() => ({ id: gqlRecordId(auth.user?.id) })),
 })
 
 const me = computed(() => data.value?.user)
@@ -164,7 +163,7 @@ const submit = handleSubmit(async (form) => {
                     <label class="relative cursor-pointer">
                         <Avatar size="3xl">
                             <AvatarImage v-if="picked || me?.profilePicture"
-                                :src="picked ?? imageUrl(me!.profilePicture)" />
+                                :src="picked ?? me!.profilePicture" />
                             <AvatarFallback v-if="me"
                                 :name="{ firstName: values.firstName || me.firstName, lastName: values.lastName || me.lastName }" />
                         </Avatar>

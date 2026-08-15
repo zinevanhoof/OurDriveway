@@ -11,7 +11,7 @@ use shared::{
     events::{
         Envelope, STREAM_BOOKINGS,
         booking::{BookingEvent, BookingReserved, CancelReason, ReleaseReason},
-        booking_subject, user::record_key,
+        booking_subject,
     },
     general_models::booking::Booked,
     general_models::spot::TimeSlot,
@@ -75,9 +75,9 @@ impl BookingService {
     pub async fn reserve(
         &self,
         request: CreateBookingRequest,
-        renter_id: String,
+        renter_id: Uuid,
     ) -> MyResult<Reserved> {
-        let spot_key = request.spot_id.clone();
+        let spot_key = request.spot_id;
         let requested = request.slots();
 
         // Stable across attempts: it's the idempotency key. If an ack is lost after
@@ -95,11 +95,7 @@ impl BookingService {
             // A previous attempt's event landed and we simply never heard the ack.
             // Because `booking_id` is stable across attempts this is recognisable,
             // and the renter gets their reservation instead of a second one.
-            if let Some(existing) = self
-                .repository
-                .booking_for_update(&record_key(&booking_id))
-                .await?
-            {
+            if let Some(existing) = self.repository.booking_for_update(&booking_id).await? {
                 return Ok(Reserved {
                     booking_id,
                     // The spot's cursor is at or past our own event by definition —
@@ -164,10 +160,10 @@ impl BookingService {
             let expires_at = Utc::now() + HOLD;
             let event = BookingEvent::Reserved(BookingReserved {
                 booking_id,
-                spot_id: parse_uuid(&spot_key)?,
+                spot_id: spot_key,
                 spot_shard: shard.clone(),
-                owner_id: owner_id.clone(),
-                renter_id: renter_id.clone(),
+                owner_id: *owner_id,
+                renter_id,
                 booked: requested.clone(),
                 amount_cents,
                 expires_at,
@@ -175,7 +171,13 @@ impl BookingService {
             });
 
             match self
-                .publish(&spot_key, shard, &event, &renter_id, Some(spot.bookings_seq))
+                .publish(
+                    &spot_key,
+                    shard,
+                    &event,
+                    &renter_id,
+                    Some(spot.bookings_seq),
+                )
                 .await
             {
                 Ok(seq) => {
@@ -215,10 +217,9 @@ impl BookingService {
     /// `payment_id` only names the event, so a redelivered webhook is discarded by the
     /// stream's duplicate window instead of appending a second `Confirmed`.
     pub async fn confirm_paid(&self, booking_id: Uuid, payment_id: Uuid) -> MyResult<u64> {
-        let key = record_key(&booking_id);
         let booking = self
             .repository
-            .booking_for_update(&key)
+            .booking_for_update(&booking_id)
             .await?
             .context_not_found(("Not Found", "That booking doesn't exist."))?;
 
@@ -231,10 +232,9 @@ impl BookingService {
             format!("payment-confirm:{payment_id}").as_bytes(),
         );
 
-        let spot_id = parse_uuid(&booking.spot_id)?;
         Ok(bus::publish(
             &self.js,
-            booking_subject(&booking.spot_shard, &spot_id),
+            booking_subject(&booking.spot_shard, &booking.spot_id),
             &envelope,
         )
         .await?)
@@ -242,7 +242,7 @@ impl BookingService {
 
     /// The renter backed out of checkout. Frees the slots immediately rather than
     /// waiting out the hold.
-    pub async fn release(&self, booking_id: &str, renter_id: &str) -> MyResult<u64> {
+    pub async fn release(&self, booking_id: &Uuid, renter_id: &Uuid) -> MyResult<u64> {
         self.transition(booking_id, renter_id, |id| BookingEvent::Released {
             booking_id: id,
             reason: ReleaseReason::Abandoned,
@@ -259,8 +259,7 @@ impl BookingService {
     /// expiry sweeper it only ever *frees* slots, so it can't lose a race in a way
     /// that matters, and the projector's `WHERE status IN ['confirmed']` makes a
     /// redelivery or a client retry a no-op.
-    pub async fn cancel(&self, booking_id: &str, renter_id: &str) -> MyResult<u64> {
-        let id = parse_uuid(booking_id)?;
+    pub async fn cancel(&self, booking_id: &Uuid, renter_id: &Uuid) -> MyResult<u64> {
         let booking = self
             .repository
             .booking_for_update(booking_id)
@@ -290,11 +289,17 @@ impl BookingService {
         }
 
         let event = BookingEvent::Cancelled {
-            booking_id: id,
+            booking_id: *booking_id,
             reason: CancelReason::ByRenter,
         };
         match self
-            .publish(&booking.spot_id, &booking.spot_shard, &event, renter_id, None)
+            .publish(
+                &booking.spot_id,
+                &booking.spot_shard,
+                &event,
+                renter_id,
+                None,
+            )
             .await
         {
             Ok(seq) => Ok(seq),
@@ -307,11 +312,11 @@ impl BookingService {
     /// Shared confirm/release path: authorize, re-check, publish under CAS.
     async fn transition(
         &self,
-        booking_id: &str,
-        renter_id: &str,
+        booking_id: &Uuid,
+        renter_id: &Uuid,
         event: impl Fn(Uuid) -> BookingEvent,
     ) -> MyResult<u64> {
-        let id = parse_uuid(booking_id)?;
+        let id = *booking_id;
 
         for _ in 0..ATTEMPTS {
             let booking = self
@@ -374,24 +379,28 @@ impl BookingService {
         let Some(availability) = spot.availability.as_ref() else {
             return Ok(());
         };
-        availability::check(availability, &spot.booked, &booking.booked, Some(&booking.booked))
-            .map_err(reject)?;
+        availability::check(
+            availability,
+            &spot.booked,
+            &booking.booked,
+            Some(&booking.booked),
+        )
+        .map_err(reject)?;
         Ok(())
     }
 
     async fn publish(
         &self,
-        spot_key: &str,
+        spot_id: &Uuid,
         shard: &str,
         event: &BookingEvent,
-        actor: &str,
+        actor: &Uuid,
         expected: Option<u64>,
     ) -> Result<u64, PublishError> {
-        let spot_id = parse_uuid(spot_key).map_err(PublishError::Failed)?;
         bus::publish_expecting(
             &self.js,
-            booking_subject(shard, &spot_id),
-            &Envelope::new(event.clone(), Some(actor.to_string())),
+            booking_subject(shard, spot_id),
+            &Envelope::new(event.clone(), Some(*actor)),
             expected,
         )
         .await
@@ -401,14 +410,13 @@ impl BookingService {
     ///
     /// Without this the retry re-reads the same stale projection, asserts the same
     /// stale sequence, and is refused again — a loop that can never converge.
-    async fn catch_up(&self, spot_key: &str, shard: &str) -> MyResult<()> {
-        let spot_id = parse_uuid(spot_key)?;
-        let head = bus::subject_head(&self.js, STREAM_BOOKINGS, &booking_subject(shard, &spot_id))
-            .await?;
+    async fn catch_up(&self, spot_id: &Uuid, shard: &str) -> MyResult<()> {
+        let head =
+            bus::subject_head(&self.js, STREAM_BOOKINGS, &booking_subject(shard, spot_id)).await?;
         // Not a warning: losing a CAS race is the mechanism working, not a fault.
         // Logged because it's otherwise invisible, and a spot generating a steady
         // stream of these is the signal that ATTEMPTS needs backoff.
-        tracing::info!(spot = %spot_key, head, "lost CAS race; catching up before retry");
+        tracing::info!(spot = %spot_id, head, "lost CAS race; catching up before retry");
 
         let mut applied = self.applied.clone();
         let _ = tokio::time::timeout(CATCH_UP, async {
@@ -423,9 +431,9 @@ impl BookingService {
     }
 }
 
-fn authorize(booking: &BookingForUpdate, renter_id: &str, expected: &str) -> MyResult<()> {
+fn authorize(booking: &BookingForUpdate, renter_id: &Uuid, expected: &str) -> MyResult<()> {
     // Ownership from the verified token, never from the request.
-    if booking.renter_id != renter_id {
+    if booking.renter_id != *renter_id {
         // 404 rather than 403: whether a booking id exists isn't this caller's
         // business.
         return Err(MyError::api(
@@ -507,12 +515,11 @@ fn wall_times<'a>(
 fn instant(local: NaiveDateTime, tz: Tz) -> Option<DateTime<Utc>> {
     tz.from_local_datetime(&local)
         .earliest()
-        .or_else(|| tz.from_local_datetime(&(local + TimeDelta::hours(1))).earliest())
+        .or_else(|| {
+            tz.from_local_datetime(&(local + TimeDelta::hours(1)))
+                .earliest()
+        })
         .map(|dt| dt.with_timezone(&Utc))
-}
-
-fn parse_uuid(key: &str) -> MyResult<Uuid> {
-    Uuid::parse_str(key).context_bad_request(("Bad Request", "Malformed id."))
 }
 
 fn taken_now() -> MyError {
@@ -576,9 +583,15 @@ mod tests {
         assert_eq!(in_time(&booked, tz, at("2026-08-03T05:59:59Z")), Some(true));
         // Exactly on the hour still counts — the boundary is inclusive.
         assert_eq!(in_time(&booked, tz, at("2026-08-03T06:00:00Z")), Some(true));
-        assert_eq!(in_time(&booked, tz, at("2026-08-03T06:00:01Z")), Some(false));
+        assert_eq!(
+            in_time(&booked, tz, at("2026-08-03T06:00:01Z")),
+            Some(false)
+        );
         // Inside the naive-UTC window, and correctly refused anyway.
-        assert_eq!(in_time(&booked, tz, at("2026-08-03T07:30:00Z")), Some(false));
+        assert_eq!(
+            in_time(&booked, tz, at("2026-08-03T07:30:00Z")),
+            Some(false)
+        );
         // An earlier date wins over an earlier clock time on a later date: 22:00 on
         // the 3rd is 20:00Z, so the deadline is 19:00Z — not 07:00 on the 4th.
         let spread: Booked = HashMap::from([
@@ -586,9 +599,15 @@ mod tests {
             ("2026-08-03".to_string(), vec![slot("22:00", "23:00")]),
         ]);
         assert_eq!(in_time(&spread, tz, at("2026-08-03T19:00:00Z")), Some(true));
-        assert_eq!(in_time(&spread, tz, at("2026-08-03T19:00:01Z")), Some(false));
+        assert_eq!(
+            in_time(&spread, tz, at("2026-08-03T19:00:01Z")),
+            Some(false)
+        );
         // Fails closed: an unknown zone can't be proven in time.
-        assert_eq!(in_time(&booked, "Not/AZone", at("2026-08-03T05:00:00Z")), None);
+        assert_eq!(
+            in_time(&booked, "Not/AZone", at("2026-08-03T05:00:00Z")),
+            None
+        );
     }
 
     #[test]

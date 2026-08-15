@@ -49,7 +49,7 @@ impl SpotService {
     pub async fn create_spot(
         &self,
         request: CreateSpotRequest,
-        owner_id: String,
+        owner_id: Uuid,
     ) -> MyResult<Created> {
         // Independently geocode the submitted address (never trust client coords).
         // No confident match -> reject; the frontend renders `detail` from 422s.
@@ -69,7 +69,7 @@ impl SpotService {
         let event = SpotEvent::Created(SpotCreated {
             spot_id,
             shard: shard.clone(),
-            owner_id: owner_id.clone(),
+            owner_id,
             title: request.title,
             description: request.description,
             price_per_hour_cents: request.price_per_hour_cents,
@@ -97,9 +97,9 @@ impl SpotService {
     /// the one deciding what counts as a change.
     pub async fn update_spot(
         &self,
-        spot_id: &str,
+        spot_id: &Uuid,
         request: UpdateSpotRequest,
-        owner_id: String,
+        owner_id: Uuid,
     ) -> MyResult<u64> {
         let (id, shard) = self.owned(spot_id, &owner_id).await?;
 
@@ -117,7 +117,7 @@ impl SpotService {
 
     /// The live switch. Off blocks new reservations; bookings already taken are
     /// honoured, which is the whole difference from a delete.
-    pub async fn set_active(&self, spot_id: &str, active: bool, owner_id: String) -> MyResult<u64> {
+    pub async fn set_active(&self, spot_id: &Uuid, active: bool, owner_id: Uuid) -> MyResult<u64> {
         let (id, shard) = self.owned(spot_id, &owner_id).await?;
         let event = if active {
             SpotEvent::Activated { spot_id: id }
@@ -130,7 +130,7 @@ impl SpotService {
     /// Withdraw the listing for good. booking-service reacts to this by cancelling
     /// every booking the spot still owes — nothing here needs to know that, or to
     /// know bookings exist at all.
-    pub async fn delete_spot(&self, spot_id: &str, owner_id: String) -> MyResult<u64> {
+    pub async fn delete_spot(&self, spot_id: &Uuid, owner_id: Uuid) -> MyResult<u64> {
         let (id, shard) = self.owned(spot_id, &owner_id).await?;
         self.publish(&id, &shard, SpotEvent::Deleted { spot_id: id }, owner_id)
             .await
@@ -141,7 +141,7 @@ impl SpotService {
     ///
     /// Not-yours is a 404, not a 403: whether a spot id exists isn't this caller's
     /// business. Same choice as booking-service's `authorize`.
-    async fn owned(&self, spot_id: &str, owner_id: &str) -> MyResult<(Uuid, String)> {
+    async fn owned(&self, spot_id: &Uuid, owner_id: &Uuid) -> MyResult<(Uuid, String)> {
         let not_found = || {
             MyError::api(
                 StatusCode::NOT_FOUND,
@@ -158,13 +158,11 @@ impl SpotService {
 
         // A deleted spot is gone as far as the host is concerned, even though the
         // row survives for the bookings that reference it.
-        if spot.owner_id != owner_id || spot.deleted {
+        if spot.owner_id != *owner_id || spot.deleted {
             return Err(not_found());
         }
 
-        let id = Uuid::parse_str(spot_id).context_bad_request(("Bad Request", "Malformed id."))?;
-
-        Ok((id, spot.shard))
+        Ok((*spot_id, spot.shard))
     }
 
     /// No compare-and-swap on any of these.
@@ -179,7 +177,7 @@ impl SpotService {
         spot_id: &Uuid,
         shard: &str,
         event: SpotEvent,
-        owner_id: String,
+        owner_id: Uuid,
     ) -> MyResult<u64> {
         bus::publish(
             &self.js,

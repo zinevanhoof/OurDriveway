@@ -8,9 +8,7 @@ use uuid::Uuid;
 
 use crate::CONFIG;
 
-/// `claim_id` is the `user:<uuid>` string from `user_claim_id` — built once,
-/// in one place, so it always matches the strings stored in other services.
-pub fn generate_jwt(claim_id: &str, exp: DateTime<Utc>, jti: Uuid) -> MyResult<String> {
+pub fn generate_jwt(user_id: &Uuid, exp: DateTime<Utc>, jti: Uuid) -> MyResult<String> {
     let now = Utc::now();
     let now_timestamp = now.timestamp();
     let exp_timestamp = exp.timestamp();
@@ -26,7 +24,12 @@ pub fn generate_jwt(claim_id: &str, exp: DateTime<Utc>, jti: Uuid) -> MyResult<S
         db: "main".to_string(),
         ac: "account".to_string(),
 
-        id: claim_id.to_string(),
+        // The only `user:` left in the codebase. SurrealDB parses this claim with
+        // `syn::record_id` and errors if it fails, so the uuid needs its `u'…'`
+        // literal form — that is what makes `$auth` a *uuid-keyed* record id, and
+        // what lets every permission clause compare `record::id($auth)` against a
+        // `TYPE uuid` field with no cast. A bare uuid here does not parse.
+        id: format!("user:u'{user_id}'"),
     };
 
     let jwt = encode(

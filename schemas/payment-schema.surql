@@ -21,12 +21,12 @@ DEFINE TABLE OVERWRITE payment SCHEMAFULL PERMISSIONS NONE;
 -- The booking this pays for, as a plain string: the booking table below is a local
 -- projection, and the authoritative one lives in booking-service's database, so this
 -- can't be a record<> link that means anything.
-DEFINE FIELD OVERWRITE booking_id ON payment TYPE string;
+DEFINE FIELD OVERWRITE booking_id ON payment TYPE uuid;
 
 -- `"user:abc"` for both. owner_id is who earns it and renter_id is who paid, both
 -- denormalized off the event so the earnings query never dereferences a booking.
-DEFINE FIELD OVERWRITE owner_id  ON payment TYPE string;
-DEFINE FIELD OVERWRITE renter_id ON payment TYPE string;
+DEFINE FIELD OVERWRITE owner_id  ON payment TYPE uuid;
+DEFINE FIELD OVERWRITE renter_id ON payment TYPE uuid;
 
 -- EUR cents, as the server priced the booking at reserve time. Matches
 -- booking.amount and view-schema's booking.amount; never a float, because binary
@@ -103,10 +103,10 @@ DEFINE INDEX OVERWRITE payment_session ON payment FIELDS session_id UNIQUE;
 -- so a replay from sequence 1 can only ever create this row complete.
 DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS NONE;
 
-DEFINE FIELD OVERWRITE spot_id    ON booking TYPE string;
+DEFINE FIELD OVERWRITE spot_id    ON booking TYPE uuid;
 DEFINE FIELD OVERWRITE spot_shard ON booking TYPE string;
-DEFINE FIELD OVERWRITE owner_id   ON booking TYPE string;
-DEFINE FIELD OVERWRITE renter_id  ON booking TYPE string;
+DEFINE FIELD OVERWRITE owner_id   ON booking TYPE uuid;
+DEFINE FIELD OVERWRITE renter_id  ON booking TYPE uuid;
 DEFINE FIELD OVERWRITE amount_cents ON booking TYPE int;
 
 -- The slots booked: "YYYY-MM-DD" -> [{ start, end }], same shape as booking-schema.
@@ -163,7 +163,7 @@ DEFINE INDEX OVERWRITE booking_owner ON booking FIELDS owner_id, status, ends_at
 -- compensating write.
 DEFINE TABLE OVERWRITE payout SCHEMAFULL PERMISSIONS NONE;
 
-DEFINE FIELD OVERWRITE owner_id     ON payout TYPE string;
+DEFINE FIELD OVERWRITE owner_id     ON payout TYPE uuid;
 DEFINE FIELD OVERWRITE amount_cents ON payout TYPE int;
 DEFINE FIELD OVERWRITE created_at   ON payout TYPE datetime;
 

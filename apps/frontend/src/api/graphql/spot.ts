@@ -40,7 +40,11 @@ const FULL_SPOT = gql`
 const MANAGE_SPOT = gql`
   # "datetime" (lowercase) is SurrealDB's own scalar name for a datetime field —
   # it coerces an RFC 3339 string, which is what toISOString() gives.
-  query GetSpotAndBookings($spotId: ID!, $now: datetime!) {
+  # Two spellings of the same spot, deliberately: spot(id:) is a record LOOKUP and
+  # takes the u'<uuid>' literal (gqlRecordId()), while spot_id is a TYPE uuid FIELD
+  # whose eq takes the plain uuid (plainUuid()). Passing either one to the other
+  # silently returns nothing — hence two variables rather than one reused.
+  query GetSpotAndBookings($spotId: ID!, $spotUuid: uuid!, $now: datetime!) {
     spot(id: $spotId) {
       id
       title
@@ -67,7 +71,7 @@ const MANAGE_SPOT = gql`
     # Still to come, as one indexed comparison. The alternative is folding every
     # booking's date map client-side, which a GraphQL filter cannot express — hence
     # ends_at existing at all.
-    bookings(where: { spot_id: { eq: $spotId }, ends_at: { gt: $now } }) {
+    bookings(where: { spot_id: { eq: $spotUuid }, ends_at: { gt: $now } }) {
       id
       renter {
         id
@@ -131,7 +135,7 @@ const SPOTS_OWNED = gql`
   # The owner can select their own inactive spots — that's what the switch is for —
   # so the list has to exclude deleted ones itself. The row survives only so a
   # renter's past bookings can still resolve a title and an address.
-  query GetOwnedSpots($id: String!) {
+  query GetOwnedSpots($id: uuid!) {
     spots(where: { owner_id: { eq: $id }, deleted: { eq: false } }) {
       id
       title
@@ -202,7 +206,7 @@ const SPOTS_IN_RADIUS = gql`
 // field names, so it cannot order by a function at all. The caller sorts the handful
 // this returns with `nearer()` and keeps two.
 const SPOTS_NEARBY = gql`
-  query SpotsNearby($lng: Float!, $lat: Float!, $meters: Float!, $me: String!) {
+  query SpotsNearby($lng: Float!, $lat: Float!, $meters: Float!, $me: uuid!) {
     spots(
       where: {
         deleted: { eq: false }

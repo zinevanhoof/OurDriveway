@@ -53,7 +53,10 @@ pub fn fold_booked(rows: &[BookingRow], at: DateTime<Utc>) -> Booked {
             if *date < cutoff {
                 continue;
             }
-            booked.entry(date.clone()).or_default().extend(slots.clone());
+            booked
+                .entry(date.clone())
+                .or_default()
+                .extend(slots.clone());
         }
     }
     for slots in booked.values_mut() {
@@ -104,7 +107,10 @@ mod tests {
     fn an_unknown_status_blocks() {
         // Fail closed: better to keep a slot unavailable than to sell it twice
         // because a future status wasn't in the exclude list.
-        let booked = fold_booked(&[row("some_future_status", "2026-08-03", "09:00", "10:00")], at());
+        let booked = fold_booked(
+            &[row("some_future_status", "2026-08-03", "09:00", "10:00")],
+            at(),
+        );
         assert_eq!(booked["2026-08-03"].len(), 1);
     }
 

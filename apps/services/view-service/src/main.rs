@@ -152,12 +152,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // verbatim, so they get a RECORD identity and are constrained by the table
     // permissions in view-schema.surql. The OWNER connection above is never
     // exposed here.
-    let proxy: Router<AppState> =
-        ReverseProxy::new(
-            "/api/view/graphql",
-            &format!("http://{}/graphql", CONFIG.surrealdb_addr),
-        )
-        .into();
+    let proxy: Router<AppState> = ReverseProxy::new(
+        "/api/view/graphql",
+        &format!("http://{}/graphql", CONFIG.surrealdb_addr),
+    )
+    .into();
 
     let app = Router::new()
         .route("/api/view/me", get(route::me::me))

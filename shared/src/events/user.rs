@@ -1,25 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The `$token.ID` string for a user: `"user:019fafc9…"` (hyphen-free).
-///
-/// Built explicitly rather than via `RecordId::to_sql()`, so the format is
-/// decided in exactly one place and can't drift from the strings stored in
-/// `owner_id`/`renter_id` elsewhere.
-pub fn user_claim_id(user_id: &Uuid) -> String {
-    format!("user:{}", record_key(user_id))
-}
-
-/// A uuid as a SurrealDB record key.
-///
-/// `simple()`, not the hyphenated form: hyphens aren't valid in a bare
-/// identifier, so SurrealDB stores such a key quoted (``user:`019f-…` ``) while
-/// GraphQL emits it unquoted. The value then fails to resolve when a client
-/// passes it back to `user(id: …)` or `spot(id: …)` — silently returning null.
-pub fn record_key(id: &Uuid) -> String {
-    id.simple().to_string()
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum UserEvent {
@@ -28,7 +9,9 @@ pub enum UserEvent {
     PasswordChanged(UserPasswordChanged),
     /// The address was proven reachable — somebody opened a link only that
     /// mailbox received. Published by user-service after checking the token.
-    EmailVerified { user_id: Uuid },
+    EmailVerified {
+        user_id: Uuid,
+    },
     /// "Send that link again." Raised by user-service when a user asks for a new
     /// verification email, and consumed only by notification-service — nothing
     /// projects it.

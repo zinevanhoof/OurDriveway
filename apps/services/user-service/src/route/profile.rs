@@ -23,7 +23,7 @@ pub async fn update_profile(
     State(state): State<AppState>,
     Valid(req): Valid<UpdateProfileRequest>,
 ) -> MyResult<(StatusCode, Json<AcceptedResponse>)> {
-    let seq = state.user_service.update_profile(&uid(&user_id), req).await?;
+    let seq = state.user_service.update_profile(&user_id, req).await?;
     Ok(accepted(seq))
 }
 
@@ -34,14 +34,9 @@ pub async fn change_password(
 ) -> MyResult<(StatusCode, Json<AcceptedResponse>)> {
     let seq = state
         .user_service
-        .change_password(&uid(&user_id), &req.current_password, &req.new_password)
+        .change_password(&user_id, &req.current_password, &req.new_password)
         .await?;
     Ok(accepted(seq))
-}
-
-/// The claim is `"user:abc123"`; the repository addresses rows by the key alone.
-fn uid(user_id: &str) -> String {
-    user_id.strip_prefix("user:").unwrap_or(user_id).to_string()
 }
 
 fn accepted(seq: u64) -> (StatusCode, Json<AcceptedResponse>) {

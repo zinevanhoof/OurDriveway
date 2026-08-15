@@ -25,7 +25,7 @@ import Button from "@/components/ui/button/Button.vue";
 import Separator from "@/components/ui/separator/Separator.vue";
 import Spinner from "@/components/ui/spinner/Spinner.vue";
 import { stripe } from "@/lib/stripe";
-import { recordId } from "@/lib/utils";
+import { gqlRecordId } from "@/lib/utils";
 import { useAuthStore } from "@/stores/auth";
 import { ME } from "@/api/graphql/user";
 import { BOOKING_STATUS } from "@/api/graphql/booking";
@@ -72,7 +72,7 @@ let actions: StripeCheckoutLoadActionsSuccess | null = null;
 // resolves for the asking user.
 const { data: me } = useQuery({
   query: ME,
-  variables: computed(() => ({ id: recordId(auth.user?.id) })),
+  variables: computed(() => ({ id: gqlRecordId(auth.user?.id) })),
   pause: computed(() => !auth.user?.id),
 });
 
@@ -213,7 +213,7 @@ let poller: ReturnType<typeof setInterval> | undefined;
 
 const { data: booking, executeQuery: refetchBooking } = useQuery({
   query: BOOKING_STATUS,
-  variables: computed(() => ({ id: recordId(bookingId.value) })),
+  variables: computed(() => ({ id: gqlRecordId(bookingId.value) })),
   requestPolicy: "network-only",
   pause: computed(() => !bookingId.value),
 });
@@ -340,11 +340,38 @@ function cssColorToHex(value: string): string | undefined {
     <template v-else>
       <div class="bg-card border border-border rounded-lg px-3.5 py-3.25 space-y-2">
         <div class="text-[15px] font-extrabold">Your booking</div>
-        <!-- Straight from the Checkout Session. Nothing is refetched to render this. -->
-        <div v-for="item in lineItems" :key="item.id"
-          class="flex items-center justify-between gap-2 text-sm font-semibold">
-          <span>{{ item.name }}</span>
-          <span class="text-muted-foreground">{{ item.total.amount }}</span>
+        <!--
+          Straight from the Checkout Session — the spot's name, its address, the times and
+          a photo, with no request of ours behind any of it. payment-service asked
+          spot-service for the title and photo once, when it created the session.
+
+          `images` here are Stripe's own CloudFront URLs, not ours: it fetched our
+          absolute URLs when the session was created and re-hosted the files. Rendered
+          directly — there is no origin of ours to join on, and the photo is frozen at
+          session creation, so editing the spot's images afterwards will not change it.
+        -->
+        <div v-for="item in lineItems" :key="item.id" class="space-y-2.5">
+          <!--
+            Same strip as SpotDetailDrawer: full-width pages so each photo snaps to
+            centre, `no-scrollbar` because the snap points are the affordance.
+          -->
+          <div v-if="item.images?.length"
+            class="flex h-40 gap-2 overflow-x-auto snap-x snap-mandatory no-scrollbar">
+            <img v-for="key in item.images" :key="key" :src="key" alt=""
+              class="snap-center shrink-0 h-full w-full object-cover rounded-md bg-accent" />
+          </div>
+
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0">
+              <div class="text-sm font-semibold">{{ item.name }}</div>
+              <!-- Wraps. It carries the times *and* the address, which is longer than
+                   one line on a phone and is the part worth reading. -->
+              <div v-if="item.description" class="text-xs text-muted-foreground font-medium">
+                {{ item.description }}
+              </div>
+            </div>
+            <span class="text-sm font-semibold shrink-0">{{ item.total.amount }}</span>
+          </div>
         </div>
         <Separator />
         <div class="flex items-center justify-between font-bold">

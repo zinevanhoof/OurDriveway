@@ -17,22 +17,20 @@ DEFINE FUNCTION OVERWRITE fn::spot_distance($loc: geometry, $lng: float, $lat: f
     RETURN geo::distance($loc, type::point([$lng, $lat]));
 };
 
--- Reads are open (active spots are public listings; an owner also sees their own
--- inactive ones). Writes are impossible for any client identity: spot-service
--- connects with a database-level user, whose role bypasses table permissions, and
--- authorizes ownership in Rust from the verified JWT.
---
--- This was `PERMISSIONS FULL`, which let any authenticated user UPDATE or DELETE
--- anyone else's spot through the proxied GraphQL/SQL endpoint.
-DEFINE TABLE OVERWRITE spot SCHEMAFULL PERMISSIONS
-    FOR select WHERE active = true OR owner_id = $token.ID,
-    FOR create, update, delete NONE;
+-- PERMISSIONS NONE, not a select clause. No browser reaches this database — it is
+-- private to spot-service, which connects with a database-level user whose role
+-- bypasses table permissions entirely and authorizes ownership in Rust from the
+-- verified JWT. The `$token.ID` clause that used to sit here therefore never
+-- constrained anything; removing it takes away nothing but the impression that
+-- this database is client-facing. Client reads of spots go through view-service,
+-- and view-schema.surql is where a real permission clause lives.
+DEFINE TABLE OVERWRITE spot SCHEMAFULL PERMISSIONS NONE;
 
--- No `VALUE $token.ID`: that forced the field from the caller's token, so the
--- table could only be written by a connection authenticated as that very user —
--- and silently coerced to NONE (rejecting the write) for any service identity.
--- spot-service now sets owner_id explicitly from the verified claim.
-DEFINE FIELD OVERWRITE owner_id ON spot TYPE string;
+-- Set explicitly by spot-service from the verified claim. Never `VALUE $token.ID`:
+-- that forced the field from the caller's token, so the table could only be written
+-- by a connection authenticated as that very user — and silently coerced to NONE
+-- (rejecting the write) for any service identity.
+DEFINE FIELD OVERWRITE owner_id ON spot TYPE uuid;
 -- Assigned once at creation and never changed: it selects the NATS subject this
 -- spot's events live on, and moving a spot between shards would split its history.
 DEFINE FIELD OVERWRITE shard ON spot TYPE string;

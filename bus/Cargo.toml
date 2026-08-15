@@ -20,3 +20,10 @@ tracing = { workspace = true }
 surrealdb = { workspace = true }
 
 shared = { path = "../shared" }
+
+# `examples/seed.rs` only. Dev-dependencies, so no service build pays for them —
+# and all three are already in the workspace graph, so nothing new compiles.
+[dev-dependencies]
+argon2 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

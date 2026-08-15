@@ -15,8 +15,7 @@ import Separator from "@/components/ui/separator/Separator.vue";
 import SpotDetailDrawer from "@/components/spot/SpotDetailDrawer.vue";
 import { canCancel, formatDay, formatSlots, isActiveNow, sortedDays } from "@/lib/bookingDates";
 import { formatCents } from "@/lib/money";
-import { recordId } from "@/lib/utils";
-import { imageUrl } from "@/lib/media";
+import { plainUuid } from "@/lib/utils";
 
 const props = defineProps<{ booking: any; past?: boolean }>();
 const emit = defineEmits<{ changed: [] }>();
@@ -107,7 +106,7 @@ function directions() {
 async function resume() {
   resuming.value = true;
   try {
-    const id = recordId(props.booking.id)!;
+    const id = plainUuid(props.booking.id)!;
     const session = await paymentApi.createSession(id);
     void router.push({ path: "/checkout", query: { session_id: session.sessionId } });
   } catch (e: any) {
@@ -120,7 +119,7 @@ async function resume() {
 async function cancel() {
   cancelling.value = true;
   try {
-    const id = recordId(props.booking.id)!;
+    const id = plainUuid(props.booking.id)!;
     // Two different endpoints behind one button: releasing an unpaid hold and
     // cancelling a paid booking are separate transitions on the server, and it
     // answers 409 if you aim the wrong one at a booking.
@@ -140,7 +139,7 @@ async function cancel() {
 <template>
   <div class="p-3 space-y-2 border border-border shadow-xs bg-card rounded-md">
     <div class="flex items-start gap-3" :class="!past && 'cursor-pointer'" @click="!past && (detailOpen = true)">
-      <img v-if="booking?.spot?.images?.[0]" :src="imageUrl(booking.spot.images[0])"
+      <img v-if="booking?.spot?.images?.[0]" :src="booking.spot.images[0]"
         class="w-20 h-20 shrink-0 rounded-lg object-cover" />
       <div class="flex-1 space-y-1">
         <div class="font-semibold">{{ booking?.spot?.title }}</div>

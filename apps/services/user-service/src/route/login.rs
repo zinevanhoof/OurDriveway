@@ -1,11 +1,11 @@
 use axum::{Json, extract::State};
-use shared::error::myerror::MyResult;
-use shared::extract::Valid;
 use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
 use cookie::time::Duration;
+use shared::error::myerror::MyResult;
+use shared::extract::Valid;
 use shared::{requests::user::LoginRequest, responses::user::AuthResponse};
 
 use crate::AppState;

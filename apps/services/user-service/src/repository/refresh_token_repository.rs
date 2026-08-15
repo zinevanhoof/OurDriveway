@@ -3,7 +3,6 @@ use shared::{
     events::{
         Envelope,
         session::{RefreshTokenIssued, RefreshTokenRevoked, RefreshTokenRotated, SessionEvent},
-        user::record_key,
     },
 };
 use surrealdb::{
@@ -11,6 +10,7 @@ use surrealdb::{
     engine::remote::ws::Client,
     types::{Datetime, SurrealValue},
 };
+use uuid::Uuid;
 
 pub struct RefreshTokenRepository {
     pub db: Surreal<Client>,
@@ -22,7 +22,7 @@ pub struct RefreshTokenRepository {
 /// user's sessions), and enough to decide whether the token is still valid.
 #[derive(SurrealValue)]
 pub struct RefreshTokenAuth {
-    pub user_uid: String,
+    pub user_uid: Uuid,
     pub shard: String,
     pub revoked: bool,
     pub expires_at: Datetime,
@@ -84,8 +84,8 @@ impl RefreshTokenRepository {
                  UPSERT _projection:SESSIONS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.token_id)))
-            .bind(("user_id", record_key(&e.user_id)))
+            .bind(("id", e.token_id))
+            .bind(("user_id", e.user_id))
             .bind(("shard", e.shard))
             .bind(("token_hash", e.token_hash))
             .bind(("jti", surrealdb::types::Uuid::from(e.jti)))
@@ -119,8 +119,8 @@ impl RefreshTokenRepository {
                  COMMIT;",
             )
             .bind(("old_hash", e.old_token_hash))
-            .bind(("id", record_key(&e.token_id)))
-            .bind(("user_id", record_key(&e.user_id)))
+            .bind(("id", e.token_id))
+            .bind(("user_id", e.user_id))
             .bind(("shard", e.shard))
             .bind(("token_hash", e.token_hash))
             .bind(("jti", surrealdb::types::Uuid::from(e.jti)))

@@ -6,10 +6,10 @@ use chrono::{DateTime, Utc};
 use shared::{
     error::myerror::{MyError, MyResult},
     events::{
-        Envelope, STREAM_BOOKINGS, STREAM_SPOTS, booking_subject,
+        Envelope, STREAM_BOOKINGS, STREAM_SPOTS,
         booking::{BookingEvent, CancelReason},
+        booking_subject,
         spot::SpotEvent,
-        user::record_key,
     },
     general_models::spot::Availability,
 };
@@ -82,7 +82,6 @@ impl SpotProjector {
             _ => return Ok(()),
         };
 
-        let key = record_key(&spot_id);
         let at = envelope.occurred_at;
 
         // ponytail: reads the booking table, which the *other* projector writes on
@@ -93,7 +92,7 @@ impl SpotProjector {
         // Close it with a reconciliation sweep over confirmed future bookings,
         // shaped like service/expiry.rs, if it ever shows up in practice.
 
-        for booking in self.repository.upcoming_confirmed(&key, at).await? {
+        for booking in self.repository.upcoming_confirmed(&spot_id, at).await? {
             if let Some(availability) = availability
                 && fits(availability, &booking)
             {
@@ -109,14 +108,11 @@ impl SpotProjector {
         &self,
         spot_shard: &str,
         spot_id: &Uuid,
-        booking_id: &str,
+        booking_id: &Uuid,
         at: DateTime<Utc>,
     ) -> MyResult<()> {
-        let booking_id = Uuid::parse_str(booking_id)
-            .map_err(|e| MyError::Bus(format!("booking id {booking_id}: {e}")))?;
-
         let event = BookingEvent::Cancelled {
-            booking_id,
+            booking_id: *booking_id,
             reason: CancelReason::SpotUnavailable,
         };
         // `actor_id: None` — the host acted on the spot, not on this booking.
@@ -187,7 +183,7 @@ mod tests {
 
     fn booking(date: &str, slots: Vec<TimeSlot>) -> LiveBooking {
         LiveBooking {
-            id: "0198f00d000070008000000000000001".into(),
+            id: Uuid::now_v7(),
             spot_shard: "00".into(),
             booked: HashMap::from([(date.to_string(), slots)]),
         }
@@ -216,11 +212,20 @@ mod tests {
 
         // Inside — survives. This is the case that matters: a booking colliding with
         // *itself* through `spot.booked` would cancel every booking on every edit.
-        assert!(fits(&hours, &booking("2026-08-03", vec![slot("09:00", "10:00")])));
+        assert!(fits(
+            &hours,
+            &booking("2026-08-03", vec![slot("09:00", "10:00")])
+        ));
         // Starts inside, runs past the close.
-        assert!(!fits(&hours, &booking("2026-08-03", vec![slot("17:00", "19:00")])));
+        assert!(!fits(
+            &hours,
+            &booking("2026-08-03", vec![slot("17:00", "19:00")])
+        ));
         // Entirely outside.
-        assert!(!fits(&hours, &booking("2026-08-03", vec![slot("06:00", "07:00")])));
+        assert!(!fits(
+            &hours,
+            &booking("2026-08-03", vec![slot("06:00", "07:00")])
+        ));
         // Right day, but the host closed Mondays altogether.
         assert!(!fits(
             &availability(vec![]),
@@ -229,7 +234,10 @@ mod tests {
         // Two slots, one of them now outside: the whole booking goes.
         assert!(!fits(
             &hours,
-            &booking("2026-08-03", vec![slot("09:00", "10:00"), slot("19:00", "20:00")])
+            &booking(
+                "2026-08-03",
+                vec![slot("09:00", "10:00"), slot("19:00", "20:00")]
+            )
         ));
     }
 
@@ -239,6 +247,9 @@ mod tests {
         // touches one date still has to be checked against every booking on it.
         let mut hours = availability(vec![slot("08:00", "18:00")]);
         hours.single.insert("2026-08-03".into(), vec![]);
-        assert!(!fits(&hours, &booking("2026-08-03", vec![slot("09:00", "10:00")])));
+        assert!(!fits(
+            &hours,
+            &booking("2026-08-03", vec![slot("09:00", "10:00")])
+        ));
     }
 }

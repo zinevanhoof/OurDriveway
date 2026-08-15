@@ -54,20 +54,7 @@ async fn sweep(js: &Context, repository: &BookingRepository) -> MyResult<()> {
     tracing::info!(count = lapsed.len(), "releasing lapsed holds");
 
     for hold in lapsed {
-        let booking_id = match Uuid::parse_str(&hold.id) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::error!(id = %hold.id, error = %e, "unparseable booking id; skipping");
-                continue;
-            }
-        };
-        let spot_id = match Uuid::parse_str(&hold.spot_id) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::error!(spot = %hold.spot_id, error = %e, "unparseable spot id; skipping");
-                continue;
-            }
-        };
+        let (booking_id, spot_id) = (hold.id, hold.spot_id);
 
         let event = BookingEvent::Released {
             booking_id,
@@ -88,7 +75,8 @@ async fn sweep(js: &Context, repository: &BookingRepository) -> MyResult<()> {
         // race in a way that matters. Applying it is guarded on the booking still
         // being 'reserved', which is what stops it undoing a payment that landed in
         // the same instant.
-        if let Err(e) = bus::publish(js, booking_subject(&hold.spot_shard, &spot_id), &envelope).await
+        if let Err(e) =
+            bus::publish(js, booking_subject(&hold.spot_shard, &spot_id), &envelope).await
         {
             tracing::error!(booking = %booking_id, error = %e, "failed to publish expiry");
         }

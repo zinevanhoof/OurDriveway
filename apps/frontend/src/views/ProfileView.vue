@@ -6,7 +6,7 @@ import { useQuery } from '@urql/vue';
 import { ME } from '@/api/graphql/user.ts';
 import { useAuthStore } from '@/stores/auth.ts';
 import { computed, ref } from 'vue';
-import { recordId } from '@/lib/utils.ts';
+import { gqlRecordId } from '@/lib/utils.ts';
 import Avatar from '@/components/ui/avatar/Avatar.vue';
 import AvatarImage from '@/components/ui/avatar/AvatarImage.vue';
 import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue';
@@ -14,7 +14,6 @@ import { Camera, ChevronRight, Lock, LogOut, UserRound } from '@lucide/vue';
 import { formatCents } from '@/lib/money';
 import { useRouter } from 'vue-router';
 import { logoutUser } from '@/api/userApi';
-import { imageUrl } from '@/lib/media'
 import PayoutsComponent from '@/components/profile/PayoutsComponent.vue';
 
 const auth = useAuthStore()
@@ -22,7 +21,7 @@ const router = useRouter()
 
 const { data } = useQuery({
     query: ME,
-    variables: computed(() => ({ id: recordId(auth.user?.id) })),
+    variables: computed(() => ({ id: gqlRecordId(auth.user?.id) })),
 })
 
 // No `!` here: the query has not resolved on first render, so this really is
@@ -51,7 +50,7 @@ const logout = async () => {
                 <button type="button" class="relative cursor-pointer"
                     @click="router.push({ name: 'profile-edit' })">
                     <Avatar size="3xl">
-                        <AvatarImage v-if="me.profilePicture" :src="imageUrl(me.profilePicture)" />
+                        <AvatarImage v-if="me.profilePicture" :src="me.profilePicture" />
                         <AvatarFallback :name="{ firstName: me.firstName, lastName: me.lastName }" />
                     </Avatar>
                     <span

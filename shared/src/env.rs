@@ -21,7 +21,9 @@ use std::{fmt::Display, str::FromStr};
 pub fn require(key: &str) -> String {
     match std::env::var(key) {
         Ok(value) => value,
-        Err(_) => panic!("{key} must be set — see this service's .env, which lists every variable it reads"),
+        Err(_) => panic!(
+            "{key} must be set — see this service's .env, which lists every variable it reads"
+        ),
     }
 }
 
@@ -35,6 +37,9 @@ where
     let raw = require(key);
     match raw.parse() {
         Ok(value) => value,
-        Err(e) => panic!("{key}={raw:?} is not a valid {}: {e}", std::any::type_name::<T>()),
+        Err(e) => panic!(
+            "{key}={raw:?} is not a valid {}: {e}",
+            std::any::type_name::<T>()
+        ),
     }
 }

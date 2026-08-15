@@ -2,10 +2,11 @@ use shared::{
     error::myerror::MyResult,
     events::{
         Envelope,
-        user::{UserEvent, UserPasswordChanged, UserRegistered, UserUpdated, record_key},
+        user::{UserEvent, UserPasswordChanged, UserRegistered, UserUpdated},
     },
 };
 use surrealdb::{Surreal, engine::remote::ws::Client, types::SurrealValue};
+use uuid::Uuid;
 
 /// Reads serve requests; the `apply_*` methods are the projector's, and are the
 /// **only** writers. Handlers publish events and never write here.
@@ -13,8 +14,8 @@ pub struct UserRepository {
     pub db: Surreal<Client>,
 }
 
-/// What login needs: the record key as a plain uuid (so the JWT claim can be
-/// built as `user:<uuid>`), the stored hash to verify against, and the user's
+/// What login needs: the record key (a uuid, straight from `record::id(id)`), the
+/// stored hash to verify against, and the user's
 /// shard so the session event lands on the same subject as their other events.
 ///
 /// `email` is here for the profile edit, which has to know whether the submitted
@@ -25,7 +26,7 @@ pub struct UserRepository {
 /// having the flag in hand.
 #[derive(SurrealValue)]
 pub struct UserAuth {
-    pub uid: String,
+    pub uid: Uuid,
     pub password: String,
     pub shard: String,
     pub email: String,
@@ -49,11 +50,11 @@ impl UserRepository {
     /// The same row, addressed by id instead of email — what every authenticated
     /// write needs, since the JWT carries the id and nothing else. Also the only
     /// way to learn a user's shard without knowing their email.
-    pub async fn find_auth_by_id(&self, uid: &str) -> MyResult<Option<UserAuth>> {
+    pub async fn find_auth_by_id(&self, uid: &Uuid) -> MyResult<Option<UserAuth>> {
         let found: Option<UserAuth> = self
             .db
             .query("SELECT record::id(id) AS uid, password, shard, email, email_verified FROM ONLY type::record('user', $id)")
-            .bind(("id", uid.to_string()))
+            .bind(("id", *uid))
             .await?
             .take(0)?;
         Ok(found)
@@ -62,11 +63,11 @@ impl UserRepository {
     /// Just the greeting for an email. Its own query rather than a field on
     /// `UserAuth`, which every login path pays for and none of them greets
     /// anybody.
-    pub async fn first_name(&self, uid: &str) -> MyResult<String> {
+    pub async fn first_name(&self, uid: &Uuid) -> MyResult<String> {
         let found: Option<String> = self
             .db
             .query("SELECT VALUE first_name FROM ONLY type::record('user', $id)")
-            .bind(("id", uid.to_string()))
+            .bind(("id", *uid))
             .await?
             .take(0)?;
         Ok(found.unwrap_or_default())
@@ -134,7 +135,7 @@ impl UserRepository {
                  UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.user_id)))
+            .bind(("id", e.user_id))
             .bind(("shard", e.shard))
             .bind(("first_name", e.first_name))
             .bind(("last_name", e.last_name))
@@ -175,7 +176,7 @@ impl UserRepository {
                  UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.user_id)))
+            .bind(("id", e.user_id))
             .bind(("first_name", e.first_name))
             .bind(("last_name", e.last_name))
             .bind(("profile_picture", e.profile_picture))
@@ -204,7 +205,7 @@ impl UserRepository {
                  UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(user_id)))
+            .bind(("id", *user_id))
             .bind(("at", surrealdb::types::Datetime::from(at)))
             .bind(("seq", seq as i64))
             .await?
@@ -225,7 +226,7 @@ impl UserRepository {
                  UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.user_id)))
+            .bind(("id", e.user_id))
             .bind(("password", e.password_hash))
             .bind(("at", surrealdb::types::Datetime::from(at)))
             .bind(("seq", seq as i64))
@@ -234,4 +235,3 @@ impl UserRepository {
         Ok(())
     }
 }
-

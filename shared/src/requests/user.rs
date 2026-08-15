@@ -78,14 +78,14 @@ pub struct UpdateProfileRequest {
     pub profile_picture: Option<String>,
 }
 
-/// The picture has to be a key media-service minted under the avatar prefix.
+/// The picture has to be a URL media-service minted under the avatar prefix.
 ///
 /// Same trust boundary as a spot's photos: it comes straight back from the client
 /// and is rendered as an `<img src>` anywhere this user appears — on their own
 /// profile, in a spot's owner card, on a booking row.
-fn is_avatar(key: &String, _: &()) -> garde::Result {
+fn is_avatar(url: &String, _: &()) -> garde::Result {
     require(
-        crate::media::is_media_key(key, crate::media::PREFIX_AVATARS),
+        crate::media::is_media_url(url, crate::media::PREFIX_AVATARS),
         "Unknown picture.",
     )
 }
@@ -201,20 +201,30 @@ mod tests {
     /// a request that 422s.
     #[test]
     fn change_password_rules_match_signup() {
-        let change = |pw: &str| ChangePasswordRequest {
-            current_password: "whatever".into(),
-            new_password: pw.into(),
-        }
-        .validate();
-        let signup = |pw: &str| SignupRequest {
-            first_name: "test".into(),
-            last_name: "test".into(),
-            email: "a@b.com".into(),
-            password: pw.into(),
-        }
-        .validate();
+        let change = |pw: &str| {
+            ChangePasswordRequest {
+                current_password: "whatever".into(),
+                new_password: pw.into(),
+            }
+            .validate()
+        };
+        let signup = |pw: &str| {
+            SignupRequest {
+                first_name: "test".into(),
+                last_name: "test".into(),
+                email: "a@b.com".into(),
+                password: pw.into(),
+            }
+            .validate()
+        };
 
-        for pw in ["Str0ng!pw", "weakpassword", "Aa1!", "NOLOWER1!", "nodigit!!"] {
+        for pw in [
+            "Str0ng!pw",
+            "weakpassword",
+            "Aa1!",
+            "NOLOWER1!",
+            "nodigit!!",
+        ] {
             assert_eq!(
                 change(pw).is_ok(),
                 signup(pw).is_ok(),
@@ -235,15 +245,17 @@ mod tests {
 
     #[test]
     fn profile_rejects_blank_names_and_plates() {
-        let profile = |plates: Vec<&str>| UpdateProfileRequest {
-            first_name: "Zine".into(),
-            last_name: "Van Hoof".into(),
-            email: "a@b.com".into(),
-            license_plates: plates.into_iter().map(Into::into).collect(),
-            current_password: None,
-            profile_picture: None,
-        }
-        .validate();
+        let profile = |plates: Vec<&str>| {
+            UpdateProfileRequest {
+                first_name: "Zine".into(),
+                last_name: "Van Hoof".into(),
+                email: "a@b.com".into(),
+                license_plates: plates.into_iter().map(Into::into).collect(),
+                current_password: None,
+                profile_picture: None,
+            }
+            .validate()
+        };
 
         assert!(profile(vec![]).is_ok(), "no plates is a valid profile");
         assert!(profile(vec!["1-ABC-123"]).is_ok());
@@ -284,11 +296,22 @@ mod tests {
             .is_ok()
         };
 
+        crate::media::init_test_base();
+        let name = "019fd9a1a3cb7d12b96249db33e2a909.jpeg";
+        let avatar = crate::media::url_for(crate::media::PREFIX_AVATARS, name);
+
         assert!(with(None), "unchanged is the common case");
-        assert!(with(Some("avatars/019fd9a1a3cb7d12b96249db33e2a909.jpeg")));
+        assert!(with(Some(&avatar)));
         // A spot photo is not an avatar — the prefixes are not interchangeable.
-        assert!(!with(Some("spots/019fd9a1a3cb7d12b96249db33e2a909.jpeg")));
+        assert!(!with(Some(&crate::media::url_for(
+            crate::media::PREFIX_SPOTS,
+            name
+        ))));
+        // Right shape, wrong origin — the check this scheme exists for.
+        assert!(!with(Some(&format!("https://evil.example/avatars/{name}"))));
         assert!(!with(Some("https://evil.example/track.png")));
+        // A bare key, i.e. the scheme this replaced.
+        assert!(!with(Some(&format!("avatars/{name}"))));
         assert!(!with(Some("")));
     }
 
@@ -312,4 +335,3 @@ mod tests {
         );
     }
 }
-

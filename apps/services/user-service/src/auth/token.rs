@@ -22,7 +22,11 @@ mod tests {
     fn is_stable_and_distinct() {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        assert_eq!(hash(&a), hash(&a), "same token must hash the same on every instance");
+        assert_eq!(
+            hash(&a),
+            hash(&a),
+            "same token must hash the same on every instance"
+        );
         assert_ne!(hash(&a), hash(&b));
         assert_eq!(hash(&a).len(), 64, "hex-encoded sha256");
     }

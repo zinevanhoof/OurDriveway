@@ -1,7 +1,11 @@
 use std::sync::{Arc, LazyLock};
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
-use axum::{Router, http::StatusCode, routing::{get, post}};
+use axum::{
+    Router,
+    http::StatusCode,
+    routing::{get, post},
+};
 use shared::env;
 
 mod route;
@@ -17,8 +21,14 @@ pub struct Config {
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
     /// `https://<account>.r2.cloudflarestorage.com`. The S3 API endpoint, which is
-    /// NOT the public read URL — that one only the frontend knows.
+    /// NOT the public read URL — see `media_base`.
     pub s3_endpoint: String,
+    /// Where those objects are *served* from, e.g. `https://images.ourdriveway.com`.
+    /// A different hostname from `s3_endpoint`, and the one that goes into events:
+    /// this service mints the absolute URL clients store. Must match the base that
+    /// spot-service and user-service validate against, or every upload is refused
+    /// on the way back in.
+    pub media_base: String,
     /// Separate buckets per environment, so local test uploads never land beside
     /// real listings and the dev credential can be scoped away from production.
     pub s3_bucket: String,
@@ -38,6 +48,7 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     port: env::require_parsed("PORT"),
     jwt_secret: env::require("JWT_SECRET"),
     s3_endpoint: env::require("S3_ENDPOINT"),
+    media_base: env::require("MEDIA_BASE"),
     s3_bucket: env::require("S3_BUCKET"),
     s3_region: env::require("S3_REGION"),
     s3_access_key_id: env::require("S3_ACCESS_KEY_ID"),
@@ -65,6 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // missing variable would surface as a panic inside the first handler that
     // needed it, leaving a process that passes its health check and fails requests.
     LazyLock::force(&CONFIG);
+    // Installs the origin `shared::media` mints and validates against. Beside the
+    // CONFIG force for the same reason: a missing base must stop the process, not
+    // surface as a rejected upload later.
+    shared::media::init_base(&CONFIG.media_base);
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
     // Credentials come from the Config above rather than a provider chain: this

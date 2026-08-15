@@ -5,7 +5,7 @@ use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use shared::error::myerror::{MyError, MyResult};
 use shared::extractors::authed_jwt::AuthedJwt;
-use shared::media::{PREFIX_AVATARS, PREFIX_SPOTS};
+use shared::media::{self, PREFIX_AVATARS, PREFIX_SPOTS};
 use uuid::Uuid;
 
 use crate::{AppState, CONFIG};
@@ -42,8 +42,8 @@ impl Kind {
 #[serde(rename_all = "camelCase")]
 pub struct UploadUrlResponse {
     /// What the client sends back in the create/edit request, and what ends up in
-    /// the event. Bare, with no hostname — see `shared::media`.
-    pub key: String,
+    /// the event: the whole URL, already loadable. See `shared::media`.
+    pub url: String,
     /// Where to PUT the bytes. Good for one object, one method and one size.
     pub upload_url: String,
 }
@@ -81,11 +81,8 @@ pub async fn upload_url(
     // filename, which meant sniffing an extension out of a string that could also
     // contain "../"; deriving it from a content type we just checked against a
     // fixed list removes the parsing problem rather than guarding it.
-    let key = format!(
-        "{}/{}.{extension}",
-        request.kind.prefix(),
-        Uuid::now_v7().simple()
-    );
+    let name = format!("{}.{extension}", Uuid::now_v7().simple());
+    let key = format!("{}/{name}", request.kind.prefix());
 
     // `content_length` and `content_type` are set so they are SIGNED, not merely
     // suggested: a presigned PUT has no equivalent of a POST policy's
@@ -107,7 +104,10 @@ pub async fn upload_url(
         .map_err(|e| internal("presign", e))?;
 
     Ok(Json(UploadUrlResponse {
-        key,
+        // The bucket key addresses the object; the URL addresses how it is *served*,
+        // which is a different hostname entirely (`S3_ENDPOINT` is the API, not the
+        // public origin). Only the second one leaves this service.
+        url: media::url_for(request.kind.prefix(), &name),
         upload_url: presigned.uri().to_string(),
     }))
 }
@@ -139,21 +139,23 @@ fn internal(what: &str, error: impl std::fmt::Display) -> MyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::media::is_media_key;
+    use shared::media::{init_base, is_media_url};
 
     /// The allowlist and the extension table are the same decision, so they can't
     /// disagree — but the key built from one has to satisfy the validator that
     /// spot-service and user-service run on the way back in.
     #[test]
     fn minted_keys_pass_the_validator_that_guards_the_event_log() {
+        init_base("https://images.test.example");
         for (content_type, kind, prefix) in [
             ("image/jpeg", Kind::Spot, PREFIX_SPOTS),
             ("image/png", Kind::Spot, PREFIX_SPOTS),
             ("image/webp", Kind::Avatar, PREFIX_AVATARS),
         ] {
             let extension = extension_for(content_type).expect("allowlisted");
-            let key = format!("{}/{}.{extension}", kind.prefix(), Uuid::now_v7().simple());
-            assert!(is_media_key(&key, prefix), "{key} rejected");
+            let name = format!("{}.{extension}", Uuid::now_v7().simple());
+            let url = media::url_for(kind.prefix(), &name);
+            assert!(is_media_url(&url, prefix), "{url} rejected");
         }
     }
 

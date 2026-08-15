@@ -1,9 +1,7 @@
 use bus::Projector;
 use shared::{
     error::myerror::{MyError, MyResult},
-    events::{
-        Envelope, STREAM_SESSIONS, STREAM_USERS, session::SessionEvent, user::UserEvent,
-    },
+    events::{Envelope, STREAM_SESSIONS, STREAM_USERS, session::SessionEvent, user::UserEvent},
 };
 
 use crate::repository::{

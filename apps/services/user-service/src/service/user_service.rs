@@ -6,7 +6,6 @@ use shared::events::session::{
 };
 use shared::events::user::{
     UserEvent, UserPasswordChanged, UserRegistered, UserUpdated, VerificationRequested,
-    user_claim_id,
 };
 use shared::events::{Envelope, session_subject, shard_of, user_subject};
 use shared::requests::user::UpdateProfileRequest;
@@ -86,7 +85,10 @@ impl UserService {
         let ok = match &found {
             Some(u) => password::verify(&u.password, password_plain),
             None => {
-                password::verify("$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$0000000000000000000000000000000000000000000", password_plain);
+                password::verify(
+                    "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$0000000000000000000000000000000000000000000",
+                    password_plain,
+                );
                 false
             }
         };
@@ -110,7 +112,7 @@ impl UserService {
             ));
         }
 
-        let user_uuid = parse_uuid(&user.uid)?;
+        let user_uuid = user.uid;
 
         let refresh_token = Uuid::new_v4();
         let (jwt, expires_at, jti) = self.mint_jwt(&user_uuid)?;
@@ -161,7 +163,7 @@ impl UserService {
         // user must stay on the subject their history already lives on.
         let user = self
             .user_repository
-            .find_auth_by_id(&user_id.simple().to_string())
+            .find_auth_by_id(&user_id)
             .await?
             .context_not_found(("Not Found", "Could not find user"))?;
 
@@ -190,7 +192,7 @@ impl UserService {
         if user.email_verified {
             return Ok(());
         }
-        let user_uuid = parse_uuid(&user.uid)?;
+        let user_uuid = user.uid;
 
         // First name comes off the projection rather than the token, because the
         // template greets the reader by it and the token carries only an id.
@@ -219,7 +221,7 @@ impl UserService {
         let Some(existing) = self.refresh_token_repository.find_by_hash(&hash).await? else {
             return Ok(());
         };
-        let user_uuid = parse_uuid(&existing.user_uid)?;
+        let user_uuid = existing.user_uid;
 
         let seq = self
             .publish_session(
@@ -251,7 +253,7 @@ impl UserService {
             ))?
         }
 
-        let user_uuid = parse_uuid(&existing.user_uid)?;
+        let user_uuid = existing.user_uid;
         let new_refresh = Uuid::new_v4();
         let (jwt, expires_at, jti) = self.mint_jwt(&user_uuid)?;
 
@@ -283,13 +285,13 @@ impl UserService {
     /// `await_seq` below only covers this service's own.
     ///
     /// No ownership lookup: the target is always the caller's own record.
-    pub async fn update_profile(&self, uid: &str, req: UpdateProfileRequest) -> MyResult<u64> {
+    pub async fn update_profile(&self, uid: &Uuid, req: UpdateProfileRequest) -> MyResult<u64> {
         let existing = self
             .user_repository
             .find_auth_by_id(uid)
             .await?
             .context_not_found(("Not Found", "Could not find user"))?;
-        let user_uuid = parse_uuid(&existing.uid)?;
+        let user_uuid = existing.uid;
 
         // Changing the address a password reset would be sent to is an account
         // takeover if it's left unguarded. Verification now catches it afterwards
@@ -333,12 +335,14 @@ impl UserService {
             profile_picture: req.profile_picture,
         });
 
-        let seq = self.publish_user(&existing.shard, &user_uuid, event).await?;
+        let seq = self
+            .publish_user(&existing.shard, &user_uuid, event)
+            .await?;
         await_seq(&self.users_applied, seq).await;
         Ok(seq)
     }
 
-    pub async fn change_password(&self, uid: &str, current: &str, new: &str) -> MyResult<u64> {
+    pub async fn change_password(&self, uid: &Uuid, current: &str, new: &str) -> MyResult<u64> {
         let existing = self
             .user_repository
             .find_auth_by_id(uid)
@@ -349,13 +353,15 @@ impl UserService {
             return Err(MyError::unauthorized("Unauthorized", "Incorrect password"));
         }
 
-        let user_uuid = parse_uuid(&existing.uid)?;
+        let user_uuid = existing.uid;
         let event = UserEvent::PasswordChanged(UserPasswordChanged {
             user_id: user_uuid,
             password_hash: password::hash(new)?,
         });
 
-        let seq = self.publish_user(&existing.shard, &user_uuid, event).await?;
+        let seq = self
+            .publish_user(&existing.shard, &user_uuid, event)
+            .await?;
         await_seq(&self.users_applied, seq).await;
         Ok(seq)
     }
@@ -364,7 +370,7 @@ impl UserService {
         bus::publish(
             &self.js,
             user_subject(shard, user_uuid),
-            &Envelope::new(event, Some(user_claim_id(user_uuid))),
+            &Envelope::new(event, Some(*user_uuid)),
         )
         .await
     }
@@ -374,7 +380,7 @@ impl UserService {
         let now = Utc::now();
         let jti = Uuid::new_v4();
         let jwt = generate_jwt(
-            &user_claim_id(user_uuid),
+            user_uuid,
             now + Duration::minutes(CONFIG.jwt_expiration),
             jti,
         )?;
@@ -394,7 +400,7 @@ impl UserService {
         bus::publish(
             &self.js,
             session_subject(shard, user_uuid),
-            &Envelope::new(event, Some(user_claim_id(user_uuid))),
+            &Envelope::new(event, Some(*user_uuid)),
         )
         .await
     }
@@ -412,8 +418,4 @@ async fn await_seq(rx: &tokio::sync::watch::Receiver<u64>, seq: u64) {
         }
     })
     .await;
-}
-
-fn parse_uuid(uid: &str) -> MyResult<Uuid> {
-    Uuid::parse_str(uid).map_err(|e| MyError::Bus(format!("bad user id {uid}: {e}")))
 }

@@ -1,16 +1,15 @@
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     events::{
         Envelope,
         booking::{BookingEvent, BookingReserved, CancelReason, ReleaseReason},
         spot::{SpotCreated, SpotEvent, SpotUpdated},
-        user::record_key,
     },
     general_models::booking::{Booked, BookingRow, fold_booked},
     general_models::spot::Availability,
 };
-use serde::Deserialize;
 use surrealdb::{
     Surreal,
     engine::remote::ws::Client,
@@ -27,7 +26,7 @@ pub struct BookingRepository {
 /// Everything reserve needs, in one point read.
 #[derive(Debug, Deserialize, SurrealValue)]
 pub struct SpotForBooking {
-    pub owner_id: Option<String>,
+    pub owner_id: Option<Uuid>,
     pub shard: Option<String>,
     pub price_per_hour: Option<i64>,
     pub availability: Option<Availability>,
@@ -48,9 +47,9 @@ pub struct SpotForBooking {
 /// A booking as confirm, release, and reserve's lost-ack recovery need it.
 #[derive(Debug, Deserialize, SurrealValue)]
 pub struct BookingForUpdate {
-    pub spot_id: String,
+    pub spot_id: Uuid,
     pub spot_shard: String,
-    pub renter_id: String,
+    pub renter_id: Uuid,
     pub status: String,
     pub booked: Booked,
     pub amount: i64,
@@ -61,8 +60,8 @@ pub struct BookingForUpdate {
 /// the spot out from under it.
 #[derive(Debug, Deserialize, SurrealValue)]
 pub struct LiveBooking {
-    /// Bare uuid, same as `LapsedHold` — it goes straight back into an event.
-    pub id: String,
+    /// The uuid straight from `record::id(id)` — it goes back into an event as-is.
+    pub id: Uuid,
     pub spot_shard: String,
     pub booked: Booked,
 }
@@ -70,10 +69,10 @@ pub struct LiveBooking {
 /// A lapsed hold the sweeper is about to release.
 #[derive(Debug, Deserialize, SurrealValue)]
 pub struct LapsedHold {
-    /// Bare uuid, not a `RecordId` — the sweeper parses it straight back into a
-    /// `Uuid` for the event, and the table name would only be in the way.
-    pub id: String,
-    pub spot_id: String,
+    /// The uuid straight from `record::id(id)`; the table name would only be in
+    /// the way when the sweeper puts it back into an event.
+    pub id: Uuid,
+    pub spot_id: Uuid,
     pub spot_shard: String,
 }
 
@@ -90,7 +89,7 @@ impl BookingRepository {
 
     // ─── reads ──────────────────────────────────────────────────────────────
 
-    pub async fn spot_for_booking(&self, spot_id: &str) -> MyResult<Option<SpotForBooking>> {
+    pub async fn spot_for_booking(&self, spot_id: &Uuid) -> MyResult<Option<SpotForBooking>> {
         Ok(self
             .db
             .query(
@@ -102,19 +101,22 @@ impl BookingRepository {
                         booked ?? {} AS booked, bookings_seq ?? 0 AS bookings_seq
                  FROM ONLY type::record('spot', $id)",
             )
-            .bind(("id", spot_id.to_string()))
+            .bind(("id", *spot_id))
             .await?
             .take(0)?)
     }
 
-    pub async fn booking_for_update(&self, booking_id: &str) -> MyResult<Option<BookingForUpdate>> {
+    pub async fn booking_for_update(
+        &self,
+        booking_id: &Uuid,
+    ) -> MyResult<Option<BookingForUpdate>> {
         Ok(self
             .db
             .query(
                 "SELECT spot_id, spot_shard, renter_id, status, booked, amount, hold_until
                  FROM ONLY type::record('booking', $id)",
             )
-            .bind(("id", booking_id.to_string()))
+            .bind(("id", *booking_id))
             .await?
             .take(0)?)
     }
@@ -140,7 +142,7 @@ impl BookingRepository {
     /// the reactor's output a function of the log.
     pub async fn upcoming_confirmed(
         &self,
-        spot_id: &str,
+        spot_id: &Uuid,
         at: DateTime<Utc>,
     ) -> MyResult<Vec<LiveBooking>> {
         Ok(self
@@ -149,7 +151,7 @@ impl BookingRepository {
                 "SELECT record::id(id) AS id, spot_shard, booked FROM booking
                  WHERE spot_id = $spot_id AND status = 'confirmed' AND ends_at > $at",
             )
-            .bind(("spot_id", spot_id.to_string()))
+            .bind(("spot_id", *spot_id))
             .bind(("at", Datetime::from(at)))
             .await?
             .take(0)?)
@@ -170,12 +172,7 @@ impl BookingRepository {
         }
     }
 
-    async fn spot_created(
-        &self,
-        e: SpotCreated,
-        at: DateTime<Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
+    async fn spot_created(&self, e: SpotCreated, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
         // MERGE, never CONTENT. CONTENT replaces the whole record body with the
         // listed keys, which would wipe `booked` and `bookings_seq` — the SPOTS and
         // BOOKINGS projectors advance independently, so on any cold rebuild this
@@ -190,7 +187,7 @@ impl BookingRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.spot_id)))
+            .bind(("id", e.spot_id))
             .bind(("owner_id", e.owner_id))
             .bind(("shard", e.shard))
             .bind(("price", e.price_per_hour_cents))
@@ -215,7 +212,7 @@ impl BookingRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.spot_id)))
+            .bind(("id", e.spot_id))
             .bind(("price", e.price_per_hour_cents))
             .bind(("availability", e.availability))
             .bind(("at", Datetime::from(at)))
@@ -239,7 +236,7 @@ impl BookingRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&spot_id)))
+            .bind(("id", spot_id))
             .bind(("active", active))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
@@ -256,7 +253,7 @@ impl BookingRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&spot_id)))
+            .bind(("id", spot_id))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
             .await?
@@ -281,7 +278,7 @@ impl BookingRepository {
     }
 
     async fn reserved(&self, e: BookingReserved, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
-        let spot_id = record_key(&e.spot_id);
+        let spot_id = e.spot_id;
         self.db
             .query(
                 "UPSERT type::record('booking', $id) CONTENT {
@@ -291,7 +288,7 @@ impl BookingRepository {
                      created_at: $at
                  };",
             )
-            .bind(("id", record_key(&e.booking_id)))
+            .bind(("id", e.booking_id))
             .bind(("spot_id", spot_id.clone()))
             .bind(("spot_shard", e.spot_shard))
             .bind(("owner_id", e.owner_id))
@@ -361,8 +358,8 @@ impl BookingRepository {
         from: &[&str],
         release: Option<ReleaseReason>,
         cancel: Option<CancelReason>,
-    ) -> MyResult<Option<String>> {
-        let spot_id: Option<String> = self
+    ) -> MyResult<Option<Uuid>> {
+        let spot_id: Option<Uuid> = self
             .db
             .query(
                 "UPDATE type::record('booking', $id) SET
@@ -373,9 +370,12 @@ impl BookingRepository {
                  WHERE status IN $from
                  RETURN VALUE spot_id;",
             )
-            .bind(("id", record_key(&booking_id)))
+            .bind(("id", booking_id))
             .bind(("to", to.to_string()))
-            .bind(("from", from.iter().map(|s| s.to_string()).collect::<Vec<_>>()))
+            .bind((
+                "from",
+                from.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            ))
             .bind(("release", release.map(|r| r.as_str().to_string())))
             .bind(("cancel", cancel.map(|c| c.as_str().to_string())))
             .await?
@@ -383,7 +383,7 @@ impl BookingRepository {
         Ok(spot_id)
     }
 
-    async fn refold_opt(&self, spot_id: Option<String>, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
+    async fn refold_opt(&self, spot_id: Option<Uuid>, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
         match spot_id {
             Some(id) => self.refold(&id, at, seq).await,
             // The transition didn't apply (already released, already confirmed).
@@ -398,11 +398,11 @@ impl BookingRepository {
     ///
     /// A full recompute, not an incremental merge: re-delivering the same event
     /// then produces the same map, where appending slots would double them up.
-    async fn refold(&self, spot_id: &str, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
+    async fn refold(&self, spot_id: &Uuid, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
         let rows: Vec<BookingRow> = self
             .db
             .query("SELECT status, booked FROM booking WHERE spot_id = $spot_id")
-            .bind(("spot_id", spot_id.to_string()))
+            .bind(("spot_id", *spot_id))
             .await?
             .take(0)?;
 
@@ -417,7 +417,7 @@ impl BookingRepository {
                  UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", spot_id.to_string()))
+            .bind(("id", *spot_id))
             .bind(("booked", fold_booked(&rows, at)))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))

@@ -16,6 +16,7 @@ pub mod media;
 pub mod notification;
 pub mod requests;
 pub mod responses;
+pub mod rpc;
 
 /// rustls ends up compiled with BOTH the `aws-lc-rs` and `ring` providers (pulled
 /// in through surrealdb/hyper-rustls across the workspace), so it can't auto-pick

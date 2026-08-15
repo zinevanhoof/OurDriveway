@@ -9,6 +9,9 @@ import { User } from "@/types/User";
 //
 // `profile` is null for the moment between registering and the projection
 // catching up; `id` always resolves because it comes from the claim itself.
+//
+// `id` is a plain hyphenated uuid. That is the form a `where` filter on a uuid
+// field takes directly; a `user(id:)` lookup needs it wrapped by gqlRecordId().
 export async function fetchMe(): Promise<User> {
   const response = await apiFetch("/api/view/me");
   if (!response.ok) throw new Error(`fetchMe failed: ${response.status}`);

@@ -4,16 +4,19 @@ use axum::{Json, response::IntoResponse};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use shared::error::myerror::MyResult;
-use shared::events::{STREAM_BOOKINGS, user::record_key};
+use shared::events::STREAM_BOOKINGS;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::booking::CreateBookingRequest;
+use uuid::Uuid;
 
 use crate::AppState;
 
 #[derive(Serialize)]
 pub struct ReservedResponse {
-    pub id: String,
+    /// The uuid, hyphenated. The client wraps it as `u'<uuid>'` for a GraphQL
+    /// `booking(id:)` lookup — see `recordId()` in the frontend.
+    pub id: Uuid,
     /// `"BOOKINGS:812"` — where this write landed in the log. The client echoes it
     /// back on its next read so a load balancer can't route it to an instance that
     /// hasn't projected this event yet.
@@ -44,7 +47,7 @@ pub async fn reserve(
     Ok((
         StatusCode::ACCEPTED,
         Json(ReservedResponse {
-            id: record_key(&reserved.booking_id),
+            id: reserved.booking_id,
             seq: format!("{STREAM_BOOKINGS}:{}", reserved.seq),
             expires_at: reserved.expires_at,
             amount_cents: reserved.amount_cents,
@@ -62,7 +65,7 @@ pub async fn reserve(
 pub async fn release(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-    Path(booking_id): Path<String>,
+    Path(booking_id): Path<Uuid>,
 ) -> MyResult<impl IntoResponse> {
     let seq = state.booking_service.release(&booking_id, &user_id).await?;
     Ok(accepted(seq))
@@ -77,7 +80,7 @@ pub async fn release(
 pub async fn cancel(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-    Path(booking_id): Path<String>,
+    Path(booking_id): Path<Uuid>,
 ) -> MyResult<impl IntoResponse> {
     let seq = state.booking_service.cancel(&booking_id, &user_id).await?;
     Ok(accepted(seq))

@@ -7,12 +7,15 @@ use shared::events::STREAM_SPOTS;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::spot::{CreateSpotRequest, UpdateSpotRequest};
+use uuid::Uuid;
 
 use crate::AppState;
 
 #[derive(Serialize)]
 pub struct CreatedResponse {
-    pub id: String,
+    /// The uuid, hyphenated. The client wraps it as `u'<uuid>'` before handing it
+    /// to a GraphQL `spot(id:)` lookup — see `recordId()` in the frontend.
+    pub id: Uuid,
     /// `"SPOTS:4712"` — where this write landed in the log. The client echoes it
     /// back on its next read so a load balancer can't route it to an instance
     /// that hasn't projected this event yet.
@@ -43,7 +46,7 @@ pub async fn create_spot(
     Ok((
         StatusCode::ACCEPTED,
         Json(CreatedResponse {
-            id: shared::events::user::record_key(&created.spot_id),
+            id: created.spot_id,
             seq: format!("{STREAM_SPOTS}:{}", created.seq),
         }),
     ))
@@ -53,10 +56,13 @@ pub async fn create_spot(
 pub async fn update_spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path(id): Path<Uuid>,
     Valid(request): Valid<UpdateSpotRequest>,
 ) -> MyResult<(StatusCode, Json<AcceptedResponse>)> {
-    let seq = state.spot_service.update_spot(&id, request, user_id).await?;
+    let seq = state
+        .spot_service
+        .update_spot(&id, request, user_id)
+        .await?;
 
     Ok(accepted(seq))
 }
@@ -71,7 +77,7 @@ pub struct ActiveRequest {
 pub async fn set_active(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path(id): Path<Uuid>,
     Json(request): Json<ActiveRequest>,
 ) -> MyResult<(StatusCode, Json<AcceptedResponse>)> {
     let seq = state
@@ -84,7 +90,7 @@ pub async fn set_active(
 pub async fn delete_spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path(id): Path<Uuid>,
 ) -> MyResult<(StatusCode, Json<AcceptedResponse>)> {
     let seq = state.spot_service.delete_spot(&id, user_id).await?;
     Ok(accepted(seq))

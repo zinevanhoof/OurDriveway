@@ -14,8 +14,11 @@ USE NS main DB main;
 -- shared/src/db.rs), so there is no second credential to keep in sync — and no
 -- password literal committed to the repo.
 
-DEFINE TABLE OVERWRITE user SCHEMAFULL
-    PERMISSIONS FOR select WHERE id = $auth.id;
+-- PERMISSIONS NONE, matching every other table in this file and the other private
+-- schemas. As the header says, no record access is even defined here, so `$auth` is
+-- never populated and the `id = $auth.id` clause that used to sit here could not
+-- have constrained anything. The real per-user clause lives in view-schema.surql.
+DEFINE TABLE OVERWRITE user SCHEMAFULL PERMISSIONS NONE;
 
 -- Assigned once at registration; selects the NATS subject this user's events
 -- live on, so it must never change.

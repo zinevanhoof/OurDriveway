@@ -10,23 +10,27 @@ USE NS main DB main;
 -- Without OVERWRITE the second boot fails on redefinition.
 
 -- ─── booking ────────────────────────────────────────────────────────────────
--- spot_id / owner_id are plain strings: the spot table lives in the spot-service DB,
+-- spot_id / owner_id are plain uuids: the spot table lives in the spot-service DB,
 -- so this DB can't hold a record<spot> link. owner_id is denormalized in at create
--- time (frontend already has it from the spot) so the select permission can scope to
--- the owner without a cross-DB dereference. renter_id comes from the JWT.
-DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS
-    FOR create WHERE true,
-    FOR select, update WHERE renter_id = $token.ID OR owner_id = $token.ID;
+-- time (frontend already has it from the spot) so a booking can be scoped to the
+-- owner without a cross-DB dereference. renter_id comes from the JWT.
+--
+-- PERMISSIONS NONE, not a select clause. No browser reaches this database — it is
+-- private to booking-service, which connects with a database-level user whose role
+-- bypasses table permissions and authorizes in Rust from the verified JWT. The
+-- `$token.ID` clause that used to sit here never constrained anything. Client reads
+-- of bookings go through view-service; view-schema.surql holds the real clause.
+DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS NONE;
 
-DEFINE FIELD OVERWRITE spot_id    ON booking TYPE string;
-DEFINE FIELD OVERWRITE owner_id   ON booking TYPE string;
+DEFINE FIELD OVERWRITE spot_id    ON booking TYPE uuid;
+DEFINE FIELD OVERWRITE owner_id   ON booking TYPE uuid;
 
--- No `VALUE $token.ID`. That forced the field from the *caller's* token, so this
+-- Set explicitly by booking-service from the verified claim, carried in the event.
+-- Never `VALUE $token.ID`: that forced the field from the *caller's* token, so this
 -- row could only ever be written by a connection authenticated as that very user —
 -- and silently coerced to NONE (rejecting the write) for the service identity that
 -- actually writes it. Same bug the owner_id comment in spot-schema.surql describes.
--- booking-service sets it explicitly from the verified claim, carried in the event.
-DEFINE FIELD OVERWRITE renter_id  ON booking TYPE string;
+DEFINE FIELD OVERWRITE renter_id  ON booking TYPE uuid;
 
 -- The spot's shard, denormalized so the expiry sweeper can rebuild this booking's
 -- NATS subject without a second lookup.
@@ -92,7 +96,7 @@ DEFINE INDEX OVERWRITE booking_ends   ON booking FIELDS spot_id, status, ends_at
 -- still absent, so the gap fails closed rather than booking against nothing.
 DEFINE TABLE OVERWRITE spot SCHEMAFULL PERMISSIONS NONE;
 
-DEFINE FIELD OVERWRITE owner_id       ON spot TYPE option<string>;
+DEFINE FIELD OVERWRITE owner_id       ON spot TYPE option<uuid>;
 DEFINE FIELD OVERWRITE shard          ON spot TYPE option<string>;
 DEFINE FIELD OVERWRITE price_per_hour ON spot TYPE option<int>;      -- EUR cents
 DEFINE FIELD OVERWRITE timezone       ON spot TYPE option<string>;

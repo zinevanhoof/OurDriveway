@@ -12,8 +12,8 @@ use chrono::{DateTime, Duration, Utc};
 use shared::error::myerror::{MyError, MyResult};
 // `StripeRequest` is imported for its `customize()` method, which is what carries an
 // idempotency key onto a request — it is a trait method, not an inherent one.
+use shared::{general_models::booking::Booked, rpc::spot::SpotCard};
 use stripe::{Client, IdempotencyKey, RequestStrategy, StripeRequest};
-use shared::general_models::booking::Booked;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSession, CreateCheckoutSessionLineItems, CreateCheckoutSessionLineItemsPriceData,
     CreateCheckoutSessionPaymentIntentData, ExpireCheckoutSession, ProductData,
@@ -92,14 +92,8 @@ pub struct SessionState {
 /// best-effort, and an event for a booking or a type we don't handle is expected
 /// traffic. The caller answers 200 to it so Stripe stops retrying.
 pub enum Outcome {
-    Succeeded {
-        booking_id: Uuid,
-        intent_id: String,
-    },
-    Failed {
-        booking_id: Uuid,
-        reason: String,
-    },
+    Succeeded { booking_id: Uuid, intent_id: String },
+    Failed { booking_id: Uuid, reason: String },
     Ignored,
 }
 
@@ -125,6 +119,7 @@ impl Stripe {
         booking_id: &Uuid,
         amount_cents: i64,
         booked: &Booked,
+        card: Option<&SpotCard>,
         hold_until: DateTime<Utc>,
         return_url: &str,
     ) -> MyResult<NewSession> {
@@ -132,15 +127,14 @@ impl Stripe {
         // exactly this — there is no catalogue to point at and never will be, since every
         // booking is a different number of hours at a different spot's rate.
         //
-        // The name is the *only* description of the purchase the renter ever sees: the
-        // checkout screen renders it straight from `getSession()` and it is what lands on
-        // their Stripe receipt. It used to read "OurDriveway parking — booking 019fa…",
-        // which meant the screen had to refetch the booking to show anything useful.
+        // This line item is the *whole* description of the purchase: the checkout screen
+        // renders it from `getSession()` and never refetches anything, and it is what
+        // lands on the renter's Stripe receipt.
         let line_item = CreateCheckoutSessionLineItems {
             quantity: Some(1),
             price_data: Some(CreateCheckoutSessionLineItemsPriceData {
                 unit_amount: Some(amount_cents),
-                product_data: Some(ProductData::new(describe(booked))),
+                product_data: Some(product(booking_id, booked, card)),
                 ..CreateCheckoutSessionLineItemsPriceData::new(Currency::EUR)
             }),
             ..CreateCheckoutSessionLineItems::new()
@@ -229,7 +223,8 @@ impl Stripe {
             },
             paid: matches!(
                 session.payment_status,
-                CheckoutSessionPaymentStatus::Paid | CheckoutSessionPaymentStatus::NoPaymentRequired
+                CheckoutSessionPaymentStatus::Paid
+                    | CheckoutSessionPaymentStatus::NoPaymentRequired
             ),
             client_secret: session.client_secret,
         })
@@ -296,10 +291,60 @@ pub fn verify(payload: &str, signature: &str, secret: &str) -> MyResult<Outcome>
     })
 }
 
-/// What the renter is buying, in one line: `"Parking · 14 Aug, 09:00–11:00"`.
+/// Stripe's cap on `images`, documented on the field. Sending a ninth is an API error, so
+/// the list is truncated rather than trusted — a host can add photos after the session
+/// exists, and a spot with nine of them must not make a checkout unpayable.
+const MAX_IMAGES: usize = 8;
+
+/// The line item: everything the renter sees about what they are buying.
 ///
-/// This is the Checkout Session's line item — the only description of the purchase that
-/// reaches the payment screen or the Stripe receipt, and what `getSession()` renders.
+/// The whole point of asking spot-service for a [`SpotCard`] — with it, the screen can
+/// show the place, the times, the address and a photo without a single request of its own.
+///
+/// Without it, the booking id takes the place of a title. Deliberately not `describe()`:
+/// if the spot cannot be named, the id is the only thing that identifies this purchase in
+/// a dashboard, a dispute or a receipt, and a line reading only "Parking · 14 Aug" names
+/// nothing at all. The times still appear underneath, because `booked` is ours and cannot
+/// go missing.
+///
+/// **Must be deterministic**, like everything else under the idempotency key. It is —
+/// given the same card. What makes that safe is that a card is only ever fetched for a
+/// booking with no payment row yet; a resume returns the stored session without coming
+/// anywhere near here. See `create_session` in payment_service.rs.
+fn product(booking_id: &Uuid, booked: &Booked, card: Option<&SpotCard>) -> ProductData {
+    let Some(card) = card else {
+        return ProductData {
+            description: Some(describe(booked)),
+            ..ProductData::new(format!("Booking {booking_id}"))
+        };
+    };
+
+    ProductData {
+        description: Some(format!("{} · {}", describe(booked), card.address)),
+        // Absolute URLs, straight from the projection — see `shared::media`.
+        //
+        // They have to be absolute, because **Stripe fetches these server-side and
+        // re-hosts the image on its own CDN**. A bare key gives it nothing to fetch, so
+        // the value is accepted without complaint, handed back verbatim, and the photo
+        // simply never appears — which looks like it works right up until the checkout
+        // screen renders nothing. Joining the hostname on at the edge is what this used
+        // to do instead; storing it absolute removes the step.
+        //
+        // Two consequences worth carrying. `MEDIA_BASE` must be reachable FROM STRIPE,
+        // not merely from a phone — a LAN address or a private bucket fails silently,
+        // with no error on any request we make. And the image a session shows is frozen
+        // at creation, because it is Stripe's copy: editing the spot's photos afterwards
+        // does not change it.
+        //
+        // `None` rather than an empty array when a spot has no photos: nothing to say is
+        // not the same as saying nothing, and it keeps the request shape honest.
+        images: (!card.images.is_empty())
+            .then(|| card.images.iter().take(MAX_IMAGES).cloned().collect()),
+        ..ProductData::new(card.title.clone())
+    }
+}
+
+/// When the renter is parked, in one line: `"Parking · 14 Aug, 09:00–11:00"`.
 ///
 /// **Must be deterministic.** `Booked` is a `HashMap`, so the dates and slots are sorted
 /// rather than iterated: `create_session` is called under an idempotency key derived from
@@ -513,7 +558,11 @@ mod tests {
 
         let once = describe(&booked);
         for _ in 0..50 {
-            assert_eq!(describe(&booked), once, "description must not vary per call");
+            assert_eq!(
+                describe(&booked),
+                once,
+                "description must not vary per call"
+            );
         }
         assert_eq!(once, "Parking · 14 Aug, 09:00–11:00 +2 more");
     }
@@ -526,6 +575,78 @@ mod tests {
         // Never empty: an intent with no slots would otherwise get a blank product name,
         // which Stripe rejects.
         assert_eq!(describe(&HashMap::new()), "Parking");
+    }
+
+    fn card(images: usize) -> SpotCard {
+        SpotCard {
+            title: "Kerkstraat 12".to_string(),
+            address: "2000 Antwerpen".to_string(),
+            images: (0..images).map(|i| format!("spots/{i}.jpeg")).collect(),
+        }
+    }
+
+    fn one_slot() -> Booked {
+        HashMap::from([("2026-08-14".to_string(), vec![slot("09:00", "11:00")])])
+    }
+
+    #[test]
+    fn a_card_puts_the_spot_on_the_line_item() {
+        let p = product(&Uuid::nil(), &one_slot(), Some(&card(2)));
+
+        assert_eq!(p.name, "Kerkstraat 12");
+        assert_eq!(
+            p.description.as_deref(),
+            Some("Parking · 14 Aug, 09:00–11:00 · 2000 Antwerpen")
+        );
+        // Bare keys, untouched. A hostname appearing here means someone resolved them
+        // server-side, which is the thing shared::media exists to prevent.
+        assert_eq!(
+            p.images.as_deref(),
+            Some(["spots/0.jpeg".to_string(), "spots/1.jpeg".to_string()].as_slice())
+        );
+    }
+
+    /// The property that makes the lookup safe to lose: spot-service being down costs
+    /// the renter a title, never a payment.
+    #[test]
+    fn without_a_card_the_booking_id_names_it_and_the_times_survive() {
+        let booking = Uuid::now_v7();
+        let p = product(&booking, &one_slot(), None);
+
+        assert_eq!(p.name, format!("Booking {booking}"));
+        assert_eq!(
+            p.description.as_deref(),
+            Some("Parking · 14 Aug, 09:00–11:00")
+        );
+        assert!(p.images.is_none());
+    }
+
+    #[test]
+    fn a_ninth_photo_cannot_break_a_checkout() {
+        let p = product(&Uuid::nil(), &one_slot(), Some(&card(12)));
+        assert_eq!(p.images.map(|i| i.len()), Some(MAX_IMAGES));
+
+        // Absent, not empty: the two are different requests to Stripe.
+        assert!(
+            product(&Uuid::nil(), &one_slot(), Some(&card(0)))
+                .images
+                .is_none()
+        );
+    }
+
+    /// Same input, same bytes — the line item goes to Stripe under an idempotency key
+    /// derived from the booking, and a retry whose parameters differ is refused outright.
+    #[test]
+    fn the_line_item_is_deterministic() {
+        let (booking, booked, card) = (Uuid::now_v7(), one_slot(), card(3));
+
+        let once = product(&booking, &booked, Some(&card));
+        for _ in 0..50 {
+            let again = product(&booking, &booked, Some(&card));
+            assert_eq!(again.name, once.name);
+            assert_eq!(again.description, once.description);
+            assert_eq!(again.images, once.images);
+        }
     }
 
     /// An intent from another project sharing the sandbox. Verifies fine, means

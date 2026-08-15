@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use garde::Validate;
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::general_models::spot::TimeSlot;
 use crate::requests::spot::{TimeSlotRequest, validate_single};
@@ -14,8 +15,10 @@ use crate::requests::spot::{TimeSlotRequest, validate_single};
 #[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateBookingRequest {
-    #[garde(length(min = 1))]
-    pub spot_id: String,
+    /// serde rejects a malformed uuid before garde runs, so no length rule is
+    /// needed — and nothing downstream has to parse it.
+    #[garde(skip)]
+    pub spot_id: Uuid,
     /// `"YYYY-MM-DD"` -> slots. Reuses the spot form's date+slot rules verbatim
     /// (`HH:MM`, 30-minute grid, end after start, no overlap or duplicate within a
     /// day, no past dates), because a booking that doesn't fit the grid a spot's
@@ -56,7 +59,7 @@ mod tests {
 
     fn req(date: &str, slots: Vec<TimeSlotRequest>) -> CreateBookingRequest {
         CreateBookingRequest {
-            spot_id: "abc123".into(),
+            spot_id: Uuid::now_v7(),
             booked: HashMap::from([(date.to_string(), slots)]),
         }
     }
@@ -69,22 +72,37 @@ mod tests {
 
     #[test]
     fn valid_booking_passes() {
-        assert!(req(&future(), vec![slot("09:00", "11:00")]).validate().is_ok());
+        assert!(
+            req(&future(), vec![slot("09:00", "11:00")])
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
     fn rejects_empty_and_past_and_off_grid() {
         assert!(req(&future(), vec![]).validate().is_err());
-        assert!(req("2000-01-01", vec![slot("09:00", "11:00")]).validate().is_err());
-        assert!(req(&future(), vec![slot("09:15", "11:00")]).validate().is_err());
+        assert!(
+            req("2000-01-01", vec![slot("09:00", "11:00")])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            req(&future(), vec![slot("09:15", "11:00")])
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_slots_that_overlap_within_a_day() {
         assert!(
-            req(&future(), vec![slot("09:00", "11:00"), slot("10:00", "12:00")])
-                .validate()
-                .is_err()
+            req(
+                &future(),
+                vec![slot("09:00", "11:00"), slot("10:00", "12:00")]
+            )
+            .validate()
+            .is_err()
         );
     }
 }

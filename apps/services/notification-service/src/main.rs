@@ -18,6 +18,13 @@ mod worker;
 pub struct Config {
     pub port: u16,
     pub nats_url: String,
+    /// Master switch. `false` and the service still starts, still consumes USERS,
+    /// still acks — it just never hands anything to Resend. See `Mailer::send`.
+    ///
+    /// Required like every other field rather than defaulting to `true`: whether
+    /// this deployment sends mail is exactly the kind of thing that must be
+    /// readable from the `.env` instead of inferred from an absent line.
+    pub notifications_enabled: bool,
     pub resend_api_key: String,
     /// `Name <address@domain>` or a bare address. The domain must be the one
     /// verified with Resend — mail from anything else is refused outright.
@@ -40,6 +47,9 @@ pub struct Config {
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     port: env::require_parsed("PORT"),
     nats_url: env::require("NATS_URL"),
+    // `bool::from_str` takes exactly "true" or "false"; `require_parsed` panics
+    // naming the offending value, so "1" or "TRUE" fails loudly at startup.
+    notifications_enabled: env::require_parsed("NOTIFICATIONS_ENABLED"),
     resend_api_key: env::require("RESEND_API_KEY"),
     mail_from: env::require("MAIL_FROM"),
     app_base_url: env::require("APP_BASE_URL"),
@@ -71,7 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
 
-    let mailer = Arc::new(Mailer::new(&CONFIG.resend_api_key));
+    let mailer = Arc::new(Mailer::new(
+        &CONFIG.resend_api_key,
+        CONFIG.notifications_enabled,
+    ));
 
     // `bus::worker`, never `bus::projector`. The projector creates an ephemeral
     // consumer per instance and replays from sequence 1 — which for a side effect
@@ -95,7 +108,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // PORT differs per service in local dev so several can run on one host.
     // Containerised, every service listens on 80.
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", CONFIG.port)).await?;
-    tracing::info!(port = CONFIG.port, from = %CONFIG.mail_from, "notification-service listening");
+    if !CONFIG.notifications_enabled {
+        // Warn, not info: a service that silently stops mailing is the kind of
+        // thing you want shouting in the log you check first.
+        tracing::warn!("NOTIFICATIONS_ENABLED=false — consuming and acking, sending nothing");
+    }
+    tracing::info!(
+        port = CONFIG.port,
+        from = %CONFIG.mail_from,
+        enabled = CONFIG.notifications_enabled,
+        "notification-service listening"
+    );
     Ok(axum::serve(listener, app).await?)
 }
 

@@ -73,8 +73,8 @@ pub enum PaymentEvent {
     /// client-supplied figure never reaches this.
     PayoutRequested {
         payout_id: Uuid,
-        /// `"user:abc"`, the host.
-        owner_id: String,
+        /// The host.
+        owner_id: Uuid,
         amount_cents: i64,
         requested_at: DateTime<Utc>,
     },
@@ -88,12 +88,11 @@ pub struct PaymentCreated {
     /// subject is never recomputed — the same reasoning as `spot_shard` on
     /// `BookingReserved`.
     pub booking_shard: String,
-    /// `"user:abc"` — the host who earns this. Denormalized so the earnings query is
-    /// one indexed scan of `payment` and never joins back through the booking
-    /// projection.
-    pub owner_id: String,
-    /// `"user:abc"`, from the verified JWT claim. Who is paying.
-    pub renter_id: String,
+    /// The host who earns this. Denormalized so the earnings query is one indexed
+    /// scan of `payment` and never joins back through the booking projection.
+    pub owner_id: Uuid,
+    /// From the verified JWT claim. Who is paying.
+    pub renter_id: Uuid,
     /// Stripe's `cs_…`. Known as soon as the session exists, which is what makes it the
     /// handle for expiring an unpaid checkout — the intent does not exist yet.
     pub session_id: String,

@@ -26,6 +26,11 @@ pub struct AppState {
 /// falls back to a default, because a default is a value you cannot discover by
 /// reading the `.env`.
 pub struct Config {
+    /// Where profile pictures are served from. Read only to VALIDATE: the avatar a
+    /// client sends back must be a URL media-service minted on this origin, or a
+    /// user could point their picture at any host. Same value as media-service's
+    /// MEDIA_BASE and spot-service's — see `shared::media`.
+    pub media_base: String,
     pub surrealdb_addr: String,
     pub surrealdb_user: String,
     pub surrealdb_pass: String,
@@ -46,6 +51,7 @@ pub struct Config {
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
+    media_base: env::require("MEDIA_BASE"),
     surrealdb_addr: env::require("SURREALDB_ADDR"),
     surrealdb_user: env::require("SURREALDB_USER"),
     surrealdb_pass: env::require("SURREALDB_PASS"),
@@ -78,6 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // missing variable would surface as a panic inside the first handler that
     // needed it, leaving a process that passes its health check and fails requests.
     LazyLock::force(&CONFIG);
+    // Installs the origin `shared::media` mints and validates against. Beside the
+    // CONFIG force for the same reason: a missing base must stop the process, not
+    // surface as a rejected upload later.
+    shared::media::init_base(&CONFIG.media_base);
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
     let db = shared::db::connect(
@@ -155,10 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/user/refresh", post(route::refresh::refresh))
         // Both unauthenticated: the token in the link is the credential, and a
         // user who cannot log in yet is exactly who needs these.
-        .route(
-            "/api/user/verify-email",
-            post(route::verify::verify_email),
-        )
+        .route("/api/user/verify-email", post(route::verify::verify_email))
         .route(
             "/api/user/verify-email/resend",
             post(route::verify::resend_verification),

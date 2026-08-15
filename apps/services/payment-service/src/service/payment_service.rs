@@ -13,8 +13,8 @@ use shared::{
         Envelope, STREAM_PAYMENTS,
         payment::{PaymentCreated, PaymentEvent},
         payment_subject, payout_subject, shard_of,
-        user::record_key,
     },
+    rpc::spot::{SUBJECT_SPOT_CARD, SpotCard},
 };
 use uuid::Uuid;
 
@@ -30,6 +30,9 @@ use crate::{
 
 pub struct PaymentService {
     js: Context,
+    /// The same connection `js` publishes over, for the one thing JetStream is wrong for:
+    /// asking spot-service what a spot is called. See [`shared::rpc`].
+    nc: async_nats::Client,
     repository: Arc<PaymentRepository>,
     stripe: Arc<Stripe>,
     settler: Arc<Settler>,
@@ -46,6 +49,7 @@ impl PaymentService {
         settlement_secs: i64,
     ) -> Self {
         Self {
+            nc: js.client().clone(),
             js,
             repository,
             stripe,
@@ -56,32 +60,35 @@ impl PaymentService {
 
     /// Hands the renter a client secret for the Payment Element.
     ///
-    /// Fully idempotent, with no read-and-branch: the payment id is derived from the
-    /// booking, and so is the Stripe idempotency key. Calling this twice returns the
-    /// *same* session from Stripe and upserts the same row here — which matters because
-    /// the row does not exist yet when the request returns (the projector applies the
-    /// event a moment later), so a double-submitted checkout has nothing to read to
-    /// discover it is a duplicate.
+    /// Idempotent twice over, and the two layers are not redundant:
     ///
-    /// That property is also what makes `payment_booking UNIQUE` in the schema safe.
+    /// 1. **A payment we already know about is never re-created.** "Continue payment" on a
+    ///    reserved booking retrieves the session it already has. Nothing is rebuilt, so
+    ///    nothing can be rebuilt *differently* — which matters because the Stripe
+    ///    idempotency key is derived from the booking, and Stripe rejects a replay whose
+    ///    parameters differ. A spot retitled between reserving and paying would otherwise
+    ///    fail the resume, the same way an `expires_at` taken from `Utc::now()` once did.
+    /// 2. **Below that, the key still holds.** Two checkouts submitted at once both find
+    ///    no payment row — the projector applies our event a moment after this returns —
+    ///    so both reach Stripe, and the key is what makes them the same session rather
+    ///    than two payable ones.
+    ///
+    /// Layer 2 is also what makes `payment_booking UNIQUE` in the schema safe.
     pub async fn create_session(
         &self,
-        booking_id: &str,
-        renter_id: &str,
+        booking_id: &Uuid,
+        renter_id: &Uuid,
         return_url: &str,
     ) -> MyResult<NewSession> {
-        let booking_uuid = parse_uuid(booking_id)?;
-        let key = record_key(&booking_uuid);
-
         let booking = self
             .repository
-            .booking(&key)
+            .booking(booking_id)
             .await?
             .context_not_found(("Not Found", "That booking doesn't exist."))?;
 
         // Identity comes from the verified token, and this is the only check that
         // stops one renter paying for — and thereby confirming — another's booking.
-        if booking.renter_id != renter_id {
+        if booking.renter_id != *renter_id {
             return Err(MyError::api(
                 axum::http::StatusCode::FORBIDDEN,
                 "Forbidden",
@@ -114,13 +121,39 @@ impl PaymentService {
                 )
             })?;
 
-        let payment_id = payment_id_for(&booking_uuid);
+        // Resume: this booking already has a session, so hand back that one. See the
+        // note on layer 1 above — re-creating it is not merely wasteful, it is the thing
+        // that breaks. A session that has since expired falls through, where the guards
+        // above have already refused anything whose hold is gone.
+        if let Some(payment) = self.repository.payment_for_booking(booking_id).await? {
+            let state = self.stripe.retrieve_session(&payment.session_id).await?;
+            if let Some(client_secret) = state.client_secret {
+                return Ok(NewSession {
+                    session_id: payment.session_id,
+                    client_secret,
+                });
+            }
+        }
+
+        // What the renter is buying, for the line item. Best-effort on purpose: a spot
+        // this cannot describe still gets paid for, it just says less. Nothing below is
+        // allowed to depend on it — see the note on `shared::rpc`.
+        let spot_id = booking.spot_id;
+        let card: Option<SpotCard> = bus::service::request(&self.nc, SUBJECT_SPOT_CARD, &spot_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(spot_id = %spot_id, error = %e, "no spot card; labelling with the booking id");
+                None
+            });
+
+        let payment_id = payment_id_for(booking_id);
         let session = self
             .stripe
             .create_session(
-                &booking_uuid,
+                booking_id,
                 booking.amount_cents,
                 &booking.booked,
+                card.as_ref(),
                 hold_until,
                 return_url,
             )
@@ -128,8 +161,8 @@ impl PaymentService {
 
         let event = PaymentEvent::Created(PaymentCreated {
             payment_id,
-            booking_id: booking_uuid,
-            booking_shard: shard_of(&booking_uuid),
+            booking_id: *booking_id,
+            booking_shard: shard_of(booking_id),
             owner_id: booking.owner_id,
             renter_id: booking.renter_id,
             session_id: session.session_id.clone(),
@@ -137,7 +170,7 @@ impl PaymentService {
             created_at: Utc::now(),
         });
 
-        self.publish_payment(event, &booking_uuid, &format!("payment-created:{payment_id}"))
+        self.publish_payment(event, booking_id, &format!("payment-created:{payment_id}"))
             .await?;
 
         Ok(session)
@@ -155,8 +188,8 @@ impl PaymentService {
     pub async fn session_state(
         &self,
         session_id: &str,
-        renter_id: &str,
-    ) -> MyResult<(SessionState, String)> {
+        renter_id: &Uuid,
+    ) -> MyResult<(SessionState, Uuid)> {
         let not_found = || MyError::api(StatusCode::NOT_FOUND, "Not Found", "No such checkout.");
 
         let payment = self
@@ -165,7 +198,7 @@ impl PaymentService {
             .await?
             .ok_or_else(not_found)?;
 
-        if payment.renter_id != renter_id {
+        if payment.renter_id != *renter_id {
             return Err(not_found());
         }
 
@@ -221,7 +254,7 @@ impl PaymentService {
         Ok(())
     }
 
-    pub async fn earnings(&self, owner_id: &str) -> MyResult<Earnings> {
+    pub async fn earnings(&self, owner_id: &Uuid) -> MyResult<Earnings> {
         let cutoff = Utc::now() - chrono::Duration::seconds(self.settlement_secs);
         self.repository.earnings(owner_id, cutoff).await
     }
@@ -232,8 +265,11 @@ impl PaymentService {
     /// concurrent requests both see the same affordable balance, which is why this
     /// publishes under compare-and-swap on the host's own subject: exactly one wins and
     /// the loser gets a 409 to retry against the reduced balance.
-    pub async fn request_payout(&self, owner_id: &str) -> MyResult<(u64, i64)> {
-        let amount_cents = self.settler.available_for(owner_id, self.settlement_secs).await?;
+    pub async fn request_payout(&self, owner_id: &Uuid) -> MyResult<(u64, i64)> {
+        let amount_cents = self
+            .settler
+            .available_for(owner_id, self.settlement_secs)
+            .await?;
 
         if amount_cents <= 0 {
             return Err(MyError::api(
@@ -243,19 +279,18 @@ impl PaymentService {
             ));
         }
 
-        let owner_uuid = owner_uuid(owner_id)?;
-        let shard = shard_of(&owner_uuid);
-        let subject = payout_subject(&shard, &owner_uuid);
+        let shard = shard_of(owner_id);
+        let subject = payout_subject(&shard, owner_id);
         let head = bus::subject_head(&self.js, STREAM_PAYMENTS, &subject).await?;
 
         let envelope = Envelope::new(
             PaymentEvent::PayoutRequested {
                 payout_id: Uuid::now_v7(),
-                owner_id: owner_id.to_string(),
+                owner_id: *owner_id,
                 amount_cents,
                 requested_at: Utc::now(),
             },
-            Some(owner_id.to_string()),
+            Some(*owner_id),
         );
 
         let seq = bus::publish_expecting(&self.js, subject, &envelope, Some(head)).await?;
@@ -298,22 +333,6 @@ pub fn payment_id_for(booking_id: &Uuid) -> Uuid {
     )
 }
 
-/// `"user:019fafc9…"` -> the uuid, for sharding.
-fn owner_uuid(owner_id: &str) -> MyResult<Uuid> {
-    let key = owner_id.strip_prefix("user:").unwrap_or(owner_id);
-    Uuid::parse_str(key).map_err(|e| MyError::Bus(format!("owner id {owner_id}: {e}")))
-}
-
-fn parse_uuid(id: &str) -> MyResult<Uuid> {
-    Uuid::parse_str(id).map_err(|_| {
-        MyError::api(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Bad Request",
-            "That isn't a valid booking id.",
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,14 +343,5 @@ mod tests {
         let booking = Uuid::now_v7();
         assert_eq!(payment_id_for(&booking), payment_id_for(&booking));
         assert_ne!(payment_id_for(&booking), payment_id_for(&Uuid::now_v7()));
-    }
-
-    #[test]
-    fn owner_uuid_accepts_the_claim_form_and_the_bare_key() {
-        let id = Uuid::now_v7();
-        let key = record_key(&id);
-        assert_eq!(owner_uuid(&format!("user:{key}")).unwrap(), id);
-        assert_eq!(owner_uuid(&key).unwrap(), id);
-        assert!(owner_uuid("user:not-a-uuid").is_err());
     }
 }

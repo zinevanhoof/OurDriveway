@@ -94,11 +94,11 @@ pub struct BookingReserved {
     /// subject this booking lives on, and a recomputed value would split a spot's
     /// history across two subjects the moment SHARD_COUNT changed.
     pub spot_shard: String,
-    /// `"user:abc"` — denormalized from the spot so the booking row can be scoped
-    /// to the owner without a cross-database dereference.
-    pub owner_id: String,
-    /// `"user:abc"`, from the verified JWT claim.
-    pub renter_id: String,
+    /// Denormalized from the spot so the booking row can be scoped to the owner
+    /// without a cross-database dereference.
+    pub owner_id: Uuid,
+    /// From the verified JWT claim.
+    pub renter_id: Uuid,
     /// `"YYYY-MM-DD"` -> slots, in the spot's timezone. Same shape as a spot's
     /// single-day availability, minus the weekly recurrence.
     pub booked: HashMap<String, Vec<TimeSlot>>,

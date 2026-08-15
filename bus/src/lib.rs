@@ -7,6 +7,7 @@ pub mod connect;
 pub mod health;
 pub mod projector;
 pub mod publisher;
+pub mod service;
 pub mod snapshot;
 pub mod worker;
 

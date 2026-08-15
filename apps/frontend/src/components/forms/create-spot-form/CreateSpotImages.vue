@@ -10,7 +10,6 @@ import {
 } from '@/components/ui/dialog'
 import { ImagePlus, X } from '@lucide/vue'
 import Button from '@/components/ui/button/Button.vue';
-import { imageUrl } from '@/lib/media'
 
 defineProps<{ imageErrors: string[] }>()
 
@@ -21,14 +20,14 @@ defineProps<{ imageErrors: string[] }>()
 const images = defineModel<(string | File)[]>('images', { required: true })
 
 // Object URLs are derived from `images`; revoke the old batch so they don't leak.
-// Stored keys resolve against VITE_MEDIA_BASE instead — nothing to revoke there.
+// Stored images are already absolute URLs — nothing to build and nothing to revoke.
 const previewUrls = ref<(string | undefined)[]>([])
 const revokeAll = () =>
     previewUrls.value.forEach(u => u?.startsWith('blob:') && URL.revokeObjectURL(u))
 
 watch(images, (items) => {
     revokeAll()
-    previewUrls.value = items.map(i => typeof i === 'string' ? imageUrl(i) : URL.createObjectURL(i))
+    previewUrls.value = items.map(i => typeof i === 'string' ? i : URL.createObjectURL(i))
 }, { deep: true, immediate: true })
 
 onScopeDispose(revokeAll)

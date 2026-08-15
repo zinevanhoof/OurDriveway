@@ -1,15 +1,14 @@
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     events::{
         Envelope,
         booking::{BookingEvent, BookingReserved, CancelReason, ReleaseReason},
         payment::{PaymentCreated, PaymentEvent},
-        user::record_key,
     },
     general_models::booking::Booked,
 };
-use serde::Deserialize;
 use surrealdb::{
     Surreal,
     engine::remote::ws::Client,
@@ -27,8 +26,12 @@ pub struct PaymentRepository {
 /// payment may be created and what happens to money afterwards.
 #[derive(Debug, Deserialize, SurrealValue)]
 pub struct BookingForPayment {
-    pub owner_id: String,
-    pub renter_id: String,
+    /// Which spot, so the checkout can ask spot-service what to call it. The id alone —
+    /// payment-service holds no spot data and consumes no SPOTS events. See
+    /// [`shared::rpc::spot`].
+    pub spot_id: Uuid,
+    pub owner_id: Uuid,
+    pub renter_id: Uuid,
     pub amount_cents: i64,
     pub status: String,
     pub hold_until: Option<DateTime<Utc>>,
@@ -41,9 +44,9 @@ pub struct BookingForPayment {
 /// The payment attached to one booking, if any.
 #[derive(Debug, Deserialize, SurrealValue)]
 pub struct PaymentRow {
-    /// Bare uuid, not a `RecordId` — it goes straight back into an event.
-    pub id: String,
-    pub booking_id: String,
+    /// The uuid straight from `record::id(id)` — it goes back into an event as-is.
+    pub id: Uuid,
+    pub booking_id: Uuid,
     /// Where this payment's events publish. Read back rather than recomputed — see
     /// the field comment in payment-schema.surql.
     pub booking_shard: String,
@@ -56,7 +59,7 @@ pub struct PaymentRow {
     pub status: String,
     pub refund_id: Option<String>,
     /// Who paid. Read so the session lookup can scope its answer to the asking renter.
-    pub renter_id: String,
+    pub renter_id: Uuid,
     /// Stripe's message from the last failed attempt, carried alongside `status =
     /// 'failed'` so the checkout screen can say *why* rather than just that it failed.
     pub failure_reason: Option<String>,
@@ -89,21 +92,21 @@ impl PaymentRepository {
 
     // ─── reads ──────────────────────────────────────────────────────────────
 
-    pub async fn booking(&self, booking_id: &str) -> MyResult<Option<BookingForPayment>> {
+    pub async fn booking(&self, booking_id: &Uuid) -> MyResult<Option<BookingForPayment>> {
         Ok(self
             .db
             .query(
-                "SELECT owner_id, renter_id, amount_cents, status, hold_until, ends_at,
-                        booked ?? {} AS booked
+                "SELECT spot_id, owner_id, renter_id, amount_cents, status, hold_until,
+                        ends_at, booked ?? {} AS booked
                  FROM ONLY type::record('booking', $id)",
             )
-            .bind(("id", booking_id.to_string()))
+            .bind(("id", *booking_id))
             .await?
             .take(0)?)
     }
 
     /// The payment for a booking. `payment_booking` is UNIQUE, so this is at most one.
-    pub async fn payment_for_booking(&self, booking_id: &str) -> MyResult<Option<PaymentRow>> {
+    pub async fn payment_for_booking(&self, booking_id: &Uuid) -> MyResult<Option<PaymentRow>> {
         Ok(self
             .db
             .query(
@@ -145,7 +148,7 @@ impl PaymentRepository {
     ///
     /// `cutoff` is passed in rather than read from a clock here so the caller decides
     /// the window and this stays a pure query.
-    pub async fn earnings(&self, owner_id: &str, cutoff: DateTime<Utc>) -> MyResult<Earnings> {
+    pub async fn earnings(&self, owner_id: &Uuid, cutoff: DateTime<Utc>) -> MyResult<Earnings> {
         let earned: Option<i64> = self
             .db
             .query(
@@ -158,7 +161,7 @@ impl PaymentRepository {
                        )
                  ) GROUP ALL",
             )
-            .bind(("o", owner_id.to_string()))
+            .bind(("o", *owner_id))
             .bind(("cutoff", Datetime::from(cutoff)))
             .await?
             .take(0)?;
@@ -170,7 +173,7 @@ impl PaymentRepository {
                      SELECT amount_cents FROM payout WHERE owner_id = $o
                  ) GROUP ALL",
             )
-            .bind(("o", owner_id.to_string()))
+            .bind(("o", *owner_id))
             .await?
             .take(0)?;
 
@@ -211,8 +214,8 @@ impl PaymentRepository {
                  UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.booking_id)))
-            .bind(("spot_id", record_key(&e.spot_id)))
+            .bind(("id", e.booking_id))
+            .bind(("spot_id", e.spot_id))
             .bind(("spot_shard", e.spot_shard))
             .bind(("owner_id", e.owner_id))
             .bind(("renter_id", e.renter_id))
@@ -247,7 +250,7 @@ impl PaymentRepository {
                  UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&booking_id)))
+            .bind(("id", booking_id))
             .bind(("reason", reason.as_str().to_string()))
             .bind(("seq", seq as i64))
             .bind(("at", Datetime::from(at)))
@@ -272,7 +275,7 @@ impl PaymentRepository {
                  UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&booking_id)))
+            .bind(("id", booking_id))
             .bind(("reason", reason.as_str().to_string()))
             .bind(("seq", seq as i64))
             .bind(("at", Datetime::from(at)))
@@ -298,7 +301,7 @@ impl PaymentRepository {
                  UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&booking_id)))
+            .bind(("id", booking_id))
             .bind(("to", to.to_string()))
             .bind((
                 "from",
@@ -324,9 +327,7 @@ impl PaymentRepository {
             } => self.payment_succeeded(payment_id, intent_id, at, seq).await,
             PaymentEvent::Failed {
                 payment_id, reason, ..
-            } => {
-                self.payment_failed(payment_id, reason, at, seq).await
-            }
+            } => self.payment_failed(payment_id, reason, at, seq).await,
             PaymentEvent::Refunded {
                 payment_id,
                 refund_id,
@@ -369,8 +370,8 @@ impl PaymentRepository {
                  UPSERT _projection:PAYMENTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.payment_id)))
-            .bind(("booking_id", record_key(&e.booking_id)))
+            .bind(("id", e.payment_id))
+            .bind(("booking_id", e.booking_id))
             .bind(("booking_shard", e.booking_shard))
             .bind(("owner_id", e.owner_id))
             .bind(("renter_id", e.renter_id))
@@ -410,7 +411,7 @@ impl PaymentRepository {
                  UPSERT _projection:PAYMENTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&payment_id)))
+            .bind(("id", payment_id))
             .bind(("reason", reason))
             .bind(("seq", seq as i64))
             .bind(("at", Datetime::from(at)))
@@ -445,7 +446,7 @@ impl PaymentRepository {
                  UPSERT _projection:PAYMENTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&payment_id)))
+            .bind(("id", payment_id))
             .bind(("intent_id", intent_id))
             .bind(("seq", seq as i64))
             .bind(("at", Datetime::from(at)))
@@ -481,7 +482,7 @@ impl PaymentRepository {
                  UPSERT _projection:PAYMENTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&payment_id)))
+            .bind(("id", payment_id))
             .bind(("to", to.to_string()))
             .bind((
                 "from",
@@ -498,7 +499,7 @@ impl PaymentRepository {
     async fn payout(
         &self,
         payout_id: Uuid,
-        owner_id: String,
+        owner_id: Uuid,
         amount_cents: i64,
         requested_at: DateTime<Utc>,
         at: DateTime<Utc>,
@@ -513,7 +514,7 @@ impl PaymentRepository {
                  UPSERT _projection:PAYMENTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&payout_id)))
+            .bind(("id", payout_id))
             .bind(("owner_id", owner_id))
             .bind(("amount", amount_cents))
             .bind(("created_at", Datetime::from(requested_at)))

@@ -1,5 +1,6 @@
 use garde::Validate;
 use serde::Deserialize;
+use uuid::Uuid;
 
 /// What the checkout step posts to start paying.
 ///
@@ -9,8 +10,10 @@ use serde::Deserialize;
 #[derive(Deserialize, Validate)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionRequest {
-    #[garde(length(min = 1))]
-    pub booking_id: String,
+    /// serde rejects a malformed uuid before garde runs, so no length rule is
+    /// needed — and nothing downstream has to parse it.
+    #[garde(skip)]
+    pub booking_id: Uuid,
 
     /// Where Stripe sends the renter after a redirect payment method, including the
     /// literal `{CHECKOUT_SESSION_ID}` placeholder Stripe substitutes.

@@ -19,18 +19,36 @@ tag: latest
 # k3d. values-local.yaml sets IfNotPresent for exactly that reason.
 imagePullPolicy: Always
 
+# Where uploaded images are SERVED from — not S3_ENDPOINT, which is the R2 API.
+#
+# One value, aliased into the three services that need it, because they must agree
+# byte for byte: media mints image URLs on this origin, spot and user validate that a
+# client-submitted image is on it. A mismatch rejects every upload on the way back in.
+# An anchor rather than three copies precisely because "these must be identical" is a
+# correctness requirement, not a convention.
+#
+# Must also be reachable FROM STRIPE, not just from a browser: listing photos go onto a
+# Checkout Session and Stripe may fetch them server-side.
+mediaBase: &mediaBase https://images.ourdriveway.example.com
+
 # Keys are load-bearing three times over: the image is
 # ourdriveway-<name>-service, the schema key is <name>-schema.surql, and the
 # ingress path is /api/<name>. Rename one and all three follow.
 services:
   user:
     env:
+      # Validates that a submitted avatar is on our origin.
+      MEDIA_BASE: *mediaBase
       # MINUTES — user_service.rs does Duration::minutes on this.
       JWT_EXPIRATION: "15"
       # DAYS — Duration::days.
       REFRESH_TOKEN_EXPIRATION: "15"
   booking: {}
-  spot: {}
+  spot:
+    env:
+      # Validates that a host's submitted listing photos are on our origin — without
+      # it a listing could point its photos at any host. See shared/src/media.rs.
+      MEDIA_BASE: *mediaBase
   view: {}
   payment:
     env:
@@ -59,6 +77,9 @@ services:
     env:
       # Not secret, and visible in review where it belongs. The credentials for
       # this bucket come from secrets.env instead.
+      # The origin this service stamps onto every URL it mints. Distinct from
+      # S3_ENDPOINT above: that is where bytes are PUT, this is where they are read.
+      MEDIA_BASE: *mediaBase
       S3_ENDPOINT: https://REPLACE-ME.r2.cloudflarestorage.com
       S3_BUCKET: ourdriveway
       # R2 has one region and it is called `auto`. Still signed, so it must match.
@@ -78,6 +99,13 @@ services:
     env:
       # Not secret and better off visible in review. RESEND_API_KEY and
       # EMAIL_TOKEN_SECRET come from secrets.env instead.
+      #
+      # Master switch. "false" keeps the pod running and consuming — it just sends
+      # nothing. Quoted like VERIFY_TOKEN_TTL_SECS below: the template renders every
+      # value through `| quote`, so a bare YAML bool would work too, but writing the
+      # string makes it obvious this reaches Rust as text that must read exactly
+      # `true` or `false`.
+      NOTIFICATIONS_ENABLED: "true"
       MAIL_FROM: OurDriveway <noreply@mail.ourdriveway.com>
       APP_BASE_URL: https://ourdriveway.com
       COMPANY_NAME: OurDriveway

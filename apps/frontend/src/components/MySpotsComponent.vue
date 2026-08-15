@@ -19,7 +19,6 @@ import { useAuthStore } from '@/stores/auth';
 import { SPOTS_OWNED } from '@/api/graphql/spot';
 import { useQuery } from '@urql/vue';
 import { computed, onMounted } from 'vue';
-import { imageUrl } from '@/lib/media'
 
 const router = useRouter()
 
@@ -73,7 +72,7 @@ onMounted(() => {
                 :key="spot.id" variant="outline" class="bg-card">
                 <ItemMedia variant="image"
                     class="group-has-data-[slot=item-description]/item:self-center group-has-data-[slot=item-description]/item:translate-y-0">
-                    <img :src="imageUrl(spot.images[0])">
+                    <img :src="spot.images[0]">
                 </ItemMedia>
                 <ItemContent>
                     <ItemTitle class="font-bold">

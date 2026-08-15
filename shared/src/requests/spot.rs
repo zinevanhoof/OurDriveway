@@ -61,14 +61,15 @@ pub struct UpdateSpotRequest {
 /// and lived in the handler as a hand-rolled 422.
 ///
 /// The membership half is a trust boundary: these strings come straight back from
-/// the client and land in an event that every renter renders as an `<img src>`.
-/// See [`crate::media::is_media_key`].
+/// the client and land in an event that every renter renders as an `<img src>` —
+/// and Stripe fetches server-side for a Checkout Session. The ORIGIN is what is
+/// really being checked; see [`crate::media::is_media_url`].
 fn are_spot_images(images: &Vec<String>, _: &()) -> garde::Result {
     require(!images.is_empty(), "Add at least one photo.")?;
     require(
         images
             .iter()
-            .all(|image| crate::media::is_media_key(image, crate::media::PREFIX_SPOTS)),
+            .all(|image| crate::media::is_media_url(image, crate::media::PREFIX_SPOTS)),
         "Unknown photo.",
     )
 }
@@ -164,7 +165,10 @@ pub(crate) fn validate_slots(slots: &Vec<TimeSlotRequest>, _: &()) -> garde::Res
         check_time(&slot.start)?;
         check_time(&slot.end)?;
         // String compare is correct for zero-padded HH:MM.
-        require(slot.start < slot.end, "End time must be after the start time.")?;
+        require(
+            slot.start < slot.end,
+            "End time must be after the start time.",
+        )?;
     }
     for (i, a) in slots.iter().enumerate() {
         for b in &slots[i + 1..] {
@@ -183,7 +187,10 @@ pub(crate) fn validate_slots(slots: &Vec<TimeSlotRequest>, _: &()) -> garde::Res
 
 /// Single-day availability: date key must be today or later, and each day's
 /// slots follow the same rules as the weekly ones.
-pub(crate) fn validate_single(map: &HashMap<String, Vec<TimeSlotRequest>>, _: &()) -> garde::Result {
+pub(crate) fn validate_single(
+    map: &HashMap<String, Vec<TimeSlotRequest>>,
+    _: &(),
+) -> garde::Result {
     // ponytail: past-date compared against UTC today, not the spot's timezone
     // (unknown until after geocoding). Fine ±1 day at the boundary; make it
     // tz-aware if the zone is resolved earlier.
@@ -305,12 +312,20 @@ mod tests {
                 },
                 single: HashMap::new(),
             },
-            images: vec![IMAGE_KEY.into()],
+            images: vec![image_url()],
         }
     }
 
-    /// Shaped exactly like what media-service mints — see `shared::media`.
-    const IMAGE_KEY: &str = "spots/019fd9a1a3cb7d12b96249db33e2a909.jpeg";
+    /// Exactly what media-service mints, built through the same function so the two
+    /// cannot drift. Installs the test origin as a side effect — `BASE` is
+    /// process-wide and every builder here needs it set.
+    fn image_url() -> String {
+        crate::media::init_test_base();
+        crate::media::url_for(
+            crate::media::PREFIX_SPOTS,
+            "019fd9a1a3cb7d12b96249db33e2a909.jpeg",
+        )
+    }
 
     #[test]
     fn valid_request_passes() {
@@ -371,7 +386,11 @@ mod tests {
         assert!(update(500, vec![slot("08:00", "10:00")]).validate().is_ok());
         assert!(update(0, vec![slot("08:00", "10:00")]).validate().is_err());
         assert!(update(500, vec![]).validate().is_err());
-        assert!(update(500, vec![slot("08:15", "10:00")]).validate().is_err());
+        assert!(
+            update(500, vec![slot("08:15", "10:00")])
+                .validate()
+                .is_err()
+        );
     }
 
     /// The image list is client-supplied and ends up in an event every renter
@@ -387,14 +406,20 @@ mod tests {
             r.validate().is_ok()
         };
 
-        assert!(with(vec![IMAGE_KEY]));
+        assert!(with(vec![&image_url()]));
         assert!(!with(vec!["https://evil.example/track.png"]));
+        // Right shape, wrong origin — the check this scheme exists for.
+        assert!(!with(vec![
+            "https://evil.example/spots/019fd9a1a3cb7d12b96249db33e2a909.jpeg"
+        ]));
         assert!(!with(vec!["spots/../../etc/passwd"]));
+        // A bare key, i.e. the scheme this replaced.
+        assert!(!with(vec!["spots/019fd9a1a3cb7d12b96249db33e2a909.jpeg"]));
         // The old scheme. Anything still holding one of these is stale data, not a
         // photo this app can serve.
         assert!(!with(vec!["/api/spot/uploads/019a.jpg"]));
         // One bad key poisons the list — an event is all-or-nothing.
-        assert!(!with(vec![IMAGE_KEY, "https://evil.example/track.png"]));
+        assert!(!with(vec![&image_url(), "https://evil.example/track.png"]));
         // Now garde's, not the route's: with one merged list there is no longer a
         // case where zero images is legitimate.
         assert!(!with(vec![]));

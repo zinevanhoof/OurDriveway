@@ -4,7 +4,8 @@ use axum::{
     Router,
     routing::{get, patch, post},
 };
-use shared::env;
+use shared::{env, rpc::spot::SUBJECT_SPOT_CARD};
+use uuid::Uuid;
 
 use crate::{
     projector::SpotProjector, repository::spot_repository::SpotRepository,
@@ -42,6 +43,13 @@ pub struct Config {
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
     pub locationiq_api_key: String,
+    /// Where listing photos are served from, e.g. `https://images.ourdriveway.com`.
+    ///
+    /// Read only to VALIDATE: the images a host sends back must be URLs
+    /// media-service minted on this origin, or a listing could point its photos at
+    /// any host on the internet. Must be byte-identical to media-service's and
+    /// user-service's MEDIA_BASE — see `shared::media`.
+    pub media_base: String,
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
@@ -53,6 +61,7 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
     jwt_secret: env::require("JWT_SECRET"),
     locationiq_api_key: env::require("LOCATIONIQ_API_KEY"),
+    media_base: env::require("MEDIA_BASE"),
 });
 
 #[tokio::main]
@@ -69,6 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // missing variable would surface as a panic inside the first handler that
     // needed it, leaving a process that passes its health check and fails requests.
     LazyLock::force(&CONFIG);
+    // Installs the origin `shared::media` mints and validates against. Beside the
+    // CONFIG force for the same reason: a missing base must stop the process, not
+    // surface as a rejected upload later.
+    shared::media::init_base(&CONFIG.media_base);
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
     let db = shared::db::connect(
@@ -109,6 +122,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
         readiness.clone(),
     ));
+
+    // Answers "what does spot 019fa… look like" for anyone who needs to *label* a spot
+    // without becoming a consumer of SPOTS — payment-service, putting a title on a
+    // Checkout Session. Read-only and unauthenticated by design: it exposes nothing a
+    // renter looking at a listing cannot already see, and the connection it arrives on is
+    // authenticated to NATS, which is more than an internal HTTP route would have been.
+    //
+    // Not gated on `readiness`. A replica still replaying answers from whatever it has
+    // projected so far, which for a spot created long ago is the whole truth, and for one
+    // created seconds ago is a missing title on a line item. Waiting would trade that for
+    // no answer at all.
+    {
+        let repository = repository.clone();
+        tokio::spawn(bus::service::serve(
+            js.client().clone(),
+            SUBJECT_SPOT_CARD,
+            "spot-service",
+            move |spot_id: Uuid| {
+                let repository = repository.clone();
+                // `images` is already absolute — stored that way, so nothing is
+                // resolved here. This used to join MEDIA_BASE onto each key at the
+                // edge, purely because the caller hands them to Stripe.
+                async move { repository.card(&spot_id).await.ok().flatten() }
+            },
+        ));
+    }
 
     let state = AppState {
         spot_service: Arc::new(SpotService { js, repository }),

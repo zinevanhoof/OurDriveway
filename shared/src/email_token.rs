@@ -16,7 +16,6 @@ use uuid::Uuid;
 use crate::{
     claims::jwt_claims::ISSUER,
     error::myerror::{MyError, MyResult},
-    events::user::record_key,
 };
 
 /// What a token is allowed to do. One variant per email that carries a link.
@@ -40,8 +39,7 @@ pub enum Purpose {
 /// `purpose` claim second.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EmailTokenClaims {
-    /// The user's record key (`record_key`, hyphen-free), matching how ids are
-    /// spelled everywhere else in the system.
+    /// The user's uuid, hyphenated — the one spelling used everywhere else.
     pub sub: String,
     pub purpose: Purpose,
     pub iat: i64,
@@ -56,7 +54,7 @@ pub struct EmailTokenClaims {
 pub fn mint(secret: &str, user_id: &Uuid, purpose: Purpose, ttl_secs: i64) -> MyResult<String> {
     let now = Utc::now().timestamp();
     let claims = EmailTokenClaims {
-        sub: record_key(user_id),
+        sub: user_id.to_string(),
         purpose,
         iat: now,
         exp: now + ttl_secs,

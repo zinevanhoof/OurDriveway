@@ -1,9 +1,8 @@
 use axum::{Json, extract::State};
 use serde::Serialize;
-use shared::{
-    error::myerror::MyResult, events::user::user_claim_id, extractors::authed_jwt::AuthedJwt,
-};
+use shared::{error::myerror::MyResult, extractors::authed_jwt::AuthedJwt};
 use surrealdb::types::SurrealValue;
+use uuid::Uuid;
 
 use crate::AppState;
 
@@ -16,8 +15,12 @@ pub struct Profile {
 
 #[derive(Serialize)]
 pub struct Me {
-    /// `"user:<uuid>"` — straight from the verified claim, so it always resolves.
-    pub id: String,
+    /// The plain uuid, straight from the verified claim, so it always resolves.
+    ///
+    /// Hyphenated, which is what the GraphQL `uuid` scalar takes on a filter
+    /// (`owner_id: { eq: … }`). A `user(id:)` *lookup* needs it wrapped as
+    /// `u'<uuid>'` instead — the frontend's `recordId()` does that.
+    pub id: Uuid,
     /// `None` only in the moment between registering and the projection catching
     /// up. Nullable by design: the id is what callers actually need, and making
     /// this a 404 would turn a millisecond of lag into a broken sign-up flow.
@@ -33,16 +36,9 @@ pub async fn me(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
 ) -> MyResult<Json<Me>> {
-    let uuid = user_id.strip_prefix("user:").unwrap_or(&user_id);
-    let profile = state.repository.profile(uuid).await?;
-
+    let profile = state.repository.profile(&user_id).await?;
     Ok(Json(Me {
-        // Reformatted through the same helper the issuer uses, so the string can
-        // never drift from what's stored in owner_id/renter_id elsewhere.
-        id: uuid
-            .parse()
-            .map(|u| user_claim_id(&u))
-            .unwrap_or_else(|_| user_id.clone()),
+        id: user_id,
         profile,
     }))
 }

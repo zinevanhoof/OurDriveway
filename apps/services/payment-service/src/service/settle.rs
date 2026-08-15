@@ -9,7 +9,7 @@ use async_nats::jetstream::Context;
 use chrono::Utc;
 use shared::{
     error::myerror::MyResult,
-    events::{Envelope, payment::PaymentEvent, payment_subject, user::record_key},
+    events::{Envelope, payment::PaymentEvent, payment_subject},
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -86,29 +86,28 @@ impl Settler {
     /// `succeeded` and the same call refunds instead. The reconciliation *is* the
     /// retry — there is deliberately no polling loop anywhere.
     pub async fn settle_up(&self, booking_id: &Uuid) -> MyResult<()> {
-        let key = record_key(booking_id);
-
         // A payment we have never heard of is the common case, not a problem: most
         // bookings are released without anyone reaching checkout.
-        let Some(payment) = self.repository.payment_for_booking(&key).await? else {
+        let Some(payment) = self.repository.payment_for_booking(booking_id).await? else {
             return Ok(());
         };
 
         // The booking, on the other hand, must exist — this payment was created from
         // it. Missing means our own BOOKINGS projection is behind, so fail and let the
         // redelivery find it rather than silently skipping a refund.
-        let booking = self.repository.booking(&key).await?.ok_or_else(|| {
+        let booking = self.repository.booking(booking_id).await?.ok_or_else(|| {
             shared::error::myerror::MyError::Bus(format!(
-                "booking {key} not projected yet; retrying"
+                "booking {booking_id} not projected yet; retrying"
             ))
         })?;
 
-        let payment_id: Uuid = payment
-            .id
-            .parse()
-            .map_err(|e| shared::error::myerror::MyError::Bus(format!("payment id: {e}")))?;
+        let payment_id = payment.id;
 
-        let event = match decide(&booking.status, &payment.status, payment.refund_id.is_some()) {
+        let event = match decide(
+            &booking.status,
+            &payment.status,
+            payment.refund_id.is_some(),
+        ) {
             Action::Nothing => return Ok(()),
 
             Action::Refund => {
@@ -164,7 +163,7 @@ impl Settler {
     }
 
     /// Whether a host may withdraw, and how much. Derived, never stored.
-    pub async fn available_for(&self, owner_id: &str, settlement_secs: i64) -> MyResult<i64> {
+    pub async fn available_for(&self, owner_id: &Uuid, settlement_secs: i64) -> MyResult<i64> {
         let cutoff = Utc::now() - chrono::Duration::seconds(settlement_secs);
         Ok(self
             .repository

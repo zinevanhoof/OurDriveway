@@ -5,7 +5,7 @@ use shared::{
         booking::{BookingEvent, BookingReserved},
         payment::PaymentEvent,
         spot::{SpotCreated, SpotEvent, SpotUpdated},
-        user::{UserEvent, UserRegistered, UserUpdated, record_key, user_claim_id},
+        user::{UserEvent, UserRegistered, UserUpdated},
     },
     general_models::booking::{BookingRow, fold_booked},
 };
@@ -102,7 +102,7 @@ impl ViewRepository {
         // Note what is absent: no password hash, ever. This table is
         // world-readable, so the projection is the first thing deciding what can
         // possibly leak. `email` is the one exception and it is projected behind
-        // a field-level `WHERE id = $token.ID` in view-schema.surql — a row stays
+        // a field-level `WHERE id = $auth.id` in view-schema.surql — a row stays
         // selectable by anyone, the address does not.
         //
         // The two UPDATEs are the backfill. Streams have no cross-stream
@@ -117,14 +117,13 @@ impl ViewRepository {
                      profile_picture: NONE, email: $email, license_plates: []
                  };
                  UPDATE spot SET owner = type::record('user', $id)
-                     WHERE owner_id = $claim AND owner = NONE;
+                     WHERE owner_id = $id AND owner = NONE;
                  UPDATE booking SET renter = type::record('user', $id)
-                     WHERE renter_id = $claim AND renter = NONE;
+                     WHERE renter_id = $id AND renter = NONE;
                  UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.user_id)))
-            .bind(("claim", user_claim_id(&e.user_id)))
+            .bind(("id", e.user_id))
             .bind(("first_name", e.first_name))
             .bind(("last_name", e.last_name))
             .bind(("email", e.email))
@@ -153,7 +152,7 @@ impl ViewRepository {
                  UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.user_id)))
+            .bind(("id", e.user_id))
             .bind(("first_name", e.first_name))
             .bind(("last_name", e.last_name))
             .bind(("profile_picture", e.profile_picture))
@@ -202,13 +201,13 @@ impl ViewRepository {
         // before this row existed at all: the booking projector's UPDATE matched
         // nothing and was dropped. Recomputing here covers that ordering, and is
         // idempotent — same backfill idiom as `user_registered` above.
-        let rows = self.bookings_for_spot(&record_key(&e.spot_id)).await?;
+        let rows = self.bookings_for_spot(&e.spot_id).await?;
         self.db
             .query(
                 "BEGIN;
                  UPSERT type::record('spot', $id) MERGE {
                      owner: (SELECT VALUE id FROM ONLY user
-                             WHERE record::id(id) = $owner_uuid LIMIT 1),
+                             WHERE record::id(id) = $owner_id LIMIT 1),
                      owner_id: $owner_id, title: $title, description: $description,
                      price_per_hour: $price, images: $images,
                      location: type::point([$lng, $lat]), active: true,
@@ -219,13 +218,8 @@ impl ViewRepository {
                  COMMIT;",
             )
             .bind(("booked", fold_booked(&rows, at)))
-            .bind(("id", record_key(&e.spot_id)))
-            .bind(("owner_id", e.owner_id.clone()))
-            // owner_id is "user:<uuid>"; the record key is just the uuid.
-            .bind((
-                "owner_uuid",
-                e.owner_id.strip_prefix("user:").unwrap_or("").to_string(),
-            ))
+            .bind(("id", e.spot_id))
+            .bind(("owner_id", e.owner_id))
             .bind(("title", e.title))
             .bind(("description", e.description))
             .bind(("price", e.price_per_hour_cents))
@@ -261,7 +255,7 @@ impl ViewRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&e.spot_id)))
+            .bind(("id", e.spot_id))
             .bind(("title", e.title))
             .bind(("description", e.description))
             .bind(("price", e.price_per_hour_cents))
@@ -288,7 +282,7 @@ impl ViewRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&spot_id)))
+            .bind(("id", spot_id))
             .bind(("active", active))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
@@ -313,7 +307,7 @@ impl ViewRepository {
                  UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&spot_id)))
+            .bind(("id", spot_id))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
             .await?
@@ -391,7 +385,7 @@ impl ViewRepository {
     async fn payout(
         &self,
         payout_id: Uuid,
-        owner_id: String,
+        owner_id: Uuid,
         amount_cents: i64,
         requested_at: chrono::DateTime<chrono::Utc>,
         at: chrono::DateTime<chrono::Utc>,
@@ -401,17 +395,13 @@ impl ViewRepository {
             .query(
                 "BEGIN;
                  UPSERT type::record('payout', $id) CONTENT {
-                     owner: (SELECT VALUE id FROM ONLY user WHERE record::id(id) = $owner_uuid LIMIT 1),
+                     owner: (SELECT VALUE id FROM ONLY user WHERE record::id(id) = $owner_id LIMIT 1),
                      owner_id: $owner_id, amount: $amount, created_at: $created_at
                  };
                  UPSERT _projection:PAYMENTS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", record_key(&payout_id)))
-            .bind((
-                "owner_uuid",
-                owner_id.strip_prefix("user:").unwrap_or("").to_string(),
-            ))
+            .bind(("id", payout_id))
             .bind(("owner_id", owner_id))
             .bind(("amount", amount_cents))
             .bind(("created_at", Datetime::from(requested_at)))
@@ -435,19 +425,15 @@ impl ViewRepository {
             .query(
                 "UPSERT type::record('booking', $id) CONTENT {
                      spot:   (SELECT VALUE id FROM ONLY spot WHERE record::id(id) = $spot_id LIMIT 1),
-                     renter: (SELECT VALUE id FROM ONLY user WHERE record::id(id) = $renter_uuid LIMIT 1),
+                     renter: (SELECT VALUE id FROM ONLY user WHERE record::id(id) = $renter_id LIMIT 1),
                      spot_id: $spot_id, owner_id: $owner_id, renter_id: $renter_id,
                      booked: $booked, amount: $amount, status: 'reserved',
                      hold_until: $expires_at, ends_at: $ends_at,
                      release_reason: NONE, cancel_reason: NONE, created_at: $at
                  };",
             )
-            .bind(("id", record_key(&e.booking_id)))
-            .bind(("spot_id", record_key(&e.spot_id)))
-            .bind((
-                "renter_uuid",
-                e.renter_id.strip_prefix("user:").unwrap_or("").to_string(),
-            ))
+            .bind(("id", e.booking_id))
+            .bind(("spot_id", e.spot_id))
             .bind(("owner_id", e.owner_id))
             .bind(("renter_id", e.renter_id))
             .bind(("booked", e.booked))
@@ -457,7 +443,7 @@ impl ViewRepository {
             .bind(("at", Datetime::from(at)))
             .await?
             .check()?;
-        self.refold_spot(&record_key(&e.spot_id), at, seq).await
+        self.refold_spot(&e.spot_id, at, seq).await
     }
 
     async fn booking_settled(
@@ -476,7 +462,7 @@ impl ViewRepository {
         // guard. It is a parameter because a cancel leaves 'confirmed', not
         // 'reserved', and a hardcoded 'reserved' would drop cancels *silently*:
         // the None branch below still advances the cursor.
-        let spot_id: Option<String> = self
+        let spot_id: Option<Uuid> = self
             .db
             .query(
                 "UPDATE type::record('booking', $id) SET
@@ -486,7 +472,7 @@ impl ViewRepository {
                  WHERE status = $from
                  RETURN VALUE spot_id;",
             )
-            .bind(("id", record_key(&booking_id)))
+            .bind(("id", booking_id))
             .bind(("from", from.to_string()))
             .bind(("status", status.to_string()))
             .bind(("release", release_reason.map(str::to_string)))
@@ -519,7 +505,7 @@ impl ViewRepository {
     /// when the spot finally lands.
     async fn refold_spot(
         &self,
-        spot_id: &str,
+        spot_id: &Uuid,
         at: chrono::DateTime<chrono::Utc>,
         seq: u64,
     ) -> MyResult<()> {
@@ -531,7 +517,7 @@ impl ViewRepository {
                  UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;
                  COMMIT;",
             )
-            .bind(("id", spot_id.to_string()))
+            .bind(("id", *spot_id))
             .bind(("booked", fold_booked(&rows, at)))
             .bind(("at", Datetime::from(at)))
             .bind(("seq", seq as i64))
@@ -540,11 +526,11 @@ impl ViewRepository {
         Ok(())
     }
 
-    async fn bookings_for_spot(&self, spot_id: &str) -> MyResult<Vec<BookingRow>> {
+    async fn bookings_for_spot(&self, spot_id: &Uuid) -> MyResult<Vec<BookingRow>> {
         Ok(self
             .db
             .query("SELECT status, booked FROM booking WHERE spot_id = $spot_id")
-            .bind(("spot_id", spot_id.to_string()))
+            .bind(("spot_id", *spot_id))
             .await?
             .take(0)?)
     }
@@ -554,14 +540,14 @@ impl ViewRepository {
     /// Profile for `GET /api/view/me`. `None` while the user's event is still in
     /// flight — the caller answers with the claim's id regardless, so this never
     /// has to 404.
-    pub async fn profile(&self, user_uuid: &str) -> MyResult<Option<crate::route::me::Profile>> {
+    pub async fn profile(&self, user_id: &Uuid) -> MyResult<Option<crate::route::me::Profile>> {
         let profile: Option<crate::route::me::Profile> = self
             .db
             .query(
                 "SELECT first_name, last_name, profile_picture
                  FROM ONLY type::record('user', $id)",
             )
-            .bind(("id", user_uuid.to_string()))
+            .bind(("id", *user_id))
             .await?
             .take(0)?;
         Ok(profile)

@@ -10,7 +10,7 @@ import { gql } from "@urql/vue";
 // `owner_id = $token.ID`, so this could not return anyone else's rows, but naming it
 // lets the query use the `payout_owner` index instead of scanning and filtering.
 const PAYOUTS = gql`
-  query GetPayouts($ownerId: String!) {
+  query GetPayouts($ownerId: uuid!) {
     payouts(where: { owner_id: { eq: $ownerId } }) {
       id
       amount

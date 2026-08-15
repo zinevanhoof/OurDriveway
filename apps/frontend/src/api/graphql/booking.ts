@@ -10,7 +10,7 @@ import { gql } from "@urql/vue";
 // be answered in the *viewer's* zone instead — wrong for anyone booking abroad.
 // `id` is what opens the detail drawer.
 const BOOKINGS_RENTED = gql`
-  query GetRentedBookings($renterId: String!) {
+  query GetRentedBookings($renterId: uuid!) {
     bookings(where: { renter_id: { eq: $renterId } }) {
       id
       status
