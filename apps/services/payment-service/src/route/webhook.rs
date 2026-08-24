@@ -2,10 +2,11 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
+    response::IntoResponse,
 };
-use shared::error::myerror::{MyError, MyResult};
+use shared::error::myerror::{ContextExt, MyResult};
 
-use crate::{AppState, CONFIG, service::stripe};
+use crate::{AppState, CONFIG, client::stripe};
 
 /// Stripe's signature header. Not a constant in the crate, so it is one here.
 const SIGNATURE: &str = "stripe-signature";
@@ -22,14 +23,14 @@ pub async fn stripe_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> MyResult<StatusCode> {
+) -> MyResult<impl IntoResponse> {
     let signature = headers
         .get(SIGNATURE)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| MyError::unauthorized("Unauthorized", "Missing signature."))?;
+        .context_unauthorized(("Unauthorized", "Missing signature."))?;
 
-    let payload = std::str::from_utf8(&body)
-        .map_err(|_| MyError::unauthorized("Unauthorized", "Malformed body."))?;
+    let payload =
+        std::str::from_utf8(&body).context_unauthorized(("Unauthorized", "Malformed body."))?;
 
     // Verifies the HMAC and the timestamp tolerance. An Err here means this did not
     // come from Stripe, so it gets 401 — never 200, which would tell an attacker

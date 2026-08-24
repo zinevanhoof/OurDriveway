@@ -1,4 +1,5 @@
-//! The two side-effect consumers. Both funnel into [`Settler::settle_up`].
+//! The two side-effect consumers. Both funnel into
+//! [`SettlementWorkerService::settle_up`].
 //!
 //! `Worker` and not `Projector`, and the difference is the whole reason this file
 //! exists — see the table in bus/src/worker.rs. A projector is fan-out: every replica
@@ -19,7 +20,7 @@ use shared::{
 };
 use tokio::sync::watch;
 
-use crate::service::settle::Settler;
+use crate::service::settlement_worker_service::SettlementWorkerService;
 
 /// How long to wait for this instance's own projector to catch up to the event being
 /// handled. Past this, fail and let the NAK bring the message back — a projector that
@@ -29,7 +30,7 @@ const PROJECTION_WAIT: Duration = Duration::from_secs(5);
 
 /// Refunds and intent cancellations, triggered by a booking ending.
 pub struct BookingWorker {
-    pub settler: Arc<Settler>,
+    pub service: Arc<SettlementWorkerService>,
     /// This instance's BOOKINGS projection cursor.
     pub applied: watch::Receiver<u64>,
 }
@@ -55,9 +56,17 @@ impl Worker for BookingWorker {
         // Wait for our own projection to include *this* event before deciding, or
         // `decide` would read the booking as still reserved and do nothing — and
         // nothing would ever trigger it again.
-        wait_for(&self.applied, seq, STREAM_BOOKINGS).await?;
+        //
+        // Erroring rather than proceeding stale: we are about to decide whether to move
+        // money, and the whole point of waiting is that the decision reads state
+        // including the event that prompted it. The NAK is the retry.
+        if !bus::await_applied(&self.applied, seq, Some(PROJECTION_WAIT)).await {
+            return Err(MyError::Bus(format!(
+                "{STREAM_BOOKINGS} projection has not reached seq {seq}; retrying"
+            )));
+        }
 
-        self.settler.settle_up(&booking_id).await
+        self.service.settle_up(&booking_id).await
     }
 }
 
@@ -67,7 +76,7 @@ impl Worker for BookingWorker {
 /// land after the hold lapsed, in which case the BOOKINGS worker already ran and found
 /// nothing but an unpaid intent.
 pub struct PaymentWorker {
-    pub settler: Arc<Settler>,
+    pub service: Arc<SettlementWorkerService>,
     /// This instance's PAYMENTS projection cursor.
     pub applied: watch::Receiver<u64>,
 }
@@ -87,36 +96,13 @@ impl Worker for PaymentWorker {
             _ => return Ok(()),
         };
 
-        wait_for(&self.applied, seq, STREAM_PAYMENTS).await?;
-
-        self.settler.settle_up(&booking_id).await
-    }
-}
-
-/// Blocks until this instance's projector for `stream` has applied `seq`.
-///
-/// `Err` on timeout rather than proceeding with stale data — the caller is about to
-/// decide whether to move money, and the whole point of waiting is that the decision
-/// reads state including the event that prompted it. Failing hands the message back to
-/// NATS, which is the retry.
-async fn wait_for(applied: &watch::Receiver<u64>, seq: u64, stream: &str) -> MyResult<()> {
-    let mut rx = applied.clone();
-    let caught_up = tokio::time::timeout(PROJECTION_WAIT, async {
-        while *rx.borrow() < seq {
-            if rx.changed().await.is_err() {
-                // The projector dropped its sender, i.e. it stopped. Readiness has
-                // already flipped; there is nothing to wait for.
-                return false;
-            }
+        // Same wait, same reason as `BookingWorker` above.
+        if !bus::await_applied(&self.applied, seq, Some(PROJECTION_WAIT)).await {
+            return Err(MyError::Bus(format!(
+                "{STREAM_PAYMENTS} projection has not reached seq {seq}; retrying"
+            )));
         }
-        true
-    })
-    .await;
 
-    match caught_up {
-        Ok(true) => Ok(()),
-        _ => Err(MyError::Bus(format!(
-            "{stream} projection has not reached seq {seq}; retrying"
-        ))),
+        self.service.settle_up(&booking_id).await
     }
 }

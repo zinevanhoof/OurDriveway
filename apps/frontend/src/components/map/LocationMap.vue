@@ -12,7 +12,8 @@ import { FULL_SPOT, SPOTS_IN_RADIUS } from "@/api/graphql/spot";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import type { SpotFilter } from "@/types/SpotFilter";
 import { spotMatches } from "@/lib/spotFilter";
-import { gqlRecordId } from "@/lib/utils";
+import { mergeBooked } from "@/lib/bookingAvailability";
+import { gqlRecordId, plainUuid } from "@/lib/utils";
 import { locateUser } from "@/lib/geo";
 import MapPinComponent from "./MapPinComponent.vue";
 import MapSearchComponent from "./MapSearchComponent.vue";
@@ -59,18 +60,21 @@ const { data: spotsInRadius } = useQuery({
 // Full detail for the selected pin, fetched on click (paused until then) so nothing
 // runs at render time and there's one query total, not one per pin. The owner's
 // profile nests in the same query — the view's `spot.owner` record link resolves it.
-// `network-only` because this is the one query whose `booked` map someone books against,
-// and a cached availability map is stale by construction: every write in this app goes
-// through REST, so there are no GraphQL mutations for graphcache to invalidate on. The
-// radius query stays cached — it selects `booked` too, but only for a "days booked"
-// count, and it re-runs on every pan.
+// `network-only` because this is the one query someone books against, and cached
+// availability is stale by construction: every write in this app goes through REST, so
+// there are no GraphQL mutations for graphcache to invalidate on. The radius query
+// stays cached and re-runs on every pan.
 //
 // Freshness, not correctness. The authority is the server's availability check, published
 // under compare-and-swap; this only stops the picker offering slots it then has to
 // retract.
 const { data: selectedSpot, executeQuery: reexecuteSpot } = useQuery({
   query: FULL_SPOT,
-  variables: computed(() => ({ id: gqlRecordId(selectedId.value) })),
+  variables: computed(() => ({
+    id: gqlRecordId(selectedId.value),
+    spotUuid: plainUuid(selectedId.value),
+    now: new Date().toISOString(),
+  })),
   pause: computed(() => selectedId.value === null),
   requestPolicy: "network-only",
 });
@@ -317,6 +321,7 @@ onBeforeUnmount(() => {
     <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable
       @book="bookingOpen = true" />
     <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot?.spot"
+      :booked="mergeBooked(selectedSpot?.bookings)"
       @booked="() => reexecuteSpot({ requestPolicy: 'network-only' })" />
   </div>
 </template>

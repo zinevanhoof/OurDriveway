@@ -3,25 +3,31 @@ use std::time::Duration;
 
 use async_nats::jetstream::Context;
 use axum::http::StatusCode;
-use bus::{PublishError, Readiness};
-use chrono::{DateTime, NaiveDateTime, TimeDelta, TimeZone, Utc};
-use chrono_tz::Tz;
+use bus::{PublishError, Readiness, format_seq};
+use chrono::Utc;
 use shared::{
+    domain_models::booking::status,
     error::myerror::{ContextExt, MyError, MyResult},
     events::{
         Envelope, STREAM_BOOKINGS,
-        booking::{BookingEvent, BookingReserved, CancelReason, ReleaseReason},
+        booking::{BookingCreated, BookingEvent, CancelReason, ReleaseReason},
         booking_subject,
     },
-    general_models::booking::Booked,
-    general_models::spot::TimeSlot,
     requests::booking::CreateBookingRequest,
+    responses::booking::CreatedResponse,
 };
+use surrealdb::{Surreal, engine::remote::ws::Client};
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::repository::booking_repository::{BookingForUpdate, BookingRepository};
-use crate::service::availability::{self, Rejection};
+use crate::policy::{
+    access::{NOT_FOUND, authorize},
+    availability::{self, Rejection},
+    schedule,
+};
+use crate::repository::{
+    booking_repository::BookingRepository, spot_mirror_repository::SpotMirrorRepository,
+};
 
 /// How long a checkout holds its slots.
 ///
@@ -35,50 +41,64 @@ pub const HOLD: Duration = Duration::from_secs(15 * 60);
 /// guarantees safety, not liveness: under real contention this could spin.
 const ATTEMPTS: usize = 3;
 
-/// How long to wait for our own projector to catch up after losing a CAS race.
-/// Same cap as view-service's `await_seq` — proceeding slightly stale beats
-/// hanging a request, and a genuinely stuck projector is already out of rotation.
-const CATCH_UP: Duration = Duration::from_secs(2);
+/// Answered whenever the spot's mirror is too incomplete to price or authorize
+/// against. Fails closed: booking against an availability we cannot see is worse
+/// than telling the renter to try again in a moment.
+const NOT_READY: (&str, &str) = (
+    "Not bookable yet",
+    "This spot isn't ready to accept bookings. Try again in a moment.",
+);
 
 /// Write side. Validates and publishes — it never writes to the database.
+///
+/// Every method takes the caller's id first, then what it is acting on, then the
+/// request body. The id comes from the verified JWT and never from the body.
 pub struct BookingService {
     pub js: Context,
-    pub repository: Arc<BookingRepository>,
+    pub bookings: BookingRepository,
+    /// Read-only here, and only for the four columns reserve needs plus the
+    /// compare-and-swap cursor — see
+    /// [`shared::domain_models::booking::SpotMirror`].
+    pub spots: SpotMirrorRepository,
     /// Applied-sequence watch for BOOKINGS, used to wait out a lost CAS race.
     pub applied: watch::Receiver<u64>,
 }
 
-pub struct Reserved {
-    pub booking_id: Uuid,
-    pub seq: u64,
-    pub expires_at: DateTime<Utc>,
-    pub amount_cents: i64,
-}
-
 impl BookingService {
-    pub fn new(js: Context, repository: Arc<BookingRepository>, readiness: &Readiness) -> Self {
+    pub fn new(js: Context, db: Arc<Surreal<Client>>, readiness: &Readiness) -> Self {
         Self {
             applied: readiness
                 .applied_rx(STREAM_BOOKINGS)
                 .expect("BOOKINGS registered with Readiness"),
             js,
-            repository,
+            bookings: BookingRepository { q: db.clone() },
+            spots: SpotMirrorRepository { q: db },
         }
     }
 
-    /// Holds slots for checkout.
+    /// Creates a booking, which starts life as a hold on its slots.
+    ///
+    /// Named for the booking rather than the hold: reserving the slots is what
+    /// creating one *entails*, not a separate thing a client can ask for. The
+    /// initial `status` is still `reserved`, because that is what the row is.
+    ///
+    /// Returns the wire shape directly. The id is in it because the client cannot
+    /// get it any other way and needs it immediately — it opens a Stripe Checkout
+    /// Session from it before any projection could have caught up. The seq is
+    /// formatted here rather than by the route because *this* is what knows the
+    /// event went to BOOKINGS; the route only picks the status code.
     ///
     /// The overlap check below is advisory — it turns a lost race into a clean 409
     /// naming the slot. The actual guarantee is the compare-and-swap on publish:
     /// two instances can both read a synced projection and both decide to write,
     /// and the server lets exactly one of them append.
-    pub async fn reserve(
+    pub async fn create_booking(
         &self,
+        renter_id: &Uuid,
         request: CreateBookingRequest,
-        renter_id: Uuid,
-    ) -> MyResult<Reserved> {
+    ) -> MyResult<CreatedResponse> {
         let spot_key = request.spot_id;
-        let requested = request.slots();
+        let requested = request.booked;
 
         // Stable across attempts: it's the idempotency key. If an ack is lost after
         // the event landed, the retry sees this booking already projected and
@@ -86,59 +106,44 @@ impl BookingService {
         let booking_id = Uuid::now_v7();
 
         for _ in 0..ATTEMPTS {
+            // Read the spot **before** the booking rows below, and keep it that way.
+            // The cursor asserted on publish comes from this row; the slots come from
+            // rows read after it. So the rows can only be newer than the cursor — a
+            // booking that lands in between is seen here (clean 409) while the
+            // compare-and-swap asserts the older sequence (refused, retried). Read in
+            // the other order and a reserve could authorize against slots it has not
+            // seen while asserting a cursor that succeeds, which is a double booking.
             let spot = self
-                .repository
-                .spot_for_booking(&spot_key)
+                .spots
+                .find_by_id(spot_key)
                 .await?
                 .context_not_found(("Not Found", "That spot doesn't exist."))?;
 
             // A previous attempt's event landed and we simply never heard the ack.
             // Because `booking_id` is stable across attempts this is recognisable,
-            // and the renter gets their reservation instead of a second one.
-            if let Some(existing) = self.repository.booking_for_update(&booking_id).await? {
-                return Ok(Reserved {
-                    booking_id,
+            // and the renter gets their booking instead of a second one.
+            if self.bookings.find_by_id(booking_id).await?.is_some() {
+                return Ok(CreatedResponse {
+                    id: booking_id,
                     // The spot's cursor is at or past our own event by definition —
                     // it was advanced by projecting it — so it's a safe position for
                     // the client to wait on.
-                    seq: spot.bookings_seq,
-                    expires_at: existing.hold_until.unwrap_or_else(Utc::now),
-                    amount_cents: existing.amount,
+                    seq: format_seq(STREAM_BOOKINGS, spot.bookings_seq),
                 });
             }
 
             // The SPOTS projection may not have caught up with this spot yet. Fail
             // closed rather than booking against an availability we can't see.
-            let (Some(availability), Some(price), Some(owner_id), Some(shard)) = (
-                spot.availability.as_ref(),
-                spot.price_per_hour,
-                spot.owner_id.as_ref(),
-                spot.shard.as_ref(),
-            ) else {
-                return Err(MyError::api(
-                    StatusCode::CONFLICT,
-                    "Not bookable yet",
-                    "This spot isn't ready to accept bookings. Try again in a moment.",
-                ));
-            };
+            let (availability, price, owner_id, shard) =
+                spot.bookable().context_conflict(NOT_READY)?;
 
-            if !spot.active {
-                return Err(MyError::api(
-                    StatusCode::CONFLICT,
-                    "Unavailable",
-                    "This spot is no longer accepting bookings.",
-                ));
-            }
-            if *owner_id == renter_id {
-                return Err(MyError::api(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Not allowed",
-                    "You can't book your own spot.",
-                ));
-            }
+            spot.active
+                .context_conflict(("Unavailable", "This spot is no longer accepting bookings."))?;
+            (owner_id != *renter_id)
+                .context_unprocessable_entity(("Not allowed", "You can't book your own spot."))?;
 
-            let minutes = availability::check(availability, &spot.booked, &requested, None)
-                .map_err(reject)?;
+            let taken = self.bookings.taken_for_spot(&spot_key, Utc::now()).await?;
+            let minutes = availability::check(availability, &taken, &requested).map_err(reject)?;
 
             // Truncating division rounds in the renter's favour. Slots are on a
             // 30-minute grid, so it only bites on a hand-crafted request.
@@ -151,44 +156,45 @@ impl BookingService {
             let ends_at = spot
                 .timezone
                 .as_deref()
-                .and_then(|tz| ends_at(&requested, tz))
-                .context_unprocessable_entity((
-                    "Unavailable",
-                    "This spot isn't ready to accept bookings. Try again in a moment.",
-                ))?;
+                .and_then(|tz| schedule::ends_at(&requested, tz))
+                .context_unprocessable_entity(NOT_READY)?;
 
             let expires_at = Utc::now() + HOLD;
-            let event = BookingEvent::Reserved(BookingReserved {
+            let event = BookingEvent::Created(BookingCreated {
                 booking_id,
                 spot_id: spot_key,
-                spot_shard: shard.clone(),
-                owner_id: *owner_id,
-                renter_id,
+                spot_shard: shard.to_string(),
+                owner_id,
+                renter_id: *renter_id,
                 booked: requested.clone(),
                 amount_cents,
                 expires_at,
                 ends_at,
             });
 
-            match self
-                .publish(
-                    &spot_key,
-                    shard,
-                    &event,
-                    &renter_id,
-                    Some(spot.bookings_seq),
-                )
-                .await
+            match bus::publish_expecting(
+                &self.js,
+                booking_subject(shard, &spot_key),
+                &Envelope::new(event, Some(*renter_id)),
+                Some(spot.bookings_seq),
+            )
+            .await
             {
                 Ok(seq) => {
-                    return Ok(Reserved {
-                        booking_id,
-                        seq,
-                        expires_at,
-                        amount_cents,
+                    return Ok(CreatedResponse {
+                        id: booking_id,
+                        seq: format_seq(STREAM_BOOKINGS, seq),
                     });
                 }
-                Err(PublishError::Stale) => self.catch_up(&spot_key, shard).await?,
+                Err(PublishError::Stale) => {
+                    bus::catch_up(
+                        &self.js,
+                        &self.applied,
+                        STREAM_BOOKINGS,
+                        &booking_subject(shard, &spot_key),
+                    )
+                    .await?
+                }
                 Err(PublishError::Failed(e)) => return Err(e),
             }
         }
@@ -196,332 +202,90 @@ impl BookingService {
         Err(taken_now())
     }
 
-    /// Payment succeeded, as reported by a signature-verified Stripe webhook.
-    ///
-    /// Called only by `worker::PaymentWorker`, never from a request. There is
-    /// deliberately no renter-facing confirm endpoint: a renter who could confirm their
-    /// own booking would not have to pay for it.
-    ///
-    /// This is *post*-capture, which is what makes it the opposite of `transition` in
-    /// every respect that matters — no `authorize`, no `recheck`, no compare-and-swap:
-    ///
-    /// - Money has already moved. Refusing here would leave a captured payment with no
-    ///   booking attached, which is worse than any state this could produce.
-    /// - So it publishes unconditionally, and if the booking no longer fits the spot's
-    ///   hours, `SpotProjector::react` withdraws it as `SpotUnavailable` — and
-    ///   payment-service refunds off that one trigger. One path for money coming back,
-    ///   not a second decision made here with half the picture.
-    /// - The projector's `WHERE status IN ['reserved']` is what keeps this idempotent:
-    ///   a redelivery, or a payment landing after the hold lapsed, applies to nothing.
-    ///
-    /// `payment_id` only names the event, so a redelivered webhook is discarded by the
-    /// stream's duplicate window instead of appending a second `Confirmed`.
-    pub async fn confirm_paid(&self, booking_id: Uuid, payment_id: Uuid) -> MyResult<u64> {
-        let booking = self
-            .repository
-            .booking_for_update(&booking_id)
-            .await?
-            .context_not_found(("Not Found", "That booking doesn't exist."))?;
-
-        let event = BookingEvent::Confirmed { booking_id };
-
-        // `actor_id: None` — Stripe acted, not a user holding a token.
-        let mut envelope = Envelope::new(event, None);
-        envelope.event_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_OID,
-            format!("payment-confirm:{payment_id}").as_bytes(),
-        );
-
-        Ok(bus::publish(
-            &self.js,
-            booking_subject(&booking.spot_shard, &booking.spot_id),
-            &envelope,
-        )
-        .await?)
-    }
-
     /// The renter backed out of checkout. Frees the slots immediately rather than
     /// waiting out the hold.
-    pub async fn release(&self, booking_id: &Uuid, renter_id: &Uuid) -> MyResult<u64> {
-        self.transition(booking_id, renter_id, |id| BookingEvent::Released {
-            booking_id: id,
+    ///
+    /// Authorize, publish. Nothing is re-checked and nothing is asserted, for the
+    /// same reason the sweeper needs neither: a release only ever *frees*
+    /// slots, so it can't lose a race in a way that matters. `authorize` has already
+    /// proved this is the caller's own reserved booking, and the projector's
+    /// `WHERE status IN ['reserved']` keeps a redelivery — or a payment that landed
+    /// in the same instant — from being undone.
+    ///
+    /// Deliberately cannot fail on the spot's state. A withdrawn listing or slots
+    /// booked over a lapsed hold are both reasons to let the hold go, not to refuse
+    /// and leave it blocking the spot for the rest of [`HOLD`].
+    pub async fn release(&self, renter_id: &Uuid, booking_id: &Uuid) -> MyResult<u64> {
+        let booking = self
+            .bookings
+            .find_by_id(*booking_id)
+            .await?
+            .context_not_found(NOT_FOUND)?;
+
+        authorize(&booking, renter_id, status::RESERVED)?;
+
+        let event = BookingEvent::Released {
+            booking_id: *booking_id,
             reason: ReleaseReason::Abandoned,
-        })
+        };
+        bus::publish(
+            &self.js,
+            booking_subject(&booking.spot_shard, &booking.spot_id),
+            &Envelope::new(event, Some(*renter_id)),
+        )
         .await
     }
 
     /// The renter withdraws a booking they already paid for.
     ///
-    /// Deliberately not `transition`. That path re-checks availability, which is
-    /// meaningless here — the slots are already ours and we are handing them back,
-    /// so a host who narrowed their hours since would turn a cancel into a 422. It
-    /// also publishes under compare-and-swap, which a cancel doesn't need: like the
-    /// expiry sweeper it only ever *frees* slots, so it can't lose a race in a way
-    /// that matters, and the projector's `WHERE status IN ['confirmed']` makes a
-    /// redelivery or a client retry a no-op.
-    pub async fn cancel(&self, booking_id: &Uuid, renter_id: &Uuid) -> MyResult<u64> {
+    /// Shaped like [`Self::release`] — authorize, then a plain publish — and for the
+    /// same reason: like the sweeper both only ever *free* slots, so neither
+    /// can lose a race in a way that matters, and the projector's
+    /// `WHERE status IN ['confirmed']` makes a redelivery or a client retry a no-op.
+    /// Nothing about the spot's current availability is consulted here either: the
+    /// slots are already ours and we are handing them back, so a host who narrowed
+    /// their hours since would otherwise turn a cancel into a 422.
+    ///
+    /// The deadline below is the one thing this adds, and it is about the host's
+    /// evening rather than about the slots.
+    pub async fn cancel(&self, renter_id: &Uuid, booking_id: &Uuid) -> MyResult<u64> {
         let booking = self
-            .repository
-            .booking_for_update(booking_id)
+            .bookings
+            .find_by_id(*booking_id)
             .await?
-            .context_not_found(("Not Found", "That booking doesn't exist."))?;
-        authorize(&booking, renter_id, "confirmed")?;
+            .context_not_found(NOT_FOUND)?;
+        authorize(&booking, renter_id, status::CONFIRMED)?;
 
         let timezone = self
-            .repository
-            .spot_for_booking(&booking.spot_id)
+            .spots
+            .find_by_id(booking.spot_id)
             .await?
             .and_then(|s| s.timezone);
 
         // Fails closed. A spot whose projection hasn't landed, an unknown zone, or
         // times that don't parse all mean we cannot *prove* the cancel is in time —
         // and the host has been holding the space on the strength of this booking.
-        if timezone
+        (timezone
             .as_deref()
-            .and_then(|tz| in_time(&booking.booked, tz, Utc::now()))
-            != Some(true)
-        {
-            return Err(MyError::api(
-                StatusCode::CONFLICT,
-                "Too late to cancel",
-                "A booking can only be cancelled up to an hour before it starts.",
-            ));
-        }
+            .and_then(|tz| schedule::in_time(&booking.booked, tz, Utc::now()))
+            == Some(true))
+        .context_conflict((
+            "Too late to cancel",
+            "A booking can only be cancelled up to an hour before it starts.",
+        ))?;
 
         let event = BookingEvent::Cancelled {
             booking_id: *booking_id,
             reason: CancelReason::ByRenter,
         };
-        match self
-            .publish(
-                &booking.spot_id,
-                &booking.spot_shard,
-                &event,
-                renter_id,
-                None,
-            )
-            .await
-        {
-            Ok(seq) => Ok(seq),
-            // Unreachable with `expected: None` — there is no assertion to lose.
-            Err(PublishError::Stale) => Err(taken_now()),
-            Err(PublishError::Failed(e)) => Err(e),
-        }
-    }
-
-    /// Shared confirm/release path: authorize, re-check, publish under CAS.
-    async fn transition(
-        &self,
-        booking_id: &Uuid,
-        renter_id: &Uuid,
-        event: impl Fn(Uuid) -> BookingEvent,
-    ) -> MyResult<u64> {
-        let id = *booking_id;
-
-        for _ in 0..ATTEMPTS {
-            let booking = self
-                .repository
-                .booking_for_update(booking_id)
-                .await?
-                .context_not_found(("Not Found", "That booking doesn't exist."))?;
-
-            authorize(&booking, renter_id, "reserved")?;
-            self.recheck(&booking).await?;
-
-            let seq = self
-                .repository
-                .spot_for_booking(&booking.spot_id)
-                .await?
-                .map(|s| s.bookings_seq)
-                .unwrap_or(0);
-
-            match self
-                .publish(
-                    &booking.spot_id,
-                    &booking.spot_shard,
-                    &event(id),
-                    renter_id,
-                    Some(seq),
-                )
-                .await
-            {
-                Ok(seq) => return Ok(seq),
-                Err(PublishError::Stale) => {
-                    self.catch_up(&booking.spot_id, &booking.spot_shard).await?
-                }
-                Err(PublishError::Failed(e)) => return Err(e),
-            }
-        }
-
-        Err(taken_now())
-    }
-
-    /// Re-verifies that a booking's slots are still its own to take.
-    ///
-    /// Runs on every confirm, not only when the hold lapsed. If the hold was live
-    /// nothing could have taken the slots and this passes trivially; if it lapsed
-    /// and someone else booked over it, the renter gets a 409 instead of paying for
-    /// a slot they no longer have.
-    async fn recheck(&self, booking: &BookingForUpdate) -> MyResult<()> {
-        let Some(spot) = self.repository.spot_for_booking(&booking.spot_id).await? else {
-            return Ok(());
-        };
-        // A deleted listing can't be confirmed into, even by a hold taken before the
-        // deletion. `active` is deliberately *not* checked: flipping the live switch
-        // off stops new reservations, and a checkout already under way predates it.
-        if spot.deleted {
-            return Err(MyError::api(
-                StatusCode::CONFLICT,
-                "Unavailable",
-                "The host withdrew this spot.",
-            ));
-        }
-        let Some(availability) = spot.availability.as_ref() else {
-            return Ok(());
-        };
-        availability::check(
-            availability,
-            &spot.booked,
-            &booking.booked,
-            Some(&booking.booked),
-        )
-        .map_err(reject)?;
-        Ok(())
-    }
-
-    async fn publish(
-        &self,
-        spot_id: &Uuid,
-        shard: &str,
-        event: &BookingEvent,
-        actor: &Uuid,
-        expected: Option<u64>,
-    ) -> Result<u64, PublishError> {
-        bus::publish_expecting(
+        bus::publish(
             &self.js,
-            booking_subject(shard, spot_id),
-            &Envelope::new(event.clone(), Some(*actor)),
-            expected,
+            booking_subject(&booking.spot_shard, &booking.spot_id),
+            &Envelope::new(event, Some(*renter_id)),
         )
         .await
     }
-
-    /// Waits for this instance's projector to reach the subject's current head.
-    ///
-    /// Without this the retry re-reads the same stale projection, asserts the same
-    /// stale sequence, and is refused again — a loop that can never converge.
-    async fn catch_up(&self, spot_id: &Uuid, shard: &str) -> MyResult<()> {
-        let head =
-            bus::subject_head(&self.js, STREAM_BOOKINGS, &booking_subject(shard, spot_id)).await?;
-        // Not a warning: losing a CAS race is the mechanism working, not a fault.
-        // Logged because it's otherwise invisible, and a spot generating a steady
-        // stream of these is the signal that ATTEMPTS needs backoff.
-        tracing::info!(spot = %spot_id, head, "lost CAS race; catching up before retry");
-
-        let mut applied = self.applied.clone();
-        let _ = tokio::time::timeout(CATCH_UP, async {
-            while *applied.borrow() < head {
-                if applied.changed().await.is_err() {
-                    break;
-                }
-            }
-        })
-        .await;
-        Ok(())
-    }
 }
-
-fn authorize(booking: &BookingForUpdate, renter_id: &Uuid, expected: &str) -> MyResult<()> {
-    // Ownership from the verified token, never from the request.
-    if booking.renter_id != *renter_id {
-        // 404 rather than 403: whether a booking id exists isn't this caller's
-        // business.
-        return Err(MyError::api(
-            StatusCode::NOT_FOUND,
-            "Not Found",
-            "That booking doesn't exist.",
-        ));
-    }
-    // A parameter, not a constant: confirm and release leave `reserved`, cancel
-    // leaves `confirmed`.
-    if booking.status != expected {
-        return Err(MyError::api(
-            StatusCode::CONFLICT,
-            "Already settled",
-            format!("This booking is already {}.", booking.status),
-        ));
-    }
-    Ok(())
-}
-
-/// How long before a booking starts cancelling closes. Any shorter and the host
-/// is already standing in the driveway.
-const CUTOFF: TimeDelta = TimeDelta::hours(1);
-
-/// Whether a cancel at `now` is still in time.
-///
-/// `None` when the start can't be determined at all — an unknown zone, or times
-/// that don't parse. The caller treats that as "no", because we can't hand out a
-/// cancel we can't prove is in time.
-///
-/// `now` is a parameter rather than a clock read so this stays pure and testable.
-fn in_time(booked: &Booked, timezone: &str, now: DateTime<Utc>) -> Option<bool> {
-    Some(now + CUTOFF <= starts_at(booked, timezone)?)
-}
-
-/// The first moment a booking occupies, as a UTC instant.
-///
-/// `booked` is `"YYYY-MM-DD"` plus `"HH:MM"` with no zone attached — it is the
-/// *spot's* wall clock. Reading it as UTC would slide an hour-long deadline by the
-/// spot's whole offset, which in Brussels means two hours the wrong way in summer.
-///
-/// The minimum is taken across every date and every slot: `booked` is a `HashMap`,
-/// so the first one iterated is not the first one that happens.
-fn starts_at(booked: &Booked, timezone: &str) -> Option<DateTime<Utc>> {
-    let tz: Tz = timezone.parse().ok()?;
-    let first = wall_times(booked, |s| &s.start).min()?;
-    instant(first, tz)
-}
-
-/// The last moment a booking occupies, as a UTC instant.
-///
-/// The mirror of `starts_at`, and the field every "is this still to come" filter
-/// reads. Same reason for the fold: a `HashMap` of wall-clock strings has no order
-/// of its own, so the last date iterated is not the last one that happens.
-fn ends_at(booked: &Booked, timezone: &str) -> Option<DateTime<Utc>> {
-    let tz: Tz = timezone.parse().ok()?;
-    let last = wall_times(booked, |s| &s.end).max()?;
-    instant(last, tz)
-}
-
-/// Every `"YYYY-MM-DD HH:MM"` in `booked`, picking one end of each slot.
-fn wall_times<'a>(
-    booked: &'a Booked,
-    pick: impl Fn(&TimeSlot) -> &String + Copy + 'a,
-) -> impl Iterator<Item = NaiveDateTime> + 'a {
-    booked
-        .iter()
-        .flat_map(move |(date, slots)| slots.iter().map(move |s| format!("{date} {}", pick(s))))
-        .filter_map(|local| NaiveDateTime::parse_from_str(&local, "%Y-%m-%d %H:%M").ok())
-}
-
-/// A wall time in `tz` as an instant.
-///
-/// A wall time inside a spring-forward gap names no instant at all. The same time an
-/// hour later always does; being an hour stricter one night a year beats a booking
-/// that can never be cancelled. `earliest` also settles the autumn ambiguity, in the
-/// host's favour — for an end that means a booking leaves the Upcoming tab up to an
-/// hour early on that one night, which no money depends on.
-fn instant(local: NaiveDateTime, tz: Tz) -> Option<DateTime<Utc>> {
-    tz.from_local_datetime(&local)
-        .earliest()
-        .or_else(|| {
-            tz.from_local_datetime(&(local + TimeDelta::hours(1)))
-                .earliest()
-        })
-        .map(|dt| dt.with_timezone(&Utc))
-}
-
 fn taken_now() -> MyError {
     MyError::api(
         StatusCode::CONFLICT,
@@ -547,94 +311,5 @@ fn reject(rejection: Rejection) -> MyError {
             "Invalid times",
             "Those time slots don't look right.",
         ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use shared::general_models::spot::TimeSlot;
-    use std::collections::HashMap;
-
-    fn at(s: &str) -> DateTime<Utc> {
-        s.parse().unwrap()
-    }
-
-    fn slot(start: &str, end: &str) -> TimeSlot {
-        TimeSlot {
-            start: start.into(),
-            end: end.into(),
-        }
-    }
-
-    #[test]
-    fn cancel_closes_one_hour_before_the_first_slot_in_the_spots_zone() {
-        // 09:00 in Brussels on this date is 07:00Z (CEST, UTC+2), so the deadline is
-        // 06:00Z. Reading `booked` as bare UTC would put the deadline at 08:00Z and
-        // hand out two extra hours of cancelling — the bug this test exists for.
-        let booked: Booked = HashMap::from([(
-            "2026-08-03".to_string(),
-            // Out of order on purpose: `booked` is a HashMap, so "first" has to be a
-            // minimum, not whatever happens to iterate first.
-            vec![slot("11:00", "12:00"), slot("09:00", "10:00")],
-        )]);
-        let tz = "Europe/Brussels";
-
-        assert_eq!(in_time(&booked, tz, at("2026-08-03T05:59:59Z")), Some(true));
-        // Exactly on the hour still counts — the boundary is inclusive.
-        assert_eq!(in_time(&booked, tz, at("2026-08-03T06:00:00Z")), Some(true));
-        assert_eq!(
-            in_time(&booked, tz, at("2026-08-03T06:00:01Z")),
-            Some(false)
-        );
-        // Inside the naive-UTC window, and correctly refused anyway.
-        assert_eq!(
-            in_time(&booked, tz, at("2026-08-03T07:30:00Z")),
-            Some(false)
-        );
-        // An earlier date wins over an earlier clock time on a later date: 22:00 on
-        // the 3rd is 20:00Z, so the deadline is 19:00Z — not 07:00 on the 4th.
-        let spread: Booked = HashMap::from([
-            ("2026-08-04".to_string(), vec![slot("08:00", "09:00")]),
-            ("2026-08-03".to_string(), vec![slot("22:00", "23:00")]),
-        ]);
-        assert_eq!(in_time(&spread, tz, at("2026-08-03T19:00:00Z")), Some(true));
-        assert_eq!(
-            in_time(&spread, tz, at("2026-08-03T19:00:01Z")),
-            Some(false)
-        );
-        // Fails closed: an unknown zone can't be proven in time.
-        assert_eq!(
-            in_time(&booked, "Not/AZone", at("2026-08-03T05:00:00Z")),
-            None
-        );
-    }
-
-    #[test]
-    fn ends_at_is_the_last_moment_across_every_day_in_the_spots_zone() {
-        // Deliberately out of order, and spanning two days: `booked` is a HashMap, so
-        // "last" has to be a maximum. The 4th's 09:00 iterating first must not win
-        // over the 3rd's 23:00 — nor the other way round.
-        let booked: Booked = HashMap::from([
-            (
-                "2026-08-04".to_string(),
-                vec![slot("08:00", "09:00"), slot("10:00", "11:00")],
-            ),
-            ("2026-08-03".to_string(), vec![slot("22:00", "23:00")]),
-        ]);
-
-        // 11:00 Brussels on the 4th is 09:00Z in summer. Reading the strings as UTC
-        // would answer 11:00Z and keep the booking "upcoming" two hours too long.
-        assert_eq!(
-            ends_at(&booked, "Europe/Brussels"),
-            Some(at("2026-08-04T09:00:00Z"))
-        );
-        // Same map, other end, so a start/end mix-up can't pass both.
-        assert_eq!(
-            starts_at(&booked, "Europe/Brussels"),
-            Some(at("2026-08-03T20:00:00Z"))
-        );
-        assert_eq!(ends_at(&booked, "Not/AZone"), None);
-        assert_eq!(ends_at(&HashMap::new(), "Europe/Brussels"), None);
     }
 }

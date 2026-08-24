@@ -1,58 +1,36 @@
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::{Json, response::IntoResponse};
-use chrono::{DateTime, Utc};
-use serde::Serialize;
+use axum::response::IntoResponse;
+use bus::format_seq;
 use shared::error::myerror::MyResult;
 use shared::events::STREAM_BOOKINGS;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::booking::CreateBookingRequest;
+use shared::responses::common::accepted;
 use uuid::Uuid;
 
 use crate::AppState;
 
-#[derive(Serialize)]
-pub struct ReservedResponse {
-    /// The uuid, hyphenated. The client wraps it as `u'<uuid>'` for a GraphQL
-    /// `booking(id:)` lookup — see `recordId()` in the frontend.
-    pub id: Uuid,
-    /// `"BOOKINGS:812"` — where this write landed in the log. The client echoes it
-    /// back on its next read so a load balancer can't route it to an instance that
-    /// hasn't projected this event yet.
-    pub seq: String,
-    /// When the hold lapses. Returned here so the checkout countdown needs no
-    /// follow-up query.
-    pub expires_at: DateTime<Utc>,
-    /// EUR cents, recomputed server-side from the authorised minutes.
-    pub amount_cents: i64,
-}
-
-#[derive(Serialize)]
-pub struct AcceptedResponse {
-    pub seq: String,
-}
-
 /// 202, not 201: the event is committed to the log, but the projections that
 /// answer reads are still catching up. `seq` is how a caller waits for its own
 /// write.
-pub async fn reserve(
+///
+/// The one write in the system that answers with more than a seq, and `id` is now
+/// all of it. The hold's `expires_at` and the priced `amount_cents` used to ride
+/// along for the checkout drawer's countdown and total; checkout is its own route
+/// now and reads both from the Stripe session, so nothing consumed them.
+pub async fn create_booking(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Valid(request): Valid<CreateBookingRequest>,
 ) -> MyResult<impl IntoResponse> {
     // Renter identity comes from the verified token, never from the request body.
-    let reserved = state.booking_service.reserve(request, user_id).await?;
+    let created = state
+        .booking_service
+        .create_booking(&user_id, request)
+        .await?;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ReservedResponse {
-            id: reserved.booking_id,
-            seq: format!("{STREAM_BOOKINGS}:{}", reserved.seq),
-            expires_at: reserved.expires_at,
-            amount_cents: reserved.amount_cents,
-        }),
-    ))
+    Ok(created.accepted())
 }
 
 // There is no confirm endpoint. Confirmation is not something a client can ask for:
@@ -67,8 +45,8 @@ pub async fn release(
     State(state): State<AppState>,
     Path(booking_id): Path<Uuid>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state.booking_service.release(&booking_id, &user_id).await?;
-    Ok(accepted(seq))
+    let seq = state.booking_service.release(&user_id, &booking_id).await?;
+    Ok(accepted(format_seq(STREAM_BOOKINGS, seq)))
 }
 
 /// The renter withdraws a booking they already paid for, up to an hour before it
@@ -82,15 +60,6 @@ pub async fn cancel(
     State(state): State<AppState>,
     Path(booking_id): Path<Uuid>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state.booking_service.cancel(&booking_id, &user_id).await?;
-    Ok(accepted(seq))
-}
-
-fn accepted(seq: u64) -> impl IntoResponse {
-    (
-        StatusCode::ACCEPTED,
-        Json(AcceptedResponse {
-            seq: format!("{STREAM_BOOKINGS}:{seq}"),
-        }),
-    )
+    let seq = state.booking_service.cancel(&user_id, &booking_id).await?;
+    Ok(accepted(format_seq(STREAM_BOOKINGS, seq)))
 }

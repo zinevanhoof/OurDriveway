@@ -101,12 +101,30 @@ export function bookedOutside(
     });
 }
 
+/**
+ * Every booking's slots on a spot, unioned into one `"YYYY-MM-DD"` -> slots map.
+ *
+ * The rows come from `bookings(where: { spot_id, ends_at: { gt: now } })`, and no
+ * status filter is applied here on purpose: the view's `booking` select permission
+ * hands a prospective renter only the rows that actually block a slot. Released and
+ * cancelled bookings are visible to their renter and the host, and to nobody else.
+ */
+export function mergeBooked(
+  bookings: { booked?: Record<string, TimeSlot[]> | null }[] | undefined | null,
+): Record<string, TimeSlot[]> {
+  const out: Record<string, TimeSlot[]> = {};
+  for (const b of bookings ?? [])
+    for (const [date, slots] of Object.entries(b.booked ?? {}))
+      (out[date] ??= []).push(...slots);
+  return out;
+}
+
 // What's still bookable on a date: open windows minus what's already taken.
 //
-// `occupied` is the spot's `booked` field verbatim — no reshaping and no
-// filtering. Everything in it is taken, including a slot someone is paying for
-// right now; a hold that lapses is removed server-side by the expiry sweeper, so
-// there is no expiry for this side to reason about.
+// `occupied` is `mergeBooked()`'s output — no further reshaping and no filtering.
+// Everything in it is taken, including a slot someone is paying for right now; a
+// hold that lapses stops blocking when the expiry sweeper releases it server-side,
+// so there is no expiry for this side to reason about.
 export function remainingWindows(
   availability: SpotAvailability | undefined,
   occupied: Record<string, TimeSlot[]>,
@@ -172,6 +190,22 @@ export function demo() {
   // Already happened: nothing to cancel, so it is never flagged.
   if (bookedOutside({ weekly: {}, single: {} }, at([{ start: "09:00", end: "10:00" }]), "2026-09-01").length)
     throw new Error("past dates must be skipped");
+
+  // mergeBooked: two bookings on one date must concatenate, not overwrite — the
+  // whole reason this replaced a server-side fold rather than a per-row read.
+  eq(
+    mergeBooked([
+      { booked: at([{ start: "09:00", end: "10:00" }]) },
+      { booked: at([{ start: "14:00", end: "15:00" }]) },
+      { booked: null },
+    ])["2026-08-03"],
+    [
+      { start: "09:00", end: "10:00" },
+      { start: "14:00", end: "15:00" },
+    ],
+  );
+  if (Object.keys(mergeBooked(undefined)).length)
+    throw new Error("no bookings must mean nothing taken");
 
   return "ok";
 }

@@ -32,8 +32,14 @@ const props = defineProps<{
         price_per_hour: number | string;
         address?: { formatted?: string };
         availability?: SpotAvailability;
-        booked?: Record<string, TimeSlot[]>;
     };
+    /**
+     * Slots already taken, as `mergeBooked()` of the spot's still-to-come bookings.
+     *
+     * Its own prop rather than a field on `spot`: it comes from a sibling query, not
+     * from the spot row — there is no denormalized copy on the spot any more.
+     */
+    booked?: Record<string, TimeSlot[]>;
 }>();
 
 const router = useRouter();
@@ -41,10 +47,10 @@ const router = useRouter();
 const open = defineModel<boolean>({ required: true });
 const emit = defineEmits<{ booked: [bookingId: string] }>();
 
-// Slots already taken, straight off the spot. No reshaping and no filtering:
-// everything in `booked` is taken, and a lapsed hold is removed server-side by
-// the expiry sweeper rather than being filtered out here.
-const occupied = computed(() => props.spot?.booked ?? {});
+// No reshaping and no filtering: everything in `booked` is taken, and a lapsed hold
+// stops blocking when the expiry sweeper releases it server-side rather than being
+// filtered out here.
+const occupied = computed(() => props.booked ?? {});
 
 // ─── Calendar: only host-open dates (minus bookings) within 90 days ───
 const minDate = today(getLocalTimeZone());
@@ -166,7 +172,7 @@ async function submit() {
 
     busy.value = true;
     try {
-        const reservation = await bookingApi.reserve({
+        const booking = await bookingApi.createBooking({
             spotId: plainUuid(props.spot.id)!,
             booked,
             amountCents: totals.value.amountCents,
@@ -175,9 +181,9 @@ async function submit() {
         // The session is created here rather than by the checkout screen, so that screen
         // needs nothing but a session id in its URL — no booking id, and therefore one
         // code path for entry, reload, return and retry.
-        const session = await paymentApi.createSession(reservation.id);
+        const session = await paymentApi.createSession(booking.id);
 
-        emit("booked", reservation.id);
+        emit("booked", booking.id);
         void router.push({ path: "/checkout", query: { session_id: session.sessionId } });
     } catch (e: any) {
         // Someone took the slots between rendering and submitting, the host isn't open

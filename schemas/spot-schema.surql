@@ -9,14 +9,6 @@ USE NS main DB main;
 -- so --import-file re-runs this file against an existing database on every boot.
 -- Without OVERWRITE the second boot fails on redefinition.
 
--- Distance (meters) from a spot's point to a lng/lat pair. Exists so the map's
--- radius query can filter through auto GraphQL's `call` operator: geo::distance
--- needs a geometry, which can't be passed as a JSON filter arg, so we take plain
--- floats and rebuild the point here.
-DEFINE FUNCTION OVERWRITE fn::spot_distance($loc: geometry, $lng: float, $lat: float) {
-    RETURN geo::distance($loc, type::point([$lng, $lat]));
-};
-
 -- PERMISSIONS NONE, not a select clause. No browser reaches this database — it is
 -- private to spot-service, which connects with a database-level user whose role
 -- bypasses table permissions entirely and authorizes ownership in Rust from the

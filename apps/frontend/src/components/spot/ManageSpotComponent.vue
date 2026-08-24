@@ -8,7 +8,8 @@ import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
 import { formatCents } from '@/lib/money.ts';
 import { formatDay, formatSlots, sortedDays, todayIn } from '@/lib/bookingDates.ts';
-import { deleteSpot, setSpotActive } from '@/api/spotApi.ts';
+import { deleteSpot, updateSpot } from '@/api/spotApi.ts';
+import { readErrorDetail } from '@/lib/serverErrors.ts';
 import type { TimeSlot, WeeklyAvailability } from '@/types/domain/spot';
 
 import Avatar from "../ui/avatar/Avatar.vue";
@@ -46,11 +47,15 @@ const pending = ref<boolean>()
 const live = computed(() => pending.value ?? data.value?.spot?.active ?? false)
 const errors = ref<string[]>([])
 
+// `{ active }` and nothing else: an edit only touches the fields it carries, and a
+// toggle that also resubmitted availability would run the backend's
+// cancel-what-no-longer-fits pass off a read that may be a moment stale.
 const toggleLive = async (active: boolean) => {
     pending.value = active
     errors.value = []
     try {
-        await setSpotActive(plainUuid(id)!, active)
+        const response = await updateSpot(plainUuid(id)!, { active })
+        if (!response.ok) throw new Error((await readErrorDetail(response)).join(' '))
         await executeQuery({ requestPolicy: 'network-only' })
     } catch (e) {
         errors.value = [e instanceof Error ? e.message : 'Could not change the listing.']

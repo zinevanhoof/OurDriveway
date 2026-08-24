@@ -10,6 +10,11 @@ edition.workspace = true
 async-nats = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
+# `Tx` hands each event's `occurred_at` to the projector it wraps, which is the
+# only clock an apply may read.
+chrono = { workspace = true }
+# `publish_event` stamps the actor onto each envelope.
+uuid = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,9 +26,7 @@ surrealdb = { workspace = true }
 
 shared = { path = "../shared" }
 
-# `examples/seed.rs` only. Dev-dependencies, so no service build pays for them —
-# and all three are already in the workspace graph, so nothing new compiles.
+# `examples/seed.rs` only. A dev-dependency, so no service build pays for it —
+# and it is already in the workspace graph, so nothing new compiles.
 [dev-dependencies]
 argon2 = { workspace = true }
-chrono = { workspace = true }
-uuid = { workspace = true }

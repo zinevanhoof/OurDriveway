@@ -3,45 +3,49 @@ import { recordSeq } from "@/lib/awaitSeq";
 import { LoginRequest } from "@/types/requests/LoginRequest";
 import { SignupRequest } from "@/types/requests/SignupRequest";
 
+// Every write below runs through `record`, including the three that answer with
+// something other than a 202: login and refresh carry a SESSIONS position on the
+// AuthResponse, and signup and verify answer 202 like the rest. user-service now
+// mounts the await_seq layer, so those positions are what make the *next* call to
+// it — a second signup submit, the login after a verification — read what this one
+// just wrote, on whichever replica takes it.
 const loginUser = async ({
   email,
   password,
-}: LoginRequest): Promise<Response> => {
-  const response = await apiFetch("/api/user/login", {
-    method: "POST",
-    body: JSON.stringify({
-      email,
-      password,
+}: LoginRequest): Promise<Response> =>
+  record(
+    await apiFetch("/api/user/login", {
+      method: "POST",
+      body: JSON.stringify({
+        email,
+        password,
+      }),
+      headers: {
+        "Content-Type": "application/json",
+      },
     }),
-    headers: {
-      "Content-Type": "application/json",
-    },
-  });
-
-  return response;
-};
+  );
 
 const signupUser = async ({
   firstName,
   lastName,
   email,
   password,
-}: SignupRequest): Promise<Response> => {
-  const response = await apiFetch("/api/user/signup", {
-    method: "POST",
-    body: JSON.stringify({
-      firstName,
-      lastName,
-      email,
-      password,
+}: SignupRequest): Promise<Response> =>
+  record(
+    await apiFetch("/api/user/signup", {
+      method: "POST",
+      body: JSON.stringify({
+        firstName,
+        lastName,
+        email,
+        password,
+      }),
+      headers: {
+        "Content-Type": "application/json",
+      },
     }),
-    headers: {
-      "Content-Type": "application/json",
-    },
-  });
-
-  return response;
-};
+  );
 
 /**
  * Confirms an address from the token in a mailed link.
@@ -52,11 +56,13 @@ const signupUser = async ({
  * rather than an error, which is what makes a prefetch harmless.
  */
 const verifyEmail = async (token: string): Promise<Response> =>
-  apiFetch("/api/user/verify-email", {
-    method: "POST",
-    body: JSON.stringify({ token }),
-    headers: { "Content-Type": "application/json" },
-  });
+  record(
+    await apiFetch("/api/user/email/verify", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
 
 /**
  * Asks for the verification link again.
@@ -65,14 +71,14 @@ const verifyEmail = async (token: string): Promise<Response> =>
  * which addresses are registered, so there is nothing here to branch on.
  */
 const resendVerification = async (email: string): Promise<Response> =>
-  apiFetch("/api/user/verify-email/resend", {
+  apiFetch("/api/user/email/resend", {
     method: "POST",
     body: JSON.stringify({ email }),
     headers: { "Content-Type": "application/json" },
   });
 
 const logoutUser = async () => {
-  await apiFetch("/api/user/refresh/logout", {
+  await apiFetch("/api/user/session/logout", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -80,17 +86,26 @@ const logoutUser = async () => {
   });
 };
 
-const refreshUser = async (): Promise<Response> => {
-  const response = await apiFetch("/api/user/refresh", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-  });
+const refreshUser = async (): Promise<Response> =>
+  record(
+    await apiFetch("/api/user/session/refresh", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+    }),
+  );
 
-  return response;
-};
-
+/**
+ * The two halves of `PATCH /api/user`. Every field is optional server-side, where
+ * omitted means "unchanged" — which is what lets one endpoint serve both screens,
+ * each sending only its own half.
+ *
+ * They are two types here rather than one optional-everything type because each
+ * screen really does submit its whole half, and the server refuses a body carrying
+ * both: it publishes one event per request, and a password change is a different
+ * event from a profile edit.
+ */
 export type UpdateProfileRequest = {
   firstName: string;
   lastName: string;
@@ -119,19 +134,19 @@ export type ChangePasswordRequest = {
  * answers reads is still catching up, and recording the seq is what makes the
  * next query wait for this write.
  */
-const updateProfile = async (body: UpdateProfileRequest): Promise<Response> =>
-  record(
-    await apiFetch("/api/user/me", {
-      method: "PATCH",
-      body: JSON.stringify(body),
-      headers: { "Content-Type": "application/json" },
-    }),
-  );
+const updateProfile = (body: UpdateProfileRequest): Promise<Response> =>
+  patchUser(body);
 
-const changePassword = async (body: ChangePasswordRequest): Promise<Response> =>
+/** Same endpoint, the other half — see [UpdateProfileRequest]. */
+const changePassword = (body: ChangePasswordRequest): Promise<Response> =>
+  patchUser(body);
+
+const patchUser = async (
+  body: UpdateProfileRequest | ChangePasswordRequest,
+): Promise<Response> =>
   record(
-    await apiFetch("/api/user/me/password", {
-      method: "POST",
+    await apiFetch("/api/user", {
+      method: "PATCH",
       body: JSON.stringify(body),
       headers: { "Content-Type": "application/json" },
     }),

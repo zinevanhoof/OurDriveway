@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use aws_sdk_s3::presigning::PresigningConfig;
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use shared::error::myerror::{MyError, MyResult};
 use shared::extractors::authed_jwt::AuthedJwt;
@@ -57,7 +57,7 @@ pub async fn upload_url(
     _: AuthedJwt,
     State(state): State<AppState>,
     Json(request): Json<UploadUrlRequest>,
-) -> MyResult<Json<UploadUrlResponse>> {
+) -> MyResult<impl IntoResponse> {
     let extension = extension_for(&request.content_type).ok_or_else(|| {
         MyError::api(
             StatusCode::UNPROCESSABLE_ENTITY,

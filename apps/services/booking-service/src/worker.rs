@@ -17,10 +17,13 @@ use shared::{
     events::{Envelope, STREAM_PAYMENTS, payment::PaymentEvent},
 };
 
-use crate::service::booking_service::BookingService;
+use crate::service::payment_worker_service::PaymentWorkerService;
 
 pub struct PaymentWorker {
-    pub booking_service: Arc<BookingService>,
+    /// Deliberately not `BookingService`: that type is the request-side write path,
+    /// with its authorization, availability re-checks and compare-and-swap. None of it
+    /// applies once Stripe has taken the money — see `service/payment_worker_service.rs`.
+    pub service: Arc<PaymentWorkerService>,
 }
 
 impl Worker for PaymentWorker {
@@ -44,7 +47,7 @@ impl Worker for PaymentWorker {
 
             // `Failed` is deliberately ignored rather than releasing the hold: the
             // renter can confirm the same intent again with another method, and if they
-            // walk away the expiry sweeper collects it. Refunds and intent cancellation
+            // walk away the sweeper collects it. Refunds and intent cancellation
             // are payment-service's business, not this stream's.
             _ => return Ok(()),
         };
@@ -54,9 +57,7 @@ impl Worker for PaymentWorker {
         // An error NAKs and comes back in thirty seconds, which is what covers the one
         // ordering that can go wrong here: a booking whose `Reserved` this instance's
         // BOOKINGS projector has not applied yet.
-        self.booking_service
-            .confirm_paid(booking_id, payment_id)
-            .await?;
+        self.service.confirm_paid(booking_id, payment_id).await?;
 
         Ok(())
     }

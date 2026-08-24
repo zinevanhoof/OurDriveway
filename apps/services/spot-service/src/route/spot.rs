@@ -1,36 +1,22 @@
-use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use serde::{Deserialize, Serialize};
+use axum::response::IntoResponse;
+use bus::format_seq;
 use shared::error::myerror::MyResult;
 use shared::events::STREAM_SPOTS;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::spot::{CreateSpotRequest, UpdateSpotRequest};
+use shared::responses::common::accepted;
 use uuid::Uuid;
 
 use crate::AppState;
 
-#[derive(Serialize)]
-pub struct CreatedResponse {
-    /// The uuid, hyphenated. The client wraps it as `u'<uuid>'` before handing it
-    /// to a GraphQL `spot(id:)` lookup — see `recordId()` in the frontend.
-    pub id: Uuid,
-    /// `"SPOTS:4712"` — where this write landed in the log. The client echoes it
-    /// back on its next read so a load balancer can't route it to an instance
-    /// that hasn't projected this event yet.
-    pub seq: String,
-}
-
-/// The same `seq`, for writes to a spot that already has an id.
-#[derive(Serialize)]
-pub struct AcceptedResponse {
-    pub seq: String,
-}
-
 /// 202, not 201: the event is committed to the log, but the projections that
 /// answer reads are still catching up. `seq` is how a caller waits for its own
 /// write.
+///
+/// Answers with the seq and nothing else — the minted id is not returned; see
+/// `SpotService::create_spot`.
 ///
 /// Plain JSON. Photos are already in R2 by the time this is called — the browser
 /// uploaded them against a presigned URL from media-service — so `images` carries
@@ -39,68 +25,37 @@ pub async fn create_spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Valid(request): Valid<CreateSpotRequest>,
-) -> MyResult<(StatusCode, Json<CreatedResponse>)> {
+) -> MyResult<impl IntoResponse> {
     // Ownership comes from the verified token, never from the request body.
-    let created = state.spot_service.create_spot(request, user_id).await?;
+    let seq = state.spot_service.create_spot(&user_id, request).await?;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(CreatedResponse {
-            id: created.spot_id,
-            seq: format!("{STREAM_SPOTS}:{}", created.seq),
-        }),
-    ))
+    Ok(accepted(format_seq(STREAM_SPOTS, seq)))
 }
 
 /// 202 for the same reason as create: the log has it, the projections haven't.
+///
+/// Also the live switch — there is no separate endpoint for it. Every field of
+/// [`UpdateSpotRequest`] is optional, so the manage screen's toggle is this route
+/// with a body of `{ "active": false }` and nothing else.
 pub async fn update_spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Valid(request): Valid<UpdateSpotRequest>,
-) -> MyResult<(StatusCode, Json<AcceptedResponse>)> {
+) -> MyResult<impl IntoResponse> {
     let seq = state
         .spot_service
-        .update_spot(&id, request, user_id)
+        .update_spot(&user_id, &id, request)
         .await?;
 
-    Ok(accepted(seq))
-}
-
-#[derive(Deserialize)]
-pub struct ActiveRequest {
-    pub active: bool,
-}
-
-/// The live switch. Its own route rather than a field on the edit form: it is one
-/// tap from a screen that isn't editing anything, and it publishes a different event.
-pub async fn set_active(
-    AuthedJwt { user_id, .. }: AuthedJwt,
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(request): Json<ActiveRequest>,
-) -> MyResult<(StatusCode, Json<AcceptedResponse>)> {
-    let seq = state
-        .spot_service
-        .set_active(&id, request.active, user_id)
-        .await?;
-    Ok(accepted(seq))
+    Ok(accepted(format_seq(STREAM_SPOTS, seq)))
 }
 
 pub async fn delete_spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> MyResult<(StatusCode, Json<AcceptedResponse>)> {
-    let seq = state.spot_service.delete_spot(&id, user_id).await?;
-    Ok(accepted(seq))
-}
-
-fn accepted(seq: u64) -> (StatusCode, Json<AcceptedResponse>) {
-    (
-        StatusCode::ACCEPTED,
-        Json(AcceptedResponse {
-            seq: format!("{STREAM_SPOTS}:{seq}"),
-        }),
-    )
+) -> MyResult<impl IntoResponse> {
+    let seq = state.spot_service.delete_spot(&user_id, &id).await?;
+    Ok(accepted(format_seq(STREAM_SPOTS, seq)))
 }

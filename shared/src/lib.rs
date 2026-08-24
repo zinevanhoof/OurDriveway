@@ -2,6 +2,12 @@ use std::sync::OnceLock;
 
 use jsonwebtoken::DecodingKey;
 
+// Lets `::shared::…` paths resolve *inside* this crate too, where the models
+// themselves live. Same trick serde uses. It was here for `#[derive(Row)]`, which
+// emitted absolute paths; that macro is gone, but doc links and any future derive
+// still want this.
+extern crate self as shared;
+
 pub mod claims;
 pub mod db;
 pub mod domain_models;
@@ -17,6 +23,7 @@ pub mod notification;
 pub mod requests;
 pub mod responses;
 pub mod rpc;
+pub(crate) mod validation;
 
 /// rustls ends up compiled with BOTH the `aws-lc-rs` and `ring` providers (pulled
 /// in through surrealdb/hyper-rustls across the workspace), so it can't auto-pick

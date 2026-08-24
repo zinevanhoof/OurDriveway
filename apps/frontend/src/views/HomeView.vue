@@ -5,7 +5,8 @@ import { useQuery } from '@urql/vue';
 import { formatCents } from '@/lib/money';
 import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDates';
 import { locateUser, nearer, type Position } from '@/lib/geo';
-import { gqlRecordId } from '@/lib/utils';
+import { gqlRecordId, plainUuid } from '@/lib/utils';
+import { mergeBooked } from '@/lib/bookingAvailability';
 import { useAuthStore } from '@/stores/auth';
 import { BOOKINGS_RENTED } from '@/api/graphql/booking';
 import * as paymentApi from '@/api/paymentApi';
@@ -134,18 +135,21 @@ const openSpot = (id: string) => {
 // Feeds the booking form the drawer hands off to. urql dedupes it against the
 // drawer's identical query, so this is still one request.
 //
-// `network-only` because this is the one query whose `booked` map someone books
-// against, and a cached availability map is stale by construction: every write in this
-// app goes through REST, so there are no GraphQL mutations for graphcache to invalidate
-// on. The list queries stay cached — they select `booked` too, but only to show a "days
-// booked" count, and they re-run on every pan.
+// `network-only` because this is the one query someone books against, and cached
+// availability is stale by construction: every write in this app goes through REST, so
+// there are no GraphQL mutations for graphcache to invalidate on. The list queries stay
+// cached and re-run on every pan.
 //
-// Freshness, not correctness. A map that landed a moment ago can already be wrong; the
+// Freshness, not correctness. A row that landed a moment ago can already be wrong; the
 // authority is the server's availability check, published under compare-and-swap. This
 // only stops the picker offering slots it then has to retract.
 const { data: selectedSpot, executeQuery: reexecuteSpot } = useQuery({
     query: FULL_SPOT,
-    variables: computed(() => ({ id: gqlRecordId(selectedId.value) })),
+    variables: computed(() => ({
+        id: gqlRecordId(selectedId.value),
+        spotUuid: plainUuid(selectedId.value),
+        now: new Date().toISOString(),
+    })),
     pause: computed(() => selectedId.value === null),
     requestPolicy: 'network-only',
 })
@@ -270,6 +274,7 @@ const openBooking = () => {
         <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" :booking="selectedBooking"
             :bookable="!selectedBooking" @book="bookingOpen = true" />
         <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot?.spot"
+            :booked="mergeBooked(selectedSpot?.bookings)"
             @booked="() => reexecuteSpot({ requestPolicy: 'network-only' })" />
     </div>
 </template>

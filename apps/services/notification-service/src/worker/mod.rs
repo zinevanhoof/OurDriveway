@@ -1,5 +1,6 @@
-//! One worker per stream. Each is a pure `Event -> Option<Mail>` decision plus a
-//! send; booking mail becomes `bookings.rs` here with
-//! `const STREAM = STREAM_BOOKINGS` and nothing else in the service moves.
+//! One worker per stream, each a decode and a delegation to its service in
+//! `crate::service`. Booking mail becomes `bookings.rs` here with
+//! `const STREAM = STREAM_BOOKINGS`, paired with `service/booking_worker_service.rs`,
+//! and nothing else in the service moves.
 
 pub mod users;

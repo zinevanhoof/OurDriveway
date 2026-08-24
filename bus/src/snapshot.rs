@@ -137,7 +137,11 @@ impl Snapshotter {
         // corruption. A cursor that is too old merely replays, and every apply is
         // an idempotent UPSERT.
         for stream in &self.streams {
-            if let Some(seq) = info.metadata.get(*stream).and_then(|v| v.parse::<i64>().ok()) {
+            if let Some(seq) = info
+                .metadata
+                .get(*stream)
+                .and_then(|v| v.parse::<i64>().ok())
+            {
                 self.db
                     .query("UPSERT type::record('_projection', $s) SET last_seq = $seq, updated_at = time::now()")
                     .bind(("s", (*stream).to_string()))

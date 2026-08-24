@@ -1,235 +1,102 @@
-use shared::{
-    error::myerror::MyResult,
-    events::{
-        Envelope,
-        user::{UserEvent, UserPasswordChanged, UserRegistered, UserUpdated},
-    },
-};
-use surrealdb::{Surreal, engine::remote::ws::Client, types::SurrealValue};
+use std::sync::Arc;
+
+use shared::db::Querier;
+use shared::domain_models::user::{User, UserPatch};
+use shared::error::myerror::MyResult;
+use surrealdb::{Surreal, engine::remote::ws::Client};
 use uuid::Uuid;
 
-/// Reads serve requests; the `apply_*` methods are the projector's, and are the
-/// **only** writers. Handlers publish events and never write here.
-pub struct UserRepository {
-    pub db: Surreal<Client>,
+/// The `user` table.
+///
+/// Four statements: two lookups, the write, and the partial update.
+///
+/// Defaults to the shared `Arc` connection, so every long-lived repository in the
+/// process is one refcount bump rather than one session and one root sign-in
+/// each. The projector instead builds `UserRepository<&Transaction<Client>>` per
+/// event, over the transaction it is already inside.
+pub struct UserRepository<Q: Querier = Arc<Surreal<Client>>> {
+    pub q: Q,
 }
 
-/// What login needs: the record key (a uuid, straight from `record::id(id)`), the
-/// stored hash to verify against, and the user's
-/// shard so the session event lands on the same subject as their other events.
-///
-/// `email` is here for the profile edit, which has to know whether the submitted
-/// address is actually a change before it decides to demand a password.
-///
-/// `email_verified` gates login. It is read on the same row as the password hash
-/// deliberately — one lookup, and no way to check the credential without also
-/// having the flag in hand.
-#[derive(SurrealValue)]
-pub struct UserAuth {
-    pub uid: Uuid,
-    pub password: String,
-    pub shard: String,
-    pub email: String,
-    pub email_verified: bool,
-}
-
-impl UserRepository {
-    pub async fn find_for_login(&self, email: &str) -> MyResult<Option<UserAuth>> {
-        // Password comparison moved into Rust (auth/password.rs). SurrealQL's
-        // crypto::argon2::compare would work, but hashing has to happen in Rust
-        // for determinism, so verification lives next to it.
-        let found: Option<UserAuth> = self
-            .db
-            .query("SELECT record::id(id) AS uid, password, shard, email, email_verified FROM ONLY user WHERE email = $email LIMIT 1")
-            .bind(("email", email.to_string()))
+impl<Q: Querier> UserRepository<Q> {
+    /// `*` takes every column, so a new field on [`User`] needs no edit here.
+    /// Three are spelled out because `*` returns them in a shape the struct cannot
+    /// deserialize: `id` is the record key `user:⟨uuid⟩` where the struct holds a
+    /// plain uuid, and `license_plates`/`email_verified` are NONE on rows written
+    /// before those columns existed.
+    ///
+    /// An explicit alias beats `*` for the same name in either order — checked
+    /// against SurrealDB 3.2.4 rather than assumed.
+    pub async fn find_by_id(&self, user_id: Uuid) -> MyResult<Option<User>> {
+        Ok(self
+            .q
+            .q("SELECT record::id(id) AS id,
+                       license_plates ?? []    AS license_plates,
+                       email_verified ?? false AS email_verified,
+                       *
+                FROM ONLY type::record('user', $v)")
+            .bind(("v", user_id))
             .await?
-            .take(0)?;
-        Ok(found)
+            .take(0)?)
     }
 
-    /// The same row, addressed by id instead of email — what every authenticated
-    /// write needs, since the JWT carries the id and nothing else. Also the only
-    /// way to learn a user's shard without knowing their email.
-    pub async fn find_auth_by_id(&self, uid: &Uuid) -> MyResult<Option<UserAuth>> {
-        let found: Option<UserAuth> = self
-            .db
-            .query("SELECT record::id(id) AS uid, password, shard, email, email_verified FROM ONLY type::record('user', $id)")
-            .bind(("id", *uid))
+    /// `email_idx … UNIQUE` in `schemas/user-schema.surql`, so `LIMIT 1` here is a
+    /// fact about the schema and not a hope about the data.
+    pub async fn find_by_email(&self, email: String) -> MyResult<Option<User>> {
+        Ok(self
+            .q
+            .q("SELECT record::id(id) AS id,
+                       license_plates ?? []    AS license_plates,
+                       email_verified ?? false AS email_verified,
+                       *
+                FROM ONLY user WHERE email = $v LIMIT 1")
+            .bind(("v", email))
             .await?
-            .take(0)?;
-        Ok(found)
+            .take(0)?)
     }
 
-    /// Just the greeting for an email. Its own query rather than a field on
-    /// `UserAuth`, which every login path pays for and none of them greets
-    /// anybody.
-    pub async fn first_name(&self, uid: &Uuid) -> MyResult<String> {
-        let found: Option<String> = self
-            .db
-            .query("SELECT VALUE first_name FROM ONLY type::record('user', $id)")
-            .bind(("id", *uid))
-            .await?
-            .take(0)?;
-        Ok(found.unwrap_or_default())
-    }
-
-    pub async fn email_taken(&self, email: &str) -> MyResult<bool> {
-        let found: Option<String> = self
-            .db
-            .query("SELECT VALUE email FROM ONLY user WHERE email = $email LIMIT 1")
-            .bind(("email", email.to_string()))
-            .await?
-            .take(0)?;
-        Ok(found.is_some())
-    }
-
-    // ─── projector side ─────────────────────────────────────────────────────
-
-    pub async fn last_seq(&self) -> MyResult<u64> {
-        let seq: Option<i64> = self
-            .db
-            .query("SELECT VALUE last_seq FROM ONLY _projection:USERS")
-            .await?
-            .take(0)?;
-        Ok(seq.unwrap_or(0).max(0) as u64)
-    }
-
-    pub async fn apply(&self, envelope: Envelope<UserEvent>, seq: u64) -> MyResult<()> {
-        let at = envelope.occurred_at;
-        match envelope.payload {
-            UserEvent::Registered(e) => self.registered(e, at, seq).await,
-            UserEvent::Updated(e) => self.updated(e, at, seq).await,
-            UserEvent::PasswordChanged(e) => self.password_changed(e, at, seq).await,
-            UserEvent::EmailVerified { user_id } => self.email_verified(&user_id, at, seq).await,
-            // Purely a message to notification-service; nothing here changes. The
-            // cursor still has to move, or a restart replays from before it.
-            UserEvent::VerificationRequested(_) => self.bump_cursor(at, seq).await,
-        }
-    }
-
-    /// Advances the cursor for an event that changes no rows here.
-    async fn bump_cursor(&self, at: chrono::DateTime<chrono::Utc>, seq: u64) -> MyResult<()> {
-        self.db
-            .query("UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at")
-            .bind(("at", surrealdb::types::Datetime::from(at)))
-            .bind(("seq", seq as i64))
+    /// Insert-or-replace the whole row, keyed by its own id.
+    ///
+    /// UPSERT rather than CREATE: replay must be idempotent, and a
+    /// database-generated id would differ per replica. `CONTENT $row` binds the
+    /// struct whole, so adding a field to [`User`] needs no change here.
+    ///
+    /// The row carries its own `id` and the statement also names one. SurrealDB
+    /// requires them to agree and errors if they do not, which makes this a free
+    /// assertion rather than a risk.
+    pub async fn upsert(&self, user: User) -> MyResult<()> {
+        let id = user.id;
+        self.q
+            .q("UPSERT type::record('user', $id) CONTENT $row")
+            .bind(("id", id))
+            .bind(("row", user))
             .await?
             .check()?;
         Ok(())
     }
 
-    async fn registered(
-        &self,
-        e: UserRegistered,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPSERT type::record('user', $id) CONTENT {
-                     shard: $shard, first_name: $first_name, last_name: $last_name,
-                     email: $email, password: $password, profile_picture: NONE,
-                     license_plates: [], email_verified: false
-                 };
-                 UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
+    /// Update only the columns the patch carries. Does not create the row.
+    ///
+    /// `?? column` means absent-is-unchanged, and is also the ceiling: no patch can
+    /// set a column back to NONE. The seven columns here are every column
+    /// [`UserPatch`] carries — add one there and it has to be added here too.
+    ///
+    /// `shard` is absent on purpose: it selects the subject a user's whole history
+    /// is ordered on, so moving it would strand everything already published.
+    pub async fn patch(&self, user_id: Uuid, patch: UserPatch) -> MyResult<()> {
+        patch
+            .bind(
+                self.q
+                    .q("UPDATE type::record('user', $v) SET
+                            first_name      = $first_name      ?? first_name,
+                            last_name       = $last_name       ?? last_name,
+                            email           = $email           ?? email,
+                            password        = $password        ?? password,
+                            profile_picture = $profile_picture ?? profile_picture,
+                            license_plates  = $license_plates  ?? license_plates,
+                            email_verified  = $email_verified  ?? email_verified;")
+                    .bind(("v", user_id)),
             )
-            .bind(("id", e.user_id))
-            .bind(("shard", e.shard))
-            .bind(("first_name", e.first_name))
-            .bind(("last_name", e.last_name))
-            .bind(("email", e.email))
-            .bind(("password", e.password_hash))
-            .bind(("at", surrealdb::types::Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    async fn updated(
-        &self,
-        e: UserUpdated,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        self.db
-            .query(
-                // Two statements, and the order is the point: the address has to
-                // be compared against the stored one *before* it is overwritten.
-                // Fold them into one SET and the comparison reads whatever the
-                // engine happened to assign first.
-                //
-                // Without this, changing to an unverified address keeps the flag
-                // from the old one and login lets it straight through — which
-                // makes the whole feature decorative.
-                "BEGIN;
-                 UPDATE type::record('user', $id) SET email_verified = false
-                     WHERE $email != NONE AND email != $email;
-                 UPDATE type::record('user', $id) SET
-                     first_name      = $first_name      ?? first_name,
-                     last_name       = $last_name       ?? last_name,
-                     profile_picture = $profile_picture ?? profile_picture,
-                     email           = $email           ?? email,
-                     license_plates  = $license_plates  ?? license_plates;
-                 UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", e.user_id))
-            .bind(("first_name", e.first_name))
-            .bind(("last_name", e.last_name))
-            .bind(("profile_picture", e.profile_picture))
-            .bind(("email", e.email))
-            .bind(("license_plates", e.license_plates))
-            .bind(("at", surrealdb::types::Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    /// Idempotent by construction — setting `true` twice is setting `true`. That
-    /// matters because mail scanners prefetch links, so the endpoint that
-    /// publishes this event is deliberately re-runnable.
-    async fn email_verified(
-        &self,
-        user_id: &uuid::Uuid,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPDATE type::record('user', $id) SET email_verified = true;
-                 UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", *user_id))
-            .bind(("at", surrealdb::types::Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    async fn password_changed(
-        &self,
-        e: UserPasswordChanged,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPDATE type::record('user', $id) SET password = $password;
-                 UPSERT _projection:USERS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", e.user_id))
-            .bind(("password", e.password_hash))
-            .bind(("at", surrealdb::types::Datetime::from(at)))
-            .bind(("seq", seq as i64))
             .await?
             .check()?;
         Ok(())

@@ -4,8 +4,9 @@ use garde::Validate;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::general_models::spot::TimeSlot;
-use crate::requests::spot::{TimeSlotRequest, validate_single};
+use crate::validation::require;
+
+use crate::general_models::spot::{TimeSlot, validate_single};
 
 /// What the booking form posts to reserve slots.
 ///
@@ -23,22 +24,12 @@ pub struct CreateBookingRequest {
     /// (`HH:MM`, 30-minute grid, end after start, no overlap or duplicate within a
     /// day, no past dates), because a booking that doesn't fit the grid a spot's
     /// availability is expressed on can never match a window.
-    #[garde(custom(validate_single), custom(not_empty))]
-    pub booked: HashMap<String, Vec<TimeSlotRequest>>,
-}
-
-impl CreateBookingRequest {
-    /// Drops the request wrapper once validated.
-    pub fn slots(self) -> HashMap<String, Vec<TimeSlot>> {
-        self.booked
-            .into_iter()
-            .map(|(date, slots)| (date, slots.into_iter().map(Into::into).collect()))
-            .collect()
-    }
+    #[garde(custom(validate_single), custom(not_empty), custom(not_in_the_past))]
+    pub booked: HashMap<String, Vec<TimeSlot>>,
 }
 
 /// A booking with no slots would authorise a free reservation that blocks nothing.
-fn not_empty(map: &HashMap<String, Vec<TimeSlotRequest>>, _: &()) -> garde::Result {
+fn not_empty(map: &HashMap<String, Vec<TimeSlot>>, _: &()) -> garde::Result {
     if map.values().any(|slots| !slots.is_empty()) {
         Ok(())
     } else {
@@ -46,18 +37,34 @@ fn not_empty(map: &HashMap<String, Vec<TimeSlotRequest>>, _: &()) -> garde::Resu
     }
 }
 
+/// You cannot book a slot that has already happened.
+///
+/// Here rather than in `validate_single`, for the same reason the spot form keeps
+/// its own copy: the answer depends on the clock, so it belongs to the submission
+/// and not to the slot map — which is stored on the booking and replayed for years.
+fn not_in_the_past(map: &HashMap<String, Vec<TimeSlot>>, _: &()) -> garde::Result {
+    let today = chrono::Utc::now().date_naive();
+    for key in map.keys() {
+        require(
+            crate::general_models::spot::parse_date(key)? >= today,
+            "Date cannot be in the past",
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn slot(start: &str, end: &str) -> TimeSlotRequest {
-        TimeSlotRequest {
+    fn slot(start: &str, end: &str) -> TimeSlot {
+        TimeSlot {
             start: start.into(),
             end: end.into(),
         }
     }
 
-    fn req(date: &str, slots: Vec<TimeSlotRequest>) -> CreateBookingRequest {
+    fn req(date: &str, slots: Vec<TimeSlot>) -> CreateBookingRequest {
         CreateBookingRequest {
             spot_id: Uuid::now_v7(),
             booked: HashMap::from([(date.to_string(), slots)]),

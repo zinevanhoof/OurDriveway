@@ -2,19 +2,21 @@ use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
 };
-use shared::error::myerror::{MyError, MyResult};
+use shared::error::myerror::{ContextExt, MyResult};
 
 /// Hashing happens here rather than in SurrealQL (`crypto::argon2::generate`)
 /// because a projection must be deterministic: Argon2 generates a random salt,
 /// so every replica applying the same `UserRegistered` event would store a
 /// different hash. Hash once, on the write side, and put the result in the event.
-
 pub fn hash(password: &str) -> MyResult<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
-        .map_err(|e| MyError::Bus(format!("hash password: {e}")))
+        // Was `MyError::Bus`, which is for the event log and rendered the argon2
+        // error straight into the response body. This is a 500 either way, and the
+        // client learns nothing about the hasher.
+        .context_internal("Could not hash password")
 }
 
 /// Constant-time verification against a stored PHC string. A malformed or

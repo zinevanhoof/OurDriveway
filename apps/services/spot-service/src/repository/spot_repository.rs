@@ -1,216 +1,96 @@
-use serde::Deserialize;
-use shared::{
-    error::myerror::MyResult,
-    events::{
-        Envelope,
-        spot::{SpotCreated, SpotEvent, SpotUpdated},
-    },
-    rpc::spot::SpotCard,
-};
-use surrealdb::{
-    Surreal,
-    engine::remote::ws::Client,
-    types::{Datetime, SurrealValue},
-};
+use std::sync::Arc;
+
+use shared::db::Querier;
+use shared::domain_models::spot::{Spot, SpotPatch};
+use shared::error::myerror::MyResult;
+use surrealdb::{Surreal, engine::remote::ws::Client};
 use uuid::Uuid;
 
-/// The **only** writer to this database. Request handlers publish to NATS and
-/// return; everything that lands here arrives via the projector. They do *read*
-/// from it — see `spot_for_update` — but a read can't make the copies disagree.
-pub struct SpotRepository {
-    pub db: Surreal<Client>,
+/// The `spot` table.
+///
+/// Three statements, which is all this service issues. There is no UNIQUE column
+/// here, so reads address a row by id — which is all anything wanted: the write
+/// path resolves one spot before publishing, and the card RPC resolves one spot to
+/// label it.
+///
+/// Defaults to the shared `Arc` connection, so every long-lived repository in the
+/// process is one refcount bump rather than one session and one root sign-in
+/// each. The projector instead builds `SpotRepository<&Transaction<Client>>` per
+/// event, over the transaction it is already inside.
+pub struct SpotRepository<Q: Querier = Arc<Surreal<Client>>> {
+    pub q: Q,
 }
 
-/// What an edit, a live toggle, or a delete has to know before it may publish.
-#[derive(Debug, Deserialize, SurrealValue)]
-pub struct SpotForUpdate {
-    pub owner_id: Uuid,
-    /// Read, never recomputed. `shard_of` would agree today, but it selects the
-    /// subject this spot's whole history lives on, so a changed SHARD_COUNT would
-    /// send its next event somewhere no reader is looking.
-    pub shard: String,
-    pub deleted: bool,
-}
-
-impl SpotRepository {
-    /// The spot as the write path needs it, or `None` if this instance hasn't
-    /// projected it yet — which the caller must treat as "not found" rather than
-    /// "not yours".
-    pub async fn spot_for_update(&self, spot_id: &Uuid) -> MyResult<Option<SpotForUpdate>> {
-        Ok(self
-            .db
-            .query(
-                // `?? false` for the same reason the booking repository does it:
-                // rows written before the field existed hold NONE, which won't
-                // deserialize into a bool.
-                "SELECT owner_id, shard, deleted ?? false AS deleted
-                 FROM ONLY type::record('spot', $id)",
-            )
-            .bind(("id", *spot_id))
-            .await?
-            .take(0)?)
-    }
-
-    /// The spot as somebody else's screen needs it — see [`shared::rpc::spot`].
+impl<Q: Querier> SpotRepository<Q> {
+    /// `*` takes every column, so a new field on [`Spot`] needs no edit here.
+    /// Three are spelled out because `*` returns them in a shape the struct cannot
+    /// deserialize: `id` is the record key `spot:⟨uuid⟩` where the struct holds a
+    /// plain uuid, and `images`/`deleted` are NONE on rows written before those
+    /// columns existed.
     ///
-    /// Answers for **deleted and deactivated spots too**, deliberately. The caller is
-    /// labelling something that already happened: a booking made months ago against a
-    /// listing since taken down still has to say what it was for, and a delisted spot
-    /// suddenly rendering as "Booking 019fa…" on a renter's receipt would be a bug.
-    /// Nothing here is a permission to act, so there is nothing to withhold.
-    pub async fn card(&self, spot_id: &Uuid) -> MyResult<Option<SpotCard>> {
+    /// `owner_id` is deliberately *not* unwrapped — it is a plain uuid column, not
+    /// a link, so `record::id(owner_id)` would run against a value that is not a
+    /// record id.
+    ///
+    /// An explicit alias beats `*` for the same name in either order — checked
+    /// against SurrealDB 3.2.4 rather than assumed.
+    pub async fn find_by_id(&self, spot_id: Uuid) -> MyResult<Option<Spot>> {
         Ok(self
-            .db
-            .query(
-                // `images` is returned exactly as stored — bare keys, never URLs. The
-                // hostname belongs to whoever renders them; see shared::media.
-                "SELECT title, address.formatted AS address, images ?? [] AS images
-                 FROM ONLY type::record('spot', $id)",
-            )
-            .bind(("id", *spot_id))
+            .q
+            .q("SELECT record::id(id) AS id,
+                       images  ?? []    AS images,
+                       deleted ?? false AS deleted,
+                       *
+                FROM ONLY type::record('spot', $v)")
+            .bind(("v", spot_id))
             .await?
             .take(0)?)
     }
 
-    pub async fn last_seq(&self) -> MyResult<u64> {
-        let seq: Option<i64> = self
-            .db
-            .query("SELECT VALUE last_seq FROM ONLY _projection:SPOTS")
-            .await?
-            .take(0)?;
-        Ok(seq.unwrap_or(0).max(0) as u64)
-    }
-
-    pub async fn apply(&self, envelope: Envelope<SpotEvent>, seq: u64) -> MyResult<()> {
-        // `occurred_at` from the event, never time::now() — every replica must
-        // derive the same timestamp from the same event.
-        let at = envelope.occurred_at;
-        match envelope.payload {
-            SpotEvent::Created(e) => self.created(e, at, seq).await,
-            SpotEvent::Updated(e) => self.updated(e, at, seq).await,
-            SpotEvent::Deactivated { spot_id } => self.set_active(spot_id, false, at, seq).await,
-            SpotEvent::Activated { spot_id } => self.set_active(spot_id, true, at, seq).await,
-            SpotEvent::Deleted { spot_id } => self.deleted(spot_id, at, seq).await,
-        }
-    }
-
-    async fn created(
-        &self,
-        e: SpotCreated,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        // UPSERT with an id from the event, not CREATE: replay must be idempotent,
-        // and a database-generated id would differ on every replica.
-        self.db
-            .query(
-                "BEGIN;
-                 UPSERT type::record('spot', $id) CONTENT {
-                     owner_id: $owner_id, shard: $shard, title: $title,
-                     description: $description, price_per_hour: $price,
-                     images: $images, location: type::point([$lng, $lat]),
-                     active: true, address: $address, availability: $availability,
-                     timezone: $timezone, created_at: $at, updated_at: $at
-                 };
-                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", e.spot_id))
-            .bind(("owner_id", e.owner_id))
-            .bind(("shard", e.shard))
-            .bind(("title", e.title))
-            .bind(("description", e.description))
-            .bind(("price", e.price_per_hour_cents))
-            .bind(("images", e.images))
-            .bind(("lng", e.lng))
-            .bind(("lat", e.lat))
-            .bind(("address", e.address))
-            .bind(("availability", e.availability))
-            .bind(("timezone", e.timezone))
-            .bind(("at", surrealdb::types::Datetime::from(at)))
-            .bind(("seq", seq as i64))
+    /// Insert-or-replace the whole row, keyed by its own id.
+    ///
+    /// Idempotent by construction, which is what lets the projector replay the same
+    /// event. `CONTENT $row` binds the struct whole, so adding a field to [`Spot`]
+    /// needs no change here — and every column of this table is SPOTS-owned, so
+    /// there is nothing a whole-row write can erase.
+    ///
+    /// The row carries its own `id` and the statement also names one. SurrealDB
+    /// requires them to agree and errors if they do not, which makes this a free
+    /// assertion rather than a risk.
+    pub async fn upsert(&self, spot: Spot) -> MyResult<()> {
+        let id = spot.id;
+        self.q
+            .q("UPSERT type::record('spot', $id) CONTENT $row")
+            .bind(("id", id))
+            .bind(("row", spot))
             .await?
             .check()?;
         Ok(())
     }
 
-    async fn updated(
-        &self,
-        e: SpotUpdated,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        // `??` keeps the existing value when the event field is None: absent means
-        // "unchanged", not "clear".
-        self.db
-            .query(
-                "BEGIN;
-                 UPDATE type::record('spot', $id) SET
-                     title          = $title          ?? title,
-                     description    = $description    ?? description,
-                     price_per_hour = $price          ?? price_per_hour,
-                     images         = $images         ?? images,
-                     availability   = $availability   ?? availability,
-                     updated_at     = $at;
-                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
+    /// Update only the columns the patch carries. Does not create the row.
+    ///
+    /// `?? column` means absent-is-unchanged, and is also the ceiling: no patch can
+    /// set a column back to NONE. The eight columns here are every column
+    /// [`SpotPatch`] carries — add one there and it has to be added here too.
+    ///
+    /// `owner_id`, `shard`, `location`, `address` and `timezone` are absent on
+    /// purpose: a spot cannot change hands or move.
+    pub async fn patch(&self, spot_id: Uuid, patch: SpotPatch) -> MyResult<()> {
+        patch
+            .bind(
+                self.q
+                    .q("UPDATE type::record('spot', $v) SET
+                            title          = $title          ?? title,
+                            description    = $description    ?? description,
+                            price_per_hour = $price_per_hour ?? price_per_hour,
+                            images         = $images         ?? images,
+                            availability   = $availability   ?? availability,
+                            active         = $active         ?? active,
+                            deleted        = $deleted        ?? deleted,
+                            updated_at     = $updated_at     ?? updated_at;")
+                    .bind(("v", spot_id)),
             )
-            .bind(("id", e.spot_id))
-            .bind(("title", e.title))
-            .bind(("description", e.description))
-            .bind(("price", e.price_per_hour_cents))
-            .bind(("images", e.images))
-            .bind(("availability", e.availability))
-            .bind(("at", surrealdb::types::Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    /// The host's live switch, both ways.
-    async fn set_active(
-        &self,
-        spot_id: Uuid,
-        active: bool,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPDATE type::record('spot', $id) SET active = $active, updated_at = $at;
-                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", spot_id))
-            .bind(("active", active))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    /// Soft delete: `active = false` too, so every guard that already checks the
-    /// switch refuses a deleted spot without having learned a second field.
-    async fn deleted(
-        &self,
-        spot_id: Uuid,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPDATE type::record('spot', $id) SET
-                     active = false, deleted = true, updated_at = $at;
-                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", spot_id))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
             .await?
             .check()?;
         Ok(())

@@ -1,21 +1,30 @@
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
     routing::{get, post},
 };
+use bus::AppliedSeqs;
 use shared::{
     env,
     events::{STREAM_BOOKINGS, STREAM_PAYMENTS},
 };
 
 use crate::{
+    client::stripe::Stripe,
     projector::{BookingProjector, PaymentProjector},
-    repository::payment_repository::PaymentRepository,
-    service::{payment_service::PaymentService, settle::Settler, stripe::Stripe},
+    repository::{
+        booking_mirror_repository::BookingMirrorRepository, payment_repository::PaymentRepository,
+    },
+    service::{
+        payment_service::PaymentService, settlement_worker_service::SettlementWorkerService,
+    },
     worker::{BookingWorker, PaymentWorker},
 };
 
+mod client;
+mod policy;
 mod projector;
 mod repository;
 mod route;
@@ -93,7 +102,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &CONFIG.surrealdb_pass,
     )
     .await?;
-    let repository = Arc::new(PaymentRepository { db });
+
+    // One owned client per projector, because `Surreal::begin` consumes one and each
+    // holds its own open transaction. That is the floor: two sessions, cloned once
+    // here rather than once per event.
+    let bookings_client = db.clone();
+    let payments_client = db.clone();
+
+    // Everything else shares one session. `Surreal::clone` would mint another and
+    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
+    // because nothing re-authenticates per request — see `shared::db::connect`.
+    let db = Arc::new(db);
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
@@ -117,25 +136,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await?;
 
     let stripe = Arc::new(Stripe::new(&CONFIG.stripe_secret_key));
-    let settler = Arc::new(Settler {
-        repository: repository.clone(),
+    let settlement = Arc::new(SettlementWorkerService {
+        payments: PaymentRepository { q: db.clone() },
+        bookings: BookingMirrorRepository { q: db.clone() },
         stripe: stripe.clone(),
         js: js.clone(),
     });
 
-    // The projectors are the only writers to `db`; the service only publishes.
+    // The projectors are the only writers to `db`; the service only publishes. `Tx`
+    // opens a transaction per event, applies, advances the cursor inside it and
+    // commits — so neither projector below can forget any of that.
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(BookingProjector {
-            repository: repository.clone(),
-        }),
+        bus::Tx::new(BookingProjector, bookings_client),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(PaymentProjector {
-            repository: repository.clone(),
-        }),
+        bus::Tx::new(PaymentProjector, payments_client),
         readiness.clone(),
     ));
 
@@ -146,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::spawn(bus::worker::run(
         js.clone(),
         Arc::new(BookingWorker {
-            settler: settler.clone(),
+            service: settlement.clone(),
             applied: readiness
                 .applied_rx(STREAM_BOOKINGS)
                 .expect("BOOKINGS is registered with Readiness above"),
@@ -155,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::spawn(bus::worker::run(
         js.clone(),
         Arc::new(PaymentWorker {
-            settler: settler.clone(),
+            service: settlement,
             applied: readiness
                 .applied_rx(STREAM_PAYMENTS)
                 .expect("PAYMENTS is registered with Readiness above"),
@@ -163,13 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
 
     let state = AppState {
-        payment_service: Arc::new(PaymentService::new(
-            js,
-            repository,
-            stripe,
-            settler,
-            CONFIG.settlement_secs,
-        )),
+        payment_service: Arc::new(PaymentService::new(js, db, stripe, CONFIG.settlement_secs)),
     };
 
     // No GraphQL here, and no reads of anything but this user's own money. Payout
@@ -188,8 +200,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // route simply omits it and there is no middleware exception to get wrong.
         .route("/api/payment/webhook", post(route::webhook::stripe_webhook));
 
+    // Read-your-own-writes, and the sharpest case of it in the system: the checkout
+    // drawer calls `POST /api/payment/session` immediately after booking-service
+    // answered `BOOKINGS:<seq>`, and `create_session` opens by looking that booking
+    // up in *this* service's mirror. Without this the renter reserves and is then
+    // told the booking doesn't exist.
+    //
+    // PAYMENTS as well, for the resume path: "Continue payment" reads the payment
+    // row a previous call to this same endpoint published.
+    let applied = AppliedSeqs(Arc::new(HashMap::from([
+        (
+            STREAM_BOOKINGS,
+            readiness
+                .applied_rx(STREAM_BOOKINGS)
+                .expect("BOOKINGS is registered with Readiness above"),
+        ),
+        (
+            STREAM_PAYMENTS,
+            readiness
+                .applied_rx(STREAM_PAYMENTS)
+                .expect("PAYMENTS is registered with Readiness above"),
+        ),
+    ])));
+
     let app = Router::new()
         .merge(api_router)
+        // On the API only, and before health is merged: `/readyz` reporting how far
+        // behind a projector is must never itself wait for that projector.
+        //
+        // The Stripe webhook sits under this too, harmlessly: Stripe sends no
+        // `X-Await-Seq`, so the layer is a header lookup that finds nothing.
+        .layer(axum::middleware::from_fn_with_state(
+            applied,
+            bus::await_seq::await_seq,
+        ))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

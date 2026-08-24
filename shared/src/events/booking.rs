@@ -15,9 +15,15 @@ use crate::general_models::spot::TimeSlot;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum BookingEvent {
-    /// Slots are held. They block other renters immediately, and keep blocking
-    /// until this is confirmed, released, or the hold is swept for expiry.
-    Reserved(BookingReserved),
+    /// A booking exists. Its slots are held from this moment — they block other
+    /// renters immediately, and keep blocking until this is confirmed, released, or
+    /// the hold is swept for expiry.
+    ///
+    /// Named for the booking, not the hold: holding the slots is what creating one
+    /// entails. The row's `status` is still `reserved`, because that is the state
+    /// it lands in, and the two words are not interchangeable — see
+    /// `domain_models::booking::status`.
+    Created(BookingCreated),
     /// Payment succeeded. The hold becomes permanent.
     Confirmed { booking_id: Uuid },
     /// The hold is given up and the slots go back on the market.
@@ -28,10 +34,11 @@ pub enum BookingEvent {
     /// A paid booking is withdrawn — by the renter up to an hour before it starts,
     /// or by the system when the host makes the spot unable to honour it.
     ///
-    /// Its own variant rather than a third `ReleaseReason`, because `fold_booked`
-    /// keys off the row's *status*: a `Released { reason: Cancelled }` would still
-    /// have to land as `status = 'cancelled'`, so both projectors would need to
-    /// branch on the reason to pick the target status *and* the allowed `from` —
+    /// Its own variant rather than a third `ReleaseReason`, because what blocks a
+    /// slot is keyed off the row's *status*: a `Released { reason: Cancelled }`
+    /// would still have to land as `status = 'cancelled'`, so both projectors would
+    /// need to branch on the reason to pick the target status *and* the allowed
+    /// `from` —
     /// two branches in two files instead of one straight arm each. It also keeps
     /// "your hold ran out" and "you cancelled a booking you paid for" apart in the
     /// one field a renter's history already reads.
@@ -73,7 +80,7 @@ impl CancelReason {
 pub enum ReleaseReason {
     /// The renter backed out of checkout.
     Abandoned,
-    /// The hold lapsed and the expiry sweeper collected it.
+    /// The hold lapsed and the hold sweeper collected it.
     Expired,
 }
 
@@ -87,7 +94,7 @@ impl ReleaseReason {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BookingReserved {
+pub struct BookingCreated {
     pub booking_id: Uuid,
     pub spot_id: Uuid,
     /// The spot's shard, echoed so downstream never recomputes it. It selects the

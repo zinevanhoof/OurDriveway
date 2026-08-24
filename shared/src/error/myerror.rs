@@ -46,10 +46,6 @@ impl MyError {
             detail: vec![detail.into()],
         }
     }
-
-    pub fn unauthorized(title: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self::api(StatusCode::UNAUTHORIZED, title, detail)
-    }
 }
 
 impl From<JsonRejection> for MyError {
@@ -101,8 +97,14 @@ impl IntoResponse for MyError {
     }
 }
 
-/// Ergonomic `.context_bad_request((title, detail))?` on `Result` and `Option`,
-/// mirroring the axum-anyhow helpers we replaced.
+/// Ergonomic `.context_bad_request((title, detail))?` on `Result`, `Option` and
+/// `bool`, mirroring the axum-anyhow helpers we replaced.
+///
+/// Every deliberate API error goes through here rather than through a bare
+/// `return Err(MyError::api(…))`. Two reasons beyond taste: the guard and its
+/// failure end up on one line, so a reader cannot lose track of which condition
+/// produces which status; and the status is named, so nobody has to recognise
+/// `StatusCode::UNPROCESSABLE_ENTITY` to know what a branch answers.
 pub trait ContextExt<T> {
     fn context_status(self, status: StatusCode, ctx: (&str, &str)) -> MyResult<T>;
 
@@ -118,11 +120,28 @@ pub trait ContextExt<T> {
     {
         self.context_status(StatusCode::UNAUTHORIZED, ctx)
     }
+    /// Status 403 — distinct from `context_unauthorized`: the caller is
+    /// identified, the answer is still no. An unverified login is this, not a 401.
+    fn context_forbidden(self, ctx: (&str, &str)) -> MyResult<T>
+    where
+        Self: Sized,
+    {
+        self.context_status(StatusCode::FORBIDDEN, ctx)
+    }
     fn context_not_found(self, ctx: (&str, &str)) -> MyResult<T>
     where
         Self: Sized,
     {
         self.context_status(StatusCode::NOT_FOUND, ctx)
+    }
+    /// Status 409 — for a uniqueness check that would otherwise lose to an index
+    /// later, somewhere with no request left to answer. Reads as
+    /// `find_by_email(…).is_none().context_conflict(…)`: the address must be free.
+    fn context_conflict(self, ctx: (&str, &str)) -> MyResult<T>
+    where
+        Self: Sized,
+    {
+        self.context_status(StatusCode::CONFLICT, ctx)
     }
     fn context_unprocessable_entity(self, ctx: (&str, &str)) -> MyResult<T>
     where
@@ -154,6 +173,19 @@ impl<T> ContextExt<T> for Option<T> {
     }
 }
 
+/// A plain condition, so a guard reads as `must_hold.context_forbidden(…)?`
+/// instead of `if !must_hold { return Err(…) }`.
+///
+/// **`true` passes.** State the condition you require, not the failure you are
+/// catching — `user.email_verified.context_forbidden(…)`, and for a uniqueness
+/// check `find_by_email(…).is_none().context_conflict(…)`.
+impl ContextExt<()> for bool {
+    fn context_status(self, status: StatusCode, (title, detail): (&str, &str)) -> MyResult<()> {
+        self.then_some(())
+            .ok_or_else(|| MyError::api(status, title, detail))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +200,25 @@ mod tests {
             MyError::Api { status, detail, .. } => {
                 assert_eq!(status, StatusCode::BAD_REQUEST);
                 assert_eq!(detail, vec!["missing".to_string()]);
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    /// The polarity is the one thing worth pinning: `true` is the passing case, so
+    /// a guard names the condition it requires rather than the failure it catches.
+    /// Inverted, every check in the codebase would silently mean its opposite.
+    #[test]
+    fn a_bool_guard_passes_when_true() {
+        assert!(true.context_forbidden(("Nope", "denied")).is_ok());
+
+        let err = false
+            .context_conflict(("Taken", "already exists"))
+            .unwrap_err();
+        match err {
+            MyError::Api { status, title, .. } => {
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert_eq!(title, "Taken");
             }
             other => panic!("expected Api, got {other:?}"),
         }

@@ -1,21 +1,24 @@
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
     routing::{delete, post},
 };
+use bus::AppliedSeqs;
 use shared::env;
 
 use crate::{
     projector::{BookingProjector, SpotProjector},
-    repository::booking_repository::BookingRepository,
     service::booking_service::BookingService,
 };
 
+mod policy;
 mod projector;
 mod repository;
 mod route;
 mod service;
+mod sweeper;
 mod worker;
 
 #[derive(Clone)]
@@ -72,7 +75,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &CONFIG.surrealdb_pass,
     )
     .await?;
-    let repository = Arc::new(BookingRepository { db });
+
+    // One owned client per projector, because `Surreal::begin` consumes one and
+    // each holds its own open transaction. That is the floor: two sessions, cloned
+    // once here rather than once per event.
+    let spots_client = db.clone();
+    let bookings_client = db.clone();
+
+    // Everything else shares one session. `Surreal::clone` would mint another and
+    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
+    // because nothing re-authenticates per request — see `shared::db::connect`.
+    let db = Arc::new(db);
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
@@ -109,40 +122,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // No `mark_caught_up` short-circuit any more — /readyz must stay 503 until
     // these have actually replayed, or Caddy routes bookings at an instance whose
     // availability projection is still half-built.
+    // `Tx` is the adapter that opens a transaction per event, applies, advances the
+    // cursor inside it and commits — so neither projector below can forget any of
+    // that, and `react`'s publishes now sit inside the same transaction as the
+    // projection write they precede.
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(SpotProjector {
-            repository: repository.clone(),
+        bus::Tx::new(
             // This one also publishes: a host's edit can invalidate bookings, and
             // withdrawing them is this stream's job. See `SpotProjector::react`.
-            js: js.clone(),
-        }),
+            SpotProjector { js: js.clone() },
+            spots_client,
+        ),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(BookingProjector {
-            repository: repository.clone(),
-        }),
+        bus::Tx::new(BookingProjector, bookings_client),
         readiness.clone(),
     ));
 
-    // Nothing else frees a lapsed hold — `spot.booked` carries no expiry, so no
-    // reader can filter one out. See service/expiry.rs.
-    service::expiry::spawn(js.clone(), repository.clone());
+    // Nothing else frees a lapsed hold — a `reserved` row blocks regardless of its
+    // `hold_until`, by design. See sweeper.rs.
+    tokio::spawn(sweeper::run(js.clone(), db.clone()));
 
-    let booking_service = Arc::new(BookingService::new(js.clone(), repository, &readiness));
+    let booking_service = Arc::new(BookingService::new(js.clone(), db.clone(), &readiness));
 
     // Payment confirms bookings. A worker rather than a projector, and this service
     // keeps no PAYMENTS projection — see worker.rs. Deliberately not registered with
     // `Readiness`: it builds nothing, so there is nothing for /readyz to wait on, and
     // listing PAYMENTS there would hold the instance at 503 until a stream that may be
     // empty had been "replayed".
+    //
+    // Its own service rather than the `BookingService` above: the worker path is
+    // post-capture and shares none of the request path's rules. See
+    // service/payment_worker_service.rs.
+    let service = Arc::new(service::payment_worker_service::PaymentWorkerService::new(
+        js.clone(),
+        db,
+    ));
     tokio::spawn(bus::worker::run(
         js,
-        Arc::new(worker::PaymentWorker {
-            booking_service: booking_service.clone(),
-        }),
+        Arc::new(worker::PaymentWorker { service }),
     ));
 
     let state = AppState { booking_service };
@@ -151,12 +172,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // combined projection. This database is private to this service — no browser
     // identity can reach it at all.
     let api_router: Router<AppState> = Router::new()
-        .route("/api/booking", post(route::booking::reserve))
+        .route("/api/booking", post(route::booking::create_booking))
         .route("/api/booking/{id}", delete(route::booking::release))
         .route("/api/booking/{id}/cancel", post(route::booking::cancel));
 
+    // Read-your-own-writes. Both streams, because both are read on the way in:
+    // release and cancel look the booking up on BOOKINGS, and reserve prices and
+    // authorizes against the SPOTS mirror — so a host who just listed a spot can
+    // book it, and a renter can release the hold they just took.
+    let applied = AppliedSeqs(Arc::new(HashMap::from([
+        (
+            shared::events::STREAM_BOOKINGS,
+            readiness
+                .applied_rx(shared::events::STREAM_BOOKINGS)
+                .expect("BOOKINGS is registered with Readiness above"),
+        ),
+        (
+            shared::events::STREAM_SPOTS,
+            readiness
+                .applied_rx(shared::events::STREAM_SPOTS)
+                .expect("SPOTS is registered with Readiness above"),
+        ),
+    ])));
+
     let app = Router::new()
         .merge(api_router)
+        // On the API only, and before health is merged: `/readyz` reporting how far
+        // behind a projector is must never itself wait for that projector.
+        .layer(axum::middleware::from_fn_with_state(
+            applied,
+            bus::await_seq::await_seq,
+        ))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

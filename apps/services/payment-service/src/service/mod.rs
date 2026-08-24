@@ -1,3 +1,2 @@
 pub mod payment_service;
-pub mod settle;
-pub mod stripe;
+pub mod settlement_worker_service;

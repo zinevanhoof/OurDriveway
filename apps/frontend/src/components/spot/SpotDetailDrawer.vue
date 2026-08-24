@@ -9,7 +9,7 @@ import { FULL_SPOT } from "@/api/graphql/spot";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import { formatDay, formatSlots, sortedDays } from "@/lib/bookingDates";
 import { formatCents } from "@/lib/money";
-import { gqlRecordId } from "@/lib/utils";
+import { gqlRecordId, plainUuid } from "@/lib/utils";
 import { CalendarDays, Star } from "@lucide/vue";
 import Avatar from "../ui/avatar/Avatar.vue";
 import AvatarImage from "../ui/avatar/AvatarImage.vue";
@@ -34,7 +34,14 @@ const emit = defineEmits<{ book: [] }>();
 // one query total rather than one per pin.
 const { data } = useQuery({
   query: FULL_SPOT,
-  variables: computed(() => ({ id: gqlRecordId(props.spotId) })),
+  // The bookings half of FULL_SPOT is not read here — this sheet shows the spot, and
+  // the picker next door does the subtracting. Both variables are still required, and
+  // urql dedupes this against the booking form's identical query.
+  variables: computed(() => ({
+    id: gqlRecordId(props.spotId),
+    spotUuid: plainUuid(props.spotId),
+    now: new Date().toISOString(),
+  })),
   pause: computed(() => props.spotId === null),
 });
 

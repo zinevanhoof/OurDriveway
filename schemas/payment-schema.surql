@@ -98,7 +98,7 @@ DEFINE INDEX OVERWRITE payment_session ON payment FIELDS session_id UNIQUE;
 -- payment and to decide a refund, and the booking table lives in another service's
 -- database.
 --
--- Unlike booking-service's spot projection, nothing here is option<>: BookingReserved
+-- Unlike booking-service's spot projection, nothing here is option<>: BookingCreated
 -- is always the first event for a booking and BOOKINGS never expires (max_age None),
 -- so a replay from sequence 1 can only ever create this row complete.
 DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS NONE;

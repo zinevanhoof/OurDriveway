@@ -1,0 +1,94 @@
+use std::sync::Arc;
+
+use shared::db::Querier;
+use shared::domain_models::view::spot::ViewSpotPatch;
+use shared::error::myerror::MyResult;
+use surrealdb::{Surreal, engine::remote::ws::Client};
+use uuid::Uuid;
+
+/// The `spot` table in the read model.
+///
+/// Every write from the SPOTS stream is a `SET` list, never a whole-row `CONTENT` —
+/// see [`shared::domain_models::view::spot::ViewSpot`] for why that would erase the
+/// owner link. The columns named below are exactly the ones [`ViewSpotPatch`]
+/// carries, and `owner` is not among them.
+pub struct ViewSpotRepository<Q: Querier = Arc<Surreal<Client>>> {
+    pub q: Q,
+}
+
+impl<Q: Querier> ViewSpotRepository<Q> {
+    /// Apply a `SpotCreated`, creating the row if it is not there yet.
+    ///
+    /// `UPSERT` rather than `CREATE`, so a redelivered `SpotCreated` is idempotent.
+    /// Every column of `ViewSpotPatch::created` is `Some`, so this replaces all of
+    /// them while leaving `owner` alone.
+    pub async fn merge(&self, spot_id: Uuid, patch: ViewSpotPatch) -> MyResult<()> {
+        patch
+            .bind(self.q.q(Self::SET_LIST_UPSERT).bind(("v", spot_id)))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    /// Apply an edit. Does not create the row — an edit for a spot that was never
+    /// created is a no-op, not a partial row.
+    pub async fn patch(&self, spot_id: Uuid, patch: ViewSpotPatch) -> MyResult<()> {
+        patch
+            .bind(self.q.q(Self::SET_LIST_UPDATE).bind(("v", spot_id)))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    /// The thirteen SPOTS-owned columns, in `UPSERT` and `UPDATE` form.
+    ///
+    /// Spelled out twice rather than assembled, so each statement reads as one
+    /// piece. They differ only in the verb: whether a missing row is created.
+    const SET_LIST_UPSERT: &'static str = "UPSERT type::record('spot', $v) SET
+             owner_id       = $owner_id       ?? owner_id,
+             title          = $title          ?? title,
+             description    = $description    ?? description,
+             price_per_hour = $price_per_hour ?? price_per_hour,
+             images         = $images         ?? images,
+             location       = $location       ?? location,
+             active         = $active         ?? active,
+             deleted        = $deleted        ?? deleted,
+             address        = $address        ?? address,
+             availability   = $availability   ?? availability,
+             timezone       = $timezone       ?? timezone,
+             created_at     = $created_at     ?? created_at,
+             updated_at     = $updated_at     ?? updated_at;";
+
+    const SET_LIST_UPDATE: &'static str = "UPDATE type::record('spot', $v) SET
+             owner_id       = $owner_id       ?? owner_id,
+             title          = $title          ?? title,
+             description    = $description    ?? description,
+             price_per_hour = $price_per_hour ?? price_per_hour,
+             images         = $images         ?? images,
+             location       = $location       ?? location,
+             active         = $active         ?? active,
+             deleted        = $deleted        ?? deleted,
+             address        = $address        ?? address,
+             availability   = $availability   ?? availability,
+             timezone       = $timezone       ?? timezone,
+             created_at     = $created_at     ?? created_at,
+             updated_at     = $updated_at     ?? updated_at;";
+
+    /// Points `owner` at the user row, if that user has been projected yet.
+    ///
+    /// The subquery yields NONE when they have not, and
+    /// `ViewUserRepository::backfill_links` fills it in when they arrive. Scoped
+    /// `AND owner = NONE` so re-running never repoints an already-linked row.
+    pub async fn link_owner(&self, spot_id: &Uuid, owner_id: &Uuid) -> MyResult<()> {
+        self.q
+            .q("UPDATE type::record('spot', $id)
+                SET owner = (SELECT VALUE id FROM ONLY user
+                             WHERE record::id(id) = $owner LIMIT 1)
+                WHERE owner = NONE;")
+            .bind(("id", *spot_id))
+            .bind(("owner", *owner_id))
+            .await?
+            .check()?;
+        Ok(())
+    }
+}

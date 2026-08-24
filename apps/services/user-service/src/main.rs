@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
     routing::{patch, post},
 };
+use bus::AppliedSeqs;
 use shared::env;
 
 use crate::{
@@ -11,12 +13,13 @@ use crate::{
     repository::{
         refresh_token_repository::RefreshTokenRepository, user_repository::UserRepository,
     },
-    service::user_service::UserService,
+    service::{refresh_token_service::RefreshTokenService, user_service::UserService},
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub user_service: Arc<UserService>,
+    pub refresh_token_service: Arc<RefreshTokenService>,
 }
 
 /// Every variable this service reads, in one place.
@@ -97,6 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
+    // The two projectors take an owned client each, because `Surreal::begin`
+    // consumes one and each holds its own open transaction. That is the floor:
+    // two sessions, cloned once here rather than once per event.
+    let users_client = db.clone();
+    let sessions_client = db.clone();
+
+    // Everything else shares one session. `Surreal::clone` would mint another and
+    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
+    // because nothing re-authenticates per request — see `shared::db::connect`.
+    let db = Arc::new(db);
+
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
     let readiness = bus::Readiness::new(
@@ -132,49 +146,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .applied_rx(shared::events::STREAM_SESSIONS)
         .expect("SESSIONS registered above");
 
-    // Two projectors, two streams, two independent consumers.
+    // Two projectors, two streams, two independent consumers. `Tx` is the adapter
+    // that opens a transaction per event, applies, advances the cursor inside it
+    // and commits — so neither projector below can forget any of that.
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(UserProjector {
-            repository: UserRepository { db: db.clone() },
-        }),
+        bus::Tx::new(UserProjector, users_client),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(SessionProjector {
-            repository: RefreshTokenRepository { db: db.clone() },
-        }),
+        bus::Tx::new(SessionProjector, sessions_client),
         readiness.clone(),
     ));
 
+    // Read-your-own-writes, driven by the client rather than by the handler: a
+    // write answers with the position its event landed at, the client echoes it as
+    // `X-Await-Seq`, and this waits for *whichever* replica takes the next request
+    // to catch up. That is why no service below calls `await_applied` any more —
+    // it could only ever wait on the replica that handled the write.
+    let applied = AppliedSeqs(Arc::new(HashMap::from([
+        (shared::events::STREAM_USERS, users_applied),
+        (shared::events::STREAM_SESSIONS, sessions_applied),
+    ])));
+
     let state = AppState {
         user_service: Arc::new(UserService {
-            user_repository: UserRepository { db: db.clone() },
-            refresh_token_repository: RefreshTokenRepository { db },
+            users: UserRepository { q: db.clone() },
+            js: js.clone(),
+        }),
+        refresh_token_service: Arc::new(RefreshTokenService {
+            tokens: RefreshTokenRepository { q: db },
             js,
-            users_applied,
-            sessions_applied,
         }),
     };
 
     let api_router = Router::new()
         .route("/api/user/login", post(route::login::login))
         .route("/api/user/signup", post(route::signup::signup))
-        .route("/api/user/refresh/logout", post(route::logout::logout))
-        .route("/api/user/refresh", post(route::refresh::refresh))
+        // Both under `auth::cookie::SESSION_PATH`, which is what the refresh-token
+        // cookie is scoped to — that scoping is the reason they share a prefix
+        // rather than sitting beside `login`. See `auth::cookie`.
+        .route("/api/user/session/refresh", post(route::refresh::refresh))
+        .route("/api/user/session/logout", post(route::logout::logout))
         // Both unauthenticated: the token in the link is the credential, and a
         // user who cannot log in yet is exactly who needs these.
-        .route("/api/user/verify-email", post(route::verify::verify_email))
-        .route(
-            "/api/user/verify-email/resend",
-            post(route::verify::resend_verification),
-        )
-        .route("/api/user/me", patch(route::profile::update_profile))
-        .route(
-            "/api/user/me/password",
-            post(route::profile::change_password),
-        );
+        .route("/api/user/email/verify", post(route::email::verify))
+        .route("/api/user/email/resend", post(route::email::resend))
+        // The authenticated user themselves — which one is the JWT's business, so
+        // there is no id in the path and nothing to scope under.
+        // PATCH is also the change-password form: same record, and the service
+        // decides from the body which event that becomes.
+        .route("/api/user", patch(route::user::update_user));
 
     // No GraphQL proxy here any more: every client read is served by
     // view-service from the combined projection. This database is private to
@@ -182,6 +205,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let app = Router::new()
         .merge(api_router)
+        // On the API only, and before health is merged: `/readyz` reporting how far
+        // behind a projector is must never itself wait for that projector.
+        .layer(axum::middleware::from_fn_with_state(
+            applied,
+            bus::await_seq::await_seq,
+        ))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

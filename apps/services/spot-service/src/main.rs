@@ -1,10 +1,15 @@
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
     routing::{get, patch, post},
 };
-use shared::{env, rpc::spot::SUBJECT_SPOT_CARD};
+use bus::AppliedSeqs;
+use shared::{
+    env,
+    rpc::spot::{SUBJECT_SPOT_CARD, SpotCard},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -12,6 +17,8 @@ use crate::{
     service::spot_service::SpotService,
 };
 
+mod client;
+mod policy;
 mod projector;
 mod repository;
 mod route;
@@ -91,6 +98,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
+    // The projector takes an owned client, because `Surreal::begin` consumes one
+    // and it holds its own open transaction. That is the floor: one session,
+    // cloned once here rather than once per event.
+    let spots_client = db.clone();
+
+    // Everything else shares one session. `Surreal::clone` would mint another and
+    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
+    // because nothing re-authenticates per request — see `shared::db::connect`.
+    let db = Arc::new(db);
+
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
     let readiness = bus::Readiness::new(js.client().clone(), &[shared::events::STREAM_SPOTS]);
@@ -110,16 +127,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
-    // The projector is the only *writer* to `db`. The service shares the handle to
-    // read a spot's owner and shard before it publishes an edit — it still writes
-    // nothing, so the dual-write the split avoids stays avoided.
-    let repository = Arc::new(SpotRepository { db });
-
+    // The projector is the only *writer* to `db`. The service reads a spot's owner
+    // and shard before it publishes an edit — it still writes nothing, so the
+    // dual-write the split avoids stays avoided.
+    //
+    // `Tx` is the adapter that opens a transaction per event, applies, advances
+    // the cursor inside it and commits — so the projector below cannot forget any
+    // of that.
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(SpotProjector {
-            repository: repository.clone(),
-        }),
+        bus::Tx::new(SpotProjector, spots_client),
         readiness.clone(),
     ));
 
@@ -134,23 +151,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // created seconds ago is a missing title on a line item. Waiting would trade that for
     // no answer at all.
     {
-        let repository = repository.clone();
+        let db = db.clone();
         tokio::spawn(bus::service::serve(
             js.client().clone(),
             SUBJECT_SPOT_CARD,
             "spot-service",
             move |spot_id: Uuid| {
-                let repository = repository.clone();
+                // Constructing the repository is an `Arc` bump, so it happens per
+                // call rather than being held: there is no state in it to share.
+                let spots = SpotRepository { q: db.clone() };
                 // `images` is already absolute — stored that way, so nothing is
                 // resolved here. This used to join MEDIA_BASE onto each key at the
                 // edge, purely because the caller hands them to Stripe.
-                async move { repository.card(&spot_id).await.ok().flatten() }
+                //
+                // Narrowed to a `SpotCard` here rather than by the query: the whole
+                // row is one point read either way, and a second projection shape
+                // was one more thing to keep in step with the table.
+                async move {
+                    spots
+                        .find_by_id(spot_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(SpotCard::from)
+                }
             },
         ));
     }
 
     let state = AppState {
-        spot_service: Arc::new(SpotService { js, repository }),
+        spot_service: Arc::new(SpotService {
+            js,
+            spots: SpotRepository { q: db },
+        }),
     };
 
     let api_router: Router<AppState> = Router::new()
@@ -158,9 +191,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/spot/address/suggest", get(route::address::suggest))
         .route(
             "/api/spot/{id}",
+            // PATCH is also the live switch: an edit carrying nothing but `active`.
             patch(route::spot::update_spot).delete(route::spot::delete_spot),
-        )
-        .route("/api/spot/{id}/active", post(route::spot::set_active));
+        );
     // No upload route and no body limit any more: photos go straight from the
     // browser to R2 against a presigned URL, and the per-image ceiling is signed
     // into that URL by media-service. Nothing image-sized reaches this service.
@@ -169,8 +202,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // view-service from the combined projection. This database is private to
     // this service — no browser identity can reach it at all.
 
+    // Read-your-own-writes: create answers `SPOTS:<seq>`, the client echoes it, and
+    // this holds the next request until the local projector is there. Without it,
+    // editing or deleting a spot right after creating it reads `owned()` against a
+    // projection that hasn't applied the create yet — a 404 on the caller's own spot.
+    let applied = AppliedSeqs(Arc::new(HashMap::from([(
+        shared::events::STREAM_SPOTS,
+        readiness
+            .applied_rx(shared::events::STREAM_SPOTS)
+            .expect("SPOTS is registered with Readiness above"),
+    )])));
+
     let app = Router::new()
         .merge(api_router)
+        // On the API only, and before health is merged: `/readyz` reporting how far
+        // behind a projector is must never itself wait for that projector.
+        .layer(axum::middleware::from_fn_with_state(
+            applied,
+            bus::await_seq::await_seq,
+        ))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 
@@ -201,7 +251,6 @@ mod tests {
         let _: Router = Router::new()
             .route("/api/spot", post(|| async {}))
             .route("/api/spot/address/suggest", get(|| async {}))
-            .route("/api/spot/{id}", patch(|| async {}).delete(|| async {}))
-            .route("/api/spot/{id}/active", post(|| async {}));
+            .route("/api/spot/{id}", patch(|| async {}).delete(|| async {}));
     }
 }

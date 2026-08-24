@@ -1,22 +1,24 @@
-use std::sync::Arc;
-
 use async_nats::jetstream::Context;
 use bus::Projector;
 use chrono::{DateTime, Utc};
 use shared::{
-    error::myerror::{MyError, MyResult},
+    domain_models::booking::{Booking, SpotMirrorPatch, status},
+    error::myerror::MyResult,
     events::{
         Envelope, STREAM_BOOKINGS, STREAM_SPOTS,
         booking::{BookingEvent, CancelReason},
         booking_subject,
         spot::SpotEvent,
     },
-    general_models::spot::Availability,
+    general_models::{booking::Booked, spot::Availability},
 };
+use surrealdb::{engine::remote::ws::Client, method::Transaction};
 use uuid::Uuid;
 
-use crate::repository::booking_repository::{BookingRepository, LiveBooking};
-use crate::service::availability;
+use crate::policy::availability;
+use crate::repository::{
+    booking_repository::BookingRepository, spot_mirror_repository::SpotMirrorRepository,
+};
 
 /// booking-service consumes SPOTS as well as its own stream: it needs price,
 /// availability and active-ness to authorize and price a booking server-side, and
@@ -24,35 +26,51 @@ use crate::service::availability;
 ///
 /// The two advance independently, which is exactly why a BOOKINGS event can arrive
 /// for a spot this projector hasn't created yet — see the `option<>` fields in
-/// booking-schema.surql.
+/// booking-schema.surql, and `Repository::merge`, which is what lets either
+/// projector create the row.
+///
+/// Holds no connection: `bus::Tx` hands it a `&Transaction` per event. It does hold
+/// a NATS context, because it publishes as well as projects — see `react`.
 pub struct SpotProjector {
-    pub repository: Arc<BookingRepository>,
-    /// This projector publishes as well as projects — see `react`.
     pub js: Context,
 }
 
 impl Projector for SpotProjector {
     const STREAM: &'static str = STREAM_SPOTS;
+    type Event = SpotEvent;
 
-    async fn last_seq(&self) -> MyResult<u64> {
-        self.repository.last_seq(STREAM_SPOTS).await
-    }
+    async fn apply(
+        &self,
+        tx: &Transaction<Client>,
+        event: SpotEvent,
+        at: DateTime<Utc>,
+        _seq: u64,
+    ) -> MyResult<()> {
+        let bookings = BookingRepository { q: tx };
+        let spots = SpotMirrorRepository { q: tx };
 
-    async fn apply(&self, payload: &[u8], seq: u64) -> MyResult<()> {
-        let envelope: Envelope<SpotEvent> = serde_json::from_slice(payload)
-            .map_err(|e| MyError::Bus(format!("decode SpotEvent at seq {seq}: {e}")))?;
-
-        // React *before* projecting. `apply_spot` advances the SPOTS cursor in the
-        // same transaction as the row, so a publish failing after it would never be
-        // retried — this event is not redelivered once the cursor has moved past it.
-        // In this order a failure leaves the cursor where it was and the whole thing
-        // runs again; the cancels are deduped by their event ids, and the projection
-        // write is an idempotent UPSERT.
+        // React before projecting. Both now sit inside one transaction, so on any
+        // failure the cursor stays put and the whole thing runs again — the cancels
+        // are deduped by their deterministic event ids and the mirror write is an
+        // idempotent merge.
         //
         // Nothing is read from the projection that the event doesn't already carry,
         // so running first costs nothing in accuracy.
-        self.react(&envelope).await?;
-        self.repository.apply_spot(envelope, seq).await
+        self.react(&bookings, &event, at).await?;
+
+        // `merge`, never `upsert`: CONTENT would erase `booked` and `bookings_seq`,
+        // which this stream does not own and the BOOKINGS projector may already
+        // have written.
+        match event {
+            SpotEvent::Created(e) => spots.merge(e.spot_id, SpotMirrorPatch::created(e)).await,
+            SpotEvent::Updated(e) => {
+                let spot_id = e.spot_id;
+                spots.merge(spot_id, SpotMirrorPatch::updated(e)).await
+            }
+            SpotEvent::Deleted { spot_id } => {
+                spots.merge(spot_id, SpotMirrorPatch::deleted()).await
+            }
+        }
     }
 }
 
@@ -64,12 +82,21 @@ impl SpotProjector {
     /// total order over bookings. spot-service publishes its edit without ever
     /// knowing a booking exists.
     ///
-    /// Only *confirmed* bookings are touched. A live hold on removed slots can't be
-    /// confirmed anyway (`BookingService::recheck`) and lapses within `HOLD`, so
-    /// releasing it here would buy fifteen minutes at the cost of racing a payment.
-    async fn react(&self, envelope: &Envelope<SpotEvent>) -> MyResult<()> {
-        let (spot_id, availability) = match &envelope.payload {
-            // A narrowed availability may leave paid bookings outside it.
+    /// Only *confirmed* bookings are touched. A live hold lapses within `HOLD` on its
+    /// own, so releasing it here would buy fifteen minutes at the cost of racing a
+    /// payment — and losing that race means cancelling a booking that was paid for a
+    /// moment later. A hold that *is* paid after this runs is the gap named below.
+    async fn react(
+        &self,
+        bookings: &BookingRepository<&Transaction<Client>>,
+        event: &SpotEvent,
+        at: DateTime<Utc>,
+    ) -> MyResult<()> {
+        let (spot_id, availability) = match event {
+            // A narrowed availability may leave paid bookings outside it. An edit
+            // that carries no availability cannot — and the live switch is exactly
+            // that edit, which is how flipping a listing off still honours the
+            // bookings already made.
             SpotEvent::Updated(e) => match &e.availability {
                 Some(a) => (e.spot_id, Some(a)),
                 None => return Ok(()),
@@ -77,94 +104,157 @@ impl SpotProjector {
             // The host says they cannot provide the space at all: everything still
             // owed goes, no check needed.
             SpotEvent::Deleted { spot_id } => (*spot_id, None),
-            // Created has no bookings yet; the live switch deliberately honours the
-            // ones already made.
+            // Created has no bookings yet.
             _ => return Ok(()),
         };
 
-        let at = envelope.occurred_at;
-
         // ponytail: reads the booking table, which the *other* projector writes on
-        // its own cursor. A booking confirmed moments before this edit may not be
-        // projected yet, and this event is never redelivered — so it would keep a
-        // booking outside the host's new hours. Milliseconds wide, and the reverse
-        // order is safe (a confirm arriving after this is refused by `recheck`).
-        // Close it with a reconciliation sweep over confirmed future bookings,
-        // shaped like service/expiry.rs, if it ever shows up in practice.
-
-        for booking in self.repository.upcoming_confirmed(&spot_id, at).await? {
+        // its own cursor, and this event is never redelivered — so a booking that
+        // becomes confirmed after this point keeps hours the host has withdrawn.
+        // Two windows: milliseconds, for a payment confirmed just before the edit but
+        // not yet projected; and up to `HOLD`, for a live hold paid after it, since
+        // `confirm_paid` publishes unconditionally and re-checks nothing.
+        // Close both with a reconciliation sweep over confirmed future bookings,
+        // shaped like sweeper.rs, if it ever shows up in practice.
+        for booking in bookings.upcoming_confirmed(&spot_id, at).await? {
             if let Some(availability) = availability
                 && fits(availability, &booking)
             {
                 continue;
             }
-            self.cancel(&booking.spot_shard, &spot_id, &booking.id, at)
-                .await?;
+            self.cancel(&booking, at).await?;
         }
         Ok(())
     }
 
-    async fn cancel(
-        &self,
-        spot_shard: &str,
-        spot_id: &Uuid,
-        booking_id: &Uuid,
-        at: DateTime<Utc>,
-    ) -> MyResult<()> {
+    async fn cancel(&self, booking: &Booking, at: DateTime<Utc>) -> MyResult<()> {
         let event = BookingEvent::Cancelled {
-            booking_id: *booking_id,
+            booking_id: booking.id,
             reason: CancelReason::SpotUnavailable,
         };
         // `actor_id: None` — the host acted on the spot, not on this booking.
         let mut envelope = Envelope::new(event, None);
-        // Deterministic, like the expiry sweeper's: a redelivered SpotUpdated must
+        // Deterministic, like the sweeper's: a redelivered SpotUpdated must
         // not publish a second cancel for the same booking. Keyed on the event's own
         // timestamp too, so a *later* edit that invalidates the same booking again
         // is still its own event rather than being swallowed as a duplicate.
         envelope.event_id = Uuid::new_v5(
             &Uuid::NAMESPACE_OID,
-            format!("spot-cancel:{booking_id}:{}", at.timestamp_millis()).as_bytes(),
+            format!("spot-cancel:{}:{}", booking.id, at.timestamp_millis()).as_bytes(),
         );
 
-        tracing::info!(%booking_id, spot = %spot_id, "cancelling: spot can no longer honour it");
+        tracing::info!(
+            booking = %booking.id,
+            spot = %booking.spot_id,
+            "cancelling: spot can no longer honour it"
+        );
 
         // No compare-and-swap: a cancel only ever frees slots, so there is no race it
         // can lose in a way that matters — the same reasoning as `BookingService::cancel`.
-        bus::publish(&self.js, booking_subject(spot_shard, spot_id), &envelope).await?;
+        bus::publish(
+            &self.js,
+            booking_subject(&booking.spot_shard, &booking.spot_id),
+            &envelope,
+        )
+        .await?;
         Ok(())
     }
 }
 
 /// Whether a paid booking still sits inside the spot's hours.
 ///
-/// `skip` is the booking's own slots: they are in `spot.booked` already, and without
-/// excluding them every booking would read as colliding with itself. What's left is
-/// exactly the question being asked — is it still *open* at these times.
-fn fits(availability: &Availability, booking: &LiveBooking) -> bool {
-    availability::check(
-        availability,
-        &booking.booked,
-        &booking.booked,
-        Some(&booking.booked),
-    )
-    .is_ok()
+/// Nothing is passed as busy: the question is only whether the host is still *open*
+/// at these times, and a booking measured against its own slots would collide with
+/// itself.
+fn fits(availability: &Availability, booking: &Booking) -> bool {
+    availability::check(availability, &Booked::new(), &booking.booked).is_ok()
 }
 
-pub struct BookingProjector {
-    pub repository: Arc<BookingRepository>,
-}
+/// Applies this service's own stream.
+///
+/// Every arm ends the same way: move that spot's compare-and-swap cursor to this
+/// event's sequence, in the transaction that wrote the row.
+pub struct BookingProjector;
 
 impl Projector for BookingProjector {
     const STREAM: &'static str = STREAM_BOOKINGS;
+    type Event = BookingEvent;
 
-    async fn last_seq(&self) -> MyResult<u64> {
-        self.repository.last_seq(STREAM_BOOKINGS).await
-    }
+    async fn apply(
+        &self,
+        tx: &Transaction<Client>,
+        event: BookingEvent,
+        at: DateTime<Utc>,
+        seq: u64,
+    ) -> MyResult<()> {
+        let bookings = BookingRepository { q: tx };
+        let spots = SpotMirrorRepository { q: tx };
 
-    async fn apply(&self, payload: &[u8], seq: u64) -> MyResult<()> {
-        let envelope: Envelope<BookingEvent> = serde_json::from_slice(payload)
-            .map_err(|e| MyError::Bus(format!("decode BookingEvent at seq {seq}: {e}")))?;
-        self.repository.apply_booking(envelope, seq).await
+        let spot_id = match event {
+            BookingEvent::Created(e) => {
+                let spot_id = e.spot_id;
+                bookings.upsert(Booking::created(e, at)).await?;
+                Some(spot_id)
+            }
+
+            // Scoped to 'reserved' so a duplicate delivery can't resurrect a booking
+            // that was since released.
+            BookingEvent::Confirmed { booking_id } => {
+                bookings
+                    .transition(
+                        booking_id,
+                        status::CONFIRMED,
+                        &[status::RESERVED],
+                        None,
+                        None,
+                    )
+                    .await?
+            }
+
+            // Only a *reserved* booking can be released. A payment landing
+            // microseconds before the hold lapses, with the sweeper's event arriving
+            // second, must not undo the confirmation — that WHERE clause is the
+            // whole guard.
+            BookingEvent::Released { booking_id, reason } => {
+                bookings
+                    .transition(
+                        booking_id,
+                        status::RELEASED,
+                        &[status::RESERVED],
+                        Some(reason.as_str()),
+                        None,
+                    )
+                    .await?
+            }
+
+            // Only a *confirmed* booking can be cancelled, so a redelivery after the
+            // booking was settled some other way is a no-op — which is also what
+            // makes `react` safe to re-run on a replayed SpotUpdated.
+            BookingEvent::Cancelled { booking_id, reason } => {
+                bookings
+                    .transition(
+                        booking_id,
+                        status::CANCELLED,
+                        &[status::CONFIRMED],
+                        None,
+                        Some(reason.as_str()),
+                    )
+                    .await?
+            }
+        };
+
+        // `None` means the booking row does not exist, which is the one case with
+        // nothing to point the cursor at. A transition whose guard *refused* still
+        // yields its spot id, deliberately: that event consumed a subject sequence
+        // either way, and leaving the cursor behind the subject head would refuse
+        // every later reserve on the spot.
+        let Some(spot_id) = spot_id else {
+            return Ok(());
+        };
+
+        // Same transaction as the row written above, so the cursor can never run
+        // ahead of what reserve reads.
+        spots.advance(&spot_id, seq).await
     }
 }
 
@@ -181,11 +271,22 @@ mod tests {
         }
     }
 
-    fn booking(date: &str, slots: Vec<TimeSlot>) -> LiveBooking {
-        LiveBooking {
+    fn booking(date: &str, slots: Vec<TimeSlot>) -> Booking {
+        Booking {
             id: Uuid::now_v7(),
+            spot_id: Uuid::now_v7(),
             spot_shard: "00".into(),
+            owner_id: Uuid::now_v7(),
+            renter_id: Uuid::now_v7(),
             booked: HashMap::from([(date.to_string(), slots)]),
+            amount: 500,
+            status: status::CONFIRMED.into(),
+            hold_until: None,
+            release_reason: None,
+            cancel_reason: None,
+            ends_at: Utc::now().into(),
+            rating: None,
+            created_at: Utc::now().into(),
         }
     }
 
@@ -210,8 +311,8 @@ mod tests {
         // 2026-08-03 is a Monday.
         let hours = availability(vec![slot("08:00", "18:00")]);
 
-        // Inside — survives. This is the case that matters: a booking colliding with
-        // *itself* through `spot.booked` would cancel every booking on every edit.
+        // Inside — survives. This is the case that matters: measure a booking against
+        // slots that include its own and every edit cancels every booking.
         assert!(fits(
             &hours,
             &booking("2026-08-03", vec![slot("09:00", "10:00")])

@@ -16,26 +16,17 @@ export async function createSpot(request: object): Promise<Response> {
 }
 
 /**
- * Saves an edit. Same shape as create: `images` is the host's whole list of media
- * keys, kept and newly uploaded alike, already in display order — so the server
- * never has to diff anything to tell "unchanged" from "removed".
+ * Saves an edit. The edit form sends its whole state: `images` is the host's whole
+ * list of media keys, kept and newly uploaded alike, already in display order — so
+ * the server never has to diff anything to tell "unchanged" from "removed".
+ *
+ * Every field is optional server-side, and an omitted one means "leave alone". The
+ * live switch uses that: it is this call with a body of `{ active }` and nothing
+ * else, which is what keeps a toggle from resubmitting availability — the field
+ * the backend cancels bookings over.
  */
 export async function updateSpot(spotId: string, request: object): Promise<Response> {
   return record(await apiFetch(`/api/spot/${spotId}`, json("PATCH", request)));
-}
-
-/**
- * The live switch. Off stops new reservations; bookings already taken stay valid,
- * which is the whole difference from `deleteSpot`.
- */
-export async function setSpotActive(spotId: string, active: boolean): Promise<void> {
-  const res = await apiFetch(`/api/spot/${spotId}/active`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ active }),
-  });
-  if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
-  recordSeq((await res.json()).seq);
 }
 
 /**

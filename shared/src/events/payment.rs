@@ -86,7 +86,7 @@ pub struct PaymentCreated {
     pub booking_id: Uuid,
     /// `shard_of(&booking_id)`, echoed on every later event for this payment so the
     /// subject is never recomputed — the same reasoning as `spot_shard` on
-    /// `BookingReserved`.
+    /// `BookingCreated`.
     pub booking_shard: String,
     /// The host who earns this. Denormalized so the earnings query is one indexed
     /// scan of `payment` and never joins back through the booking projection.

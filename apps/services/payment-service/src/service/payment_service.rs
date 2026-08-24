@@ -8,23 +8,26 @@ use std::sync::Arc;
 use async_nats::jetstream::Context;
 use chrono::Utc;
 use shared::{
-    error::myerror::{ContextExt, MyError, MyResult},
+    domain_models::{booking::status as booking_status, payment::Earnings},
+    error::myerror::{ContextExt, MyResult},
     events::{
         Envelope, STREAM_PAYMENTS,
         payment::{PaymentCreated, PaymentEvent},
         payment_subject, payout_subject, shard_of,
     },
+    requests::payment::CreateSessionRequest,
     rpc::spot::{SUBJECT_SPOT_CARD, SpotCard},
 };
+use surrealdb::{Surreal, engine::remote::ws::Client};
 use uuid::Uuid;
 
 use axum::http::StatusCode;
 
 use crate::{
-    repository::payment_repository::{Earnings, PaymentRepository},
-    service::{
-        settle::Settler,
-        stripe::{NewSession, Outcome, SessionState, Stripe},
+    client::stripe::{NewSession, Outcome, SessionState, Stripe},
+    repository::{
+        booking_mirror_repository::BookingMirrorRepository, payment_repository::PaymentRepository,
+        payout_repository::PayoutRepository,
     },
 };
 
@@ -33,9 +36,12 @@ pub struct PaymentService {
     /// The same connection `js` publishes over, for the one thing JetStream is wrong for:
     /// asking spot-service what a spot is called. See [`shared::rpc`].
     nc: async_nats::Client,
-    repository: Arc<PaymentRepository>,
+    payments: PaymentRepository,
+    bookings: BookingMirrorRepository,
+    /// Read-only, and only for `earnings` — payout *rows* are written by this service's
+    /// projector, never here.
+    payouts: PayoutRepository,
     stripe: Arc<Stripe>,
-    settler: Arc<Settler>,
     /// How long after a booking ends its money becomes withdrawable.
     settlement_secs: i64,
 }
@@ -43,17 +49,17 @@ pub struct PaymentService {
 impl PaymentService {
     pub fn new(
         js: Context,
-        repository: Arc<PaymentRepository>,
+        db: Arc<Surreal<Client>>,
         stripe: Arc<Stripe>,
-        settler: Arc<Settler>,
         settlement_secs: i64,
     ) -> Self {
         Self {
             nc: js.client().clone(),
             js,
-            repository,
+            payments: PaymentRepository { q: db.clone() },
+            bookings: BookingMirrorRepository { q: db.clone() },
+            payouts: PayoutRepository { q: db },
             stripe,
-            settler,
             settlement_secs,
         }
     }
@@ -76,33 +82,23 @@ impl PaymentService {
     /// Layer 2 is also what makes `payment_booking UNIQUE` in the schema safe.
     pub async fn create_session(
         &self,
-        booking_id: &Uuid,
         renter_id: &Uuid,
-        return_url: &str,
+        request: CreateSessionRequest,
     ) -> MyResult<NewSession> {
+        let booking_id = &request.booking_id;
         let booking = self
-            .repository
-            .booking(booking_id)
+            .bookings
+            .find_by_id(*booking_id)
             .await?
             .context_not_found(("Not Found", "That booking doesn't exist."))?;
 
         // Identity comes from the verified token, and this is the only check that
         // stops one renter paying for — and thereby confirming — another's booking.
-        if booking.renter_id != *renter_id {
-            return Err(MyError::api(
-                axum::http::StatusCode::FORBIDDEN,
-                "Forbidden",
-                "That booking isn't yours.",
-            ));
-        }
+        (booking.renter_id == *renter_id)
+            .context_forbidden(("Forbidden", "That booking isn't yours."))?;
 
-        if booking.status != "reserved" {
-            return Err(MyError::api(
-                axum::http::StatusCode::CONFLICT,
-                "Conflict",
-                "That booking is no longer awaiting payment.",
-            ));
-        }
+        (booking.status == booking_status::RESERVED)
+            .context_conflict(("Conflict", "That booking is no longer awaiting payment."))?;
 
         // An expired hold must not be payable. The sweeper may not have collected it yet,
         // so the timestamp is the authority here, not the status.
@@ -113,19 +109,19 @@ impl PaymentService {
         let hold_until = booking
             .hold_until
             .filter(|until| *until > Utc::now())
-            .ok_or_else(|| {
-                MyError::api(
-                    axum::http::StatusCode::GONE,
+            .context_status(
+                StatusCode::GONE,
+                (
                     "Hold Expired",
                     "This reservation has expired. Please choose your times again.",
-                )
-            })?;
+                ),
+            )?;
 
         // Resume: this booking already has a session, so hand back that one. See the
         // note on layer 1 above — re-creating it is not merely wasteful, it is the thing
         // that breaks. A session that has since expired falls through, where the guards
         // above have already refused anything whose hold is gone.
-        if let Some(payment) = self.repository.payment_for_booking(booking_id).await? {
+        if let Some(payment) = self.payments.find_by_booking_id(*booking_id).await? {
             let state = self.stripe.retrieve_session(&payment.session_id).await?;
             if let Some(client_secret) = state.client_secret {
                 return Ok(NewSession {
@@ -146,7 +142,15 @@ impl PaymentService {
                 None
             });
 
-        let payment_id = payment_id_for(booking_id);
+        // One payment per booking, named after it. Deterministic rather than random so
+        // that creating an intent is idempotent without a read: the second attempt
+        // upserts the same row instead of tripping the UNIQUE index on `booking_id`, and
+        // a webhook can name the payment without looking it up.
+        let payment_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("payment:{booking_id}").as_bytes(),
+        );
+
         let session = self
             .stripe
             .create_session(
@@ -155,7 +159,7 @@ impl PaymentService {
                 &booking.booked,
                 card.as_ref(),
                 hold_until,
-                return_url,
+                &request.return_url,
             )
             .await?;
 
@@ -170,8 +174,21 @@ impl PaymentService {
             created_at: Utc::now(),
         });
 
-        self.publish_payment(event, booking_id, &format!("payment-created:{payment_id}"))
-            .await?;
+        // Deterministic event id, so a resubmitted checkout is discarded by the stream's
+        // duplicate window instead of appended twice. No compare-and-swap: one payment
+        // owns this subject, so there is no second writer to lose a race to.
+        let mut envelope = Envelope::new(event, None);
+        envelope.event_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("payment-created:{payment_id}").as_bytes(),
+        );
+
+        bus::publish(
+            &self.js,
+            payment_subject(&shard_of(booking_id), booking_id),
+            &envelope,
+        )
+        .await?;
 
         Ok(session)
     }
@@ -187,20 +204,20 @@ impl PaymentService {
     /// "failed" from the outside. Stripe knows now.
     pub async fn session_state(
         &self,
-        session_id: &str,
         renter_id: &Uuid,
+        session_id: &str,
     ) -> MyResult<(SessionState, Uuid)> {
-        let not_found = || MyError::api(StatusCode::NOT_FOUND, "Not Found", "No such checkout.");
+        // The same answer for a session that does not exist and one that is not the
+        // caller's — a 403 would confirm it exists to someone who cannot see it.
+        const NOT_FOUND: (&str, &str) = ("Not Found", "No such checkout.");
 
         let payment = self
-            .repository
-            .payment_for_session(session_id)
+            .payments
+            .find_by_session_id(session_id.to_string())
             .await?
-            .ok_or_else(not_found)?;
+            .context_not_found(NOT_FOUND)?;
 
-        if payment.renter_id != *renter_id {
-            return Err(not_found());
-        }
+        (payment.renter_id == *renter_id).context_not_found(NOT_FOUND)?;
 
         let state = self.stripe.retrieve_session(session_id).await?;
         Ok((state, payment.booking_id))
@@ -218,7 +235,12 @@ impl PaymentService {
                 booking_id,
                 intent_id,
             } => {
-                let payment_id = payment_id_for(&booking_id);
+                // Same derivation as `create_session` — that is the point: the webhook
+                // names the payment without reading it back.
+                let payment_id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_OID,
+                    format!("payment:{booking_id}").as_bytes(),
+                );
                 (
                     PaymentEvent::Succeeded {
                         payment_id,
@@ -231,7 +253,10 @@ impl PaymentService {
             }
 
             Outcome::Failed { booking_id, reason } => {
-                let payment_id = payment_id_for(&booking_id);
+                let payment_id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_OID,
+                    format!("payment:{booking_id}").as_bytes(),
+                );
                 (
                     // Keyed on the reason as well as the payment: a renter retrying a
                     // declined card twice produces two genuine failures, and swallowing
@@ -250,13 +275,34 @@ impl PaymentService {
             Outcome::Ignored => return Ok(()),
         };
 
-        self.publish_payment(event, &booking_id, &dedupe).await?;
+        // Same as above: the id is what makes a redelivered webhook a no-op.
+        let mut envelope = Envelope::new(event, None);
+        envelope.event_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, dedupe.as_bytes());
+
+        bus::publish(
+            &self.js,
+            payment_subject(&shard_of(&booking_id), &booking_id),
+            &envelope,
+        )
+        .await?;
         Ok(())
     }
 
+    /// A host's settled income and what they have already taken out.
+    ///
+    /// Two queries over two tables rather than one join: each repository answers for
+    /// its own table, and the subtraction is arithmetic that belongs here.
     pub async fn earnings(&self, owner_id: &Uuid) -> MyResult<Earnings> {
         let cutoff = Utc::now() - chrono::Duration::seconds(self.settlement_secs);
-        self.repository.earnings(owner_id, cutoff).await
+        Ok(Earnings {
+            earned_cents: self.payments.earned(owner_id, cutoff).await?,
+            paid_out_cents: self.payouts.total_for(owner_id).await?,
+        })
+    }
+
+    /// Whether a host may withdraw, and how much. Derived, never stored.
+    async fn available_for(&self, owner_id: &Uuid) -> MyResult<i64> {
+        Ok(self.earnings(owner_id).await?.available_cents())
     }
 
     /// "Take the money out." Nothing leaves any real account.
@@ -266,18 +312,12 @@ impl PaymentService {
     /// publishes under compare-and-swap on the host's own subject: exactly one wins and
     /// the loser gets a 409 to retry against the reduced balance.
     pub async fn request_payout(&self, owner_id: &Uuid) -> MyResult<(u64, i64)> {
-        let amount_cents = self
-            .settler
-            .available_for(owner_id, self.settlement_secs)
-            .await?;
+        let amount_cents = self.available_for(owner_id).await?;
 
-        if amount_cents <= 0 {
-            return Err(MyError::api(
-                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                "Nothing to Withdraw",
-                "You have no settled earnings yet.",
-            ));
-        }
+        (amount_cents > 0).context_unprocessable_entity((
+            "Nothing to Withdraw",
+            "You have no settled earnings yet.",
+        ))?;
 
         let shard = shard_of(owner_id);
         let subject = payout_subject(&shard, owner_id);
@@ -295,53 +335,5 @@ impl PaymentService {
 
         let seq = bus::publish_expecting(&self.js, subject, &envelope, Some(head)).await?;
         Ok((seq, amount_cents))
-    }
-
-    /// Publishes onto a booking's payment subject with a deterministic event id.
-    ///
-    /// The id is what makes a retried publish — a redelivered webhook, a resubmitted
-    /// checkout — discarded by the stream's duplicate window instead of appended twice.
-    /// No compare-and-swap: one payment owns this subject, so there is no second writer
-    /// to lose a race to.
-    async fn publish_payment(
-        &self,
-        event: PaymentEvent,
-        booking_id: &Uuid,
-        dedupe: &str,
-    ) -> MyResult<u64> {
-        let mut envelope = Envelope::new(event, None);
-        envelope.event_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, dedupe.as_bytes());
-
-        Ok(bus::publish(
-            &self.js,
-            payment_subject(&shard_of(booking_id), booking_id),
-            &envelope,
-        )
-        .await?)
-    }
-}
-
-/// One payment per booking, named after it.
-///
-/// Deterministic rather than random so that creating an intent is idempotent without a
-/// read: the second attempt upserts the same row instead of tripping the UNIQUE index
-/// on `booking_id`, and a webhook can name the payment without looking it up.
-pub fn payment_id_for(booking_id: &Uuid) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_OID,
-        format!("payment:{booking_id}").as_bytes(),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The property the UNIQUE index and the webhook lookup both depend on.
-    #[test]
-    fn a_booking_always_maps_to_the_same_payment_id() {
-        let booking = Uuid::now_v7();
-        assert_eq!(payment_id_for(&booking), payment_id_for(&booking));
-        assert_ne!(payment_id_for(&booking), payment_id_for(&Uuid::now_v7()));
     }
 }

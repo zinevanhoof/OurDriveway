@@ -41,9 +41,13 @@ const BOOKINGS_RENTED = gql`
 // One booking's status, for the screen a payment redirect lands on.
 //
 // Just the status: that screen is waiting for a single transition and has no use for
-// the spot, the slots or the price. `booking`'s select permission is
-// `renter_id = $token.ID OR owner_id = $token.ID`, so this cannot be used to watch
-// somebody else's booking — it returns null instead.
+// the spot, the slots or the price.
+//
+// `status` is one of the columns `booking` exposes to everyone, because it is what
+// makes availability answerable without a denormalized copy on the spot — so this
+// document can be pointed at a booking id the caller does not own and will answer
+// 'reserved' or 'confirmed' rather than null. Nothing identifying comes back with it,
+// and released/cancelled rows stay invisible; see the note in view-schema.surql.
 //
 // There is deliberately no earnings aggregate in this file any more. Money figures come
 // from payment-service, which owns them; a second total derived here would sooner or

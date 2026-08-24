@@ -20,7 +20,7 @@ import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImag
 import { EDIT_SPOT } from '@/api/graphql/spot';
 import { deleteSpot, updateSpot } from '@/api/spotApi';
 import { uploadNewImages } from '@/api/mediaApi';
-import { bookedOutside } from '@/lib/bookingAvailability';
+import { bookedOutside, mergeBooked } from '@/lib/bookingAvailability';
 import { formatDay, formatSlots, todayIn } from '@/lib/bookingDates';
 import { centsToEuros, eurosToCents } from '@/lib/money';
 import { gqlRecordId, plainUuid } from '@/lib/utils';
@@ -32,7 +32,11 @@ const router = useRouter()
 
 const { data } = useQuery({
     query: EDIT_SPOT,
-    variables: computed(() => ({ id: gqlRecordId(id) })),
+    variables: computed(() => ({
+        id: gqlRecordId(id),
+        spotUuid: plainUuid(id),
+        now: new Date().toISOString(),
+    })),
 })
 
 // Same rules as the create form, minus the address: a spot's location is fixed at
@@ -114,7 +118,7 @@ const hasSlots = () =>
  * only the warning that it is about to happen.
  */
 const casualties = computed(() =>
-    bookedOutside(availability.value, data.value?.spot?.booked ?? {}, today.value))
+    bookedOutside(availability.value, mergeBooked(data.value?.bookings), today.value))
 
 const submit = handleSubmit(async (values) => {
     formErrors.value = []

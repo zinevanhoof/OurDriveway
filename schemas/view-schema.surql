@@ -41,10 +41,13 @@ DEFINE FUNCTION OVERWRITE fn::spot_distance($loc: geometry, $lng: float, $lat: f
 -- GET /api/view/me instead.
 --
 -- `email` is the one sensitive field that does land here, so it is scoped at
--- FIELD level: every row stays selectable, but the email reads as NONE for
--- anyone who isn't its owner. Field permissions blank a value; they do not
--- filter rows — which is exactly why the type has to be `option<string>`.
--- Anything else sensitive added later belongs behind the same clause.
+-- FIELD level: every row stays selectable, but the email reads as null for
+-- anyone who isn't its owner. Field permissions cut a key from the projected
+-- output; they do not filter rows and they do not touch what is stored — which
+-- is why the type has to be `option<string>` even though nothing ever writes
+-- NONE. A non-`option` kind renders as `T!` in auto GraphQL, and a cut key on a
+-- non-null field nulls the whole parent object. Anything else sensitive added
+-- later belongs behind the same clause, with the same `option<>`.
 --
 -- `$auth.id` compares record id to record id. Every key in this database is a
 -- uuid and the JWT claim is `user:u'<uuid>'`, so `$auth` resolves to this very
@@ -115,19 +118,9 @@ DEFINE FIELD OVERWRITE availability.single.*         ON spot TYPE array<object>;
 DEFINE FIELD OVERWRITE availability.single.*.*.start ON spot TYPE string;
 DEFINE FIELD OVERWRITE availability.single.*.*.end   ON spot TYPE string;
 
--- Slots taken on this spot: "YYYY-MM-DD" -> [{ start, end }], the same shape as
--- `availability.single` above so the client subtracts one from the other with no
--- reshaping. Recomputed from this spot's booking rows on every BOOKINGS event.
---
--- Safe to expose on a world-readable table: it carries no renter identity, no
--- booking id, and no hold expiry. That replaced a client query against `booking`
--- filtered by spot_id, which was a live bug — `booking` is only selectable by its
--- renter or the spot owner, so a prospective renter got an empty list back and
--- every slot looked free.
-DEFINE FIELD OVERWRITE booked           ON spot TYPE object DEFAULT {};
-DEFINE FIELD OVERWRITE booked.*         ON spot TYPE array<object>;
-DEFINE FIELD OVERWRITE booked.*.*.start ON spot TYPE string;
-DEFINE FIELD OVERWRITE booked.*.*.end   ON spot TYPE string;
+-- There is deliberately no `booked` map here. Which slots are taken is a query over
+-- the `booking` table below, whose select permission admits the rows that block a
+-- slot to everyone — see the note on that table.
 
 DEFINE FIELD OVERWRITE timezone   ON spot TYPE string;
 DEFINE FIELD OVERWRITE created_at ON spot TYPE datetime;
@@ -137,33 +130,85 @@ DEFINE INDEX OVERWRITE spot_owner  ON spot FIELDS owner_id;
 DEFINE INDEX OVERWRITE spot_active ON spot FIELDS active;
 
 -- ─── booking ────────────────────────────────────────────────────────────────
--- The renter's and owner's view of a booking. Availability does NOT come from
--- here — a prospective renter can't select these rows at all — it comes from
--- `spot.booked` above.
+-- The renter's and owner's view of a booking, and the source of availability for
+-- everyone else.
+--
+-- The third select clause is what replaced `spot.booked`: a stranger sees exactly
+-- the rows that block a slot, and nothing else. It is a ROW filter, which is why no
+-- client has to remember to exclude released and cancelled bookings — they are
+-- simply not selectable unless you are the renter or the owner.
+--
+-- Trade-off, stated so it is not discovered later: booking ids, their slots, their
+-- ends_at and reserved-vs-confirmed become enumerable per spot. Renter identity,
+-- amounts and hold expiry do not — those are scoped at FIELD level below.
+--
+-- With one measured exception. A WHERE is normally evaluated against the *reduced*
+-- document, so a field the caller cannot read compares as NONE and cannot be probed
+-- (surrealdb-core 3.2.4, doc/check.rs::check_where_condition). An INDEXED field
+-- skips that path: an equality filter is answered from the index, whose entries are
+-- raw. So `where: { renter_id: { eq: … } }` answers truthfully for a caller who
+-- cannot read `renter_id`, purely because `booking_renter` exists — whether a given
+-- user holds a current booking on a given spot is a boolean anyone can ask, and
+-- user ids are public. Verified both ways: adding an index to `amount` made it
+-- probeable, removing it made it stop. See vulns.txt.
+--
+-- Only `eq` leaks (range filters fall back to the document path), and only for the
+-- indexed columns — `renter_id` and `owner_id`. Dropping `booking_renter` would
+-- close it and turn every renter's own booking list into a table scan.
 DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS
-    FOR select WHERE renter_id = record::id($auth) OR owner_id = record::id($auth),
+    FOR select WHERE renter_id = record::id($auth)
+                  OR owner_id  = record::id($auth)
+                  OR status IN ['reserved', 'confirmed'],
     FOR create, update, delete NONE;
 
+-- Public, because these four ARE the availability answer: which spot, which slots,
+-- until when, and whether it still blocks.
 DEFINE FIELD OVERWRITE spot      ON booking TYPE option<record<spot>>;
-DEFINE FIELD OVERWRITE renter    ON booking TYPE option<record<user>>;
 DEFINE FIELD OVERWRITE spot_id   ON booking TYPE uuid;
-DEFINE FIELD OVERWRITE owner_id  ON booking TYPE uuid;
-DEFINE FIELD OVERWRITE renter_id ON booking TYPE uuid;
 DEFINE FIELD OVERWRITE booked           ON booking TYPE object;
 DEFINE FIELD OVERWRITE booked.*         ON booking TYPE array<object>;
 DEFINE FIELD OVERWRITE booked.*.*.start ON booking TYPE string;
 DEFINE FIELD OVERWRITE booked.*.*.end   ON booking TYPE string;
-DEFINE FIELD OVERWRITE amount     ON booking TYPE int;           -- EUR cents
 DEFINE FIELD OVERWRITE status     ON booking TYPE string
     ASSERT $value IN ['reserved', 'confirmed', 'released', 'completed', 'cancelled'];
--- Lets the renter's own checkout show a countdown. Only ever readable by the
--- renter or the owner; `spot.booked` carries no expiry at all.
-DEFINE FIELD OVERWRITE hold_until     ON booking TYPE option<datetime>;
-DEFINE FIELD OVERWRITE release_reason ON booking TYPE option<string>;
+
+-- Everything below is scoped to the two parties, the same way `user.email` is.
+--
+-- **The `option<>` is load-bearing and not about storage.** The projector always
+-- writes a real value; a denied field is cut from the projected OUTPUT, and the
+-- resolver then hands GraphQL a null. Auto GraphQL renders any non-`option` kind as
+-- `T!`, so that null violates the schema and propagates up through the non-null list
+-- element — nulling the whole `bookings` array, which reads to a client as "nothing
+-- is booked". Exactly the bug this table's select clause exists to prevent.
+DEFINE FIELD OVERWRITE renter    ON booking TYPE option<record<user>>
+    PERMISSIONS FOR select WHERE renter_id = record::id($auth)
+                              OR owner_id  = record::id($auth);
+DEFINE FIELD OVERWRITE owner_id  ON booking TYPE option<uuid>
+    PERMISSIONS FOR select WHERE renter_id = record::id($auth)
+                              OR owner_id  = record::id($auth);
+DEFINE FIELD OVERWRITE renter_id ON booking TYPE option<uuid>
+    PERMISSIONS FOR select WHERE renter_id = record::id($auth)
+                              OR owner_id  = record::id($auth);
+DEFINE FIELD OVERWRITE amount    ON booking TYPE option<int>      -- EUR cents
+    PERMISSIONS FOR select WHERE renter_id = record::id($auth)
+                              OR owner_id  = record::id($auth);
+-- Lets the renter's own checkout show a countdown. The public availability answer
+-- carries no expiry at all — a lapsed hold stops blocking when the sweeper
+-- publishes Released, not because a reader learned to skip it.
+DEFINE FIELD OVERWRITE hold_until     ON booking TYPE option<datetime>
+    PERMISSIONS FOR select WHERE renter_id = record::id($auth)
+                              OR owner_id  = record::id($auth);
+DEFINE FIELD OVERWRITE release_reason ON booking TYPE option<string>
+    PERMISSIONS FOR select WHERE renter_id = record::id($auth)
+                              OR owner_id  = record::id($auth);
 -- 'spot_unavailable' is how the renter's row can say the *host* withdrew, rather
 -- than showing the same bare "cancelled" they'd see for their own doing.
-DEFINE FIELD OVERWRITE cancel_reason  ON booking TYPE option<string>;
-DEFINE FIELD OVERWRITE rating     ON booking TYPE option<int>;
+DEFINE FIELD OVERWRITE cancel_reason  ON booking TYPE option<string>
+    PERMISSIONS FOR select WHERE renter_id = record::id($auth)
+                              OR owner_id  = record::id($auth);
+DEFINE FIELD OVERWRITE rating     ON booking TYPE option<int>
+    PERMISSIONS FOR select WHERE renter_id = record::id($auth)
+                              OR owner_id  = record::id($auth);
 
 -- The last moment this booking occupies, folded from `booked` in the spot's zone at
 -- reserve time. Upcoming-vs-past is a filter on this rather than a fold every client
@@ -171,9 +216,11 @@ DEFINE FIELD OVERWRITE rating     ON booking TYPE option<int>;
 DEFINE FIELD OVERWRITE ends_at    ON booking TYPE datetime;
 DEFINE FIELD OVERWRITE created_at ON booking TYPE datetime;
 
-DEFINE INDEX OVERWRITE booking_spot   ON booking FIELDS spot_id;
+-- The availability query and the owner's upcoming list are both
+-- (spot_id =, ends_at >), so one composite serves both — and its prefix still
+-- serves a plain spot_id lookup, which is why there is no separate index for that.
+DEFINE INDEX OVERWRITE booking_spot   ON booking FIELDS spot_id, ends_at;
 DEFINE INDEX OVERWRITE booking_renter ON booking FIELDS renter_id;
-DEFINE INDEX OVERWRITE booking_ends   ON booking FIELDS ends_at;
 
 -- The home screen's "earned this week": SUM(amount) WHERE owner_id = me AND
 -- created_at >= monday. Neither field was indexed, so that query planned as a

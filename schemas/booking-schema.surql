@@ -56,9 +56,10 @@ DEFINE FIELD OVERWRITE amount     ON booking TYPE int;
 DEFINE FIELD OVERWRITE status     ON booking TYPE string DEFAULT 'reserved'
     ASSERT $value IN ['reserved', 'confirmed', 'released', 'completed', 'cancelled'];
 
--- When a hold lapses. **The only place a hold expiry is stored** — it is
--- deliberately not carried into spot.booked, so that map means "taken" with no
--- qualification and no reader has to filter it.
+-- When a hold lapses. **The only place a hold expiry is stored**, and deliberately
+-- not part of what makes a booking block a slot: a 'reserved' row blocks, full stop.
+-- A lapsed hold stops blocking when the sweeper publishes Released, not because
+-- every reader learned to compare this against the clock.
 DEFINE FIELD OVERWRITE hold_until     ON booking TYPE option<datetime>;
 DEFINE FIELD OVERWRITE release_reason ON booking TYPE option<string>
     ASSERT $value = NONE OR $value IN ['abandoned', 'expired'];
@@ -78,12 +79,16 @@ DEFINE FIELD OVERWRITE rating     ON booking TYPE option<int>
 -- this from the event, because every replica must derive the same timestamp.
 DEFINE FIELD OVERWRITE created_at ON booking TYPE datetime;
 
-DEFINE INDEX OVERWRITE booking_spot   ON booking FIELDS spot_id;
 DEFINE INDEX OVERWRITE booking_renter ON booking FIELDS renter_id;
 -- The expiry sweeper's query: status = 'reserved' AND hold_until < now.
 DEFINE INDEX OVERWRITE booking_hold   ON booking FIELDS status, hold_until;
--- The cancel reactor's query: bookings on one spot that are still to come.
-DEFINE INDEX OVERWRITE booking_ends   ON booking FIELDS spot_id, status, ends_at;
+-- Both remaining per-spot queries: reserve's "what blocks these times" and the
+-- cancel reactor's "what is still to come". Both are (spot_id =, ends_at >) with
+-- status as a residual filter — `status` used to lead `ends_at` here, but reserve
+-- asks `status NOT IN`, which cannot range-scan, so it belongs after the comparison
+-- that can. A plain spot_id lookup is served by this index's prefix, which is why
+-- there is no separate one.
+DEFINE INDEX OVERWRITE booking_spot   ON booking FIELDS spot_id, ends_at;
 
 -- ─── spot (local projection of the SPOTS stream) ────────────────────────────
 -- booking-service needs price, availability and timezone to authorize and price a
@@ -122,23 +127,16 @@ DEFINE FIELD OVERWRITE availability.single.*         ON spot TYPE array<object>;
 DEFINE FIELD OVERWRITE availability.single.*.*.start ON spot TYPE string;
 DEFINE FIELD OVERWRITE availability.single.*.*.end   ON spot TYPE string;
 
--- Slots taken on this spot: "YYYY-MM-DD" -> [{ start, end }]. A full recompute of
--- the spot's booking rows on every BOOKINGS event, which is what makes applying an
--- event idempotent — appending would double up on a redelivery.
---
--- No hold_until and no booking_id here: everything in this map is taken, and a
--- lapsed hold is removed by the sweeper publishing Released rather than by readers
--- learning to skip it.
-DEFINE FIELD OVERWRITE booked           ON spot TYPE object DEFAULT {};
-DEFINE FIELD OVERWRITE booked.*         ON spot TYPE array<object>;
-DEFINE FIELD OVERWRITE booked.*.*.start ON spot TYPE string;
-DEFINE FIELD OVERWRITE booked.*.*.end   ON spot TYPE string;
+-- There is deliberately no `booked` map here. Which slots are taken is a query over
+-- the booking rows above (spot_id + ends_at > now, minus released/cancelled), not a
+-- denormalized copy that has to be kept in step with them.
 
 -- The compare-and-swap cursor: the stream sequence of the last BOOKINGS event
 -- applied for this spot, which is what reserve asserts as
--- `Nats-Expected-Last-Subject-Sequence`. It lives on the same record as the slots
--- it summarises, written in the same statement, so the two can never disagree —
--- a cursor ahead of its data would authorise a booking against slots it hasn't seen.
+-- `Nats-Expected-Last-Subject-Sequence`. Advanced in the same transaction as the
+-- booking row that event wrote, so it can never run ahead of the rows reserve reads
+-- — a cursor ahead of its data would authorise a booking against slots it hasn't
+-- seen.
 DEFINE FIELD OVERWRITE bookings_seq ON spot TYPE int DEFAULT 0;
 
 -- ─── projector cursors ──────────────────────────────────────────────────────

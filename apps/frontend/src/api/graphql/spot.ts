@@ -4,8 +4,12 @@ import { gql } from "@urql/vue";
 // denormalized `owner_id` string — one round trip instead of spot-then-owner.
 // Nullable: a spot whose UserRegistered hasn't been projected yet has `owner: null`
 // until the backfill lands, so every read of it must be optional.
+// Two spellings of the same spot, deliberately, and a clock: spot(id:) is a record
+// LOOKUP taking the u'<uuid>' literal (gqlRecordId()), spot_id is a TYPE uuid FIELD
+// whose eq takes the plain uuid (plainUuid()), and $now floors the booking list.
+// Passing either spelling to the other silently returns nothing.
 const FULL_SPOT = gql`
-  query GetSpot($id: ID!) {
+  query GetSpot($id: ID!, $spotUuid: uuid!, $now: datetime!) {
     spot(id: $id) {
       id
       owner {
@@ -28,10 +32,13 @@ const FULL_SPOT = gql`
         weekly
         single
       }
-      # Slots already taken: "YYYY-MM-DD" -> [{ start, end }]. Same shape as
-      # availability.single, so the picker subtracts one from the other directly.
-      # This replaced a spot_busy query — and before that a booking query that
-      # was a live bug, since a prospective renter can't select booking rows at all.
+    }
+    # What is already taken, straight off the bookings. No status filter: the view's
+    # booking select permission admits released and cancelled rows only to the renter
+    # or the owner, so what a prospective renter sees here is exactly what blocks a
+    # slot. mergeBooked() unions these into one "YYYY-MM-DD" -> slots map, the same
+    # shape as availability.single, and the picker subtracts one from the other.
+    bookings(where: { spot_id: { eq: $spotUuid }, ends_at: { gt: $now } }) {
       booked
     }
   }
@@ -62,11 +69,6 @@ const MANAGE_SPOT = gql`
         weekly
         single
       }
-      # Slots already taken: "YYYY-MM-DD" -> [{ start, end }]. Same shape as
-      # availability.single, so the picker subtracts one from the other directly.
-      # This replaced a spot_busy query — and before that a booking query that
-      # was a live bug, since a prospective renter can't select booking rows at all.
-      booked
     }
     # Still to come, as one indexed comparison. The alternative is folding every
     # booking's date map client-side, which a GraphQL filter cannot express — hence
@@ -88,7 +90,7 @@ const MANAGE_SPOT = gql`
 `;
 
 const EDIT_SPOT = gql`
-  query GetSpot($id: ID!) {
+  query GetSpot($id: ID!, $spotUuid: uuid!, $now: datetime!) {
     spot(id: $id) {
       id
       title
@@ -110,10 +112,10 @@ const EDIT_SPOT = gql`
         weekly
         single
       }
-      # Slots already taken: "YYYY-MM-DD" -> [{ start, end }]. Same shape as
-      # availability.single, so the picker subtracts one from the other directly.
-      # This replaced a spot_busy query — and before that a booking query that
-      # was a live bug, since a prospective renter can't select booking rows at all.
+    }
+    # The bookings the edit screen warns about: narrowing the hours cancels any of
+    # these that fall outside them. Same shape and the same reasoning as FULL_SPOT.
+    bookings(where: { spot_id: { eq: $spotUuid }, ends_at: { gt: $now } }) {
       booked
     }
   }

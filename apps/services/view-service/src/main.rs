@@ -10,13 +10,13 @@ use shared::{
     events::{STREAM_BOOKINGS, STREAM_PAYMENTS, STREAM_SPOTS, STREAM_USERS},
 };
 
+use bus::AppliedSeqs;
+
 use crate::{
-    await_seq::AppliedSeqs,
     projector::{BookingProjector, PaymentProjector, SpotProjector, UserProjector},
-    repository::ViewRepository,
+    repository::user_repository::ViewUserRepository,
 };
 
-mod await_seq;
 mod projector;
 mod repository;
 mod route;
@@ -29,7 +29,9 @@ mod route;
 /// are answered by the service that owns them.
 #[derive(Clone)]
 pub struct AppState {
-    pub repository: Arc<ViewRepository>,
+    /// Only the `user` table, and only for `/me`. Everything else a client reads
+    /// comes through the GraphQL proxy below, straight from the database.
+    pub users: Arc<ViewUserRepository>,
 }
 
 /// Every variable this service reads, in one place.
@@ -82,7 +84,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &CONFIG.surrealdb_pass,
     )
     .await?;
-    let repository = Arc::new(ViewRepository { db });
+
+    // One owned client per projector — four here, because `Surreal::begin` consumes
+    // one and each holds its own open transaction. That is the floor: four sessions,
+    // cloned once at boot rather than once per event.
+    let users_client = db.clone();
+    let spots_client = db.clone();
+    let bookings_client = db.clone();
+    let payments_client = db.clone();
+
+    // The `/me` handler shares one session. `Surreal::clone` would mint another and
+    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
+    // because nothing re-authenticates per request — see `shared::db::connect`.
+    let db = Arc::new(db);
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
@@ -119,32 +133,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ),
     ])));
 
+    // `Tx` opens a transaction per event, applies, advances that stream's cursor
+    // inside it and commits — so none of the four below can forget any of it.
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(UserProjector {
-            repository: repository.clone(),
-        }),
+        bus::Tx::new(UserProjector, users_client),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(SpotProjector {
-            repository: repository.clone(),
-        }),
+        bus::Tx::new(SpotProjector, spots_client),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        Arc::new(BookingProjector {
-            repository: repository.clone(),
-        }),
+        bus::Tx::new(BookingProjector, bookings_client),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js,
-        Arc::new(PaymentProjector {
-            repository: repository.clone(),
-        }),
+        bus::Tx::new(PaymentProjector, payments_client),
         readiness.clone(),
     ));
 
@@ -163,10 +171,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .merge(proxy)
         .layer(axum::middleware::from_fn_with_state(
             applied,
-            await_seq::await_seq,
+            bus::await_seq::await_seq,
         ))
         .merge(bus::health::routes(readiness))
-        .with_state(AppState { repository });
+        .with_state(AppState {
+            users: Arc::new(ViewUserRepository { q: db }),
+        });
 
     // PORT differs per service in local dev so several can run on one host.
     // Containerised, every service listens on 80.

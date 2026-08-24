@@ -71,7 +71,10 @@ where
     F: Fn(Q) -> Fut,
     Fut: Future<Output = R>,
 {
-    let mut requests = match nc.queue_subscribe(subject.to_string(), queue.to_string()).await {
+    let mut requests = match nc
+        .queue_subscribe(subject.to_string(), queue.to_string())
+        .await
+    {
         Ok(sub) => sub,
         Err(e) => {
             tracing::error!(subject, error = %e, "could not subscribe; nothing will answer");

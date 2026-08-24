@@ -8,3 +8,5 @@ CLAUDE.md
 # Vendored Helm subchart tarballs. Chart.lock IS committed — it pins the
 # resolved NATS version, so `helm dependency update` is reproducible.
 k8s/chart/charts/
+.cargo
+.fallow

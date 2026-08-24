@@ -3,10 +3,14 @@ use std::sync::{Arc, LazyLock};
 use axum::{Router, http::StatusCode, routing::get};
 use shared::env;
 
-use crate::{mailer::Mailer, worker::users::UserWorker};
+use crate::{
+    client::mailer::Mailer, service::user_worker_service::UserWorkerService,
+    worker::users::UserWorker,
+};
 
-mod mailer;
-mod template;
+mod client;
+mod policy;
+mod service;
 mod worker;
 
 /// Everything this service reads, in one place.
@@ -94,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::spawn(bus::worker::run(
         js.clone(),
         Arc::new(UserWorker {
-            mailer: mailer.clone(),
+            service: Arc::new(UserWorkerService::new(mailer)),
         }),
     ));
 

@@ -1,4 +1,5 @@
 use async_nats::jetstream::{self, Context, stream::Config};
+use shared::error::myerror::{MyError, MyResult};
 use shared::events::STREAMS;
 
 /// Connects to NATS and returns a JetStream context.
@@ -6,8 +7,10 @@ use shared::events::STREAMS;
 /// The URL is passed in from the caller's `Config`. It used to default to
 /// `nats://localhost:4222` when unset — which in a container meant a service
 /// quietly dialled itself, failed, and looked like a broker outage.
-pub async fn connect(url: &str) -> Result<Context, async_nats::Error> {
-    let client = async_nats::connect(url).await?;
+pub async fn connect(url: &str) -> MyResult<Context> {
+    let client = async_nats::connect(url)
+        .await
+        .map_err(|e| MyError::Bus(format!("connect {url}: {e}")))?;
     tracing::info!(%url, "connected to NATS");
     Ok(jetstream::new(client))
 }
@@ -17,7 +20,7 @@ pub async fn connect(url: &str) -> Result<Context, async_nats::Error> {
 ///
 /// Every stream binds `<domain>.*.>`, so raising `SHARD_COUNT` never requires a
 /// stream change.
-pub async fn ensure_streams(js: &Context) -> Result<(), async_nats::Error> {
+pub async fn ensure_streams(js: &Context) -> MyResult<()> {
     for (name, subject, max_age) in STREAMS {
         js.get_or_create_stream(Config {
             name: (*name).to_string(),
@@ -33,7 +36,8 @@ pub async fn ensure_streams(js: &Context) -> Result<(), async_nats::Error> {
             duplicate_window: std::time::Duration::from_secs(120),
             ..Default::default()
         })
-        .await?;
+        .await
+        .map_err(|e| MyError::Bus(format!("ensure stream {name}: {e}")))?;
         tracing::info!(stream = name, subject, "stream ready");
     }
     Ok(())

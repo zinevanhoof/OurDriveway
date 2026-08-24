@@ -2,6 +2,8 @@ use garde::Validate;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::validation::require;
+
 /// What the checkout step posts to start paying.
 ///
 /// One field, and note what is **absent**: an amount. The server takes it from the
@@ -30,6 +32,12 @@ pub struct CreateSessionRequest {
     /// Not shape-checked either. `garde`'s `url` rule needs a feature flag that pulls in
     /// the `url` crate, and Stripe already rejects a malformed `return_url` when the
     /// session is created — which surfaces here as a 502 naming the parameter.
-    #[garde(length(min = 1))]
+    #[garde(custom(not_blank))]
     pub return_url: String,
+}
+
+/// Spelled out rather than `length(min = 1)`: garde 0.23 has no message override on
+/// its built-ins, and this reaches the client verbatim.
+fn not_blank(value: &String, _: &()) -> garde::Result {
+    require(!value.trim().is_empty(), "Required.")
 }

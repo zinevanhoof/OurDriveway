@@ -125,7 +125,7 @@ pub fn booking_subject(spot_shard: &str, spot_id: &Uuid) -> String {
 ///
 /// `booking_shard` is `shard_of(&booking_id)`, computed once when the payment is
 /// created and echoed on every later event, for the same reason `spot_shard` is
-/// carried on `BookingReserved`: recomputing it would move the subject the moment
+/// carried on `BookingCreated`: recomputing it would move the subject the moment
 /// SHARD_COUNT changed and split one payment's history in two.
 pub fn payment_subject(booking_shard: &str, booking_id: &Uuid) -> String {
     format!("payments.{booking_shard}.booking.{booking_id}")

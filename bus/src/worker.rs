@@ -5,7 +5,7 @@ use async_nats::jetstream::{
     consumer::{AckPolicy, DeliverPolicy},
 };
 use futures::StreamExt;
-use shared::error::myerror::MyResult;
+use shared::error::myerror::{MyError, MyResult};
 
 /// Performs a **side effect** for each event on a stream — sending mail, calling
 /// a third party, anything the outside world can observe.
@@ -151,8 +151,8 @@ fn consumer_config(durable: &str) -> async_nats::jetstream::consumer::pull::Conf
     }
 }
 
-fn bus_err(msg: String) -> shared::error::myerror::MyError {
-    shared::error::myerror::MyError::Bus(msg)
+fn bus_err(msg: String) -> MyError {
+    MyError::Bus(msg)
 }
 
 #[cfg(test)]

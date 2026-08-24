@@ -1,30 +1,156 @@
 use std::{sync::Arc, time::Duration};
 
 use async_nats::jetstream::{Context, consumer::DeliverPolicy};
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use shared::error::myerror::MyResult;
+use shared::{
+    db::Cursor,
+    error::myerror::{MyError, MyResult},
+    events::Envelope,
+};
+use surrealdb::{Surreal, engine::remote::ws::Client, method::Transaction};
 
 use crate::health::Readiness;
 
 /// Applies a stream's events to this instance's own database.
 ///
 /// Implementations must be **deterministic**: no `time::now()`, no `rand`, no
-/// database-generated ids. Every replica replays the same events independently,
-/// so anything derived from a local clock or a random source makes them disagree
+/// database-generated ids. Every replica replays the same events independently, so
+/// anything derived from a local clock or a random source makes them disagree
 /// permanently. Timestamps and ids come from the event.
 ///
-/// `apply` must also persist the cursor **in the same transaction** as the data.
-/// Split them and a crash between the two either replays applied events (harmless
-/// if `apply` is idempotent) or skips unapplied ones (silent corruption).
+/// The two usual ways to break that are gone by construction here: there is no cursor
+/// to forget — [`Tx`] advances it in the same transaction as the data — and no clock to
+/// reach for other than the `at` handed in. Multi-statement applies are genuinely atomic
+/// for the same reason, rather than a hand-rolled `BEGIN … COMMIT` in one query string.
+///
+/// Wrap one in a [`Tx`] to run it: `bus::projector::run(js, Tx::new(MyProjector, db),
+/// readiness)`.
 pub trait Projector: Send + Sync + 'static {
     const STREAM: &'static str;
 
-    /// Highest stream sequence already applied. 0 when the projection is empty.
-    fn last_seq(&self) -> impl Future<Output = MyResult<u64>> + Send;
+    /// The event enum carried by this stream's envelopes.
+    type Event: serde::de::DeserializeOwned + Send;
 
-    /// Apply one event. Must be idempotent — at-least-once delivery means this
-    /// will be handed the same message twice eventually.
-    fn apply(&self, payload: &[u8], seq: u64) -> impl Future<Output = MyResult<()>> + Send;
+    /// Apply one decoded event inside an open transaction. Must be idempotent.
+    ///
+    /// `at` is the envelope's `occurred_at` — the only clock an implementation may
+    /// use, because every replica has to derive the same timestamps from the same
+    /// event.
+    ///
+    /// `seq` is this event's position in the stream. Most projectors ignore it —
+    /// advancing the cursor is [`Tx`]'s job and deliberately not reachable from
+    /// here. It is passed because a projection may legitimately *store* a stream
+    /// position as data: booking-service keeps a per-spot `bookings_seq` that
+    /// reserve asserts as a compare-and-swap precondition, and it has to be the
+    /// same number the cursor moves to.
+    fn apply(
+        &self,
+        tx: &Transaction<Client>,
+        event: Self::Event,
+        at: DateTime<Utc>,
+        seq: u64,
+    ) -> impl Future<Output = MyResult<()>> + Send;
+}
+
+/// Drives a [`Projector`], owning the three things the inner type is then unable to get
+/// wrong: decoding the envelope, opening and closing the transaction, and advancing the
+/// cursor inside it.
+///
+/// This is what [`run`] consumes — a bare `Projector` cannot be run, because none of the
+/// above would happen.
+pub struct Tx<P> {
+    projector: P,
+    /// The one client this projector's transactions are opened on, parked here
+    /// between events.
+    ///
+    /// `Surreal::begin` consumes the client and `commit`/`cancel` hand it back, so
+    /// cycling it through here means the projector never clones. That is not a
+    /// micro-optimisation: `Surreal::clone` mints a *session*, and the WS engine
+    /// replays every `replayable()` command onto it — for this codebase `Attach`,
+    /// `Signin` and `Use`. A clone per event re-authenticates with root over the
+    /// socket before every applied event, which a cold replay pays for once per
+    /// message in the stream.
+    ///
+    /// No lock: [`run`] owns this and applies events one at a time, so `&mut self`
+    /// is the whole of the mutual exclusion. `Option` only so the client can be
+    /// moved into `begin` and back — `None` mid-event, and after a failed commit
+    /// or rollback, which stops the projector for good so nothing observes it.
+    client: Option<Surreal<Client>>,
+}
+
+impl<P> Tx<P> {
+    /// Takes the client by value rather than borrowing one from `projector`: this
+    /// is the only place a transaction can be opened, so this is the only thing
+    /// that needs a connection. A `Projector` therefore holds none at all and
+    /// cannot reach the database except through the `&Transaction` it is handed.
+    pub fn new(projector: P, client: Surreal<Client>) -> Self {
+        Self {
+            projector,
+            client: Some(client),
+        }
+    }
+
+    fn client(&self) -> MyResult<&Surreal<Client>> {
+        self.client
+            .as_ref()
+            .ok_or_else(|| bus_err("projector has no connection; it already failed".into()))
+    }
+}
+
+impl<P: Projector> Tx<P> {
+    /// Highest stream sequence already applied. 0 when the projection is empty.
+    async fn last_seq(&self) -> MyResult<u64> {
+        Cursor::last_seq(self.client()?, P::STREAM).await
+    }
+
+    /// Decode, apply and bump the cursor, all inside one transaction.
+    ///
+    /// `&mut self` because [`run`] owns this and applies events strictly one at a time.
+    /// That is the whole of the mutual exclusion protecting `client`.
+    async fn apply(&mut self, payload: &[u8], seq: u64) -> MyResult<()> {
+        let envelope: Envelope<P::Event> = serde_json::from_slice(payload).map_err(|e| {
+            shared::error::myerror::MyError::Bus(format!("decode {} at seq {seq}: {e}", P::STREAM))
+        })?;
+        let at = envelope.occurred_at;
+        let cursor = Cursor {
+            stream: P::STREAM,
+            at,
+            seq,
+        };
+
+        self.client()?;
+        let client = self.client.take().expect("checked");
+
+        let tx = client.begin().await?;
+
+        // One `Result` for both statements, so a failing cursor bump takes the
+        // same cancel path as a failing apply. An early `?` here would drop the
+        // transaction instead: `Transaction` is #[must_use] and holds state on the
+        // server, so a dropped one keeps whatever it locked until the server times
+        // it out.
+        let applied = async {
+            self.projector.apply(&tx, envelope.payload, at, seq).await?;
+            cursor.bump(&tx).await
+        }
+        .await;
+
+        match applied {
+            Ok(()) => {
+                self.client = Some(tx.commit().await?);
+                Ok(())
+            }
+            Err(e) => {
+                // Best effort. If the rollback itself fails the client is gone
+                // with it, but so is this projector: the error returned here stops
+                // the loop, so no later event looks for it.
+                if let Ok(client) = tx.cancel().await {
+                    self.client = Some(client);
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Runs a projector until it fails. Spawn one per stream.
@@ -34,7 +160,9 @@ pub trait Projector: Send + Sync + 'static {
 /// worse than being drained: `/readyz` goes 503 and the load balancer takes it
 /// out of rotation, leaving a diagnosable stopped replica instead of a silently
 /// wrong one.
-pub async fn run<P: Projector>(js: Context, projector: Arc<P>, readiness: Arc<Readiness>) {
+/// Takes the [`Tx`] by value: this is its sole owner, which is what makes
+/// `apply(&mut self)` and the state it protects possible.
+pub async fn run<P: Projector>(js: Context, projector: Tx<P>, readiness: Arc<Readiness>) {
     if let Err(e) = run_inner(js, projector, &readiness).await {
         tracing::error!(stream = P::STREAM, error = %e, "projector stopped");
         readiness.mark_failed(P::STREAM);
@@ -43,7 +171,7 @@ pub async fn run<P: Projector>(js: Context, projector: Arc<P>, readiness: Arc<Re
 
 async fn run_inner<P: Projector>(
     js: Context,
-    projector: Arc<P>,
+    mut projector: Tx<P>,
     readiness: &Arc<Readiness>,
 ) -> MyResult<()> {
     let cursor = projector.last_seq().await?;
@@ -144,6 +272,6 @@ async fn run_inner<P: Projector>(
     }
 }
 
-fn bus_err(msg: String) -> shared::error::myerror::MyError {
-    shared::error::myerror::MyError::Bus(msg)
+fn bus_err(msg: String) -> MyError {
+    MyError::Bus(msg)
 }

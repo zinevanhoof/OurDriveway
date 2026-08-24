@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use shared::{
     claims::jwt_claims::{ISSUER, JwtClaims},
@@ -8,15 +8,21 @@ use uuid::Uuid;
 
 use crate::CONFIG;
 
-pub fn generate_jwt(user_id: &Uuid, exp: DateTime<Utc>, jti: Uuid) -> MyResult<String> {
+/// Mints an access token for a user, and returns the two things its session needs
+/// alongside it: when the *refresh* token that accompanies it should expire, and
+/// the `jti` binding the pair together.
+///
+/// Both lifetimes come from `CONFIG` and are read here rather than by the caller,
+/// so there is one place that decides how long a session lives.
+pub fn mint(user_id: &Uuid) -> MyResult<(String, DateTime<Utc>, Uuid)> {
     let now = Utc::now();
-    let now_timestamp = now.timestamp();
-    let exp_timestamp = exp.timestamp();
+    let exp = now + Duration::minutes(CONFIG.jwt_expiration);
+    let jti = Uuid::new_v4();
 
     let claims = JwtClaims {
-        iat: now_timestamp,
-        nbf: now_timestamp,
-        exp: exp_timestamp,
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: exp.timestamp(),
         iss: ISSUER.to_string(),
         jti,
 
@@ -38,5 +44,9 @@ pub fn generate_jwt(user_id: &Uuid, exp: DateTime<Utc>, jti: Uuid) -> MyResult<S
         &EncodingKey::from_secret(CONFIG.jwt_secret.as_bytes()),
     )?;
 
-    Ok(jwt)
+    Ok((
+        jwt,
+        now + Duration::days(CONFIG.refresh_token_expiration),
+        jti,
+    ))
 }

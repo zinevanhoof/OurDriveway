@@ -11,41 +11,47 @@
 
 const HEADER = "X-Await-Seq";
 
-/** `"SPOTS:4712"` — the newest write this client has made. */
-let latest: string | null = null;
+/** The newest position this client has written, per stream. */
+let latest: Record<string, number> = {};
 
 /**
  * Records the log position from a write response.
  *
- * Only ever moves forward within a stream. Switching streams (a spot write, then
- * a booking write) replaces it: the header carries one position, and the most
- * recent write is the one worth waiting for.
+ * One position per stream, each only ever moving forward. It used to be a single
+ * slot that a write to another stream replaced — fine while only spot and booking
+ * writes carried a seq, but user-service now answers login and refresh with a
+ * SESSIONS position, and those are frequent enough to have displaced the USERS or
+ * SPOTS position a following read still needed.
  */
 export function recordSeq(seq: string | null | undefined): void {
   if (!seq || !/^[A-Z_]+:\d+$/.test(seq)) return;
 
   const [stream, value] = seq.split(":");
-  const [currentStream, currentValue] = latest?.split(":") ?? [];
-  if (stream === currentStream && Number(value) <= Number(currentValue)) return;
-
-  latest = seq;
+  latest[stream] = Math.max(Number(value), latest[stream] ?? 0);
 }
 
 /**
- * Header for the newest write, or nothing if this client hasn't written.
+ * Header for every stream this client has written, or nothing if it hasn't.
  *
- * Deliberately never cleared. Once a projector is past the position the check is
- * a single integer comparison that returns immediately, so a stale header costs
- * nothing — while clearing it after one use would leave concurrent requests, and
+ * `SPOTS:4712,SESSIONS:19` — the server waits for each in turn, under one shared
+ * timeout, and ignores streams it doesn't project.
+ *
+ * Deliberately never cleared. Once a projector is past a position the check is a
+ * single integer comparison that returns immediately, so a stale entry costs
+ * nothing — while clearing after one use would leave concurrent requests, and
  * requests that land on a *different* instance later, unprotected.
  */
 export function awaitSeqHeader(): Record<string, string> {
-  return latest ? { [HEADER]: latest } : {};
+  const value = Object.entries(latest)
+    .map(([stream, seq]) => `${stream}:${seq}`)
+    .join(",");
+
+  return value ? { [HEADER]: value } : {};
 }
 
 /** Test seam. */
 export function resetSeq(): void {
-  latest = null;
+  latest = {};
 }
 
 // ponytail: runnable self-check for the ordering rules — call demo() from a
@@ -70,11 +76,20 @@ export function demo() {
   recordSeq("SPOTS:11");
   eq(awaitSeqHeader(), { "X-Await-Seq": "SPOTS:11" }, "moves forward");
 
-  recordSeq("BOOKINGS:2"); // different stream: the newest write is what matters
+  // A second stream is kept alongside the first, not instead of it — the whole
+  // point of the map. A login must not cost a pending spot write its position.
+  recordSeq("BOOKINGS:2");
   eq(
     awaitSeqHeader(),
-    { "X-Await-Seq": "BOOKINGS:2" },
-    "switching stream replaces",
+    { "X-Await-Seq": "SPOTS:11,BOOKINGS:2" },
+    "streams are tracked side by side",
+  );
+
+  recordSeq("SPOTS:12"); // and each still moves independently
+  eq(
+    awaitSeqHeader(),
+    { "X-Await-Seq": "SPOTS:12,BOOKINGS:2" },
+    "one stream advancing leaves the other alone",
   );
 
   for (const junk of [
@@ -90,7 +105,7 @@ export function demo() {
     recordSeq(junk as string);
     eq(
       awaitSeqHeader(),
-      { "X-Await-Seq": "BOOKINGS:2" },
+      { "X-Await-Seq": "SPOTS:12,BOOKINGS:2" },
       `junk ignored: ${junk}`,
     );
   }

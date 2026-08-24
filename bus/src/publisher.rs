@@ -2,7 +2,13 @@ use async_nats::jetstream::context::PublishErrorKind;
 use async_nats::jetstream::stream::LastRawMessageErrorKind;
 use async_nats::jetstream::{Context, message::PublishMessage};
 use serde::Serialize;
-use shared::{error::myerror::MyError, events::Envelope};
+use shared::{
+    error::myerror::{MyError, MyResult},
+    events::Envelope,
+};
+use tokio::sync::watch;
+
+use crate::await_applied;
 
 /// Publishing lost a race: the subject moved on since the sequence we asserted.
 ///
@@ -37,11 +43,23 @@ impl From<PublishError> for MyError {
 /// to its own database, because the projector will apply this same event a moment
 /// later — writing in both places is a dual write with no atomicity between them,
 /// and the two copies drift the first time one of them fails.
+/// The one way to append an event. Nothing wraps this — services call it directly, so
+/// there is a single place to read to know what appending does.
+///
+/// The subject stays an argument rather than being derived from the event type. It
+/// genuinely varies: a booking publishes onto its *spot's* subject and a payment onto
+/// its *booking's*, because that is the entity whose ordering has to be serialized — a
+/// mapping from event type to subject would get both wrong.
+///
+/// Callers build the [`Envelope`] themselves, usually `Envelope::new(event, actor)`.
+/// `actor` is `None` for events a service raises on its own behalf rather than in
+/// response to a request — an expiry sweep, a Stripe webhook — and a caller that needs a
+/// deterministic `event_id` for deduplication overwrites the field before publishing.
 pub async fn publish<T: Serialize>(
     js: &Context,
     subject: String,
     envelope: &Envelope<T>,
-) -> Result<u64, MyError> {
+) -> MyResult<u64> {
     publish_expecting(js, subject, envelope, None)
         .await
         .map_err(Into::into)
@@ -101,7 +119,7 @@ pub async fn publish_expecting<T: Serialize>(
 ///
 /// This is the value to assert in the next `publish_expecting`, and the position a
 /// caller waits for its projector to reach after losing a CAS race.
-pub async fn subject_head(js: &Context, stream: &str, subject: &str) -> Result<u64, MyError> {
+pub async fn subject_head(js: &Context, stream: &str, subject: &str) -> MyResult<u64> {
     let handle = js
         .get_stream(stream)
         .await
@@ -115,4 +133,39 @@ pub async fn subject_head(js: &Context, stream: &str, subject: &str) -> Result<u
         Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => Ok(0),
         Err(e) => Err(MyError::Bus(format!("subject head {subject}: {e}"))),
     }
+}
+
+/// Waits for this instance's projector to reach the subject's head, after losing a
+/// compare-and-swap race.
+///
+/// The other half of [`publish_expecting`], and the reason it lives beside it: a
+/// retry that skips this re-reads the same stale projection, asserts the same stale
+/// sequence, and is refused again — a loop that can never converge. Every
+/// `Err(PublishError::Stale)` arm should be this call.
+///
+/// `applied` is the receiver for `stream`, from [`crate::Readiness::applied_rx`].
+/// Nothing here is per-service: the subject is a string the caller already built to
+/// publish on, so a payout subject works exactly like a booking's.
+pub async fn catch_up(
+    js: &Context,
+    applied: &watch::Receiver<u64>,
+    stream: &str,
+    subject: &str,
+) -> MyResult<()> {
+    let head = subject_head(js, stream, subject).await?;
+    // Not a warning: losing a CAS race is the mechanism working, not a fault.
+    // Logged because it's otherwise invisible, and a subject generating a steady
+    // stream of these is the signal that the caller's retry bound needs backoff.
+    tracing::info!(
+        stream,
+        subject,
+        head,
+        "lost CAS race; catching up before retry"
+    );
+
+    // `None` for the wait: proceeding slightly stale beats hanging, and a retry that
+    // asserts a stale sequence just loses again — which is what the caller's attempt
+    // bound is for.
+    await_applied(applied, head, None).await;
+    Ok(())
 }

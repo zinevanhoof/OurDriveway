@@ -53,7 +53,12 @@ DEFINE FIELD OVERWRITE expires_at         ON refresh_token TYPE datetime;
 DEFINE FIELD OVERWRITE revoked            ON refresh_token TYPE bool DEFAULT false;
 DEFINE FIELD OVERWRITE revoked_reason     ON refresh_token TYPE option<string>;
 
-DEFINE INDEX OVERWRITE refresh_token_hash ON refresh_token FIELDS token_hash;
+-- UNIQUE, which it was not until now. Every lookup of a refresh token goes
+-- through this column and expects exactly one row — `Repository::find_by` only
+-- accepts a column marked `#[row(unique)]`, and that marker is a claim about
+-- *this* line. A token hash is SHA-256 of a random v4 uuid, so the constraint
+-- rejects nothing that could legitimately occur.
+DEFINE INDEX OVERWRITE refresh_token_hash ON refresh_token FIELDS token_hash UNIQUE;
 
 -- Projector cursor for the USERS stream, written in the same transaction as the
 -- rows it describes. See the note in spot-schema.surql.

@@ -12,19 +12,9 @@ use crate::general_models::spot::{Address, Availability};
 pub enum SpotEvent {
     Created(SpotCreated),
     Updated(SpotUpdated),
-    /// Taken off the market by its host. Blocks new reservations and hides the spot
-    /// from search; bookings already made stay valid and are honoured.
-    Deactivated {
-        spot_id: Uuid,
-    },
-    /// Put back on the market. The mirror of `Deactivated` — the two are a toggle,
-    /// which is why neither is folded into `SpotUpdated`: a host flipping the switch
-    /// isn't editing the listing, and the projector arm for each is one line.
-    Activated {
-        spot_id: Uuid,
-    },
-    /// Withdrawn for good. Unlike `Deactivated` this also cancels every booking the
-    /// spot still owes, because the host is saying they cannot provide the space.
+    /// Withdrawn for good. Unlike switching the listing off — which is a
+    /// `SpotUpdated` carrying nothing but `active` — this also cancels every booking
+    /// the spot still owes, because the host is saying they cannot provide the space.
     ///
     /// A soft delete: the row stays so a renter's past bookings keep resolving their
     /// spot's title and address. `deleted` is what hides it everywhere else.
@@ -60,6 +50,11 @@ pub struct SpotCreated {
 }
 
 /// Partial update — `None` means "leave alone", not "clear".
+///
+/// The live switch is one of these, carrying `active` and nothing else. It used to
+/// be its own pair of events; folding it in is what lets the toggle avoid
+/// resubmitting `availability`, which is the field booking-service cancels
+/// bookings over.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpotUpdated {
     pub spot_id: Uuid,
@@ -68,4 +63,24 @@ pub struct SpotUpdated {
     pub price_per_hour_cents: Option<i64>,
     pub images: Option<Vec<String>>,
     pub availability: Option<Availability>,
+    /// Off blocks new reservations and hides the spot from search; bookings already
+    /// made stay valid and are honoured. That is the whole difference from
+    /// [`SpotEvent::Deleted`].
+    pub active: Option<bool>,
+}
+
+#[cfg(test)]
+impl SpotUpdated {
+    /// Nothing but the live switch — exactly what the manage screen's toggle sends.
+    pub fn live(active: bool) -> Self {
+        Self {
+            spot_id: Uuid::now_v7(),
+            title: None,
+            description: None,
+            price_per_hour_cents: None,
+            images: None,
+            availability: None,
+            active: Some(active),
+        }
+    }
 }
