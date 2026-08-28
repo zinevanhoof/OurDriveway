@@ -1,0 +1,39 @@
+# TiKV configuration for the single-node dev cluster.
+#
+# Untuned, TiKV sizes itself to the host: it takes ~45% of system memory for the
+# block cache alone. On this box that collides with the build — CLAUDE.md already
+# pins `jobs = 4` because linking seven service binaries is what makes VSCode get
+# OOM-killed. Everything below exists to keep the datastore small enough that the
+# stack and a `cargo check` can be up at the same time.
+#
+# These are DEV numbers. A real deployment should delete this file and let TiKV
+# size itself to a machine it does not share.
+
+[storage]
+# Default is 4. One scheduler worker is plenty for a spike and saves the threads.
+scheduler-worker-pool-size = 1
+
+[storage.block-cache]
+# Default here would be several GB. This is the single biggest lever.
+capacity = "128MB"
+
+[rocksdb]
+max-open-files = 1024
+# Default is 8 background jobs; on one store with no write pressure that is idle
+# threads and memory.
+max-background-jobs = 2
+
+[raftdb]
+max-open-files = 1024
+max-background-jobs = 2
+
+[raftstore]
+# Single store, so there is no peer to fall behind and nothing to be gained from
+# aggressive tick rates.
+raft-base-tick-interval = "1s"
+# Keeps the write path honest without the periodic full-region scans that only
+# matter once there are replicas to compare against.
+region-compact-check-interval = "5m"
+
+[server]
+grpc-concurrency = 2

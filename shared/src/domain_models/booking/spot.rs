@@ -34,9 +34,6 @@ use crate::{
 pub struct SpotMirror {
     pub id: Uuid,
     pub owner_id: Option<Uuid>,
-    /// The *spot's* shard, so a booking event lands on the subject that spot's
-    /// bookings are ordered on.
-    pub shard: Option<String>,
     /// EUR cents.
     pub price_per_hour: Option<i64>,
     pub availability: Option<Availability>,
@@ -82,7 +79,6 @@ pub struct SpotMirror {
 #[derive(Debug, Default)]
 pub struct SpotMirrorPatch {
     pub owner_id: Option<Uuid>,
-    pub shard: Option<String>,
     pub price_per_hour: Option<i64>,
     pub availability: Option<Availability>,
     pub timezone: Option<String>,
@@ -100,7 +96,6 @@ impl SpotMirrorPatch {
     pub fn bind(self, q: Query<'_, Client>) -> Query<'_, Client> {
         q.bind(vars! {
             owner_id:       self.owner_id,
-            shard:          self.shard,
             price_per_hour: self.price_per_hour,
             availability:   self.availability,
             timezone:       self.timezone,
@@ -117,7 +112,6 @@ impl SpotMirrorPatch {
     pub fn created(e: SpotCreated) -> Self {
         Self {
             owner_id: Some(e.owner_id),
-            shard: Some(e.shard),
             price_per_hour: Some(e.price_per_hour_cents),
             availability: Some(e.availability),
             timezone: Some(e.timezone),
@@ -153,17 +147,16 @@ impl SpotMirrorPatch {
 /// Whether this mirror knows enough about the spot to price and authorize a
 /// booking.
 ///
-/// Returns the four columns together or nothing at all: they arrive in one event,
+/// Returns the three columns together or nothing at all: they arrive in one event,
 /// so a row holding some but not others is not a state the log can produce, and
 /// callers that checked them one at a time would each invent their own answer for
 /// the partial case.
 impl SpotMirror {
-    pub fn bookable(&self) -> Option<(&Availability, i64, Uuid, &str)> {
+    pub fn bookable(&self) -> Option<(&Availability, i64, Uuid)> {
         Some((
             self.availability.as_ref()?,
             self.price_per_hour?,
             self.owner_id?,
-            self.shard.as_deref()?,
         ))
     }
 }
@@ -187,7 +180,6 @@ mod tests {
     fn set_covers_every_patchable_column() {
         let _: SpotMirrorPatch = SpotMirrorPatch {
             owner_id: None,
-            shard: None,
             price_per_hour: None,
             availability: None,
             timezone: None,

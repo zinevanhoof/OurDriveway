@@ -70,6 +70,20 @@ impl CancelReason {
             Self::SpotUnavailable => "spot_unavailable",
         }
     }
+
+    /// The inverse, for reading the column back out of a row — which is what a
+    /// backfill does when it re-emits a cancellation from current state.
+    ///
+    /// Beside [`Self::as_str`] so the two cannot drift, and total rather than
+    /// `Option`: the schema asserts the set, so an unrecognised string is a
+    /// corrupted row, and defaulting a *renter's* cancellation onto the host is the
+    /// safer way to be wrong — it is the reason that owes a full refund.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "by_renter" => Self::ByRenter,
+            _ => Self::SpotUnavailable,
+        }
+    }
 }
 
 /// Why a hold ended without becoming a booking. Costs nothing to carry and it's
@@ -91,16 +105,36 @@ impl ReleaseReason {
             Self::Expired => "expired",
         }
     }
+
+    /// The inverse, for the same reason as [`CancelReason::parse`]. Neither answer
+    /// costs anyone money here — this is the difference between "you backed out"
+    /// and "your hold ran out" in a renter's history.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "abandoned" => Self::Abandoned,
+            _ => Self::Expired,
+        }
+    }
+}
+
+impl BookingEvent {
+    /// The booking every variant is about — the aggregate half of `booking:<uuid>`.
+    pub fn booking_id(&self) -> Uuid {
+        match self {
+            Self::Created(e) => e.booking_id,
+            Self::Confirmed { booking_id }
+            | Self::Released { booking_id, .. }
+            | Self::Cancelled { booking_id, .. } => *booking_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BookingCreated {
     pub booking_id: Uuid,
+    /// Selects the subject this booking lives on: every booking for one spot
+    /// shares that spot's subject, which is what gives them a total order.
     pub spot_id: Uuid,
-    /// The spot's shard, echoed so downstream never recomputes it. It selects the
-    /// subject this booking lives on, and a recomputed value would split a spot's
-    /// history across two subjects the moment SHARD_COUNT changed.
-    pub spot_shard: String,
     /// Denormalized from the spot so the booking row can be scoped to the owner
     /// without a cross-database dereference.
     pub owner_id: Uuid,
@@ -123,4 +157,24 @@ pub struct BookingCreated {
     /// it *and* know the zone. Folded once here instead, which is what lets both the
     /// host's and the renter's list filter on a single indexed field.
     pub ends_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `as_str` writes the column, `parse` reads it back. They are two matches over
+    /// the same strings, so nothing but this stops one gaining a variant the other
+    /// does not — and the failure would be quiet: a backfilled cancellation
+    /// attributed to the wrong party, which is the difference between a full refund
+    /// and none.
+    #[test]
+    fn every_reason_round_trips_through_its_column() {
+        for reason in [CancelReason::ByRenter, CancelReason::SpotUnavailable] {
+            assert_eq!(CancelReason::parse(reason.as_str()), reason);
+        }
+        for reason in [ReleaseReason::Abandoned, ReleaseReason::Expired] {
+            assert_eq!(ReleaseReason::parse(reason.as_str()), reason);
+        }
+    }
 }

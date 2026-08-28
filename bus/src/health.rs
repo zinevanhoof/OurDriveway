@@ -8,7 +8,6 @@ use std::{
 
 use async_nats::connection::State;
 use axum::{Router, http::StatusCode, routing::get};
-use tokio::sync::watch;
 
 /// Tracks whether this instance is fit to serve traffic.
 ///
@@ -24,9 +23,8 @@ pub struct Readiness {
 
 struct StreamState {
     caught_up: AtomicBool,
-    /// Last stream sequence this instance has applied. Projectors publish here;
-    /// request handlers wait on it for read-your-own-writes.
-    applied: watch::Sender<u64>,
+    /// Set once a lane dies, and never cleared. See [`Readiness::mark_failed`].
+    failed: AtomicBool,
 }
 
 impl Readiness {
@@ -40,7 +38,7 @@ impl Readiness {
                         *name,
                         StreamState {
                             caught_up: AtomicBool::new(false),
-                            applied: watch::channel(0).0,
+                            failed: AtomicBool::new(false),
                         },
                     )
                 })
@@ -48,36 +46,43 @@ impl Readiness {
         })
     }
 
-    /// Called by a projector once it has reached the stream's last sequence.
+    /// Called by a projector once **every** partition of the stream is drained.
+    /// Idempotent, and quiet when it is. A follower calls this on every poll of
+    /// the shared cursors — once a second — so logging unconditionally buried the
+    /// log in a line that says nothing after the first one.
     pub fn mark_caught_up(&self, stream: &str) {
-        if let Some(s) = self.streams.get(stream) {
-            s.caught_up.store(true, Ordering::Release);
+        if let Some(s) = self.streams.get(stream)
+            && !s.caught_up.swap(true, Ordering::AcqRel)
+        {
             tracing::info!(stream, "caught up");
         }
     }
 
-    /// Called when a projector hits an error it can't apply.
+    /// Called when a lane hits an error it can't apply.
     ///
-    /// A projector must stop rather than skip the message: skipping makes this
-    /// instance permanently disagree with its peers, which is far worse than
-    /// being drained. Flipping readiness is how it gets taken out of rotation.
+    /// A lane must stop rather than skip the message: skipping makes this
+    /// projection permanently disagree with the log, which is far worse than
+    /// being drained. Flipping readiness is how the instance gets taken out of
+    /// rotation.
+    ///
+    /// Per stream, not per partition. One wedged lane means this stream's
+    /// projection is incomplete, and a client cannot know which aggregates fell in
+    /// that partition — so the whole stream is unready, which is what it already
+    /// meant before the lanes existed.
+    ///
+    /// **Sticky, and that is the point.** The readiness poller keeps running after a
+    /// lane dies, and the other fifteen lanes go on draining; once another replica
+    /// picks up the dead lane's unacked message, every consumer reports drained and
+    /// [`Self::mark_caught_up`] would put this instance straight back into rotation
+    /// with a lane that is never coming back. Clearing it needs a restart, which is
+    /// what "a diagnosable stopped replica" means.
     pub fn mark_failed(&self, stream: &str) {
         if let Some(s) = self.streams.get(stream) {
             s.caught_up.store(false, Ordering::Release);
-            tracing::error!(stream, "projector stalled — instance not ready");
+            if !s.failed.swap(true, Ordering::AcqRel) {
+                tracing::error!(stream, "projector stalled — instance not ready");
+            }
         }
-    }
-
-    /// Records progress after a message has been applied *and committed*.
-    pub fn set_applied(&self, stream: &str, seq: u64) {
-        if let Some(s) = self.streams.get(stream) {
-            let _ = s.applied.send(seq);
-        }
-    }
-
-    /// Watch handle for a stream's applied sequence.
-    pub fn applied_rx(&self, stream: &str) -> Option<watch::Receiver<u64>> {
-        self.streams.get(stream).map(|s| s.applied.subscribe())
     }
 
     /// `Ok(())` when serving traffic is safe, `Err(reason)` otherwise.
@@ -88,6 +93,18 @@ impl Readiness {
         match self.client.connection_state() {
             State::Connected => {}
             other => return Err(format!("nats {other:?}")),
+        }
+
+        // Checked before `caught_up`, and separately, so the reason is the useful
+        // one: a stalled lane reads very differently from a cold start.
+        let failed: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.failed.load(Ordering::Acquire))
+            .map(|(name, _)| *name)
+            .collect();
+        if !failed.is_empty() {
+            return Err(format!("projector stalled: {}", failed.join(", ")));
         }
 
         let lagging: Vec<_> = self
@@ -126,3 +143,15 @@ where
             }),
         )
 }
+
+// `await_applied`, `APPLIED_TIMEOUT` and the `applied` watch that fed them are gone.
+//
+// They published `ack_floor.stream_sequence` from a stream's one consumer, so a
+// worker could ask "has my projection consumed the event that woke me". A stream has
+// `PARTITIONS` cursors now and that number has no single value: the lane holding the
+// event may be current while an unrelated lane sits at a lower floor, and the minimum
+// across them would stall a refund on a partition the worker does not care about.
+//
+// The question is better asked per aggregate anyway, which is what the event already
+// carries — `bus::await_version::reached(db, table, id, envelope.version, timeout)`.
+// Its one caller was payment-service's `BookingWorker`.

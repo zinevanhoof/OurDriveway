@@ -18,11 +18,11 @@ use shared::{
         Envelope, STREAM_BOOKINGS, STREAM_PAYMENTS, booking::BookingEvent, payment::PaymentEvent,
     },
 };
-use tokio::sync::watch;
+use surrealdb::{Surreal, engine::remote::ws::Client};
 
 use crate::service::settlement_worker_service::SettlementWorkerService;
 
-/// How long to wait for this instance's own projector to catch up to the event being
+/// How long to wait for this service's booking mirror to catch up to the event being
 /// handled. Past this, fail and let the NAK bring the message back — a projector that
 /// is more than a moment behind is a problem to be retried, not waited out inside a
 /// consumer loop that is holding up every other message.
@@ -31,8 +31,9 @@ const PROJECTION_WAIT: Duration = Duration::from_secs(5);
 /// Refunds and intent cancellations, triggered by a booking ending.
 pub struct BookingWorker {
     pub service: Arc<SettlementWorkerService>,
-    /// This instance's BOOKINGS projection cursor.
-    pub applied: watch::Receiver<u64>,
+    /// Read to check the booking mirror's version before deciding. Not written —
+    /// that is `BookingProjector`'s job, on the same rows.
+    pub db: Arc<Surreal<Client>>,
 }
 
 impl Worker for BookingWorker {
@@ -57,12 +58,23 @@ impl Worker for BookingWorker {
         // `decide` would read the booking as still reserved and do nothing — and
         // nothing would ever trigger it again.
         //
+        // Waits on the **aggregate version**, not on a stream position. It used to be
+        // `bus::await_applied(&self.applied, seq, …)`, reading the BOOKINGS
+        // consumer's `ack_floor`; that stopped having a single value once the
+        // projector became `PARTITIONS` consumers with independent cursors, and it
+        // was always the coarser question — this booking reaching `version` is what
+        // the decision actually needs, not everything published before it.
+        //
         // Erroring rather than proceeding stale: we are about to decide whether to move
         // money, and the whole point of waiting is that the decision reads state
         // including the event that prompted it. The NAK is the retry.
-        if !bus::await_applied(&self.applied, seq, Some(PROJECTION_WAIT)).await {
+        let version = envelope.version;
+        if !bus::await_version::reached(&self.db, "booking", &booking_id, version, PROJECTION_WAIT)
+            .await
+        {
             return Err(MyError::Bus(format!(
-                "{STREAM_BOOKINGS} projection has not reached seq {seq}; retrying"
+                "{STREAM_BOOKINGS} mirror of booking:{booking_id} has not reached \
+                 version {version} (seq {seq}); retrying"
             )));
         }
 
@@ -77,8 +89,6 @@ impl Worker for BookingWorker {
 /// nothing but an unpaid intent.
 pub struct PaymentWorker {
     pub service: Arc<SettlementWorkerService>,
-    /// This instance's PAYMENTS projection cursor.
-    pub applied: watch::Receiver<u64>,
 }
 
 impl Worker for PaymentWorker {
@@ -96,13 +106,17 @@ impl Worker for PaymentWorker {
             _ => return Ok(()),
         };
 
-        // Same wait, same reason as `BookingWorker` above.
-        if !bus::await_applied(&self.applied, seq, Some(PROJECTION_WAIT)).await {
-            return Err(MyError::Bus(format!(
-                "{STREAM_PAYMENTS} projection has not reached seq {seq}; retrying"
-            )));
-        }
-
+        // No wait here, unlike `BookingWorker` above, and the asymmetry is the point:
+        // PAYMENTS is this service's *own* stream. The payment row is written inside
+        // the transaction that enqueues the event, so by the time this event exists
+        // at all the row it describes is already committed — there is no projection
+        // left to be behind.
+        //
+        // It used to hold a `watch::Receiver<u64>` for the PAYMENTS cursor and wait
+        // on it. That projector was deleted when this service started writing its own
+        // rows, and the receiver it asked `Readiness` for went with it — leaving an
+        // `.expect` on a stream no longer registered, which panicked this service on
+        // boot.
         self.service.settle_up(&booking_id).await
     }
 }

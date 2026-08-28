@@ -27,7 +27,13 @@ pub fn mint(user_id: &Uuid) -> MyResult<(String, DateTime<Utc>, Uuid)> {
         jti,
 
         ns: "main".to_string(),
-        db: "main".to_string(),
+        // view-service's database, NOT user-service's — this claim is only ever
+        // used by the browser against view-service's GraphQL endpoint, where
+        // `DEFINE ACCESS account ON DATABASE` lives. SurrealDB validates a
+        // record-access token against the ns/db/ac it names, so this has to be
+        // the database holding that ACCESS definition (schemas/view-schema.surql),
+        // not the one this service happens to write to.
+        db: "view".to_string(),
         ac: "account".to_string(),
 
         // The only `user:` left in the codebase. SurrealDB parses this claim with

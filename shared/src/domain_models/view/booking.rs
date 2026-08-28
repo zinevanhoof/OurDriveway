@@ -19,6 +19,11 @@ use crate::{
 #[derive(Clone, Debug, SurrealValue)]
 pub struct ViewBooking {
     pub id: Uuid,
+    /// booking-service's version of this booking, as last applied here. On the model
+    /// rather than only in the schema for the same reason as
+    /// [`super::user::ViewUser::version`] — this row is written with `CONTENT $row`,
+    /// and a model missing the column clears it.
+    pub version: u64,
     pub spot_id: Uuid,
     pub owner_id: Uuid,
     pub renter_id: Uuid,
@@ -37,9 +42,10 @@ pub struct ViewBooking {
 
 impl ViewBooking {
     /// The row a `Created` writes.
-    pub fn created(e: BookingCreated, at: DateTime<Utc>) -> Self {
+    pub fn created(e: BookingCreated, at: DateTime<Utc>, version: u64) -> Self {
         Self {
             id: e.booking_id,
+            version,
             spot_id: e.spot_id,
             owner_id: e.owner_id,
             renter_id: e.renter_id,

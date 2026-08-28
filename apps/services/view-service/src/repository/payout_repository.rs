@@ -29,15 +29,18 @@ impl<Q: Querier> ViewPayoutRepository<Q> {
         Ok(())
     }
 
-    /// Points `owner` at the host's row, if they have been projected yet.
+    /// Points `owner` at the host's row.
+    ///
+    /// Written unconditionally rather than resolved through a subquery — see
+    /// `ViewBookingRepository::link_refs` for why that subquery was the bug and not
+    /// the safety.
     ///
     /// Runs straight after the `upsert` that cleared it, in the same transaction, so
     /// there is no existing link to preserve and no `= NONE` scope needed.
     pub async fn link_owner(&self, payout_id: &Uuid, owner_id: &Uuid) -> MyResult<()> {
         self.q
             .q("UPDATE type::record('payout', $id)
-                SET owner = (SELECT VALUE id FROM ONLY user
-                             WHERE record::id(id) = $owner LIMIT 1);")
+                SET owner = type::record('user', $owner);")
             .bind(("id", *payout_id))
             .bind(("owner", *owner_id))
             .await?

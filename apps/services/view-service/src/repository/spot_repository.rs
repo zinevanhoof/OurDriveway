@@ -74,16 +74,19 @@ impl<Q: Querier> ViewSpotRepository<Q> {
              created_at     = $created_at     ?? created_at,
              updated_at     = $updated_at     ?? updated_at;";
 
-    /// Points `owner` at the user row, if that user has been projected yet.
+    /// Points `owner` at the host's row.
     ///
-    /// The subquery yields NONE when they have not, and
-    /// `ViewUserRepository::backfill_links` fills it in when they arrive. Scoped
-    /// `AND owner = NONE` so re-running never repoints an already-linked row.
+    /// Written unconditionally rather than resolved through a subquery — see
+    /// `ViewBookingRepository::link_refs` for why that subquery was the bug and not
+    /// the safety.
+    ///
+    /// Still scoped `WHERE owner = NONE`, unlike `link_refs`: that one runs after an
+    /// `upsert` that cleared the link, this one after a `merge` that preserved it, so
+    /// there *is* an existing value here and no reason to rewrite it.
     pub async fn link_owner(&self, spot_id: &Uuid, owner_id: &Uuid) -> MyResult<()> {
         self.q
             .q("UPDATE type::record('spot', $id)
-                SET owner = (SELECT VALUE id FROM ONLY user
-                             WHERE record::id(id) = $owner LIMIT 1)
+                SET owner = type::record('user', $owner)
                 WHERE owner = NONE;")
             .bind(("id", *spot_id))
             .bind(("owner", *owner_id))

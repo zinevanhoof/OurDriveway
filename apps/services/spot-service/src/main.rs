@@ -1,25 +1,19 @@
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
     routing::{get, patch, post},
 };
-use bus::AppliedSeqs;
 use shared::{
     env,
     rpc::spot::{SUBJECT_SPOT_CARD, SpotCard},
 };
 use uuid::Uuid;
 
-use crate::{
-    projector::SpotProjector, repository::spot_repository::SpotRepository,
-    service::spot_service::SpotService,
-};
+use crate::{repository::spot_repository::SpotRepository, service::spot_service::SpotService};
 
 mod client;
 mod policy;
-mod projector;
 mod repository;
 mod route;
 mod service;
@@ -43,10 +37,12 @@ pub struct Config {
     pub surrealdb_addr: String,
     pub surrealdb_user: String,
     pub surrealdb_pass: String,
+    /// This service's own database inside the shared `main` namespace. Every
+    /// service used to be "main"; on TiKV they share one keyspace, so this is
+    /// what keeps their tables apart.
+    pub surrealdb_db: String,
     pub nats_url: String,
     pub port: u16,
-    /// 0 disables snapshots entirely — see `bus::snapshot::install`.
-    pub snapshot_interval_secs: u64,
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
     pub locationiq_api_key: String,
@@ -63,9 +59,9 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     surrealdb_addr: env::require("SURREALDB_ADDR"),
     surrealdb_user: env::require("SURREALDB_USER"),
     surrealdb_pass: env::require("SURREALDB_PASS"),
+    surrealdb_db: env::require("SURREALDB_DB"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
-    snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
     jwt_secret: env::require("JWT_SECRET"),
     locationiq_api_key: env::require("LOCATIONIQ_API_KEY"),
     media_base: env::require("MEDIA_BASE"),
@@ -95,50 +91,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &CONFIG.surrealdb_addr,
         &CONFIG.surrealdb_user,
         &CONFIG.surrealdb_pass,
+        &CONFIG.surrealdb_db,
     )
     .await?;
 
-    // The projector takes an owned client, because `Surreal::begin` consumes one
-    // and it holds its own open transaction. That is the floor: one session,
-    // cloned once here rather than once per event.
-    let spots_client = db.clone();
-
-    // Everything else shares one session. `Surreal::clone` would mint another and
-    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
-    // because nothing re-authenticates per request — see `shared::db::connect`.
+    // The projector is gone — this service writes its own rows. What is left
+    // needing an owned session is the election and the outbox relay.
+    // One connection for the whole process — election, relay, handlers and the await
+    // layer all share it. `Surreal::clone` would mint a session and replay the root
+    // sign-in onto it; cloning the `Arc` is a refcount bump. The sessions that do get
+    // minted are per *transaction*, in `shared::db::begin`, and die with it.
     let db = Arc::new(db);
+    let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
-    let readiness = bus::Readiness::new(js.client().clone(), &[shared::events::STREAM_SPOTS]);
+    // No streams: this service projects nothing now — it writes its own rows and
+    // enqueues the event beside them. `/readyz` reduces to "is NATS reachable",
+    // which the outbox relay still needs.
+    let readiness = bus::Readiness::new(js.client().clone(), &[]);
 
-    // No-op when SNAPSHOT_INTERVAL_SECS=0, which is how this runs with a
-    // disposable projection store: every start replays from sequence 1.
-    bus::snapshot::install(
-        &js,
-        bus::SnapshotConfig {
-            db_addr: &CONFIG.surrealdb_addr,
-            db_user: &CONFIG.surrealdb_user,
-            db_pass: &CONFIG.surrealdb_pass,
-            service: "spot-service",
-            streams: vec![shared::events::STREAM_SPOTS],
-            every_secs: CONFIG.snapshot_interval_secs,
-        },
-    )
-    .await?;
 
     // The projector is the only *writer* to `db`. The service reads a spot's owner
-    // and shard before it publishes an edit — it still writes nothing, so the
-    // dual-write the split avoids stays avoided.
+    // before it publishes an edit — it still writes nothing, so the dual-write the
+    // split avoids stays avoided.
     //
-    // `Tx` is the adapter that opens a transaction per event, applies, advances
-    // the cursor inside it and commits — so the projector below cannot forget any
-    // of that.
-    tokio::spawn(bus::projector::run(
-        js.clone(),
-        bus::Tx::new(SpotProjector, spots_client),
-        readiness.clone(),
-    ));
+    // For the outbox relay, which is all this service runs off the bus — it has no
+    // projector and no worker, so there is nothing else here an election would gate.
+    // The relay has no backstop of its own, so exactly one instance may run it.
+    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
+
+
+    // Carries every SPOTS event this service commits. This is now the only path by
+    // which they reach NATS.
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
 
     // Answers "what does spot 019fa… look like" for anyone who needs to *label* a spot
     // without becoming a consumer of SPOTS — payment-service, putting a title on a
@@ -181,7 +167,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let state = AppState {
         spot_service: Arc::new(SpotService {
-            js,
             spots: SpotRepository { q: db },
         }),
     };
@@ -202,25 +187,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // view-service from the combined projection. This database is private to
     // this service — no browser identity can reach it at all.
 
-    // Read-your-own-writes: create answers `SPOTS:<seq>`, the client echoes it, and
-    // this holds the next request until the local projector is there. Without it,
-    // editing or deleting a spot right after creating it reads `owned()` against a
-    // projection that hasn't applied the create yet — a 404 on the caller's own spot.
-    let applied = AppliedSeqs(Arc::new(HashMap::from([(
-        shared::events::STREAM_SPOTS,
-        readiness
-            .applied_rx(shared::events::STREAM_SPOTS)
-            .expect("SPOTS is registered with Readiness above"),
-    )])));
 
     let app = Router::new()
         .merge(api_router)
         // On the API only, and before health is merged: `/readyz` reporting how far
         // behind a projector is must never itself wait for that projector.
+        // Waits on the aggregate versions a client echoes back, against this
+        // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            applied,
-            bus::await_seq::await_seq,
+            bus::AwaitVersions(await_db),
+            bus::await_version::await_version,
         ))
+        // After the layer, deliberately — a backfill is not a client read and has
+        // no version to wait on. Not under `/api` either, which is what keeps it
+        // off the ingress; see `route::spot::backfill`.
+        .route("/internal/backfill", post(route::spot::backfill))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

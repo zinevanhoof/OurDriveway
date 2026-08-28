@@ -30,15 +30,28 @@ impl<Q: Querier> ViewBookingRepository<Q> {
         Ok(())
     }
 
-    /// Points `spot` and `renter` at their rows, where those rows exist yet.
+    /// Points `spot` and `renter` at their rows.
     ///
-    /// Both subqueries yield NONE otherwise, and the string ids beside them are what
-    /// permissions and filters actually use — the links exist only so a GraphQL query
-    /// can traverse into a spot or a renter without a second round trip.
+    /// The string ids beside them are what permissions and filters actually use — the
+    /// links exist only so a GraphQL query can traverse into a spot or a renter
+    /// without a second round trip.
     ///
-    /// Unconditional rather than scoped `= NONE` like the others: this runs straight
-    /// after the `upsert` that cleared both, in the same transaction, so there is
-    /// never an existing link here to preserve.
+    /// **Written unconditionally, not resolved through a `SELECT … WHERE record::id`.**
+    /// The schema types these `option<record<…>>` with no existence constraint, so a
+    /// link to a row that has not been projected yet is legal and reads as absent —
+    /// exactly what the subquery's NONE produced — and then becomes correct by itself
+    /// the moment that row arrives.
+    ///
+    /// The subquery version left the link NONE *permanently* whenever the target had
+    /// not landed yet. That was patched over by `backfill_links` methods that ran when
+    /// the target arrived, which covered the sequential cases and not the concurrent
+    /// one: USERS and BOOKINGS advance independently, so each side could start its
+    /// transaction before the other's row was visible, neither resolve, and the link
+    /// stay null for good. Measured, on a rebuild that applied both streams at once.
+    ///
+    /// Also unconditional rather than scoped `= NONE`: this runs straight after the
+    /// `upsert` that cleared both, in the same transaction, so there is never an
+    /// existing link here to preserve.
     pub async fn link_refs(
         &self,
         booking_id: &Uuid,
@@ -47,10 +60,8 @@ impl<Q: Querier> ViewBookingRepository<Q> {
     ) -> MyResult<()> {
         self.q
             .q("UPDATE type::record('booking', $id) SET
-                    spot   = (SELECT VALUE id FROM ONLY spot
-                              WHERE record::id(id) = $spot LIMIT 1),
-                    renter = (SELECT VALUE id FROM ONLY user
-                              WHERE record::id(id) = $renter LIMIT 1);")
+                    spot   = type::record('spot', $spot),
+                    renter = type::record('user', $renter);")
             .bind(vars! {
                 id:     *booking_id,
                 spot:   *spot_id,

@@ -8,33 +8,39 @@
 //! paying a rebuild in both directions on every alternation. `--all-targets` is
 //! what extends the workspace build to examples.
 //!
-//! Publishes events rather than writing to any database, because the log is the
-//! source of truth — every service's projection is built from it, so this one
-//! command populates all five databases and survives a wipe-and-replay. Seeding
-//! SurrealDB directly would fill one database, leave the others empty, and vanish
-//! on the next rebuild.
+//! Writes the authoritative rows AND enqueues their events, exactly as a service
+//! does — because that is what a service does now. It used to only publish, and
+//! every projection was built from the log; owning services write their own rows
+//! today, so a publish-only seed left every database empty and the events with
+//! nobody to apply them.
+//!
+//! So this reaches into user-service's and spot-service's databases directly. That
+//! is a thing no *service* may do, and it is deliberate here: the alternative is
+//! driving the HTTP API, which would make seeding a spot depend on a live
+//! LocationIQ key and a network round trip.
+//!
+//! The `_outbox` rows are the important half. Each service's relay picks them up
+//! and publishes them, which is what still populates view-service and the local
+//! mirrors — one command, all five databases, same as before.
 //!
 //! Reuses the real event structs on purpose. Hand-written JSON would compile
 //! against nothing and drift silently the first time a payload changes.
 //!
-//! Idempotent, and permanently so. Ids are UUIDv5 derived from the names below,
-//! and every seeded entity is published with `expected_last_subject_sequence = 0`
-//! — "append only if this subject has never been written". A second run is refused
-//! as `Stale` and skipped.
-//!
-//! The `Nats-Msg-Id` dedupe alone is NOT enough: the stream's duplicate window is
-//! 120s, so re-running any later would append a second copy of every event. The
-//! projections would survive that (they upsert by the same key) but the log — the
-//! actual source of truth — would accumulate a duplicate set on every dev start.
+//! Idempotent. Ids are UUIDv5 derived from the names below, so a second run
+//! upserts the same rows; the `_outbox` rows are keyed by a v5 event id too, so a
+//! re-run replaces rather than appends. The stream's `Nats-Msg-Id` dedupe then
+//! discards anything the relay sends twice inside its window.
 
 use argon2::{
     Argon2, PasswordHasher,
     password_hash::{SaltString, rand_core::OsRng},
 };
 use chrono::Utc;
-use shared::error::myerror::MyError;
+use shared::db::Querier;
+use shared::domain_models::spot::Spot;
+use shared::domain_models::user::User;
 use shared::events::{
-    Envelope, shard_of,
+    Envelope, aggregate_id,
     spot::{SpotCreated, SpotEvent},
     spot_subject,
     user::{UserEvent, UserRegistered},
@@ -54,11 +60,23 @@ fn stable(name: &str) -> Uuid {
 
 /// `Envelope::new` mints a random v7 event id; a seed wants a deterministic one so
 /// the broker can recognise a re-run as a duplicate.
-fn envelope<T>(payload: T, actor_id: Option<Uuid>, event_key: &str) -> Envelope<T> {
+fn envelope<T>(
+    payload: T,
+    actor_id: Option<Uuid>,
+    event_key: &str,
+    aggregate: String,
+    version: u64,
+) -> Envelope<T> {
     Envelope {
         event_id: stable(event_key),
+        aggregate,
+        version,
         occurred_at: Utc::now(),
         actor_id,
+        // These *are* the original events, not a re-emission of state derived from
+        // them — so notification-service is meant to see a seeded signup and act on
+        // it, exactly as it would a real one.
+        backfill: false,
         payload,
     }
 }
@@ -109,6 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let js = async_nats::jetstream::new(client);
     println!("connected to {url}");
 
+    // The shared SurrealDB in front of TiKV. Same default the services use.
+    let addr = std::env::var("SURREALDB_ADDR").unwrap_or_else(|_| "localhost:8000".into());
+
     // The services declare these too, and `get_or_create_stream` is idempotent —
     // so this also covers being the first thing to reach a fresh broker.
     bus::ensure_streams(&js).await?;
@@ -123,56 +144,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (stable("seed:user:bob"), "Bob", "Beckers", "bob@example.com"),
     ];
 
+    let user_db = shared::db::connect(&addr, "root", "root", "user").await?;
+
     for (id, first, last, email) in users {
-        let shard = shard_of(&id);
-        let subject = user_subject(&shard, &id);
+        let registered = UserRegistered {
+            user_id: id,
+            first_name: first.into(),
+            last_name: last.into(),
+            email: email.into(),
+            // Hashed here for the same reason the real signup path does it: Argon2
+            // salts randomly, so it has to happen once on the write side.
+            password_hash: hash(PASSWORD),
+        };
 
-        let registered = envelope(
-            UserEvent::Registered(UserRegistered {
-                user_id: id,
-                shard: shard.clone(),
-                first_name: first.into(),
-                last_name: last.into(),
-                email: email.into(),
-                // Hashed here for the same reason the real signup path does it:
-                // Argon2 salts randomly, so hashing inside a projection would give
-                // every replica a different answer for the same event.
-                password_hash: hash(PASSWORD),
-            }),
-            Some(id),
-            &format!("seed:event:registered:{id}"),
-        );
+        let tx = shared::db::begin(&user_db).await?;
 
-        match bus::publish_expecting(&js, subject.clone(), &registered, Some(0)).await {
-            Ok(seq) => {
-                // Chained on the sequence just returned, not `Some(0)` again — the
-                // subject is no longer empty. Without this they could not log in:
-                // user-service reads `email_verified` on the same row as the hash.
-                let verified = envelope(
-                    UserEvent::EmailVerified { user_id: id },
-                    Some(id),
-                    &format!("seed:event:verified:{id}"),
-                );
-                bus::publish_expecting(&js, subject, &verified, Some(seq))
-                    .await
-                    .map_err(MyError::from)?;
-                println!("user     {id}  {email}");
-            }
-            Err(bus::PublishError::Stale) => println!("user     {id}  {email}  (already seeded)"),
-            Err(bus::PublishError::Failed(e)) => return Err(e.into()),
-        }
+        // Verified on the way in. The real path needs a mailed token, and a seeded
+        // account that cannot log in is not a seeded account.
+        let mut row = User::registered(registered.clone(), 1);
+        row.email_verified = true;
+        tx.q("UPSERT type::record('user', $id) CONTENT $row")
+            .bind(("id", id))
+            .bind(("row", row))
+            .await?
+            .check()?;
+
+        bus::outbox::enqueue(
+            &tx,
+            &user_subject(&id),
+            &envelope(
+                UserEvent::Registered(registered),
+                Some(id),
+                &format!("seed:event:registered:{id}"),
+                aggregate_id("user", &id),
+                1,
+            ),
+        )
+        .await?;
+        tx.commit().await?;
+
+        println!("user     {id}  {email}");
     }
 
     // Owned by Alice, so Bob is the one who can book it — a renter may not book
     // their own spot.
     let (owner_id, ..) = users[0];
     let spot_id = stable("seed:spot:alice-driveway");
-    let spot_shard = shard_of(&spot_id);
-
-    let created = envelope(
-        SpotEvent::Created(SpotCreated {
+    let spot_created = SpotCreated {
             spot_id,
-            shard: spot_shard.clone(),
             owner_id,
             title: "Driveway near Brussels Central".into(),
             description: Some("Seeded test spot. Easy to reach, fits one car.".into()),
@@ -196,19 +215,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // from the geocoded point; here it is stated so the seed needs no
             // network call.
             timezone: "Europe/Brussels".into(),
-        }),
-        Some(owner_id),
-        &format!("seed:event:spot-created:{spot_id}"),
-    );
+    };
 
-    match bus::publish_expecting(&js, spot_subject(&spot_shard, &spot_id), &created, Some(0)).await
-    {
-        Ok(_) => println!("spot     {spot_id}  owned by {owner_id}"),
-        Err(bus::PublishError::Stale) => {
-            println!("spot     {spot_id}  owned by {owner_id}  (already seeded)")
-        }
-        Err(bus::PublishError::Failed(e)) => return Err(e.into()),
-    }
-    println!("\npassword for both users: {PASSWORD}");
+    let spot_db = shared::db::connect(&addr, "root", "root", "spot").await?;
+    let tx = shared::db::begin(&spot_db).await?;
+
+    tx.q("UPSERT type::record('spot', $id) CONTENT $row")
+        .bind(("id", spot_id))
+        .bind(("row", Spot::created(spot_created.clone(), Utc::now(), 1)))
+        .await?
+        .check()?;
+
+    bus::outbox::enqueue(
+        &tx,
+        &spot_subject(&spot_id),
+        &envelope(
+            SpotEvent::Created(spot_created),
+            Some(owner_id),
+            &format!("seed:event:spot-created:{spot_id}"),
+            aggregate_id("spot", &spot_id),
+            1,
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+
+    println!("spot     {spot_id}  owned by {owner_id}");
+    println!("\nRelays publish the outbox rows; view-service catches up within a moment.");
+    println!("password for both users: {PASSWORD}");
     Ok(())
 }

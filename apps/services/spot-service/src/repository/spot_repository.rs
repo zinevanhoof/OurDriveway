@@ -38,11 +38,34 @@ impl<Q: Querier> SpotRepository<Q> {
         Ok(self
             .q
             .q("SELECT record::id(id) AS id,
+                       version ?? 0     AS version,
                        images  ?? []    AS images,
                        deleted ?? false AS deleted,
                        *
                 FROM ONLY type::record('spot', $v)")
             .bind(("v", spot_id))
+            .await?
+            .take(0)?)
+    }
+
+    /// Every spot, deleted ones included, for `SpotService::backfill`.
+    ///
+    /// Deleted ones matter: their rows stay selectable so a renter's past bookings
+    /// keep resolving a title, so a rebuild that skipped them would leave exactly
+    /// those bookings unlabelled.
+    ///
+    /// ponytail: reads the whole table into memory in one pass. Fine for a
+    /// maintenance endpoint; page on `id` — `WHERE id > $after ORDER BY id LIMIT $n`
+    /// — if listings ever outgrow it.
+    pub async fn all(&self) -> MyResult<Vec<Spot>> {
+        Ok(self
+            .q
+            .q("SELECT record::id(id) AS id,
+                       version ?? 0     AS version,
+                       images  ?? []    AS images,
+                       deleted ?? false AS deleted,
+                       *
+                FROM spot")
             .await?
             .take(0)?)
     }
@@ -74,7 +97,7 @@ impl<Q: Querier> SpotRepository<Q> {
     /// set a column back to NONE. The eight columns here are every column
     /// [`SpotPatch`] carries — add one there and it has to be added here too.
     ///
-    /// `owner_id`, `shard`, `location`, `address` and `timezone` are absent on
+    /// `owner_id`, `location`, `address` and `timezone` are absent on
     /// purpose: a spot cannot change hands or move.
     pub async fn patch(&self, spot_id: Uuid, patch: SpotPatch) -> MyResult<()> {
         patch

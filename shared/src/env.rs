@@ -3,9 +3,8 @@
 //! Every variable a service reads is mandatory and is declared in that service's
 //! `.env`. There are deliberately no defaults here: a default is a value nobody
 //! can see from the `.env` file, and the ones that used to exist
-//! (`SURREALDB_USER=root`, `NATS_URL=nats://localhost:4222`, a 15-minute snapshot
-//! interval) were invisible in exactly the deployments where being wrong costs
-//! the most.
+//! (`SURREALDB_USER=root`, `NATS_URL=nats://localhost:4222`) were invisible in
+//! exactly the deployments where being wrong costs the most.
 //!
 //! These helpers exist only so the four `Config` structs don't each repeat the
 //! same panic message. They read no variable of their own — the caller names

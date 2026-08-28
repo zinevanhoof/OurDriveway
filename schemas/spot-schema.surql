@@ -1,4 +1,7 @@
-USE NS main DB main;
+-- One database per service inside the shared `main` namespace. Was DB main for
+-- every service, which was safe only while each ran its own SurrealDB over its
+-- own datastore; on TiKV they share one keyspace and this name is the isolation.
+USE NS main DB spot;
 
 -- This database is PRIVATE to its service. No GraphQL config and no record
 -- access are defined, so a client JWT cannot authenticate against it at all —
@@ -18,14 +21,18 @@ USE NS main DB main;
 -- and view-schema.surql is where a real permission clause lives.
 DEFINE TABLE OVERWRITE spot SCHEMAFULL PERMISSIONS NONE;
 
+-- Monotonic, bumped by the owning service inside the transaction that writes the
+-- rows. Three jobs in one column: the token a client waits on
+-- (`spot:<id>@7`), the key two concurrent writers collide on so TiKV refuses
+-- one, and the gap detector that stops an out-of-order event applying
+-- silently.
+DEFINE FIELD OVERWRITE version ON spot TYPE int DEFAULT 0;
+
 -- Set explicitly by spot-service from the verified claim. Never `VALUE $token.ID`:
 -- that forced the field from the caller's token, so the table could only be written
 -- by a connection authenticated as that very user — and silently coerced to NONE
 -- (rejecting the write) for any service identity.
 DEFINE FIELD OVERWRITE owner_id ON spot TYPE uuid;
--- Assigned once at creation and never changed: it selects the NATS subject this
--- spot's events live on, and moving a spot between shards would split its history.
-DEFINE FIELD OVERWRITE shard ON spot TYPE string;
 DEFINE FIELD OVERWRITE title ON spot TYPE string;
 DEFINE FIELD OVERWRITE description ON spot TYPE option<string>;
 -- EUR cents. Was `float`; binary floating point can't represent most decimal
@@ -82,12 +89,39 @@ DEFINE FIELD OVERWRITE updated_at ON spot TYPE datetime;
 
 DEFINE INDEX OVERWRITE spot_owner ON spot FIELDS owner_id;
 
--- Where this instance's projector has got to in the SPOTS stream. Written in the
--- same transaction as the data it describes, so a crash can never leave the
--- cursor ahead of the rows (which would silently skip events on restart).
+
+-- ─── leader election ────────────────────────────────────────────────────────
+-- One row, `_lease:leader`, and it exists for the OUTBOX RELAY only.
 --
--- PERMISSIONS NONE keeps it invisible to any client identity; only the service's
--- database-level connection, whose role bypasses table permissions, touches it.
-DEFINE TABLE OVERWRITE _projection SCHEMAFULL PERMISSIONS NONE;
-DEFINE FIELD OVERWRITE last_seq   ON _projection TYPE int;
-DEFINE FIELD OVERWRITE updated_at ON _projection TYPE datetime;
+-- The projectors do not need it: they pull from one durable consumer with
+-- `max_ack_pending: 1`, so JetStream itself hands out one event at a time across
+-- every replica, in stream order. The relay has no such backstop — it reads rows
+-- from this database and publishes them, and two relays could publish one
+-- entity's events out of order, which the downstream `WHERE status IN $from`
+-- guards drop rather than reorder.
+--
+-- Expiry is compared against `time::now()` INSIDE the database. Replicas do not
+-- share a clock; they do share this row.
+DEFINE TABLE OVERWRITE _lease SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD OVERWRITE holder     ON _lease TYPE string;
+DEFINE FIELD OVERWRITE expires_at ON _lease TYPE datetime;
+
+-- ─── transactional outbox ───────────────────────────────────────────────────
+-- Events written in the SAME transaction as the data that caused them, then
+-- moved to NATS by the relay. This is the one thing JetStream cannot provide on
+-- its own: its guarantees begin once a message is in the stream, and this closes
+-- the window before that.
+--
+-- The record id is the envelope's `event_id`, so enqueuing the same event twice
+-- is one row — the same property `Nats-Msg-Id` gives on the way out.
+DEFINE TABLE OVERWRITE _outbox SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD OVERWRITE subject    ON _outbox TYPE string;
+-- The serialized envelope, as text so a stuck row can be read with a SELECT.
+DEFINE FIELD OVERWRITE payload    ON _outbox TYPE string;
+DEFINE FIELD OVERWRITE created_at ON _outbox TYPE datetime;
+-- The relay's read: oldest first. `id` is deliberately NOT in the index — it is
+-- the record key, not a field, and SurrealDB rejects it here ("The field 'id'
+-- does not exist"). The relay still ORDERs by `created_at, id` so two events
+-- enqueued in one transaction, sharing a timestamp, are retried in the order
+-- they were sent; only the leading column is indexed.
+DEFINE INDEX OVERWRITE _outbox_order ON _outbox FIELDS created_at;

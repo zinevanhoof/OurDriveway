@@ -24,9 +24,6 @@ pub struct RefreshToken {
     /// cross-service id is a plain uuid, because the table it points at lives in
     /// another database. Here both tables are in this one.
     pub user_id: Uuid,
-    /// The *user's* shard — sessions live on the user's subject so one user's
-    /// whole session history stays on one ordered subject.
-    pub shard: String,
     /// `refresh_token_hash … UNIQUE`. The only way a token is ever looked up:
     /// refresh and logout both arrive holding a plaintext token and nothing else.
     ///
@@ -72,7 +69,6 @@ impl RefreshToken {
         Self {
             id: e.token_id,
             user_id: e.user_id,
-            shard: e.shard,
             token_hash: e.token_hash,
             jti: e.jti.into(),
             created_at: at.into(),
@@ -89,7 +85,6 @@ impl RefreshToken {
         Self {
             id: e.token_id,
             user_id: e.user_id,
-            shard: e.shard,
             token_hash: e.token_hash,
             jti: e.jti.into(),
             created_at: at.into(),

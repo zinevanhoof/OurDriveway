@@ -1,19 +1,25 @@
-//! Write side. Validates and publishes — it never writes to the database.
+//! Write side. Validates, writes its own rows, and enqueues the event beside them
+//! — all in one transaction.
 //!
-//! Every payment row this service reads back was put there by its own projector
-//! applying an event this file published. See the note on `bus::publish`.
+//! Every payment row this service reads back was written by the request that
+//! caused it, not by a projector applying an event a moment later.
 
 use std::sync::Arc;
 
 use async_nats::jetstream::Context;
 use chrono::Utc;
+use bus::outbox;
+use shared::db;
 use shared::{
-    domain_models::{booking::status as booking_status, payment::Earnings},
-    error::myerror::{ContextExt, MyResult},
+    domain_models::{
+        booking::status as booking_status,
+        payment::{Earnings, Payment, PaymentPatch, Payout, status},
+    },
+    error::myerror::{ContextExt, MyError, MyResult},
     events::{
-        Envelope, STREAM_PAYMENTS,
+        Envelope, aggregate_id, format_version,
         payment::{PaymentCreated, PaymentEvent},
-        payment_subject, payout_subject, shard_of,
+        payment_subject, payout_subject,
     },
     requests::payment::CreateSessionRequest,
     rpc::spot::{SUBJECT_SPOT_CARD, SpotCard},
@@ -32,9 +38,12 @@ use crate::{
 };
 
 pub struct PaymentService {
-    js: Context,
-    /// The same connection `js` publishes over, for the one thing JetStream is wrong for:
-    /// asking spot-service what a spot is called. See [`shared::rpc`].
+    /// Only for the one thing JetStream is wrong for: asking spot-service what a
+    /// spot is called. See [`shared::rpc`].
+    ///
+    /// There is no `js` here any more — this service publishes nothing directly.
+    /// Events go into `_outbox` in the same transaction as the rows, and the relay
+    /// carries them.
     nc: async_nats::Client,
     payments: PaymentRepository,
     bookings: BookingMirrorRepository,
@@ -55,7 +64,6 @@ impl PaymentService {
     ) -> Self {
         Self {
             nc: js.client().clone(),
-            js,
             payments: PaymentRepository { q: db.clone() },
             bookings: BookingMirrorRepository { q: db.clone() },
             payouts: PayoutRepository { q: db },
@@ -163,32 +171,39 @@ impl PaymentService {
             )
             .await?;
 
-        let event = PaymentEvent::Created(PaymentCreated {
+        let created = PaymentCreated {
             payment_id,
             booking_id: *booking_id,
-            booking_shard: shard_of(booking_id),
             owner_id: booking.owner_id,
             renter_id: booking.renter_id,
             session_id: session.session_id.clone(),
             amount_cents: booking.amount_cents,
             created_at: Utc::now(),
-        });
+        };
 
-        // Deterministic event id, so a resubmitted checkout is discarded by the stream's
-        // duplicate window instead of appended twice. No compare-and-swap: one payment
-        // owns this subject, so there is no second writer to lose a race to.
-        let mut envelope = Envelope::new(event, None);
+        let tx = db::begin(&self.payments.q).await?;
+        let version = db::next_version(&tx, "payment", &payment_id).await?;
+
+        PaymentRepository { q: &tx }
+            .upsert(Payment::created(created.clone(), version))
+            .await?;
+
+        // Deterministic event id, so a resubmitted checkout is discarded by the
+        // stream's duplicate window instead of appended twice. The `_outbox` row is
+        // keyed by it too, so a retry inside this transaction is one row either way.
+        let mut envelope = Envelope::new(
+            PaymentEvent::Created(created),
+            None,
+            aggregate_id("payment", &payment_id),
+            version,
+        );
         envelope.event_id = Uuid::new_v5(
             &Uuid::NAMESPACE_OID,
             format!("payment-created:{payment_id}").as_bytes(),
         );
 
-        bus::publish(
-            &self.js,
-            payment_subject(&shard_of(booking_id), booking_id),
-            &envelope,
-        )
-        .await?;
+        outbox::enqueue(&tx, &payment_subject(booking_id), &envelope).await?;
+        tx.commit().await?;
 
         Ok(session)
     }
@@ -230,7 +245,7 @@ impl PaymentService {
     /// is withdrawn downstream and refunded by `settle_up`, which is one refund trigger
     /// rather than a decision made here with half the information.
     pub async fn record_webhook(&self, outcome: Outcome) -> MyResult<()> {
-        let (event, booking_id, dedupe) = match outcome {
+        let (event, booking_id, dedupe, payment_id) = match outcome {
             Outcome::Succeeded {
                 booking_id,
                 intent_id,
@@ -249,6 +264,7 @@ impl PaymentService {
                     },
                     booking_id,
                     format!("payment-succeeded:{payment_id}"),
+                    payment_id,
                 )
             }
 
@@ -268,6 +284,7 @@ impl PaymentService {
                     },
                     booking_id,
                     format!("payment-failed:{payment_id}:{reason}"),
+                    payment_id,
                 )
             }
 
@@ -275,16 +292,45 @@ impl PaymentService {
             Outcome::Ignored => return Ok(()),
         };
 
+        let tx = db::begin(&self.payments.q).await?;
+        let payments = PaymentRepository { q: &tx };
+        let version = db::next_version(&tx, "payment", &payment_id).await?;
+
+        // `WHERE status IN UNPAID` is the guard that makes a redelivered webhook a
+        // no-op, and it now runs in the same transaction as the event rather than a
+        // projector's moment later.
+        match &event {
+            PaymentEvent::Succeeded { intent_id, .. } => {
+                payments
+                    .transition(
+                        payment_id,
+                        &status::UNPAID,
+                        PaymentPatch::succeeded(intent_id.clone()),
+                    )
+                    .await?;
+            }
+            PaymentEvent::Failed { reason, .. } => {
+                payments
+                    .transition(payment_id, &status::UNPAID, PaymentPatch::failed(reason.clone()))
+                    .await?;
+            }
+            // `handle_webhook` builds only the two above.
+            _ => {}
+        }
+        db::set_version(&tx, "payment", &payment_id, version).await?;
+
         // Same as above: the id is what makes a redelivered webhook a no-op.
-        let mut envelope = Envelope::new(event, None);
+        let mut envelope = Envelope::new(
+            event,
+            None,
+            aggregate_id("payment", &payment_id),
+            version,
+        );
         envelope.event_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, dedupe.as_bytes());
 
-        bus::publish(
-            &self.js,
-            payment_subject(&shard_of(&booking_id), &booking_id),
-            &envelope,
-        )
-        .await?;
+        outbox::enqueue(&tx, &payment_subject(&booking_id), &envelope).await?;
+        tx.commit().await?;
+
         Ok(())
     }
 
@@ -311,7 +357,7 @@ impl PaymentService {
     /// concurrent requests both see the same affordable balance, which is why this
     /// publishes under compare-and-swap on the host's own subject: exactly one wins and
     /// the loser gets a 409 to retry against the reduced balance.
-    pub async fn request_payout(&self, owner_id: &Uuid) -> MyResult<(u64, i64)> {
+    pub async fn request_payout(&self, owner_id: &Uuid) -> MyResult<(String, i64)> {
         let amount_cents = self.available_for(owner_id).await?;
 
         (amount_cents > 0).context_unprocessable_entity((
@@ -319,21 +365,90 @@ impl PaymentService {
             "You have no settled earnings yet.",
         ))?;
 
-        let shard = shard_of(owner_id);
-        let subject = payout_subject(&shard, owner_id);
-        let head = bus::subject_head(&self.js, STREAM_PAYMENTS, &subject).await?;
+        let payout_id = Uuid::now_v7();
+        let requested = PaymentEvent::PayoutRequested {
+            payout_id,
+            owner_id: *owner_id,
+            amount_cents,
+            requested_at: Utc::now(),
+        };
+
+        let tx = db::begin(&self.payouts.q).await?;
+
+        // THE serialisation point, and the reason the `host` table exists. Two
+        // double-clicked withdrawals create two different payout rows, so nothing
+        // else in this transaction collides — bumping the host's version does, and
+        // TiKV refuses one of them. This replaced a compare-and-swap on the host's
+        // NATS subject, which the write moving into the database made impossible.
+        let host_version = db::next_version(&tx, "host", owner_id).await?;
+        db::set_version(&tx, "host", owner_id, host_version).await?;
+
+        // No `set_version` after this one: the row carries its own version and this
+        // is a whole-row write. The `host` bump above still needs it — that row has
+        // no model at all, it is only ever a counter.
+        let payout_version = db::next_version(&tx, "payout", &payout_id).await?;
+        PayoutRepository { q: &tx }
+            .upsert(
+                Payout::requested(&requested, payout_version)
+                    .ok_or_else(|| MyError::Bus("payout event is not a PayoutRequested".into()))?,
+            )
+            .await?;
 
         let envelope = Envelope::new(
-            PaymentEvent::PayoutRequested {
-                payout_id: Uuid::now_v7(),
-                owner_id: *owner_id,
-                amount_cents,
-                requested_at: Utc::now(),
-            },
+            requested,
             Some(*owner_id),
+            aggregate_id("payout", &payout_id),
+            payout_version,
         );
+        // The payout's own version is what the client waits on — view-service
+        // records that, not the host counter this transaction contended over.
+        let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        let seq = bus::publish_expecting(&self.js, subject, &envelope, Some(head)).await?;
-        Ok((seq, amount_cents))
+        outbox::enqueue(&tx, &payout_subject(owner_id), &envelope).await?;
+        tx.commit().await?;
+
+        Ok((await_token, amount_cents))
+    }
+
+    /// Re-emits every payout as the event that reproduces its row, for a consumer
+    /// that needs rebuilding. See [`outbox::backfill`] for what this is and is not.
+    ///
+    /// Payouts and nothing else, because payouts are all PAYMENTS has downstream:
+    /// view-service projects `PayoutRequested` and deliberately ignores every other
+    /// variant — what a renter was charged is this service's to answer, and a second
+    /// copy of it elsewhere would be a second version of the same money. So there is
+    /// no payment projection to rebuild, and re-emitting `Succeeded` or `Refunded`
+    /// would only wake this service's own settlement worker for no reason.
+    ///
+    /// One event each: a payout is written once and never changes.
+    pub async fn backfill(&self) -> MyResult<usize> {
+        let mut sent = 0;
+
+        for payout in self.payouts.all().await? {
+            let requested_at = payout.created_at.into();
+
+            sent += outbox::backfill(
+                &self.payouts.q,
+                // Keyed by host, like the original — that subject is what serialises
+                // one host's withdrawals, and a backfill has no business landing on
+                // a different one.
+                &payout_subject(&payout.owner_id),
+                &aggregate_id("payout", &payout.id),
+                payout.version,
+                [(
+                    requested_at,
+                    PaymentEvent::PayoutRequested {
+                        payout_id: payout.id,
+                        owner_id: payout.owner_id,
+                        amount_cents: payout.amount_cents,
+                        requested_at,
+                    },
+                )],
+            )
+            .await?;
+        }
+
+        tracing::info!(events = sent, "payouts backfilled");
+        Ok(sent)
     }
 }

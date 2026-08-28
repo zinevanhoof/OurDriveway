@@ -1,0 +1,98 @@
+{{/*
+Applies every schema to its own database, once, then exits.
+
+This used to be `--import-file` on every SurrealDB sidecar's boot, which was free
+while each one wrote to its own private datastore. Against a single shared TiKV
+keyspace it becomes N instances issuing identical `DEFINE … OVERWRITE` statements
+concurrently — and that is the very write conflict the booking path exists to
+defend against. Measured during step 1: six concurrent imports of one schema
+produced 90 errors, all `WriteConflict`; one sequential import produces zero.
+`OVERWRITE` makes a DEFINE idempotent in its *end state*, but TiKV conflicts on
+the key's write timestamp rather than on whether the value differs, so identical
+concurrent definitions still lose.
+
+A Helm hook rather than a plain Job, because a Job's spec is immutable and every
+`helm upgrade` has to be able to re-run this. `before-hook-creation` deletes the
+previous one first; re-running is safe precisely because every DEFINE is OVERWRITE.
+
+`post-install`, not `pre-install`: there is no SurrealDB to import into until the
+release is applied. Services may therefore come up a few seconds before their
+tables exist. They fail loudly and recover on their own — shared/src/db.rs
+connects once and exits if it cannot, so the pod CrashLoopBackOffs and is fine on
+the retry.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: schema-import
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  # Two attempts past the first. The waits below already cover "not up yet", so a
+  # failure here is a broken schema, and retrying a broken schema forever only
+  # buries the error message.
+  backoffLimit: 2
+  template:
+    metadata:
+      name: schema-import
+    spec:
+      restartPolicy: Never
+      containers:
+        # curl, not the surrealdb image: that one is distroless, so there is no
+        # shell to run a loop in.
+        - name: import
+          image: {{ .Values.curlImage }}
+          env:
+            - name: SURREALDB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: SURREALDB_USER
+            - name: SURREALDB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: SURREALDB_PASS
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              until curl -sf http://surrealdb:8000/health >/dev/null; do
+                echo "waiting for surrealdb"; sleep 2
+              done
+              {{- /* Only the services that have a database. Rendered from the same
+                     map the ConfigMap is keyed by, so neither can list a file the
+                     other does not. */}}
+              for s in {{ range $name, $svc := .Values.services }}{{ if ne $svc.db false }}{{ $name }} {{ end }}{{ end }}; do
+                echo "applying $s-schema.surql"
+                # POST /sql rather than the `surreal import` CLI or POST /import:
+                # /import rejects anything without an `OPTION IMPORT;` preamble the
+                # schemas do not carry, and /sql runs DEFINE statements with full
+                # side effects — which is what applying a schema is.
+                #
+                # The `surreal-db` header is only a fallback. Each schema opens with
+                # `USE NS main DB <service>;` and that statement wins, so this loop
+                # needs no per-file configuration and each file stays the single
+                # source of its own database name.
+                out=$(curl -sS --fail-with-body -X POST http://surrealdb:8000/sql \
+                  -u "$SURREALDB_USER:$SURREALDB_PASS" \
+                  -H 'surreal-ns: main' -H 'surreal-db: main' \
+                  -H 'Accept: application/json' \
+                  --data-binary "@/schemas/$s-schema.surql")
+                # /sql answers 200 even when individual statements fail, so the
+                # status code alone would let a broken schema through silently.
+                case "$out" in
+                  *'"status":"ERR"'*) echo "FAILED: $out"; exit 1 ;;
+                esac
+              done
+              echo "all schemas applied"
+          volumeMounts:
+            - name: schemas
+              mountPath: /schemas
+              readOnly: true
+      volumes:
+        - name: schemas
+          configMap:
+            name: {{ .Values.schemaConfigMap }}

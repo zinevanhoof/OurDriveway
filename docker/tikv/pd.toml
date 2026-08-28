@@ -1,0 +1,15 @@
+# PD configuration for the single-node dev cluster.
+#
+# `max-replicas = 1` is the one setting that is not optional. PD defaults to 3,
+# and with a single TiKV store it can never place three replicas of a region —
+# so every region stays in a pending state, the cluster never reports healthy,
+# and every write hangs rather than failing. This is the usual first-run failure
+# for a one-node TiKV, and it looks like a network problem.
+[replication]
+max-replicas = 1
+
+# Nothing to balance across on one store, and the scheduler otherwise logs a
+# steady stream of operators it cannot satisfy.
+[schedule]
+max-merge-region-size = 20
+max-merge-region-keys = 200000

@@ -29,10 +29,26 @@ pub struct VerificationRequested {
     pub first_name: String,
 }
 
+impl UserEvent {
+    /// The user every variant is about — the aggregate half of `user:<uuid>`.
+    ///
+    /// Saves each consumer re-deriving it with its own match, and makes a new
+    /// variant that forgets to carry a user id a compile error here rather than a
+    /// silently unversioned row somewhere downstream.
+    pub fn user_id(&self) -> Uuid {
+        match self {
+            Self::Registered(e) => e.user_id,
+            Self::Updated(e) => e.user_id,
+            Self::PasswordChanged(e) => e.user_id,
+            Self::EmailVerified { user_id } => *user_id,
+            Self::VerificationRequested(e) => e.user_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserRegistered {
     pub user_id: Uuid,
-    pub shard: String,
     pub first_name: String,
     pub last_name: String,
     pub email: String,

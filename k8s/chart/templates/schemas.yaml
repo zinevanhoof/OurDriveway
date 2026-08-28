@@ -6,13 +6,20 @@
 # time someone edited only one. `--set-file` is the native way across that line —
 # see deploy.sh, which passes all four.
 #
-# Keys are rebuilt as <name>-schema.surql so the mount path in services.yaml is
+# Keys are rebuilt as <name>-schema.surql so the path the import Job reads is
 # derivable from the service name and nothing has to list the files twice.
 #
-# A `stateless: true` service has no database and therefore no schema, so it is
-# exempt from the check below rather than needing an empty file to satisfy it.
+# A `db: false` service has no database and therefore no schema, so it is exempt
+# from the check below rather than needing an empty file to satisfy it.
+#
+# This is mounted by templates/schema-import.yaml and by nothing else. It used to
+# be mounted into every service pod, because each SurrealDB sidecar re-imported at
+# boot — which is also why services.yaml carried a `checksum/schemas` annotation to
+# roll them when it changed. Neither is needed now: the Job applies the schemas to
+# the shared datastore on every install and upgrade, and no service holds a copy to
+# go stale.
 {{- range $name, $svc := .Values.services }}
-{{- if and (not $svc.stateless) (not (hasKey $.Values.schemas $name)) }}
+{{- if and (ne $svc.db false) (not (hasKey $.Values.schemas $name)) }}
   {{- /* Loud at template time. A silently missing schema would otherwise start a
         database with no tables, which fails much later and much less obviously. */}}
   {{- fail (printf "no schema for %s-service — install with k8s/deploy.sh, or pass --set-file schemas.%s=schemas/%s-schema.surql" $name $name $name) }}

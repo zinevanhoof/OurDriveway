@@ -1,32 +1,37 @@
 {{/*
-One template for every backend. A pod is a service plus its OWN SurrealDB
-sidecar — that pairing is not an optimisation, it is what bus/src/projector.rs
-requires: every instance creates an *ephemeral* consumer and replays the whole
-stream into its own database, keeping its cursor in that same database. Point two
-replicas at one shared DB and you get two projectors racing over one cursor.
+One template for every backend, and every one of them is now a plain stateless
+pod: an app container, and nothing else.
 
-Sidecar-per-pod makes "a database per replica" fall out of `replicas: N` for free,
-and the DB is reachable only from inside its own pod.
+What used to be here was a SurrealDB sidecar per pod on an `emptyDir`. That was
+not decoration — bus/src/projector.rs gave every instance an *ephemeral* consumer
+that replayed the whole stream into its own database and kept its cursor there, so
+two replicas sharing one database meant two projectors racing over one cursor.
+Sidecar-per-pod made "a database per replica" fall out of `replicas: N`.
 
-`stateless: true` in values.yaml opts a service out of all of it — no sidecar, no
-schema, no data volume.
+None of that is true any more. The databases are authoritative and live in TiKV,
+projectors share a durable consumer per partition, and a service writes its own rows
+inside the request's transaction. So the sidecar, the `fsGroup` that let it write a fresh
+emptyDir, the data volume, the schema mount and the startup probe are all gone, and
+"stateless" stopped being a property that told two services apart — everything here
+is stateless.
 
-Three properties, three flags, because they stopped coinciding. `stateless` used
-to also imply "no NATS", which held only while media-service was the sole
-stateless service: it mints presigned R2 upload URLs and touches neither a
-database nor the broker. notification-service is stateless too but consumes the
-log — its consumer cursor lives in NATS instead of a projection — so:
+What is left are two facts about a service, spelled the same way and defaulting to
+the common case, so an ordinary service still declares nothing:
 
-  stateless: true   no SurrealDB sidecar, no schema, no data volume
-  nats: false       no NATS_URL and no wait-for-nats init container (media only)
-  api: false        no ingress path (notification only — it exposes only health)
+  db: false      no SURREALDB_* env, no schema, no wait-for-surrealdb
+                 (media and notification — one holds nothing at all, the other's
+                 only cursor lives in NATS)
+  nats: false    no NATS_URL and no wait-for-nats  (media only)
+  api: false     no ingress path  (notification only — it exposes only health)
 
-All three default to the common case, so an ordinary service still declares
-nothing.
+`stateless: true` was the old spelling of the first one, back when having a
+database and having local state were the same question.
 */}}
 {{- range $name, $svc := .Values.services }}
 {{- $needsNats := true }}
 {{- if hasKey $svc "nats" }}{{- $needsNats = $svc.nats }}{{- end }}
+{{- $needsDb := true }}
+{{- if hasKey $svc "db" }}{{- $needsDb = $svc.db }}{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -43,34 +48,25 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: {{ $name }}-service
-      annotations:
-        # Rolls the pods when a schema changes. The ConfigMap keeps a stable name,
-        # so without this it would mutate underneath running pods and only take
-        # effect at the next unrelated restart — a 3am kind of bug.
-        checksum/schemas: {{ $.Values.schemas | toYaml | sha256sum }}
     spec:
-      {{- if not $svc.stateless }}
-      securityContext:
-        # The SurrealDB image runs as uid 65532 (nonroot) and a fresh emptyDir is
-        # root-owned, so without this the datastore cannot be written. fsGroup
-        # makes the kubelet chown it — the clean version of the `user: "0:0"`
-        # workaround the compose file needed.
-        fsGroup: 65532
-      {{- end }}
-      {{- if or $needsNats (not $svc.stateless) }}
+      {{- if or $needsNats $needsDb }}
       initContainers:
+        {{/*
+        Kubernetes has no `depends_on`, so the compose file's
+        `condition: service_healthy` becomes these: plain init containers that
+        block until the dependency answers. Both matter because the app dials each
+        once at boot and exits if it cannot — bus/src/connect.rs and
+        shared/src/db.rs — so without them a pod that starts first just
+        CrashLoopBackOffs until it happens to win the race.
+
+        Both reuse the app image, already pulled for this pod, and bash's /dev/tcp
+        builtin: no netcat, no CLI, no second image to keep pinned. Dialling the
+        ClusterIP Service rather than a pod is what makes a bare TCP check enough —
+        kube-proxy only routes to endpoints that passed their own readiness probe,
+        which for SurrealDB means TiKV is reachable and for NATS means JetStream is
+        up.
+        */}}
         {{- if $needsNats }}
-        # Kubernetes has no `depends_on`, so the compose file's
-        # `nats: condition: service_healthy` becomes this: a plain init container
-        # that blocks until the broker answers. bus/src/connect.rs dials once and
-        # gives up, so without it a pod that boots ahead of NATS just CrashLoops
-        # until NATS happens to win the race.
-        #
-        # Reuses the app image — already pulled for this pod — and bash's
-        # /dev/tcp builtin, so there is no netcat, no nats CLI and no second
-        # image to keep pinned. Dialling the ClusterIP Service and not a pod is
-        # what makes a bare TCP check enough: kube-proxy only routes to endpoints
-        # that passed the NATS chart's own readiness probe, JetStream included.
         - name: wait-for-nats
           image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
           imagePullPolicy: {{ $.Values.imagePullPolicy }}
@@ -80,46 +76,14 @@ spec:
             # Quoted: unquoted, `until : <…` is a YAML mapping key, not a string.
             - 'until : </dev/tcp/{{ $.Release.Name }}-nats/4222; do echo "waiting for nats"; sleep 2; done'
         {{- end }}
-        {{- if not $svc.stateless }}
-        # A native sidecar (initContainer + restartPolicy: Always), not a plain
-        # container. shared/src/db.rs connects once at boot and does NOT retry, so
-        # the app must not start until the socket is accepting. Only a native
-        # sidecar's startupProbe gives that ordering guarantee inside a pod.
-        # Needs Kubernetes >= 1.29.
-        - name: surrealdb
-          image: {{ $.Values.surrealdb.image }}
-          restartPolicy: Always
-          args:
-            - start
-            - --log=info
-            # Same values the app is given below, from one place in values.yaml.
-            - --user={{ $.Values.surrealdb.user }}
-            - --pass={{ $.Values.surrealdb.pass }}
-            # Bound to loopback on purpose. Container ports are namespaced per
-            # pod, but 0.0.0.0 would still answer on the pod IP — i.e. a root/root
-            # SurrealDB, /sql included, reachable from every other pod in the
-            # cluster. Loopback makes it genuinely private to this pod, which is
-            # what lets root/root stay unremarkable.
-            - --bind=127.0.0.1:8000
-            # Re-imported on every boot, which is why every DEFINE in the schemas
-            # is OVERWRITE. With a disposable datastore this is the only thing
-            # that puts the tables there at all.
-            - --import-file
-            - /schemas/{{ $name }}-schema.surql
-            - {{ $.Values.surrealdb.storage }}
-          volumeMounts:
-            - name: data
-              mountPath: /data
-            - name: schemas
-              mountPath: /schemas
-              readOnly: true
-          startupProbe:
-            # The image is distroless — no shell, no curl. Exec the binary
-            # directly, and note the subcommand is `is-ready`, not `isready`.
-            exec:
-              command: ["/surreal", "is-ready", "--endpoint", "http://127.0.0.1:8000"]
-            periodSeconds: 2
-            failureThreshold: 30
+        {{- if $needsDb }}
+        - name: wait-for-surrealdb
+          image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          command:
+            - bash
+            - -c
+            - 'until : </dev/tcp/surrealdb/8000; do echo "waiting for surrealdb"; sleep 2; done'
         {{- end }}
       {{- end }}
       containers:
@@ -135,16 +99,18 @@ spec:
           env:
             - name: PORT
               value: {{ $.Values.port | quote }}
-            {{- if not $svc.stateless }}
-            # The sidecar in this same pod, on loopback.
+            {{- if $needsDb }}
+            # The shared query engine, not a sidecar. SURREALDB_USER and
+            # SURREALDB_PASS come from the secret below, which is also where
+            # SurrealDB itself reads them — see templates/surrealdb.yaml.
             - name: SURREALDB_ADDR
-              value: "127.0.0.1:8000"
-            - name: SURREALDB_USER
-              value: {{ $.Values.surrealdb.user | quote }}
-            - name: SURREALDB_PASS
-              value: {{ $.Values.surrealdb.pass | quote }}
-            - name: SNAPSHOT_INTERVAL_SECS
-              value: {{ $.Values.snapshotIntervalSecs | quote }}
+              value: "surrealdb:8000"
+            # This service's own database inside the shared `main` namespace. On
+            # TiKV every service shares one keyspace, so this is what keeps their
+            # tables apart — and it is the service name, which is also the schema
+            # key and the ingress path.
+            - name: SURREALDB_DB
+              value: {{ $name | quote }}
             {{- end }}
             {{- if $needsNats }}
             - name: NATS_URL
@@ -154,27 +120,25 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
-          # JWT_SECRET for every service, plus LOCATIONIQ_API_KEY, the R2
-          # credentials and the Stripe keys. See secrets.env.example.
-
+          # JWT_SECRET for every service, the SurrealDB root credentials, plus
+          # LOCATIONIQ_API_KEY, the R2 credentials and the Stripe keys. See
+          # secrets.env.example.
           envFrom:
             - secretRef:
                 name: {{ $.Values.secretName }}
-          # /readyz means "my projection has caught up with the log", so this is
-          # what keeps a replaying pod out of the Service's endpoint list. It
-          # replaces the `health_uri /readyz` checks Caddy used to run, and does
-          # it better: Caddy probing a ClusterIP hits a random pod and learns
-          # nothing about the one it is about to dial.
+          # /readyz means "my projections have caught up", so this is what keeps a
+          # pod that is still catching up out of the Service's endpoint list.
           #
-          # A stateless service answers both unconditionally — it has no
-          # projection, so alive IS ready. Same probes, so the template stays one.
+          # It answers much sooner than it used to. A pod no longer rebuilds a
+          # database from sequence 1 — its rows are already in TiKV — so what is
+          # left to wait for is a foreign projection, and for user-, spot- and
+          # payment-service not even that: they register no streams at all, and
+          # /readyz there reduces to "is NATS reachable" for the outbox relay.
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
             periodSeconds: 5
-            # Generous: a cold start replays every stream from sequence 1, and
-            # failing readiness only withholds traffic — it never restarts a pod.
             failureThreshold: 60
           # /healthz deliberately ignores NATS (see bus/src/health.rs). Pointing
           # liveness at /readyz instead would restart every pod in the cluster
@@ -184,15 +148,6 @@ spec:
               path: /healthz
               port: http
             periodSeconds: 10
-      {{- if not $svc.stateless }}
-      volumes:
-        - name: data
-          emptyDir:
-            sizeLimit: {{ $.Values.surrealdb.sizeLimit }}
-        - name: schemas
-          configMap:
-            name: {{ $.Values.schemaConfigMap }}
-      {{- end }}
 ---
 apiVersion: v1
 kind: Service

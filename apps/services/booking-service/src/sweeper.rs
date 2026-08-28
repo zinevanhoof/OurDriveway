@@ -16,13 +16,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_nats::jetstream::Context;
 use shared::{
+    domain_models::booking::status,
     error::myerror::MyResult,
     events::{
         Envelope,
         booking::{BookingEvent, ReleaseReason},
-        booking_subject,
+        aggregate_id, booking_subject,
     },
 };
 use uuid::Uuid;
@@ -38,20 +38,20 @@ const MAX_PER_SWEEP: usize = 200;
 
 /// Sweeps forever. `tokio::spawn` is the caller's, like the projectors' and the
 /// worker's — this loop is no more special than theirs.
-pub async fn run(js: Context, db: Arc<Surreal<Client>>) {
+pub async fn run(db: Arc<Surreal<Client>>) {
     let bookings = BookingRepository { q: db };
     let mut ticker = tokio::time::interval(TICK);
     loop {
         ticker.tick().await;
         // Deliberately swallowed. A failed tick is retried a minute later; a
         // propagated error would end the task, and nothing else frees a hold.
-        if let Err(e) = sweep(&js, &bookings).await {
+        if let Err(e) = sweep(&bookings).await {
             tracing::error!(error = %e, "sweep failed; retrying next tick");
         }
     }
 }
 
-async fn sweep(js: &Context, bookings: &BookingRepository) -> MyResult<()> {
+async fn sweep(bookings: &BookingRepository) -> MyResult<()> {
     let lapsed = bookings.lapsed_holds(MAX_PER_SWEEP).await?;
     if lapsed.is_empty() {
         return Ok(());
@@ -60,14 +60,50 @@ async fn sweep(js: &Context, bookings: &BookingRepository) -> MyResult<()> {
 
     for hold in lapsed {
         let (booking_id, spot_id) = (hold.id, hold.spot_id);
-        let spot_shard = hold.spot_shard;
 
         let event = BookingEvent::Released {
             booking_id,
             reason: ReleaseReason::Expired,
         };
+        let tx = match shared::db::begin(&bookings.q).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(booking = %booking_id, error = %e, "could not open transaction");
+                continue;
+            }
+        };
+        let version = match shared::db::next_version(&tx, "booking", &booking_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(booking = %booking_id, error = %e, "could not read version");
+                continue;
+            }
+        };
+
+        // Scoped to `reserved`, which is what stops this undoing a payment that
+        // landed in the same instant — the sweeper and `confirm_paid` genuinely
+        // race, and the guard is the whole answer to it.
+        let moved = BookingRepository { q: &tx }
+            .transition(
+                booking_id,
+                status::RELEASED,
+                &[status::RESERVED],
+                Some(ReleaseReason::Expired.as_str()),
+                None,
+            )
+            .await;
+        if let Err(e) = moved {
+            tracing::error!(booking = %booking_id, error = %e, "could not release");
+            continue;
+        }
+        if let Err(e) = shared::db::set_version(&tx, "booking", &booking_id, version).await {
+            tracing::error!(booking = %booking_id, error = %e, "could not set version");
+            continue;
+        }
+
         // `actor_id: None` — nobody requested this, the clock did.
-        let mut envelope = Envelope::new(event, None);
+        let mut envelope =
+            Envelope::new(event, None, aggregate_id("booking", &booking_id), version);
         // Deliberately NOT a v7 id, the only place in the system that isn't. It
         // rides the `Nats-Msg-Id` header `publish` already sets, so two instances
         // sweeping the same booking inside the stream's 120s duplicate_window
@@ -81,8 +117,14 @@ async fn sweep(js: &Context, bookings: &BookingRepository) -> MyResult<()> {
         // race in a way that matters. Applying it is guarded on the booking still
         // being 'reserved', which is what stops it undoing a payment that landed in
         // the same instant.
-        if let Err(e) = bus::publish(js, booking_subject(&spot_shard, &spot_id), &envelope).await {
-            tracing::error!(booking = %booking_id, error = %e, "failed to publish release");
+        if let Err(e) = bus::outbox::enqueue(&tx, &booking_subject(&spot_id), &envelope).await {
+            tracing::error!(booking = %booking_id, error = %e, "could not enqueue release");
+            continue;
+        }
+        if let Err(e) = tx.commit().await {
+            // Nothing is lost: the hold is still `reserved` with a past
+            // `hold_until`, so the next tick a minute from now picks it up again.
+            tracing::error!(booking = %booking_id, error = %e, "could not commit release");
         }
     }
     Ok(())

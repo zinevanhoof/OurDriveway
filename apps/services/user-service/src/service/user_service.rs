@@ -1,10 +1,12 @@
-use async_nats::jetstream::Context;
-use shared::domain_models::user::User;
+use chrono::Utc;
+use shared::domain_models::user::{User, UserPatch};
 use shared::error::myerror::{ContextExt, MyResult};
 use shared::events::user::{
     UserEvent, UserPasswordChanged, UserRegistered, UserUpdated, VerificationRequested,
 };
-use shared::events::{Envelope, shard_of, user_subject};
+use bus::outbox;
+use shared::db;
+use shared::events::{Envelope, aggregate_id, format_version, user_subject};
 use shared::requests::user::{
     Email, LoginRequest, ResendVerificationRequest, SignupRequest, UpdateUserRequest,
     VerifyEmailRequest,
@@ -15,31 +17,25 @@ use crate::{CONFIG, auth::password, repository::user_repository::UserRepository}
 
 /// Write side for the user itself: who they are, and proving it.
 ///
-/// Nothing here writes to the database — the projectors do, from the same events
-/// every other instance consumes. Reads go straight to the models in
-/// `shared::domain_models`.
+/// Writes its own rows and enqueues the event beside them, in one transaction.
+/// Reads go straight to the models in `shared::domain_models`.
 ///
 /// Sessions are [`crate::service::refresh_token_service::RefreshTokenService`]'s.
 /// This one stops at `authenticate`, which answers "are these credentials good"
 /// and hands back the row; deciding what token to mint for it is the other
 /// service's call.
-/// No `await_applied` anywhere below, deliberately.
-///
-/// Every write here answers with the position its event landed at, and the client
-/// echoes it as `X-Await-Seq`; the [`bus::await_seq`] layer mounted in `main` then
-/// waits on whichever replica handles the next read. `await_applied` could only
-/// ever wait on the replica that handled the *write*, which is the wrong one as
-/// often as not — and it charged up to 2s for the privilege even when nothing read
-/// afterwards.
+/// Every write answers with `user:<id>@<version>`, which the client echoes as
+/// `X-Await-Version`; the [`bus::await_version`] layer mounted in `main` holds a
+/// following read until this service's own rows have reached it. Reading back what
+/// this service just wrote needs no wait at all — the transaction committed.
 pub struct UserService {
     pub users: UserRepository,
-    pub js: Context,
 }
 
 impl UserService {
-    /// Returns the log position, so the client can echo it and have the next call
-    /// — a second submit of the same form, most usefully — read this write.
-    pub async fn signup(&self, req: SignupRequest) -> MyResult<u64> {
+    /// Returns `user:<id>@<version>`, so the client can echo it and have the next
+    /// call — a second submit of the same form, most usefully — see this write.
+    pub async fn signup(&self, req: SignupRequest) -> MyResult<String> {
         // Turns the common case into a 409. It is not the guard, though — see the
         // deterministic event id below for the concurrent case this read cannot
         // see, and `email_idx … UNIQUE` for the backstop behind both.
@@ -92,22 +88,42 @@ impl UserService {
         );
 
         let user_id = Uuid::now_v7();
-        let shard = shard_of(&user_id);
-        let event = UserEvent::Registered(UserRegistered {
+        let registered = UserRegistered {
             user_id,
-            shard: shard.clone(),
             first_name: req.first_name,
             last_name: req.last_name,
             email: req.email.into(),
-            // Hashed here, not in the projection: Argon2 salts randomly, so a
-            // projection would produce a different hash on every replica.
+            // Hashed here rather than anywhere downstream: Argon2 salts randomly,
+            // so hashing twice from the same event gives two different answers.
             password_hash: password::hash(req.password.as_str())?,
-        });
+        };
 
-        let mut envelope = Envelope::new(event, Some(user_id));
+        // The row and its event, in one transaction. This is the whole shape of
+        // the rewrite: the database is authoritative, and the event is a durable
+        // side effect of the same commit rather than the thing that caused it.
+        let tx = db::begin(&self.users.q).await?;
+        let version = db::next_version(&tx, "user", &user_id).await?;
+
+        // No `set_version` after this: the row carries its own version and this is
+        // a whole-row write. The separate statement is still needed wherever a
+        // *patch* moves a row, since a patch does not touch the column.
+        UserRepository { q: &tx }
+            .upsert(User::registered(registered.clone(), version))
+            .await?;
+
+        let mut envelope = Envelope::new(
+            UserEvent::Registered(registered),
+            Some(user_id),
+            aggregate_id("user", &user_id),
+            version,
+        );
         envelope.event_id = event_id;
+        let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        bus::publish(&self.js, user_subject(&shard, &user_id), &envelope).await
+        outbox::enqueue(&tx, &user_subject(&user_id), &envelope).await?;
+        tx.commit().await?;
+
+        Ok(await_token)
     }
 
     /// Checks credentials and returns the user they belong to.
@@ -170,27 +186,51 @@ impl UserService {
     /// Returns the log position, which the client echoes on the login that follows
     /// — `authenticate` reads `email_verified`, so a login racing this projection
     /// would answer "verify your email" to someone who just did.
-    pub async fn verify_email(&self, req: VerifyEmailRequest) -> MyResult<u64> {
+    pub async fn verify_email(&self, req: VerifyEmailRequest) -> MyResult<String> {
         let user_id = shared::email_token::verify(
             &CONFIG.email_token_secret,
             &req.token,
             shared::email_token::Purpose::VerifyEmail,
         )?;
 
-        // The token proves which account, but not which shard — and events for a
-        // user must stay on the subject their history already lives on.
-        let user = self
-            .users
+        let tx = db::begin(&self.users.q).await?;
+        let users = UserRepository { q: &tx };
+
+        // Read inside the transaction: the token proves which account, but this
+        // must refuse one naming a user who no longer exists rather than writing
+        // for them.
+        users
             .find_by_id(user_id)
             .await?
             .context_not_found(("Not Found", "Could not find user"))?;
 
-        bus::publish(
-            &self.js,
-            user_subject(&user.shard, &user_id),
-            &Envelope::new(UserEvent::EmailVerified { user_id }, Some(user_id)),
-        )
-        .await
+        let version = db::next_version(&tx, "user", &user_id).await?;
+        // Idempotent by construction — setting `true` twice is setting `true`.
+        // That matters because mail scanners prefetch links, so this endpoint is
+        // deliberately re-runnable.
+        users
+            .patch(
+                user_id,
+                UserPatch {
+                    email_verified: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        db::set_version(&tx, "user", &user_id, version).await?;
+
+        let envelope = Envelope::new(
+            UserEvent::EmailVerified { user_id },
+            Some(user_id),
+            aggregate_id("user", &user_id),
+            version,
+        );
+        let await_token = format_version(&envelope.aggregate, envelope.version);
+
+        outbox::enqueue(&tx, &user_subject(&user_id), &envelope).await?;
+        tx.commit().await?;
+
+        Ok(await_token)
     }
 
     /// Asks notification-service to send the verification link again.
@@ -215,22 +255,29 @@ impl UserService {
         // No seq answered and none needed: `VerificationRequested` is projected by
         // nothing — it is a message to notification-service — so there is no state
         // here for a follow-up read to be waiting on.
-        bus::publish(
-            &self.js,
-            user_subject(&user.shard, &user.id),
-            &Envelope::new(
-                UserEvent::VerificationRequested(VerificationRequested {
-                    user_id: user.id,
-                    email: user.email,
-                    // Off the projection rather than the token: the template greets the
-                    // reader by name and the token carries only an id. No second query
-                    // for it — the row above is the whole user.
-                    first_name: user.first_name,
-                }),
-                Some(user.id),
-            ),
-        )
-        .await?;
+        // A transaction for an event that writes no row, which looks odd until you
+        // ask where else the outbox row would go: the enqueue *is* the write, and it
+        // still has to be atomic with the version it claims.
+        let tx = db::begin(&self.users.q).await?;
+        let version = db::next_version(&tx, "user", &user.id).await?;
+        db::set_version(&tx, "user", &user.id, version).await?;
+
+        let envelope = Envelope::new(
+            UserEvent::VerificationRequested(VerificationRequested {
+                user_id: user.id,
+                email: user.email,
+                // Off the projection rather than the token: the template greets the
+                // reader by name and the token carries only an id. No second query
+                // for it — the row above is the whole user.
+                first_name: user.first_name,
+            }),
+            Some(user.id),
+            aggregate_id("user", &user.id),
+            version,
+        );
+
+        outbox::enqueue(&tx, &user_subject(&user.id), &envelope).await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -251,7 +298,7 @@ impl UserService {
     /// failed on the second would leave the first in the log for good.
     ///
     /// No ownership lookup: the target is always the caller's own record.
-    pub async fn update_user(&self, uid: &Uuid, req: UpdateUserRequest) -> MyResult<u64> {
+    pub async fn update_user(&self, uid: &Uuid, req: UpdateUserRequest) -> MyResult<String> {
         let existing = self
             .users
             .find_by_id(*uid)
@@ -353,11 +400,120 @@ impl UserService {
             }
         };
 
-        bus::publish(
-            &self.js,
-            user_subject(&existing.shard, &user_uuid),
-            &Envelope::new(event, Some(user_uuid)),
-        )
-        .await
+        let tx = db::begin(&self.users.q).await?;
+        let users = UserRepository { q: &tx };
+        let version = db::next_version(&tx, "user", &user_uuid).await?;
+
+        match &event {
+            UserEvent::PasswordChanged(e) => {
+                users
+                    .patch(
+                        user_uuid,
+                        UserPatch {
+                            password: Some(e.password_hash.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+            }
+
+            // Order is the point, and it used to be the projector's: the submitted
+            // address has to be compared against the stored one *before* it is
+            // overwritten. Without this, changing to an unverified address keeps the
+            // flag from the old one and login lets it straight through, which makes
+            // the whole feature decorative.
+            UserEvent::Updated(e) => {
+                if e.email.as_ref().is_some_and(|new| *new != existing.email) {
+                    users
+                        .patch(
+                            user_uuid,
+                            UserPatch {
+                                email_verified: Some(false),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                }
+                users.patch(user_uuid, e.clone().into()).await?;
+            }
+
+            // `update_user` builds only the two variants above.
+            _ => {}
+        }
+
+        db::set_version(&tx, "user", &user_uuid, version).await?;
+
+        let envelope = Envelope::new(
+            event,
+            Some(user_uuid),
+            aggregate_id("user", &user_uuid),
+            version,
+        );
+        let await_token = format_version(&envelope.aggregate, envelope.version);
+
+        outbox::enqueue(&tx, &user_subject(&user_uuid), &envelope).await?;
+        tx.commit().await?;
+
+        Ok(await_token)
+    }
+
+    /// Re-emits every user as the events that reproduce their current row, for a
+    /// consumer that needs rebuilding. See [`outbox::backfill`] for what this is and
+    /// is not.
+    ///
+    /// Two events each, and both are needed. `Registered` is the only variant
+    /// view-service will create a row from, and it deliberately lands with no
+    /// picture and no plates because a fresh signup has neither — so `Updated` puts
+    /// back whatever the account has changed since.
+    ///
+    /// `EmailVerified` is not among them and is not an omission: nothing downstream
+    /// projects it. Verification stays in this service's own row, which is the thing
+    /// being read here rather than rebuilt. `VerificationRequested` is left out for
+    /// a much louder reason — it is a mail, and re-emitting it would send one to
+    /// every account on the system.
+    pub async fn backfill(&self) -> MyResult<usize> {
+        let mut sent = 0;
+
+        for user in self.users.all().await? {
+            let user_id = user.id;
+
+            let registered = UserRegistered {
+                user_id,
+                first_name: user.first_name,
+                last_name: user.last_name,
+                email: user.email,
+                password_hash: user.password,
+            };
+            let updated = UserUpdated {
+                user_id,
+                // The three `Registered` above already carries. `None` is "leave
+                // alone", so re-stating them would only be a chance to disagree.
+                first_name: None,
+                last_name: None,
+                email: None,
+                profile_picture: user.profile_picture,
+                license_plates: Some(user.license_plates),
+            };
+
+            // This table keeps no timestamp of its own and nothing downstream stores
+            // one off a USERS event, so there is no original clock to recover here —
+            // unlike spots and bookings, whose rows carry theirs.
+            let now = Utc::now();
+
+            sent += outbox::backfill(
+                &self.users.q,
+                &user_subject(&user_id),
+                &aggregate_id("user", &user_id),
+                user.version,
+                [
+                    (now, UserEvent::Registered(registered)),
+                    (now, UserEvent::Updated(updated)),
+                ],
+            )
+            .await?;
+        }
+
+        tracing::info!(events = sent, "users backfilled");
+        Ok(sent)
     }
 }

@@ -26,10 +26,9 @@ pub enum SessionEvent {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefreshTokenIssued {
     pub token_id: Uuid,
+    /// Sessions live on the *user's* subject, so a user's whole session history
+    /// stays on one ordered subject.
     pub user_id: Uuid,
-    /// The *user's* shard — sessions live on the user's subject so a user's whole
-    /// session history stays on one ordered subject.
-    pub shard: String,
     pub token_hash: String,
     pub jti: Uuid,
     pub expires_at: DateTime<Utc>,
@@ -40,7 +39,6 @@ pub struct RefreshTokenRotated {
     pub old_token_hash: String,
     pub token_id: Uuid,
     pub user_id: Uuid,
-    pub shard: String,
     pub token_hash: String,
     pub jti: Uuid,
     pub expires_at: DateTime<Utc>,

@@ -17,4 +17,5 @@
 
 pub mod access;
 pub mod availability;
+pub mod replay;
 pub mod schedule;

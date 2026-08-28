@@ -23,12 +23,12 @@ pub mod payout_repository;
 
 /// Round-trips each table through a real SurrealDB.
 ///
-/// `#[ignore]`d, because these need `payment-service-db` up on :8004 with
-/// `schemas/payment-schema.surql` imported, and CI runs `cargo test --workspace`
-/// with no database:
+/// `#[ignore]`d, because these need the shared SurrealDB up on :8000 with
+/// `schemas/payment-schema.surql` imported into the `payment` database, and CI
+/// runs `cargo test --workspace` with no database:
 ///
 /// ```sh
-/// docker compose -f docker/docker-compose-dev.yml up -d payment-service-db
+/// docker compose -f docker/docker-compose-dev.yml up -d surrealdb schema-import
 /// cargo test --workspace -- --ignored
 /// ```
 ///
@@ -63,9 +63,9 @@ mod live_tests {
 
     async fn db() -> Arc<Surreal<Client>> {
         Arc::new(
-            shared::db::connect("127.0.0.1:8004", "root", "root")
+            shared::db::connect("127.0.0.1:8000", "root", "root", "payment")
                 .await
-                .expect("payment-service-db on :8004 — see this module's docs"),
+                .expect("shared surrealdb on :8000, db `payment` — see this module's docs"),
         )
     }
 
@@ -88,13 +88,13 @@ mod live_tests {
         let session_id = format!("cs_test_{id}");
         let row = Payment {
             id,
+            version: 1,
             booking_id,
             owner_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             amount_cents: 1234,
             session_id: session_id.clone(),
             intent_id: None,
-            booking_shard: "3".to_string(),
             status: status::CREATED.to_string(),
             refund_id: None,
             failure_reason: None,
@@ -177,7 +177,6 @@ mod live_tests {
         let row = BookingMirror {
             id,
             spot_id: Uuid::now_v7(),
-            spot_shard: "1".to_string(),
             owner_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             amount_cents: 500,
@@ -230,6 +229,7 @@ mod live_tests {
         for (id, amount_cents) in [(a, 700), (b, 300)] {
             repo.upsert(Payout {
                 id,
+                version: 1,
                 owner_id,
                 amount_cents,
                 created_at: Utc::now().into(),

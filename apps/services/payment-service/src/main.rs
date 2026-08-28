@@ -1,19 +1,17 @@
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
     routing::{get, post},
 };
-use bus::AppliedSeqs;
 use shared::{
     env,
-    events::{STREAM_BOOKINGS, STREAM_PAYMENTS},
+    events::STREAM_BOOKINGS,
 };
 
 use crate::{
     client::stripe::Stripe,
-    projector::{BookingProjector, PaymentProjector},
+    projector::BookingProjector,
     repository::{
         booking_mirror_repository::BookingMirrorRepository, payment_repository::PaymentRepository,
     },
@@ -45,10 +43,12 @@ pub struct Config {
     pub surrealdb_addr: String,
     pub surrealdb_user: String,
     pub surrealdb_pass: String,
+    /// This service's own database inside the shared `main` namespace. Every
+    /// service used to be "main"; on TiKV they share one keyspace, so this is
+    /// what keeps their tables apart.
+    pub surrealdb_db: String,
     pub nats_url: String,
     pub port: u16,
-    /// 0 disables snapshots entirely — see `bus::snapshot::install`.
-    pub snapshot_interval_secs: u64,
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
     /// `sk_test_…` for a sandbox. Never logged, and the only credential that can move
@@ -73,9 +73,9 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     surrealdb_addr: env::require("SURREALDB_ADDR"),
     surrealdb_user: env::require("SURREALDB_USER"),
     surrealdb_pass: env::require("SURREALDB_PASS"),
+    surrealdb_db: env::require("SURREALDB_DB"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
-    snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
     jwt_secret: env::require("JWT_SECRET"),
     stripe_secret_key: env::require("STRIPE_SECRET_KEY"),
     stripe_webhook_secret: env::require("STRIPE_WEBHOOK_SECRET"),
@@ -100,19 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &CONFIG.surrealdb_addr,
         &CONFIG.surrealdb_user,
         &CONFIG.surrealdb_pass,
+        &CONFIG.surrealdb_db,
     )
     .await?;
 
-    // One owned client per projector, because `Surreal::begin` consumes one and each
-    // holds its own open transaction. That is the floor: two sessions, cloned once
-    // here rather than once per event.
-    let bookings_client = db.clone();
-    let payments_client = db.clone();
-
-    // Everything else shares one session. `Surreal::clone` would mint another and
-    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
-    // because nothing re-authenticates per request — see `shared::db::connect`.
+    // One connection for the whole process — projector lanes, election, relay,
+    // workers, handlers and the await layer all share it. `Surreal::clone` would mint
+    // a session and replay the root sign-in onto it; cloning the `Arc` is a refcount
+    // bump. The sessions that do get minted are per *transaction*, in
+    // `shared::db::begin`, and die with it.
     let db = Arc::new(db);
+    let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
@@ -120,63 +118,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // BOOKINGS as well as its own stream: this service needs a booking's price, renter
     // and lifecycle to authorize a payment and to decide a refund, and the booking
     // table lives in another service's database.
-    let readiness = bus::Readiness::new(js.client().clone(), &[STREAM_BOOKINGS, STREAM_PAYMENTS]);
+    // BOOKINGS only now. PAYMENTS is this service's own stream and it no longer
+    // projects it — those rows are written directly by the request that causes them.
+    let readiness = bus::Readiness::new(js.client().clone(), &[STREAM_BOOKINGS]);
 
-    bus::snapshot::install(
-        &js,
-        bus::SnapshotConfig {
-            db_addr: &CONFIG.surrealdb_addr,
-            db_user: &CONFIG.surrealdb_user,
-            db_pass: &CONFIG.surrealdb_pass,
-            service: "payment-service",
-            streams: vec![STREAM_BOOKINGS, STREAM_PAYMENTS],
-            every_secs: CONFIG.snapshot_interval_secs,
-        },
-    )
-    .await?;
 
     let stripe = Arc::new(Stripe::new(&CONFIG.stripe_secret_key));
     let settlement = Arc::new(SettlementWorkerService {
         payments: PaymentRepository { q: db.clone() },
         bookings: BookingMirrorRepository { q: db.clone() },
         stripe: stripe.clone(),
-        js: js.clone(),
     });
 
-    // The projectors are the only writers to `db`; the service only publishes. `Tx`
-    // opens a transaction per event, applies, advances the cursor inside it and
-    // commits — so neither projector below can forget any of that.
+    // The service writes `db` directly, inside each request's transaction. `run`
+    // opens a transaction per event, applies and commits.
+    // For the outbox relay only. The projectors need no election: each partition is
+    // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
+    // event at a time *per partition* across every replica, in order — and different
+    // partitions are different bookings, which have no order between them. The relay
+    // has no such backstop, so exactly one instance may run it.
+    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
+
     tokio::spawn(bus::projector::run(
         js.clone(),
-        bus::Tx::new(BookingProjector, bookings_client),
-        readiness.clone(),
-    ));
-    tokio::spawn(bus::projector::run(
-        js.clone(),
-        bus::Tx::new(PaymentProjector, payments_client),
+        Arc::new(BookingProjector),
+        db.clone(),
         readiness.clone(),
     ));
 
+    // Carries every PAYMENTS event this service commits — the only path by which
+    // they reach NATS.
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
+
     // The refund side. Workers, not projectors — one refund per event across the whole
-    // deployment, and no replay of history on a cold start. Each holds its own stream's
-    // applied cursor so it can decide against a projection that includes the event that
-    // woke it. `.expect` is safe: both streams were just named to `Readiness::new`.
+    // deployment, and no replay of history on a cold start.
+    //
+    // Deliberately NOT partitioned. A worker performs a side effect and needs no
+    // order between events; partitioning it would cap refund throughput at
+    // `PARTITIONS` for nothing.
+    //
+    // Only the BOOKINGS one holds a database handle, because only BOOKINGS is a
+    // stream this service projects — it waits for its own mirror to include the event
+    // that woke it before deciding whether to move money.
     tokio::spawn(bus::worker::run(
         js.clone(),
         Arc::new(BookingWorker {
             service: settlement.clone(),
-            applied: readiness
-                .applied_rx(STREAM_BOOKINGS)
-                .expect("BOOKINGS is registered with Readiness above"),
+            db: db.clone(),
         }),
     ));
+    // No handle for this one: PAYMENTS is this service's own stream and it
+    // projects nothing off it any more — see `PaymentWorker::handle`.
     tokio::spawn(bus::worker::run(
         js.clone(),
         Arc::new(PaymentWorker {
             service: settlement,
-            applied: readiness
-                .applied_rx(STREAM_PAYMENTS)
-                .expect("PAYMENTS is registered with Readiness above"),
         }),
     ));
 
@@ -200,28 +196,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // route simply omits it and there is no middleware exception to get wrong.
         .route("/api/payment/webhook", post(route::webhook::stripe_webhook));
 
-    // Read-your-own-writes, and the sharpest case of it in the system: the checkout
-    // drawer calls `POST /api/payment/session` immediately after booking-service
-    // answered `BOOKINGS:<seq>`, and `create_session` opens by looking that booking
-    // up in *this* service's mirror. Without this the renter reserves and is then
-    // told the booking doesn't exist.
-    //
-    // PAYMENTS as well, for the resume path: "Continue payment" reads the payment
-    // row a previous call to this same endpoint published.
-    let applied = AppliedSeqs(Arc::new(HashMap::from([
-        (
-            STREAM_BOOKINGS,
-            readiness
-                .applied_rx(STREAM_BOOKINGS)
-                .expect("BOOKINGS is registered with Readiness above"),
-        ),
-        (
-            STREAM_PAYMENTS,
-            readiness
-                .applied_rx(STREAM_PAYMENTS)
-                .expect("PAYMENTS is registered with Readiness above"),
-        ),
-    ])));
 
     let app = Router::new()
         .merge(api_router)
@@ -229,11 +203,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // behind a projector is must never itself wait for that projector.
         //
         // The Stripe webhook sits under this too, harmlessly: Stripe sends no
-        // `X-Await-Seq`, so the layer is a header lookup that finds nothing.
+        // `X-Await-Version`, so the layer is a header lookup that finds nothing.
+        // Waits on the aggregate versions a client echoes back, against this
+        // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            applied,
-            bus::await_seq::await_seq,
+            bus::AwaitVersions(await_db),
+            bus::await_version::await_version,
         ))
+        // After the layer, deliberately — a backfill is not a client read and has
+        // no version to wait on. Not under `/api` either, which is what keeps it
+        // off the ingress; see `route::payment::backfill`.
+        .route("/internal/backfill", post(route::payment::backfill))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

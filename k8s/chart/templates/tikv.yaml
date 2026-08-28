@@ -1,0 +1,271 @@
+{{/*
+PD + TiKV — the authoritative store, and the only thing in this deployment whose
+loss is data loss.
+
+That sentence is the whole of what changed. Every service used to carry its own
+SurrealDB sidecar on an `emptyDir`, because bus/src/projector.rs replayed the log
+into a private datastore per replica; the log was the source of truth and the
+databases were caches you could throw away. Now the databases are the truth, they
+all live in one keyspace here, and the log is a seven-day integration bus.
+
+Raw StatefulSets rather than `tidb-operator`, matching the hand-rolled style of
+the rest of this chart. The operator is the right answer the day TiKV operations
+— rolling upgrades, scaling stores, backup schedules — become real work; it is a
+CRD, a controller and an RBAC surface to run one process today.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tikv-config
+data:
+  pd.toml: |
+    # `max-replicas` is the one setting that is not optional, and it is derived
+    # rather than configured so it cannot disagree with reality: PD defaults to 3,
+    # and with fewer stores than that it can never place a region — so every region
+    # stays pending, the cluster never reports healthy, and writes *hang* rather
+    # than failing. That is the usual first-run failure for a small TiKV, and it
+    # presents as a network problem.
+    #
+    # Capped at 3 because more copies than that buys durability nobody asked for
+    # and costs a write round trip to each.
+    [replication]
+    max-replicas = {{ min (int .Values.tikv.replicas) 3 }}
+  {{- with .Values.tikv.config }}
+  # Only present when something set it. The default is deliberately empty: TiKV
+  # sizes itself to the machine it is on, which is right for a node it does not
+  # share. `k8s/deploy.sh local` passes docker/tikv/tikv.toml through `--set-file`,
+  # because a k3d cluster shares a laptop with a cargo build and TiKV would
+  # otherwise take ~45% of its memory for the block cache alone.
+  tikv.toml: |
+{{ . | indent 4 }}
+  {{- end }}
+---
+{{/*
+Headless: the pods need stable, individually addressable DNS names, because PD
+members and TiKV stores *advertise* an address that other members dial back. A
+ClusterIP would hand them a load-balanced VIP, and a Raft peer told to reach
+`pd-1` at an address that answers as any-of-three is a cluster that never forms.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd
+spec:
+  clusterIP: None
+  # So a store can dial `pd` before every member is ready. The alternative is a
+  # bootstrap deadlock: no member is ready until the cluster forms, and the
+  # cluster cannot form until members can resolve each other.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: pd
+  ports:
+    - name: client
+      port: 2379
+    - name: peer
+      port: 2380
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pd
+spec:
+  serviceName: pd
+  replicas: {{ .Values.tikv.pd.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pd
+      annotations:
+        checksum/config: {{ .Values.tikv.config | default "" | sha256sum }}
+    spec:
+      initContainers:
+        # PD dials its own advertised name during startup, and a pod's DNS record
+        # does not exist until moments after it has an IP. Losing that race is
+        # fatal, not retried: PD logs `lookup pd-0.pd: no such host` against its own
+        # etcd endpoint and exits.
+        #
+        # Observed on a real install — pd-0 came up on the second attempt and then
+        # carried `RESTARTS 1` for the life of the pod, which is exactly the "looks
+        # like a fault, isn't one" state the wait-for-nats init container elsewhere
+        # in this chart exists to avoid.
+        #
+        # curl exits 6 and only 6 for "couldn't resolve host", so any other code —
+        # 7 refused, 28 timed out, 0 answered — means DNS is serving this name.
+        - name: wait-for-dns
+          image: {{ .Values.curlImage }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              while true; do
+                curl -s -o /dev/null --max-time 2 "http://$POD_NAME.pd:2379"
+                rc=$?
+                [ "$rc" -ne 6 ] && break
+                echo "waiting for my own dns name"
+                sleep 1
+              done
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+      containers:
+        - name: pd
+          image: {{ .Values.tikv.pd.image }}
+          # `$(POD_NAME)` is substituted by the kubelet from the env below.
+          # It has to be: the advertised addresses are per-pod, and a StatefulSet
+          # renders one spec for every replica.
+          args:
+            - --name=$(POD_NAME)
+            - --data-dir=/data/pd
+            - --client-urls=http://0.0.0.0:2379
+            # The address PD hands back to clients, so it must be routable from
+            # them — never 0.0.0.0, which resolves for the listener and nowhere
+            # else. Same trap the compose file documents.
+            - --advertise-client-urls=http://$(POD_NAME).pd:2379
+            - --peer-urls=http://0.0.0.0:2380
+            - --advertise-peer-urls=http://$(POD_NAME).pd:2380
+            - --initial-cluster={{ $peers := list }}{{- range $i := until (int .Values.tikv.pd.replicas) }}{{ $peers = append $peers (printf "pd-%d=http://pd-%d.pd:2380" $i $i) }}{{- end }}{{ join "," $peers }}
+            - --config=/config/pd.toml
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: client
+              containerPort: 2379
+            - name: peer
+              containerPort: 2380
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+              readOnly: true
+          # The same check the compose healthcheck uses, and for the same reason:
+          # a TCP probe on 2379 passes while the cluster is still unformed, which
+          # is exactly the state that makes every write hang.
+          readinessProbe:
+            exec:
+              command: ["/pd-ctl", "-u", "http://127.0.0.1:2379", "health"]
+            periodSeconds: 5
+            failureThreshold: 12
+          resources: {{- toYaml .Values.tikv.pd.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: tikv-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.tikv.pd.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tikv
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: tikv
+  ports:
+    - name: peer
+      port: 20160
+    - name: status
+      port: 20180
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tikv
+spec:
+  serviceName: tikv
+  replicas: {{ .Values.tikv.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tikv
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tikv
+      annotations:
+        checksum/config: {{ .Values.tikv.config | default "" | sha256sum }}
+    spec:
+      initContainers:
+        # A store registers itself with PD at startup and exits if it cannot.
+        # Without this the pod CrashLoopBackOffs until PD happens to win the race,
+        # which works but reads like a fault.
+        #
+        # Deliberately *not* the `is_initialized` check SurrealDB does below: a
+        # cluster is initialized by its first store registering, so waiting for that
+        # here would be waiting for itself.
+        #
+        # curl and not busybox's `nc -z`: busybox resolves short service names
+        # through its own resolver and does not follow the pod's DNS search list, so
+        # `nc -z pd 2379` answers `bad address 'pd'` forever. Measured on a real
+        # install — the init container never exited.
+        - name: wait-for-pd
+          image: {{ .Values.curlImage }}
+          command: ["sh", "-c", "until curl -sf http://pd:2379/pd/api/v1/version >/dev/null; do echo 'waiting for pd'; sleep 2; done"]
+      containers:
+        - name: tikv
+          image: {{ .Values.tikv.image }}
+          args:
+            - --addr=0.0.0.0:20160
+            # What PD records as this store's location and hands to clients. Same
+            # reasoning as PD's own advertise flags above.
+            - --advertise-addr=$(POD_NAME).tikv:20160
+            - --status-addr=0.0.0.0:20180
+            - --advertise-status-addr=$(POD_NAME).tikv:20180
+            - --data-dir=/data/tikv
+            - --pd-endpoints=pd:2379
+            {{- if .Values.tikv.config }}
+            - --config=/config/tikv.toml
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: peer
+              containerPort: 20160
+            - name: status
+              containerPort: 20180
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- if .Values.tikv.config }}
+            - name: config
+              mountPath: /config
+              readOnly: true
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: status
+            periodSeconds: 5
+            failureThreshold: 12
+          resources: {{- toYaml .Values.tikv.resources | nindent 12 }}
+      {{- if .Values.tikv.config }}
+      volumes:
+        - name: config
+          configMap:
+            name: tikv-config
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.tikv.storage }}

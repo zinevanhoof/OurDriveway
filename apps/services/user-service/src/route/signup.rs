@@ -1,7 +1,5 @@
 use axum::extract::State;
 use axum::response::IntoResponse;
-use bus::format_seq;
-use shared::events::STREAM_USERS;
 use shared::responses::common::accepted;
 use shared::{error::myerror::MyResult, extract::Valid, requests::user::SignupRequest};
 
@@ -15,7 +13,7 @@ pub async fn signup(
     State(state): State<AppState>,
     Valid(req): Valid<SignupRequest>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state.user_service.signup(req).await?;
+    let token = state.user_service.signup(req).await?;
 
-    Ok(accepted(format_seq(STREAM_USERS, seq)))
+    Ok(accepted(token))
 }

@@ -70,35 +70,20 @@ impl<Q: Querier> ViewUserRepository<Q> {
         Ok(())
     }
 
-    /// Points every row that was waiting for this user at it.
-    ///
-    /// A spot or a booking may already be sitting in the read model with its link
-    /// still NONE, because SPOTS and BOOKINGS advance independently of USERS and
-    /// routinely arrive first. This is the other half of the subquery in
-    /// `ViewSpotRepository::link_owner` and friends: one resolves forwards when the
-    /// user is already there, this one backwards when they are not.
-    ///
-    /// Scoped `AND … = NONE` so it only ever fills a gap, never repoints a row —
-    /// which is what makes it safe to re-run on a replay.
-    ///
-    /// No `BEGIN`/`COMMIT`: this runs inside the transaction `bus::Tx` already opened
-    /// for the event, and nesting one would be a different statement than intended.
-    /// The three updates are one statement list in one round trip.
-    ///
-    /// `payout` is included; the hand-written version this replaced covered only
-    /// `spot` and `booking`. A payout whose owner had not been projected kept
-    /// `owner = NONE` permanently, because nothing else ever revisited the row.
-    pub async fn backfill_links(&self, user_id: &Uuid) -> MyResult<()> {
-        self.q
-            .q("UPDATE spot    SET owner  = type::record('user', $id)
-                    WHERE owner_id  = $id AND owner  = NONE;
-                UPDATE booking SET renter = type::record('user', $id)
-                    WHERE renter_id = $id AND renter = NONE;
-                UPDATE payout  SET owner  = type::record('user', $id)
-                    WHERE owner_id  = $id AND owner  = NONE;")
-            .bind(("id", *user_id))
-            .await?
-            .check()?;
-        Ok(())
-    }
 }
+
+// `backfill_links` is gone. It pointed every spot, booking and payout that was
+// waiting for a user at them once that user arrived — the backwards half of a pair
+// whose forwards half was a `SELECT … WHERE record::id(id) = $x` in each of the other
+// repositories.
+//
+// Both halves existed to work around the same thing: a link written only if its
+// target was already projected. Those links are `option<record<…>>` with no existence
+// constraint, so they can simply be written — a link to a row that has not arrived yet
+// reads as absent and resolves itself when it does. Writing them straight
+// (`ViewBookingRepository::link_refs`) makes the forwards case total, which leaves the
+// backwards case with nothing to repair.
+//
+// It also closed a hole neither half covered: USERS and BOOKINGS advance
+// independently, so each could start its transaction before the other's row was
+// visible, neither resolve, and the link stay null permanently.

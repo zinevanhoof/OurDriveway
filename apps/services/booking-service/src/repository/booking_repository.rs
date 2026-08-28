@@ -39,6 +39,19 @@ impl<Q: Querier> BookingRepository<Q> {
             .take(0)?)
     }
 
+    /// Every booking, for `BookingService::backfill`.
+    ///
+    /// ponytail: reads the whole table into memory in one pass, and this is the
+    /// table most likely to be the one that outgrows it. Page on `id` — `WHERE id >
+    /// $after ORDER BY id LIMIT $n` — when it does.
+    pub async fn all(&self) -> MyResult<Vec<Booking>> {
+        Ok(self
+            .q
+            .q("SELECT record::id(id) AS id, * FROM booking")
+            .await?
+            .take(0)?)
+    }
+
     /// Insert-or-replace the whole row, keyed by its own id.
     ///
     /// Idempotent by construction, which is what lets a projector replay the same

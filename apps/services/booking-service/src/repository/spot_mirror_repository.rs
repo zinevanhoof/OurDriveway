@@ -59,7 +59,6 @@ impl<Q: Querier> SpotMirrorRepository<Q> {
                 self.q
                     .q("UPSERT type::record('spot', $v) SET
                             owner_id       = $owner_id       ?? owner_id,
-                            shard          = $shard          ?? shard,
                             price_per_hour = $price_per_hour ?? price_per_hour,
                             availability   = $availability   ?? availability,
                             timezone       = $timezone       ?? timezone,

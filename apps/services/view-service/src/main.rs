@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock},
-};
+use std::sync::{Arc, LazyLock};
 
 use axum::{Router, routing::get};
 use axum_reverse_proxy::ReverseProxy;
@@ -10,7 +7,6 @@ use shared::{
     events::{STREAM_BOOKINGS, STREAM_PAYMENTS, STREAM_SPOTS, STREAM_USERS},
 };
 
-use bus::AppliedSeqs;
 
 use crate::{
     projector::{BookingProjector, PaymentProjector, SpotProjector, UserProjector},
@@ -44,10 +40,12 @@ pub struct Config {
     pub surrealdb_addr: String,
     pub surrealdb_user: String,
     pub surrealdb_pass: String,
+    /// This service's own database inside the shared `main` namespace. Every
+    /// service used to be "main"; on TiKV they share one keyspace, so this is
+    /// what keeps their tables apart.
+    pub surrealdb_db: String,
     pub nats_url: String,
     pub port: u16,
-    /// 0 disables snapshots entirely — see `bus::snapshot::install`.
-    pub snapshot_interval_secs: u64,
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
 }
@@ -56,9 +54,9 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     surrealdb_addr: env::require("SURREALDB_ADDR"),
     surrealdb_user: env::require("SURREALDB_USER"),
     surrealdb_pass: env::require("SURREALDB_PASS"),
+    surrealdb_db: env::require("SURREALDB_DB"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
-    snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
     jwt_secret: env::require("JWT_SECRET"),
 });
 
@@ -82,21 +80,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &CONFIG.surrealdb_addr,
         &CONFIG.surrealdb_user,
         &CONFIG.surrealdb_pass,
+        &CONFIG.surrealdb_db,
     )
     .await?;
 
-    // One owned client per projector — four here, because `Surreal::begin` consumes
-    // one and each holds its own open transaction. That is the floor: four sessions,
-    // cloned once at boot rather than once per event.
-    let users_client = db.clone();
-    let spots_client = db.clone();
-    let bookings_client = db.clone();
-    let payments_client = db.clone();
-
-    // The `/me` handler shares one session. `Surreal::clone` would mint another and
-    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
-    // because nothing re-authenticates per request — see `shared::db::connect`.
+    // One connection for the whole process — projectors, election, relay, handlers
+    // and the await layer all share it. `Surreal::clone` would mint a session and
+    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. The
+    // sessions that do get minted are per *transaction*, in `shared::db::begin`, and
+    // die with it.
+    //
+    // This used to be 4 x 16 connections for the projectors plus three more for the
+    // lease, the relay and the await layer, on the theory that an open transaction
+    // blocks every other session on the socket. It does not — but the replayed sign-in
+    // a clone carries is not free either, and `bus/examples/clone_cost` prices it at
+    // +27.5ms per transaction against a connection of one's own.
     let db = Arc::new(db);
+    let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
@@ -105,56 +105,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &[STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
     );
 
-    // No-op when SNAPSHOT_INTERVAL_SECS=0, which is how this runs with a
-    // disposable projection store: every start replays from sequence 1.
-    bus::snapshot::install(
-        &js,
-        bus::SnapshotConfig {
-            db_addr: &CONFIG.surrealdb_addr,
-            db_user: &CONFIG.surrealdb_user,
-            db_pass: &CONFIG.surrealdb_pass,
-            service: "view-service",
-            streams: vec![STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
-            every_secs: CONFIG.snapshot_interval_secs,
-        },
-    )
-    .await?;
 
-    let applied = AppliedSeqs(Arc::new(HashMap::from([
-        (STREAM_USERS, readiness.applied_rx(STREAM_USERS).unwrap()),
-        (STREAM_SPOTS, readiness.applied_rx(STREAM_SPOTS).unwrap()),
-        (
-            STREAM_BOOKINGS,
-            readiness.applied_rx(STREAM_BOOKINGS).unwrap(),
-        ),
-        (
-            STREAM_PAYMENTS,
-            readiness.applied_rx(STREAM_PAYMENTS).unwrap(),
-        ),
-    ])));
 
-    // `Tx` opens a transaction per event, applies, advances that stream's cursor
-    // inside it and commits — so none of the four below can forget any of it.
+    // For the outbox relay only. The projectors need no election: each partition is
+    // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
+    // event at a time *per partition* across every replica, in order — and different
+    // partitions are different aggregates, which have no order between them. The
+    // relay has no such backstop, so exactly one instance may run it.
+    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
+
+    // Four projectors, `PARTITIONS` lanes each, all on the one connection above.
+    // A transaction per event, on a session that lives only as long as it does.
     tokio::spawn(bus::projector::run(
         js.clone(),
-        bus::Tx::new(UserProjector, users_client),
+        Arc::new(UserProjector),
+        db.clone(),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        bus::Tx::new(SpotProjector, spots_client),
+        Arc::new(SpotProjector),
+        db.clone(),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        bus::Tx::new(BookingProjector, bookings_client),
+        Arc::new(BookingProjector),
+        db.clone(),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
-        js,
-        bus::Tx::new(PaymentProjector, payments_client),
+        js.clone(),
+        Arc::new(PaymentProjector),
+        db.clone(),
         readiness.clone(),
     ));
+
+    // view-service publishes nothing today, so this relay has nothing to carry.
+    // Spawned anyway so every service has the same shape and a future event from
+    // the read model has somewhere to go.
+    tokio::spawn(bus::outbox::run(db.clone(), js, leader.clone()));
 
     // Reads reach SurrealDB with the client's own Authorization header forwarded
     // verbatim, so they get a RECORD identity and are constrained by the table
@@ -169,9 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .route("/api/view/me", get(route::me::me))
         .merge(proxy)
+        // Waits on the aggregate versions a client echoes back, against this
+        // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            applied,
-            bus::await_seq::await_seq,
+            bus::AwaitVersions(await_db),
+            bus::await_version::await_version,
         ))
         .merge(bus::health::routes(readiness))
         .with_state(AppState {

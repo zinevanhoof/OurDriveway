@@ -1,5 +1,5 @@
-# The backends differ in two facts: some extra env, and whether they carry state
-# at all. Everything else about them is identical, so they are data here and one
+# The backends differ in some extra env and in which of two dependencies they
+# have. Everything else about them is identical, so they are data here and one
 # template in templates/services.yaml — not five near-copies that drift the first
 # time a probe changes.
 registry: ghcr.io/zinevanhoof
@@ -62,17 +62,12 @@ services:
       # safe if those rules are ever relaxed. payment-service's .env sets 0 so a payout
       # is testable locally without waiting a day.
       SETTLEMENT_SECS: "86400"
-  # The one service with no database, no NATS consumer and no schema: it mints
-  # presigned R2 upload URLs and holds nothing. `stateless` is what strips the
-  # SurrealDB sidecar, the schema mount and the wait-for-nats init container from
-  # its pod — see templates/services.yaml.
-  #
-  # This is also what removed the uploads emptyDir that used to pin spot-service
-  # to one replica: images now live in R2 rather than on a pod's local disk.
+  # The one service that talks to neither a database nor the broker: it mints
+  # presigned R2 upload URLs and holds nothing at all. Both flags off strips the
+  # SurrealDB env, the schema and both init containers — see
+  # templates/services.yaml.
   media:
-    stateless: true
-    # The only service that talks to neither a database nor the broker: it mints
-    # presigned R2 upload URLs and holds nothing.
+    db: false
     nats: false
     env:
       # Not secret, and visible in review where it belongs. The credentials for
@@ -89,12 +84,12 @@ services:
       # Per-image ceiling in bytes (20 MiB), signed into the URL so it holds no
       # matter what is proxying in front of the service.
       MAX_UPLOAD_BYTES: "20971520"
-  # Stateless like media, but it does consume the log — its consumer cursor lives
-  # in NATS rather than in a projection, which is why it needs no SurrealDB and no
-  # schema. `api: false` keeps it off the ingress: it exposes only /healthz and
-  # /readyz, so there is nothing outside the cluster should be able to reach.
+  # No database like media, but it does consume the log — its consumer cursor
+  # lives in NATS rather than in a projection, which is why it needs no SurrealDB
+  # and no schema. `api: false` keeps it off the ingress: it exposes only /healthz
+  # and /readyz, so there is nothing outside the cluster should be able to reach.
   notification:
-    stateless: true
+    db: false
     api: false
     env:
       # Not secret and better off visible in review. RESEND_API_KEY and
@@ -117,35 +112,71 @@ services:
 
 replicas: 1
 
+# The query engine over TiKV. Stores nothing itself, so these are ordinary
+# replaceable pods behind one ClusterIP — see templates/surrealdb.yaml.
 surrealdb:
-  # Pinned to match the `surrealdb` crate in Cargo.toml. `:latest` drifting under
-  # a projection store is not a surprise anyone wants.
+  # Pinned to match the `surrealdb` crate in Cargo.toml, and doubly worth pinning
+  # now: `shared::db::is_write_conflict` string-matches SurrealDB's error message
+  # because a TiKV write conflict has no typed surface, so a version that rewords
+  # it turns every contended booking into a 500. `bus/examples/tikv_spike` is the
+  # check to run before moving this.
   image: surrealdb/surrealdb:v3.2.4
-  # Used for BOTH the sidecar's --user/--pass and the app's SURREALDB_USER/PASS,
-  # so the two can't drift into a boot-time auth failure. Not a secret worth
-  # hiding: the sidecar binds 127.0.0.1, so nothing outside the pod can reach it.
-  user: root
-  pass: root
-  # surrealkv on an emptyDir: a real on-disk datastore that happens to be
-  # disposable. NOT `memory` — that would hold every projection in RAM, and the
-  # read model is the largest thing here.
-  #
-  # The emptyDir is node-local scratch deleted with the pod, which is the whole
-  # trick: disk-backed like production, stateless like a cache. No PVC, no
-  # StatefulSet, no volume to back up or migrate. Every pod start replays the log
-  # from sequence 1 and rebuilds this from scratch.
-  storage: surrealkv:/data/db
-  # Sized for the projection, not the log. This is scratch — if a service ever
-  # OOMs the node's ephemeral storage, that is the signal to turn snapshots back
-  # on, not to grow this.
-  sizeLimit: 2Gi
+  # Reads scale here. Writes are TiKV's problem, not this pod's.
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # `user`/`pass` are gone from this file. They used to be unremarkable in plain
+  # sight because the sidecar bound 127.0.0.1 and was private to its pod; a shared
+  # ClusterIP makes them the only thing between any pod in the namespace and a root
+  # session, so they live in k8s/secrets.env as SURREALDB_USER / SURREALDB_PASS.
+  # Helm also stores every value it renders in the release secret and hands them
+  # back to `helm get values`, which is the same reason JWT_SECRET was never here.
 
-# 0 disables the snapshot/restore path entirely. Nothing worth snapshotting while
-# the datastore is disposable — a snapshot would only ever be a slower way to
-# reach the state the log already produces. Set this (900 is the code default)
-# once the log is long enough for replay to be felt, and pair it with an S3 or
-# NATS object store the objects can live in.
-snapshotIntervalSecs: 0
+# The authoritative store — see templates/tikv.yaml.
+#
+# `storage` on both is the one thing in this chart whose loss is data loss rather
+# than a rebuild. Everything else is derived from it: a service database, the read
+# model, and the seven days of events in NATS.
+tikv:
+  # Stores. `max-replicas` in PD's config is derived from this and capped at 3, so
+  # a single-node cluster is placeable and a three-node one is durable without
+  # anyone having to know that PD defaults to 3 and hangs when it cannot meet it.
+  replicas: 1
+  image: pingcap/tikv:v8.5.7
+  storage: 20Gi
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+  # Extra TiKV config, appended as tikv.toml. Empty on purpose: untuned, TiKV
+  # sizes itself to the machine, which is what you want on a node it does not
+  # share. `k8s/deploy.sh local` passes docker/tikv/tikv.toml through --set-file,
+  # because a k3d cluster shares a laptop with a cargo build and TiKV would
+  # otherwise take ~45% of its memory for the block cache alone.
+  config: ""
+  # Cluster metadata, region placement, and the timestamp oracle every transaction
+  # takes its start and commit timestamps from. Small, and the thing everything
+  # else dials.
+  pd:
+    # Raft. Go to 3 for an odd quorum the day losing this pod means an outage.
+    replicas: 1
+    image: pingcap/pd:v8.5.7
+    storage: 5Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+# curl with a shell. Used for applying the schemas — the surrealdb image is
+# distroless, so there is no shell in it to run a loop — and for the three init
+# containers around the storage layer, which the services cover with bash's
+# /dev/tcp but PD, TiKV and SurrealDB have no app image to borrow.
+#
+# Not busybox, which would be the obvious small choice: its `nc` resolves through
+# its own resolver rather than the pod's DNS search list, so `nc -z pd 2379` says
+# `bad address 'pd'` forever. Measured, on a real install.
+curlImage: curlimages/curl:8.11.1
 
 # Created outside this chart, by deploy.sh, from the gitignored k8s/secrets.env.
 # Deliberately not templated: Helm stores every rendered value in the release

@@ -17,11 +17,12 @@ pub mod spot_repository;
 
 /// Round-trips the table through a real SurrealDB.
 ///
-/// `#[ignore]`d — needs `spot-service-db` on :8002 with `schemas/spot-schema.surql`
-/// imported, and CI runs `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the shared SurrealDB on :8000 with
+/// `schemas/spot-schema.surql` imported into the `spot` database, and CI runs
+/// `cargo test --workspace` with no database:
 ///
 /// ```sh
-/// docker compose -f docker/docker-compose-dev.yml up -d spot-service-db
+/// docker compose -f docker/docker-compose-dev.yml up -d surrealdb schema-import
 /// cargo test --workspace -- --ignored
 /// ```
 ///
@@ -47,9 +48,9 @@ mod live_tests {
 
     async fn db() -> Arc<Surreal<Client>> {
         Arc::new(
-            shared::db::connect("127.0.0.1:8002", "root", "root")
+            shared::db::connect("127.0.0.1:8000", "root", "root", "spot")
                 .await
-                .expect("spot-service-db on :8002 — see this module's docs"),
+                .expect("shared surrealdb on :8000, db `spot` — see this module's docs"),
         )
     }
 
@@ -81,8 +82,8 @@ mod live_tests {
         let owner_id = Uuid::now_v7();
         let row = Spot {
             id,
+            version: 1,
             owner_id,
-            shard: "00".to_string(),
             title: "Driveway".to_string(),
             description: Some("Near the station".to_string()),
             price_per_hour: 250,

@@ -28,7 +28,6 @@ pub struct BookingMirror {
     /// Which spot, so checkout can ask spot-service what to call it. The id alone —
     /// this service holds no spot data and consumes no SPOTS events.
     pub spot_id: Uuid,
-    pub spot_shard: String,
     pub owner_id: Uuid,
     pub renter_id: Uuid,
     pub amount_cents: i64,
@@ -66,7 +65,6 @@ impl BookingMirror {
         Self {
             id: e.booking_id,
             spot_id: e.spot_id,
-            spot_shard: e.spot_shard,
             owner_id: e.owner_id,
             renter_id: e.renter_id,
             amount_cents: e.amount_cents,

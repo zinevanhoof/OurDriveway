@@ -33,12 +33,12 @@ pub mod spot_mirror_repository;
 
 /// Round-trips both tables through a real SurrealDB.
 ///
-/// `#[ignore]`d, because these need `booking-service-db` up on :8001 with
-/// `schemas/booking-schema.surql` imported, and CI runs `cargo test --workspace`
-/// with no database:
+/// `#[ignore]`d, because these need the shared SurrealDB up on :8000 with
+/// `schemas/booking-schema.surql` imported into the `booking` database, and CI
+/// runs `cargo test --workspace` with no database:
 ///
 /// ```sh
-/// docker compose -f docker/docker-compose-dev.yml up -d booking-service-db
+/// docker compose -f docker/docker-compose-dev.yml up -d surrealdb schema-import
 /// cargo test --workspace -- --ignored
 /// ```
 ///
@@ -72,9 +72,9 @@ mod live_tests {
 
     async fn db() -> Arc<Surreal<Client>> {
         Arc::new(
-            shared::db::connect("127.0.0.1:8001", "root", "root")
+            shared::db::connect("127.0.0.1:8000", "root", "root", "booking")
                 .await
-                .expect("booking-service-db on :8001 — see this module's docs"),
+                .expect("shared surrealdb on :8000, db `booking` — see this module's docs"),
         )
     }
 
@@ -124,8 +124,8 @@ mod live_tests {
         let (id, spot_id) = (Uuid::now_v7(), Uuid::now_v7());
         let row = Booking {
             id,
+            version: 1,
             spot_id,
-            spot_shard: "00".to_string(),
             owner_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: slots(),
@@ -246,7 +246,6 @@ mod live_tests {
             id,
             SpotMirrorPatch {
                 owner_id: Some(owner_id),
-                shard: Some("00".to_string()),
                 price_per_hour: Some(700),
                 availability: Some(availability()),
                 timezone: Some("Europe/Brussels".to_string()),

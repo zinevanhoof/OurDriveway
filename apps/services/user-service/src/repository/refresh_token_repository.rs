@@ -52,7 +52,6 @@ impl<Q: Querier> RefreshTokenRepository<Q> {
         self.q
             .q("UPSERT type::record('refresh_token', $id) CONTENT {
                     user_id:        type::record('user', $user_id),
-                    shard:          $shard,
                     token_hash:     $token_hash,
                     jti:            $jti,
                     created_at:     $created_at,
@@ -63,7 +62,6 @@ impl<Q: Querier> RefreshTokenRepository<Q> {
             .bind(vars! {
                 id:             token.id,
                 user_id:        token.user_id,
-                shard:          token.shard,
                 token_hash:     token.token_hash,
                 jti:            token.jti,
                 created_at:     token.created_at,

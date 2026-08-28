@@ -35,6 +35,18 @@ impl UserWorkerService {
     /// Sends whatever this event deserves, keyed on the event id so a redelivery is
     /// recognised by the provider rather than sent twice.
     pub async fn notify(&self, envelope: &Envelope<UserEvent>) -> MyResult<()> {
+        // The one place in the codebase that reads this flag, and the reason it
+        // exists. A backfill re-emits `Registered` for every account so a projection
+        // can be rebuilt from current state — harmless for a database, and a fresh
+        // verification email to every user on the system if it reached here.
+        //
+        // Guarded here rather than in the worker so that anything else this service
+        // grows is covered by the same check: sending mail is what must not repeat,
+        // not consuming the event.
+        if envelope.backfill {
+            return Ok(());
+        }
+
         let Some(mail) = self.mail_for(&envelope.payload)? else {
             return Ok(());
         };
@@ -67,8 +79,13 @@ impl UserWorkerService {
 
 /// Minted here, at send time, so the 24-hour clock starts when the mail leaves
 /// rather than when the account was created — and so the token never enters an
-/// event. `STREAM_USERS` has no `max_age`; anything published there is a
-/// permanent record.
+/// event.
+///
+/// The second half used to read "`STREAM_USERS` has no `max_age`; anything
+/// published there is a permanent record". It expires after a week now, but the
+/// reasoning survives the change intact: a week is still far longer than the
+/// token's 24 hours, and a bearer credential has no business in a log that anything
+/// downstream can replay at all.
 fn verification_url(user_id: &Uuid) -> MyResult<String> {
     let token = email_token::mint(
         &CONFIG.email_token_secret,

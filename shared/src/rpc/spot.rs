@@ -4,7 +4,19 @@ use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
 /// Subject spot-service answers on. Queue-subscribed, so replicas share the load.
-pub const SUBJECT_SPOT_CARD: &str = "spots.card";
+///
+/// `rpc.` and not `spots.`, which is where it used to live. A JetStream stream
+/// captures **every** message on a subject it binds, request/reply included, so
+/// `spots.card` matched the SPOTS stream's `spots.>` and every RPC request was
+/// stored as if it were an event. The projectors on that stream have no
+/// `filter_subject` narrow enough to have excluded it before partitioning, so one
+/// `SpotCard` lookup was enough to feed a bare `Uuid` to
+/// `serde_json::from_slice::<Envelope<SpotEvent>>` and stop both SPOTS projectors
+/// for good.
+///
+/// Nothing binds `rpc.>`, which is the point. `only_event_subjects_land_in_streams`
+/// in `crate::events` is what keeps it that way.
+pub const SUBJECT_SPOT_CARD: &str = "rpc.spot.card";
 
 /// A spot as something else needs to *display* it. The request is the bare `Uuid`.
 ///

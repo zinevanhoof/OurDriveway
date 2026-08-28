@@ -1,8 +1,6 @@
 use axum::{extract::State, response::IntoResponse};
-use bus::format_seq;
-use shared::events::STREAM_USERS;
 use shared::extractors::authed_jwt::AuthedJwt;
-use shared::responses::common::accepted;
+use shared::responses::common::{accepted, backfilled};
 use shared::{error::myerror::MyResult, extract::Valid, requests::user::UpdateUserRequest};
 
 use crate::AppState;
@@ -17,6 +15,28 @@ pub async fn update_user(
     State(state): State<AppState>,
     Valid(req): Valid<UpdateUserRequest>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state.user_service.update_user(&user_id, req).await?;
-    Ok(accepted(format_seq(STREAM_USERS, seq)))
+    let token = state.user_service.update_user(&user_id, req).await?;
+    Ok(accepted(token))
+}
+
+/// `POST /internal/backfill` — re-emit every user, for rebuilding a consumer.
+///
+/// **Not under `/api`, and that is what keeps it private.** The ingress routes
+/// `/api/<service>` and sends everything else to the SPA, so nothing outside the
+/// cluster can reach this path on this service at all — the same effect
+/// notification-service gets from `api: false`, without taking the rest of the
+/// routes off the ingress with it. It follows that there is no `AuthedJwt` here:
+/// there is no user whose token would mean anything, and reachability is the
+/// control.
+///
+/// Unauthenticated *inside* the cluster, though. Anything that can dial the pod can
+/// trigger a backfill, which costs a burst of re-projected events and no data loss.
+/// If that ever needs to be more than a comment, a shared secret header is the
+/// cheapest next rung.
+///
+/// Synchronous, so the count in the response is the real one and a script can wait
+/// on it. It walks whole tables — see the ponytail note in `UserRepository::all` for
+/// when that stops being reasonable.
+pub async fn backfill(State(state): State<AppState>) -> MyResult<impl IntoResponse> {
+    Ok(backfilled(state.user_service.backfill().await?))
 }

@@ -23,6 +23,22 @@ impl<Q: Querier> PayoutRepository<Q> {
         Ok(())
     }
 
+    /// Every payout, for `PaymentService::backfill`.
+    ///
+    /// Payouts and not payments: view-service projects `PayoutRequested` and
+    /// deliberately nothing else off PAYMENTS — what a renter was charged is this
+    /// service's to answer — so the payment table has no downstream projection to
+    /// rebuild.
+    ///
+    /// ponytail: whole table in one pass, same ceiling and same fix as the others.
+    pub async fn all(&self) -> MyResult<Vec<Payout>> {
+        Ok(self
+            .q
+            .q("SELECT record::id(id) AS id, version ?? 0 AS version, * FROM payout")
+            .await?
+            .take(0)?)
+    }
+
     /// Everything this host has already withdrawn.
     ///
     /// A sum, so it never fetches the rows to add up one column in Rust.

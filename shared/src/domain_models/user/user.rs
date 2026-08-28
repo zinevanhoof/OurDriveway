@@ -18,10 +18,14 @@ pub struct User {
     /// what lets this be a plain uuid — the JWT carries one, and nothing outside
     /// the database should have to know about record keys.
     pub id: Uuid,
-    /// Read, never recomputed. `shard_of` would agree today, but this selects the
-    /// subject the user's whole history lives on, so a changed SHARD_COUNT would
-    /// send their next event where no reader is looking.
-    pub shard: String,
+    /// Bumped by user-service inside the transaction that writes this row. The
+    /// token a client waits on, the key concurrent writers collide on, and the
+    /// gap detector for an out-of-order event — see `shared::events::Envelope`.
+    ///
+    /// On the model rather than only in the schema so a whole-row write carries it,
+    /// and so a read can answer "which version is this" — which is what a backfill
+    /// re-emitting current state has to stamp on the events it raises.
+    pub version: u64,
     pub first_name: String,
     pub last_name: String,
     /// `email_idx … UNIQUE` in `schemas/user-schema.surql`. That index is the real
@@ -44,14 +48,20 @@ pub struct User {
     pub email_verified: bool,
 }
 
-impl From<UserRegistered> for User {
-    /// The three columns the event does not carry. These used to be literals in
-    /// the projector's `CONTENT` block; they are defaults of the model, so they
-    /// belong where the model is.
-    fn from(e: UserRegistered) -> Self {
+impl User {
+    /// The row a `Registered` writes.
+    ///
+    /// Was `From<UserRegistered>` until the row carried a version — that is assigned
+    /// by the transaction, not by the event, so there is a second argument now and
+    /// no total conversion left to implement. Same shape as [`super::super::spot::Spot::created`]
+    /// and `Booking::created`.
+    ///
+    /// The three columns the event does not carry are defaults of the model; they
+    /// used to be literals in the projector's `CONTENT` block.
+    pub fn registered(e: UserRegistered, version: u64) -> Self {
         Self {
             id: e.user_id,
-            shard: e.shard,
+            version,
             first_name: e.first_name,
             last_name: e.last_name,
             email: e.email,
@@ -69,8 +79,7 @@ impl From<UserRegistered> for User {
 /// UserPatch { password: Some(hash), ..Default::default() }
 /// ```
 ///
-/// `shard` is absent on purpose: it selects the subject a user's whole history is
-/// ordered on, so it is written once at registration and never edited.
+/// Only the columns an edit can touch.
 #[derive(Debug, Default)]
 pub struct UserPatch {
     pub first_name: Option<String>,

@@ -16,6 +16,10 @@ use uuid::Uuid;
 #[derive(Clone, Debug, SurrealValue)]
 pub struct ViewPayout {
     pub id: Uuid,
+    /// The owning service's version of this aggregate, carried so a `CONTENT $row`
+    /// write does not clear the column — see [`super::user::ViewUser::version`] for
+    /// what happens when it does.
+    pub version: u64,
     pub owner_id: Uuid,
     /// EUR cents.
     pub amount: i64,

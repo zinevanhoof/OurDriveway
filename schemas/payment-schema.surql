@@ -1,4 +1,7 @@
-USE NS main DB main;
+-- One database per service inside the shared `main` namespace. Was DB main for
+-- every service, which was safe only while each ran its own SurrealDB over its
+-- own datastore; on TiKV they share one keyspace and this name is the isolation.
+USE NS main DB payment;
 
 -- This database is PRIVATE to its service, more strictly than any of the others: it
 -- holds Stripe intent ids and what every renter was charged. No GraphQL config and no
@@ -17,6 +20,13 @@ USE NS main DB main;
 -- One row per booking that someone started paying for. Written only by the PAYMENTS
 -- projector, from events payment-service itself published.
 DEFINE TABLE OVERWRITE payment SCHEMAFULL PERMISSIONS NONE;
+
+-- Monotonic, bumped by the owning service inside the transaction that writes the
+-- rows. Three jobs in one column: the token a client waits on
+-- (`payment:<id>@7`), the key two concurrent writers collide on so TiKV refuses
+-- one, and the gap detector that stops an out-of-order event applying
+-- silently.
+DEFINE FIELD OVERWRITE version ON payment TYPE int DEFAULT 0;
 
 -- The booking this pays for, as a plain string: the booking table below is a local
 -- projection, and the authoritative one lives in booking-service's database, so this
@@ -50,12 +60,6 @@ DEFINE FIELD OVERWRITE session_id ON payment TYPE string;
 -- refund path leans on: `settle_up`'s Refund arm only matches 'succeeded', so it cannot
 -- be reached while this is NONE. Keep the two writes together if this is ever touched.
 DEFINE FIELD OVERWRITE intent_id ON payment TYPE option<string>;
-
--- The shard this payment's subject lives on, stored rather than recomputed from
--- booking_id. `shard_of` is deterministic, but only for a fixed SHARD_COUNT — raising
--- it would move where a later Refunded event publishes and split one payment's history
--- across two subjects. Same reasoning as spot_shard on the booking table.
-DEFINE FIELD OVERWRITE booking_shard ON payment TYPE string;
 
 -- 'created' means a session exists and nothing has been charged. The three terminal
 -- states are 'succeeded' (money taken and the booking confirmed), 'refunded' (taken
@@ -103,8 +107,14 @@ DEFINE INDEX OVERWRITE payment_session ON payment FIELDS session_id UNIQUE;
 -- so a replay from sequence 1 can only ever create this row complete.
 DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS NONE;
 
+-- Monotonic, bumped by the owning service inside the transaction that writes the
+-- rows. Three jobs in one column: the token a client waits on
+-- (`booking:<id>@7`), the key two concurrent writers collide on so TiKV refuses
+-- one, and the gap detector that stops an out-of-order event applying
+-- silently.
+DEFINE FIELD OVERWRITE version ON booking TYPE int DEFAULT 0;
+
 DEFINE FIELD OVERWRITE spot_id    ON booking TYPE uuid;
-DEFINE FIELD OVERWRITE spot_shard ON booking TYPE string;
 DEFINE FIELD OVERWRITE owner_id   ON booking TYPE uuid;
 DEFINE FIELD OVERWRITE renter_id  ON booking TYPE uuid;
 DEFINE FIELD OVERWRITE amount_cents ON booking TYPE int;
@@ -163,19 +173,65 @@ DEFINE INDEX OVERWRITE booking_owner ON booking FIELDS owner_id, status, ends_at
 -- compensating write.
 DEFINE TABLE OVERWRITE payout SCHEMAFULL PERMISSIONS NONE;
 
+-- Monotonic, bumped by the owning service inside the transaction that writes the
+-- rows. Three jobs in one column: the token a client waits on
+-- (`payout:<id>@7`), the key two concurrent writers collide on so TiKV refuses
+-- one, and the gap detector that stops an out-of-order event applying
+-- silently.
+DEFINE FIELD OVERWRITE version ON payout TYPE int DEFAULT 0;
+
 DEFINE FIELD OVERWRITE owner_id     ON payout TYPE uuid;
 DEFINE FIELD OVERWRITE amount_cents ON payout TYPE int;
 DEFINE FIELD OVERWRITE created_at   ON payout TYPE datetime;
 
 DEFINE INDEX OVERWRITE payout_owner ON payout FIELDS owner_id;
 
--- ─── projector cursors ──────────────────────────────────────────────────────
--- Where this instance's projectors have got to, one row per stream. Written in the
--- same transaction as the data it describes, so a crash can never leave a cursor
--- ahead of the rows — which would silently skip events on restart.
+
+-- ─── host ───────────────────────────────────────────────────────────────────
+-- One row per host, holding nothing but a version. It exists solely as the key
+-- two concurrent withdrawals collide on.
 --
--- PERMISSIONS NONE keeps it invisible to any client identity; only the service's own
--- database-level connection, whose role bypasses table permissions, touches it.
-DEFINE TABLE OVERWRITE _projection SCHEMAFULL PERMISSIONS NONE;
-DEFINE FIELD OVERWRITE last_seq   ON _projection TYPE int;
-DEFINE FIELD OVERWRITE updated_at ON _projection TYPE datetime;
+-- A host's balance is derived (earnings − payouts), never stored, so two
+-- double-clicked withdrawals both read the same available amount and both create
+-- a *different* payout row — different keys, no write conflict, money out twice.
+-- Bumping this row inside the same transaction is what makes TiKV refuse one of
+-- them. It replaced a compare-and-swap on the host's NATS subject, which could not
+-- survive the write moving into the database.
+DEFINE TABLE OVERWRITE host SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD OVERWRITE version ON host TYPE int DEFAULT 0;
+
+-- ─── leader election ────────────────────────────────────────────────────────
+-- One row, `_lease:leader`, and it exists for the OUTBOX RELAY only.
+--
+-- The projectors do not need it: they pull from one durable consumer with
+-- `max_ack_pending: 1`, so JetStream itself hands out one event at a time across
+-- every replica, in stream order. The relay has no such backstop — it reads rows
+-- from this database and publishes them, and two relays could publish one
+-- entity's events out of order, which the downstream `WHERE status IN $from`
+-- guards drop rather than reorder.
+--
+-- Expiry is compared against `time::now()` INSIDE the database. Replicas do not
+-- share a clock; they do share this row.
+DEFINE TABLE OVERWRITE _lease SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD OVERWRITE holder     ON _lease TYPE string;
+DEFINE FIELD OVERWRITE expires_at ON _lease TYPE datetime;
+
+-- ─── transactional outbox ───────────────────────────────────────────────────
+-- Events written in the SAME transaction as the data that caused them, then
+-- moved to NATS by the relay. This is the one thing JetStream cannot provide on
+-- its own: its guarantees begin once a message is in the stream, and this closes
+-- the window before that.
+--
+-- The record id is the envelope's `event_id`, so enqueuing the same event twice
+-- is one row — the same property `Nats-Msg-Id` gives on the way out.
+DEFINE TABLE OVERWRITE _outbox SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD OVERWRITE subject    ON _outbox TYPE string;
+-- The serialized envelope, as text so a stuck row can be read with a SELECT.
+DEFINE FIELD OVERWRITE payload    ON _outbox TYPE string;
+DEFINE FIELD OVERWRITE created_at ON _outbox TYPE datetime;
+-- The relay's read: oldest first. `id` is deliberately NOT in the index — it is
+-- the record key, not a field, and SurrealDB rejects it here ("The field 'id'
+-- does not exist"). The relay still ORDERs by `created_at, id` so two events
+-- enqueued in one transaction, sharing a timestamp, are retried in the order
+-- they were sent; only the leading column is indexed.
+DEFINE INDEX OVERWRITE _outbox_order ON _outbox FIELDS created_at;

@@ -1,39 +1,24 @@
-# The only compose topology left: the databases plus Caddy on the host network,
-# so a phone on the LAN reaches one origin. The Rust services run natively on the
-# host (the "run-all-services" VS Code task), which is why none of them appear
-# below — including media-service, which is reached on :3004 through the Caddy
-# route in Caddyfile-dev.
+# The storage layer plus Caddy on the host network, so a phone on the LAN reaches
+# one origin. The Rust services run natively on the host (the "run-all-services"
+# VS Code task), which is why none of them appear below — including media-service,
+# which is reached on :3004 through the Caddy route in Caddyfile-dev.
+#
+# The five per-service SurrealDB containers are gone. They existed because each
+# service owned a private surrealkv datastore and rebuilt it from the log on every
+# boot; TiKV is authoritative now, so there is one stateless SurrealDB in front of
+# it and the per-service split is a database name (SURREALDB_DB) rather than a
+# process. Ports 8001-8004 are free as a result — everything is on 8000.
 #
 # The one container here that is neither a database nor a proxy is stripe-cli, which
 # forwards webhooks *inward* to payment-service on :3006 — see the note on it below.
 #
 # Production is Kubernetes, not compose. See k8s/.
-x-surrealdb:
-  &surrealdb # Pinned to match the `surrealdb` crate version in Cargo.toml.
-  image: surrealdb/surrealdb:v3.2.4
-  restart: unless-stopped
-  # Still root: with no volume the datastore goes in the container's own writable
-  # layer, and `nonroot` cannot mkdir /data at the filesystem root.
-  user: "0:0"
-  command:
-    - start
-    - --log=info
-    - --user=root
-    - --pass=root
-    - --import-file
-    - /schema.surql
-    # surrealkv in the container's own layer — a real on-disk datastore that dies
-    # with the container. Disk-backed like production, disposable like a cache,
-    # which is exactly what k8s gets from its emptyDir. Requires every DEFINE in
-    # the schema to be OVERWRITE, since --import-file re-runs on each boot.
-    - surrealkv:/data/db
-  healthcheck:
-    # Distroless image (no shell), so exec form only. Subcommand is `is-ready`.
-    test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
-    interval: 5s
-    timeout: 3s
-    retries: 20
-    start_period: 10s
+
+# The x-surrealdb anchor is gone with the five per-service databases it templated.
+# It existed because each service ran its OWN SurrealDB over its own surrealkv
+# datastore — one process per service, five private copies. On TiKV, SurrealDB
+# stores nothing at all: it is a stateless query engine, so one of it serves every
+# service and the databases below are logical names inside one keyspace.
 
 services:
   # The event log. Published on the host port because in this topology the Rust
@@ -52,42 +37,148 @@ services:
       retries: 20
       start_period: 5s
 
-  user-service-db:
-    <<: *surrealdb
+  # ─── storage ──────────────────────────────────────────────────────────────
+  #
+  # PD + TiKV are the authoritative store now, and the only thing in this file
+  # holding a volume that matters. The five SurrealDB containers that used to sit
+  # here were caches: `docker compose down -v` cost a replay. These are not — down
+  # -v is data loss.
+
+  # The placement driver: cluster metadata, region placement, and the timestamp
+  # oracle every transaction takes its start and commit timestamps from.
+  pd:
+    image: pingcap/pd:v8.5.7
+    restart: unless-stopped
+    command:
+      - --name=pd0
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      # Must be the service name, not 0.0.0.0: this is the address PD hands back
+      # to clients, and SurrealDB dials whatever it is told. With 0.0.0.0 the
+      # connection succeeds and then every request goes nowhere.
+      - --advertise-client-urls=http://pd:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd0=http://pd:2380
+      # `[replication] max-replicas = 1`. Not optional on one TiKV node — the
+      # default of 3 leaves every region unplaceable, the cluster never reports
+      # healthy, and writes hang rather than fail. See the file.
+      - --config=/pd.toml
+    volumes:
+      - ./tikv/pd.toml:/pd.toml:ro
+      - pd-data:/data
+    ports:
+      - "2379:2379"
+    healthcheck:
+      test: ["CMD", "/pd-ctl", "-u", "http://127.0.0.1:2379", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  tikv:
+    image: pingcap/tikv:v8.5.7
+    restart: unless-stopped
+    command:
+      - --addr=0.0.0.0:20160
+      # Same reasoning as PD's advertise-client-urls: this is what PD records and
+      # hands to clients as the location of this store.
+      - --advertise-addr=tikv:20160
+      - --status-addr=0.0.0.0:20180
+      - --data-dir=/data/tikv
+      - --pd-endpoints=pd:2379
+      # Caps the block cache. Untuned, TiKV sizes itself to the host and collides
+      # with the build budget CLAUDE.md pins `jobs = 4` for.
+      - --config=/tikv.toml
+    volumes:
+      - ./tikv/tikv.toml:/tikv.toml:ro
+      - tikv-data:/data
+    depends_on:
+      pd:
+        condition: service_healthy
+
+  # One SurrealDB for every service, because on TiKV it holds nothing — the five
+  # separate processes only ever existed to own five separate datastores. Each
+  # service selects its own database (SURREALDB_DB in its .env); the namespace is
+  # `main` for all of them.
+  #
+  # No volume, and no --import-file: the data lives in TiKV, and the schemas are
+  # applied once by schema-import below rather than by every boot of every
+  # instance.
+  surrealdb:
+    # Pinned to the same version as the `surrealdb` crate in the workspace Cargo.toml.
+    # Move both together — a client/server version split makes any result here mean two
+    # things at once — and wipe with `down -v` when you do: a 3.2.1 server cannot read
+    # a datastore 3.2.4 wrote, and fails with `Failed to get table` rather than saying
+    # anything about versions.
+    image: surrealdb/surrealdb:v3.2.4
+    restart: unless-stopped
+    command:
+      - start
+      - --log=info
+      - --user=root
+      - --pass=root
+      - tikv://pd:2379
     ports:
       - "8000:8000"
-    volumes:
-      - ../schemas/user-schema.surql:/schema.surql:ro
+    depends_on:
+      - tikv
+    healthcheck:
+      # Distroless image (no shell), so exec form only. Subcommand is `is-ready`.
+      test:
+        ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
 
-  booking-service-db:
-    <<: *surrealdb
-    ports:
-      - "8001:8000"
+  # Applies each schema to its own database, once, then exits.
+  #
+  # This used to be `--import-file` on every SurrealDB container's boot, which was
+  # free because each wrote to its own private datastore. Against one shared TiKV
+  # keyspace that becomes N instances issuing the same `DEFINE ... OVERWRITE`
+  # statements concurrently — the exact optimistic write conflict the booking path
+  # has to defend against. So it runs exactly once, from one place.
+  #
+  # `restart: "no"` because this is a job, not a service: compose would otherwise
+  # treat its clean exit as a crash and run it forever.
+  # curl, not the surrealdb image: that one is distroless, so there is no shell to
+  # run a loop in. And POST /sql rather than the `surreal import` CLI or POST
+  # /import — /import rejects anything without an `OPTION IMPORT;` preamble the
+  # schemas do not carry, and /sql runs DEFINE statements with full side effects,
+  # which is what applying a schema is.
+  #
+  # The `surreal-db` header is only a fallback. Each schema opens with
+  # `USE NS main DB <service>;` and that statement wins, so this loop needs no
+  # per-file configuration and the file stays the single source of its own
+  # database name. Verified: importing user-schema.surql with `surreal-db: other`
+  # still lands the tables in `user` and never creates `other`.
+  schema-import:
+    image: curlimages/curl:latest
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for s in user spot booking payment view; do
+          echo "applying $$s-schema.surql"
+          out=$$(curl -sS --fail-with-body -X POST http://surrealdb:8000/sql \
+            -u root:root \
+            -H 'surreal-ns: main' -H 'surreal-db: main' \
+            -H 'Accept: application/json' \
+            --data-binary "@/schemas/$$s-schema.surql")
+          # /sql answers 200 even when individual statements fail, so the status
+          # code alone would let a broken schema through silently.
+          case "$$out" in
+            *'"status":"ERR"'*) echo "FAILED: $$out"; exit 1 ;;
+          esac
+        done
+        echo "all schemas applied"
     volumes:
-      - ../schemas/booking-schema.surql:/schema.surql:ro
-
-  spot-service-db:
-    <<: *surrealdb
-    ports:
-      - "8002:8000"
-    volumes:
-      - ../schemas/spot-schema.surql:/schema.surql:ro
-
-  # The combined read model. Rebuildable from the log, so losing this volume
-  # costs a replay, not data.
-  view-service-db:
-    <<: *surrealdb
-    ports:
-      - "8003:8000"
-    volumes:
-      - ../schemas/view-schema.surql:/schema.surql:ro
-
-  payment-service-db:
-    <<: *surrealdb
-    ports:
-      - "8004:8000"
-    volumes:
-      - ../schemas/payment-schema.surql:/schema.surql:ro
+      - ../schemas:/schemas:ro
+    depends_on:
+      surrealdb:
+        condition: service_healthy
 
   # Delivers Stripe webhooks to payment-service without a public URL.
   #
@@ -147,3 +238,9 @@ services:
       - ./Caddyfile-dev:/etc/caddy/Caddyfile:ro
       - ../apps/frontend/dist:/srv/dist:ro
 
+# The authoritative data. Named volumes rather than the container's own layer,
+# because unlike every SurrealDB container this file used to run, these do NOT
+# rebuild from the log — `docker compose down -v` is data loss, not a replay.
+volumes:
+  pd-data:
+  tikv-data:

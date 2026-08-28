@@ -28,16 +28,31 @@ kubectl create secret generic app-secrets \
   --from-env-file=k8s/secrets.env \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Deliberately no `kubectl rollout restart` here. The projection stores are
-# disposable, so restarting a pod throws its database away and replays the whole
-# log to rebuild it — too expensive to do on every deploy on the off chance a
-# secret moved. Rotating one is an explicit
-# `kubectl rollout restart deployment -n ourdriveway`; a schema change rolls
-# itself via checksum/schemas in services.yaml.
+# Deliberately no `kubectl rollout restart` here. A pod picks up a rotated secret
+# at its next start, and rolling every deployment on the off chance one moved is
+# noise. Rotating one is an explicit
+# `kubectl rollout restart deployment -n ourdriveway`.
+#
+# A schema change needs no roll at all any more: it used to, because every pod
+# carried a SurrealDB sidecar that re-imported at boot, so services.yaml rolled
+# them via a checksum annotation. The schemas are applied to the shared datastore
+# by the schema-import Job, which re-runs on every upgrade, and no service holds a
+# copy to go stale.
 SET_FILES=()
 for s in user booking spot view payment; do
   SET_FILES+=(--set-file "schemas.$s=schemas/$s-schema.surql")
 done
+
+# Untuned, TiKV sizes its block cache to the machine — ~45% of system memory. On a
+# k3d cluster that machine is a laptop that is also running a cargo build, which
+# CLAUDE.md already pins `jobs = 4` to survive. Same file the compose dev stack
+# mounts, rather than a second copy of the same numbers in values-local.yaml.
+#
+# Deliberately not applied to prod: a real deployment should let TiKV size itself
+# to a node it does not share.
+if [[ "$ENV" == local ]]; then
+  SET_FILES+=(--set-file "tikv.config=docker/tikv/tikv.toml")
+fi
 
 helm upgrade --install ourdriveway k8s/chart \
   --namespace "$NS" \

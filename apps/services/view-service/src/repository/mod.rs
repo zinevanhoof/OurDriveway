@@ -39,11 +39,12 @@ pub mod user_repository;
 
 /// Round-trips the read model through a real SurrealDB.
 ///
-/// `#[ignore]`d — needs `view-service-db` on :8003 with `schemas/view-schema.surql`
-/// imported, and CI runs `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the shared SurrealDB on :8000 with
+/// `schemas/view-schema.surql` imported into the `view` database, and CI runs
+/// `cargo test --workspace` with no database:
 ///
 /// ```sh
-/// docker compose -f docker/docker-compose-dev.yml up -d view-service-db
+/// docker compose -f docker/docker-compose-dev.yml up -d surrealdb schema-import
 /// cargo test --workspace -- --ignored
 /// ```
 ///
@@ -76,9 +77,9 @@ mod live_tests {
 
     async fn db() -> Arc<Surreal<Client>> {
         Arc::new(
-            shared::db::connect("127.0.0.1:8003", "root", "root")
+            shared::db::connect("127.0.0.1:8000", "root", "root", "view")
                 .await
-                .expect("view-service-db on :8003 — see this module's docs"),
+                .expect("shared surrealdb on :8000, db `view` — see this module's docs"),
         )
     }
 
@@ -123,6 +124,7 @@ mod live_tests {
     fn a_user(id: Uuid) -> ViewUser {
         ViewUser {
             id,
+            version: 1,
             first_name: "Ada".to_string(),
             last_name: "Lovelace".to_string(),
             profile_picture: None,
@@ -135,7 +137,6 @@ mod live_tests {
         SpotCreated {
             spot_id,
             owner_id,
-            shard: "00".to_string(),
             title: "Driveway".to_string(),
             description: None,
             price_per_hour_cents: 250,
@@ -212,7 +213,10 @@ mod live_tests {
         let (spot_id, owner_id) = (Uuid::now_v7(), Uuid::now_v7());
         let at = Utc::now();
 
-        // The owner has not been projected yet, so the link cannot resolve.
+        // The owner has not been projected yet, and the link is written anyway.
+        // That is the fix, not a leak: `owner` is `option<record<user>>` with no
+        // existence constraint, so it reads as absent until the row lands and then
+        // resolves itself — where the old subquery left it NONE for good.
         spots
             .merge(
                 spot_id,
@@ -223,17 +227,16 @@ mod live_tests {
         spots.link_owner(&spot_id, &owner_id).await.unwrap();
         assert_eq!(
             link_of(&db, "spot", spot_id, "owner").await,
-            None,
-            "the link must resolve to NONE until the user exists"
+            Some(owner_id),
+            "the link must be written whether or not the user exists yet"
         );
 
-        // Now the owner lands, and backfill points every waiting row at them.
+        // The owner lands. Nothing has to revisit the spot for the link to work.
         users.upsert(a_user(owner_id)).await.unwrap();
-        users.backfill_links(&owner_id).await.unwrap();
         assert_eq!(
             link_of(&db, "spot", spot_id, "owner").await,
             Some(owner_id),
-            "backfill must fill the gap the subquery left"
+            "the link must still point at the owner once they arrive"
         );
 
         // A later SPOTS edit must not disturb it.
@@ -287,6 +290,7 @@ mod live_tests {
         bookings
             .upsert(ViewBooking {
                 id: booking_id,
+                version: 1,
                 spot_id,
                 owner_id,
                 renter_id,
@@ -365,6 +369,7 @@ mod live_tests {
         payouts
             .upsert(ViewPayout {
                 id: payout_id,
+                version: 1,
                 owner_id,
                 amount: 700,
                 created_at: Utc::now().into(),
@@ -374,19 +379,19 @@ mod live_tests {
         payouts.link_owner(&payout_id, &owner_id).await.unwrap();
         assert_eq!(
             link_of(&db, "payout", payout_id, "owner").await,
-            None,
-            "no owner projected yet, so the subquery yields NONE"
+            Some(owner_id),
+            "the link must be written whether or not the owner exists yet"
         );
 
-        // The regression this table's backfill was added for: a payout whose owner
-        // had not been projected kept `owner = NONE` permanently, because nothing
-        // else ever revisited the row.
+        // The regression this covers: a payout whose owner had not been projected
+        // kept `owner = NONE` permanently, because nothing else ever revisited the
+        // row. It used to be fixed by a backfill pass when the user arrived; it is
+        // now fixed by never leaving the gap in the first place.
         users.upsert(a_user(owner_id)).await.unwrap();
-        users.backfill_links(&owner_id).await.unwrap();
         assert_eq!(
             link_of(&db, "payout", payout_id, "owner").await,
             Some(owner_id),
-            "backfill must reach payout, not just spot and booking"
+            "the link must still point at the owner once they arrive"
         );
 
         drop_row(&db, "payout", payout_id).await;

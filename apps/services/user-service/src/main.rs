@@ -1,15 +1,12 @@
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
     routing::{patch, post},
 };
-use bus::AppliedSeqs;
 use shared::env;
 
 use crate::{
-    projector::{SessionProjector, UserProjector},
     repository::{
         refresh_token_repository::RefreshTokenRepository, user_repository::UserRepository,
     },
@@ -37,10 +34,12 @@ pub struct Config {
     pub surrealdb_addr: String,
     pub surrealdb_user: String,
     pub surrealdb_pass: String,
+    /// This service's own database inside the shared `main` namespace. Every
+    /// service used to be "main"; on TiKV they share one keyspace, so this is
+    /// what keeps their tables apart.
+    pub surrealdb_db: String,
     pub nats_url: String,
     pub port: u16,
-    /// 0 disables snapshots entirely — see `bus::snapshot::install`.
-    pub snapshot_interval_secs: u64,
     pub jwt_secret: String,
     /// Verification links only, and deliberately NOT `jwt_secret`. `JwtClaims`
     /// carries no purpose or audience field, so a link signed with the access
@@ -58,9 +57,9 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     surrealdb_addr: env::require("SURREALDB_ADDR"),
     surrealdb_user: env::require("SURREALDB_USER"),
     surrealdb_pass: env::require("SURREALDB_PASS"),
+    surrealdb_db: env::require("SURREALDB_DB"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
-    snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
     jwt_secret: env::require("JWT_SECRET"),
     email_token_secret: env::require("EMAIL_TOKEN_SECRET"),
     jwt_expiration: env::require_parsed("JWT_EXPIRATION"),
@@ -68,7 +67,6 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
 });
 
 mod auth;
-mod projector;
 mod repository;
 mod route;
 mod service;
@@ -97,87 +95,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &CONFIG.surrealdb_addr,
         &CONFIG.surrealdb_user,
         &CONFIG.surrealdb_pass,
+        &CONFIG.surrealdb_db,
     )
     .await?;
 
-    // The two projectors take an owned client each, because `Surreal::begin`
-    // consumes one and each holds its own open transaction. That is the floor:
-    // two sessions, cloned once here rather than once per event.
-    let users_client = db.clone();
-    let sessions_client = db.clone();
-
-    // Everything else shares one session. `Surreal::clone` would mint another and
-    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
-    // because nothing re-authenticates per request — see `shared::db::connect`.
+    // One connection for the whole process — election, relay, handlers and the await
+    // layer all share it. `Surreal::clone` would mint a session and replay the root
+    // sign-in onto it; cloning the `Arc` is a refcount bump. The sessions that do get
+    // minted are per *transaction*, in `shared::db::begin`, and die with it.
     let db = Arc::new(db);
+    let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
-    let readiness = bus::Readiness::new(
-        js.client().clone(),
-        &[
-            shared::events::STREAM_USERS,
-            shared::events::STREAM_SESSIONS,
-        ],
-    );
+    // No streams: this service projects nothing now. It writes its own rows
+    // directly, so "am I caught up" has no meaning here and `/readyz` reduces to
+    // "is NATS reachable" — which still matters, because the outbox relay needs it.
+    let readiness = bus::Readiness::new(js.client().clone(), &[]);
 
-    // No-op when SNAPSHOT_INTERVAL_SECS=0, which is how this runs with a
-    // disposable projection store: every start replays from sequence 1.
-    bus::snapshot::install(
-        &js,
-        bus::SnapshotConfig {
-            db_addr: &CONFIG.surrealdb_addr,
-            db_user: &CONFIG.surrealdb_user,
-            db_pass: &CONFIG.surrealdb_pass,
-            service: "user-service",
-            streams: vec![
-                shared::events::STREAM_USERS,
-                shared::events::STREAM_SESSIONS,
-            ],
-            every_secs: CONFIG.snapshot_interval_secs,
-        },
-    )
-    .await?;
 
-    let users_applied = readiness
-        .applied_rx(shared::events::STREAM_USERS)
-        .expect("USERS registered above");
-    let sessions_applied = readiness
-        .applied_rx(shared::events::STREAM_SESSIONS)
-        .expect("SESSIONS registered above");
 
-    // Two projectors, two streams, two independent consumers. `Tx` is the adapter
-    // that opens a transaction per event, applies, advances the cursor inside it
-    // and commits — so neither projector below can forget any of that.
-    tokio::spawn(bus::projector::run(
-        js.clone(),
-        bus::Tx::new(UserProjector, users_client),
-        readiness.clone(),
-    ));
-    tokio::spawn(bus::projector::run(
-        js.clone(),
-        bus::Tx::new(SessionProjector, sessions_client),
-        readiness.clone(),
-    ));
+    // For the outbox relay, which is now the only thing here that must run on
+    // exactly one instance. There are no projectors left to elect for: this
+    // service writes its own rows inside the request's transaction, and the event
+    // goes into `_outbox` in that same transaction.
+    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
 
-    // Read-your-own-writes, driven by the client rather than by the handler: a
-    // write answers with the position its event landed at, the client echoes it as
-    // `X-Await-Seq`, and this waits for *whichever* replica takes the next request
-    // to catch up. That is why no service below calls `await_applied` any more —
-    // it could only ever wait on the replica that handled the write.
-    let applied = AppliedSeqs(Arc::new(HashMap::from([
-        (shared::events::STREAM_USERS, users_applied),
-        (shared::events::STREAM_SESSIONS, sessions_applied),
-    ])));
+    // Carries every USERS and SESSIONS event this service commits. No longer
+    // scaffolding — this is the only path by which those events reach NATS.
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
+
 
     let state = AppState {
         user_service: Arc::new(UserService {
             users: UserRepository { q: db.clone() },
-            js: js.clone(),
         }),
         refresh_token_service: Arc::new(RefreshTokenService {
             tokens: RefreshTokenRepository { q: db },
-            js,
         }),
     };
 
@@ -207,10 +161,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .merge(api_router)
         // On the API only, and before health is merged: `/readyz` reporting how far
         // behind a projector is must never itself wait for that projector.
+        // Waits on the aggregate versions a client echoes back, against this
+        // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            applied,
-            bus::await_seq::await_seq,
+            bus::AwaitVersions(await_db),
+            bus::await_version::await_version,
         ))
+        // After the layer, deliberately — a backfill is not a client read and has
+        // no version to wait on. Not under `/api` either, which is what keeps it
+        // off the ingress; see `route::user::backfill`.
+        .route("/internal/backfill", post(route::user::backfill))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

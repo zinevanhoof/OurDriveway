@@ -3,17 +3,14 @@ use chrono::{DateTime, Utc};
 use shared::{
     domain_models::{
         booking::status as booking_status,
-        payment::{BookingMirror, BookingMirrorPatch, Payment, PaymentPatch, Payout, status},
+        payment::{BookingMirror, BookingMirrorPatch},
     },
     error::myerror::MyResult,
-    events::{STREAM_BOOKINGS, STREAM_PAYMENTS, booking::BookingEvent, payment::PaymentEvent},
+    events::{STREAM_BOOKINGS, booking::BookingEvent},
 };
 use surrealdb::{engine::remote::ws::Client, method::Transaction};
 
-use crate::repository::{
-    booking_mirror_repository::BookingMirrorRepository, payment_repository::PaymentRepository,
-    payout_repository::PayoutRepository,
-};
+use crate::repository::booking_mirror_repository::BookingMirrorRepository;
 
 /// payment-service consumes BOOKINGS as well as its own stream, for two things it
 /// cannot answer otherwise: what a booking costs and who it belongs to (before a
@@ -27,6 +24,13 @@ pub struct BookingProjector;
 
 impl Projector for BookingProjector {
     const STREAM: &'static str = STREAM_BOOKINGS;
+    /// Not `payment-bookings` — that is [`crate::worker::BookingWorker`]'s, and this
+    /// is the one place in the codebase where a projector and a worker read the same
+    /// stream. Two consumers, deliberately: the projector delivers from sequence 1 to
+    /// every replica, the worker delivers new messages to one. Sharing a name asks
+    /// JetStream for both at once, and it refuses — "deliver policy can not be
+    /// updated" — leaving whichever lost the race permanently stalled.
+    const DURABLE: &'static str = "payment-booking-mirror";
     type Event = BookingEvent;
 
     async fn apply(
@@ -34,9 +38,10 @@ impl Projector for BookingProjector {
         tx: &Transaction<Client>,
         event: BookingEvent,
         _at: DateTime<Utc>,
-        _seq: u64,
+        version: u64,
     ) -> MyResult<()> {
         let bookings = BookingMirrorRepository { q: tx };
+        let booking_id = event.booking_id();
 
         match event {
             // `upsert`, not `merge`: BookingCreated is always the first event for a
@@ -73,90 +78,17 @@ impl Projector for BookingProjector {
                     )
                     .await
             }
-        }
+        }?;
+
+        shared::db::set_version(tx, "booking", &booking_id, version).await
     }
 }
 
-/// This service's own stream, projected back into the `payment` and `payout` tables.
-///
-/// Handlers publish and never write, so this is the only path by which a payment row
-/// comes to exist — including the one the request that created it will read back.
-pub struct PaymentProjector;
-
-impl Projector for PaymentProjector {
-    const STREAM: &'static str = STREAM_PAYMENTS;
-    type Event = PaymentEvent;
-
-    async fn apply(
-        &self,
-        tx: &Transaction<Client>,
-        event: PaymentEvent,
-        _at: DateTime<Utc>,
-        _seq: u64,
-    ) -> MyResult<()> {
-        let payments = PaymentRepository { q: tx };
-
-        match event {
-            PaymentEvent::Created(e) => payments.upsert(Payment::created(e)).await,
-
-            // Reachable from `created` *or* `failed`: a renter whose first attempt was
-            // declined retries on the same session, and refusing that transition would
-            // leave a paid booking stuck as failed.
-            PaymentEvent::Succeeded {
-                payment_id,
-                intent_id,
-                ..
-            } => {
-                payments
-                    .transition(
-                        payment_id,
-                        &status::UNPAID,
-                        PaymentPatch::succeeded(intent_id),
-                    )
-                    .await
-            }
-
-            // From itself as well as from `created`: two declines in a row are two
-            // genuine failures and the second must still record its reason.
-            PaymentEvent::Failed {
-                payment_id, reason, ..
-            } => {
-                payments
-                    .transition(payment_id, &status::UNPAID, PaymentPatch::failed(reason))
-                    .await
-            }
-
-            PaymentEvent::Refunded {
-                payment_id,
-                refund_id,
-                ..
-            } => {
-                payments
-                    .transition(
-                        payment_id,
-                        &[status::SUCCEEDED],
-                        PaymentPatch::refunded(refund_id),
-                    )
-                    .await
-            }
-
-            // An unpaid session, which is `created` *or* `failed` — a booking whose
-            // renter was declined and then walked away still has a live session that
-            // has to be voided.
-            PaymentEvent::SessionExpired { payment_id, .. } => {
-                payments
-                    .transition(payment_id, &status::UNPAID, PaymentPatch::expired())
-                    .await
-            }
-
-            // A different table entirely, and the one event here that is not about a
-            // payment. `Payout::requested` is what turns the event into a row.
-            ref e @ PaymentEvent::PayoutRequested { .. } => {
-                let Some(payout) = Payout::requested(e) else {
-                    return Ok(());
-                };
-                PayoutRepository { q: tx }.upsert(payout).await
-            }
-        }
-    }
-}
+// `PaymentProjector` is gone. This service's own PAYMENTS events are no longer
+// projected back in: `payment_service` and `settlement_worker_service` write the
+// `payment` and `payout` rows directly, inside the transaction that enqueues the
+// event. Consuming its own stream would have re-applied writes it had already
+// made.
+//
+// What remains is the BOOKINGS mirror above — a *foreign* stream, which is exactly
+// what a projector is still for.

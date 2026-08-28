@@ -40,6 +40,8 @@ pub mod status {
 #[derive(Clone, Debug, SurrealValue)]
 pub struct Payment {
     pub id: Uuid,
+    /// See `Booking::version` — same field, same three jobs.
+    pub version: u64,
     /// `payment_booking … UNIQUE`, and load-bearing: one booking gets at most one
     /// PaymentIntent, so a second row for one booking means the renter could be
     /// charged twice.
@@ -61,10 +63,6 @@ pub struct Payment {
     /// Written in the *same patch* as `status = 'succeeded'` — see
     /// [`PaymentPatch::succeeded`].
     pub intent_id: Option<String>,
-    /// The shard this payment's subject lives on, stored rather than recomputed:
-    /// `shard_of` is deterministic only for a fixed SHARD_COUNT, and raising it
-    /// would split one payment's history across two subjects.
-    pub booking_shard: String,
     /// One of [`status`].
     pub status: String,
     /// Set together with `status = 'refunded'`. Its presence is what makes the
@@ -79,16 +77,16 @@ pub struct Payment {
 
 impl Payment {
     /// The row a `Created` writes. Everything else is a patch on top of this.
-    pub fn created(e: PaymentCreated) -> Self {
+    pub fn created(e: PaymentCreated, version: u64) -> Self {
         Self {
             id: e.payment_id,
+            version,
             booking_id: e.booking_id,
             owner_id: e.owner_id,
             renter_id: e.renter_id,
             amount_cents: e.amount_cents,
             session_id: e.session_id,
             intent_id: None,
-            booking_shard: e.booking_shard,
             status: status::CREATED.to_string(),
             refund_id: None,
             failure_reason: None,

@@ -1,49 +1,66 @@
-// Read-your-own-writes for a publish-only backend.
+// Read-your-own-writes, keyed by aggregate.
 //
-// A write doesn't return a row — it returns the position its event landed at in
-// the log (`202 { id, seq: "SPOTS:4712" }`). The projections that answer reads
-// are per-instance and eventually consistent, so an immediate follow-up read can
-// legitimately hit an instance that hasn't applied that event yet: you create a
-// spot and it isn't in the list.
+// A write answers with the version its aggregate reached — `202 { id, seq:
+// "spot:019f…@3" }`. Reads are served from projections that lag the write by
+// however long the outbox relay and the projector take, so an immediate follow-up
+// read can legitimately land before its own write is visible: you create a spot
+// and it isn't in the list.
 //
-// Echoing the position back on subsequent requests lets view-service block until
-// its own projector has caught up to it (see await_seq.rs, capped at 2s).
+// Echoing the token back on subsequent requests lets the read side block until it
+// has reached that version (see bus/src/await_version.rs, capped at 2s).
+//
+// This used to carry a log position — `SPOTS:4712`. Two reasons it no longer can:
+// once the database is authoritative a write commits *before* its event reaches
+// NATS, so no stream sequence exists when the route has to answer; and a stream
+// position waited on every spot in the system rather than the one just written.
 
-const HEADER = "X-Await-Seq";
+const HEADER = "X-Await-Version";
 
-/** The newest position this client has written, per stream. */
+/** Newest version this client has written, per aggregate (`spot:019f…`). */
 let latest: Record<string, number> = {};
 
 /**
- * Records the log position from a write response.
+ * Records the version token from a write response.
  *
- * One position per stream, each only ever moving forward. It used to be a single
- * slot that a write to another stream replaced — fine while only spot and booking
- * writes carried a seq, but user-service now answers login and refresh with a
- * SESSIONS position, and those are frequent enough to have displaced the USERS or
- * SPOTS position a following read still needed.
+ * One entry per aggregate, each only ever moving forward. Per *aggregate* and not
+ * per stream: two spots are two independent rows, and waiting on one must not make
+ * a reader wait on the other.
  */
-export function recordSeq(seq: string | null | undefined): void {
-  if (!seq || !/^[A-Z_]+:\d+$/.test(seq)) return;
+export function recordSeq(token: string | null | undefined): void {
+  if (!token) return;
 
-  const [stream, value] = seq.split(":");
-  latest[stream] = Math.max(Number(value), latest[stream] ?? 0);
+  // `<table>:<uuid>@<version>`. Split from the right on `@` so the aggregate half
+  // stays intact, mirroring `parse_version` on the server.
+  const at = token.lastIndexOf("@");
+  if (at < 0) return;
+
+  const aggregate = token.slice(0, at);
+  const digits = token.slice(at + 1);
+
+  // `/^\d+$/` rather than `Number.isInteger(Number(digits))`: `Number("")` is 0,
+  // and 0 is a perfectly good integer — so `spot:…@` would have recorded version
+  // 0 instead of being rejected. The self-check below caught exactly that.
+  if (!aggregate.includes(":") || !/^\d+$/.test(digits)) return;
+
+  const version = Number(digits);
+
+  latest[aggregate] = Math.max(version, latest[aggregate] ?? 0);
 }
 
 /**
- * Header for every stream this client has written, or nothing if it hasn't.
+ * Header for every aggregate this client has written, or nothing if it hasn't.
  *
- * `SPOTS:4712,SESSIONS:19` — the server waits for each in turn, under one shared
- * timeout, and ignores streams it doesn't project.
+ * `spot:019f…@3,user:01a0…@7` — the server waits for each in turn, under one
+ * shared timeout, and skips aggregates it holds no table for.
  *
- * Deliberately never cleared. Once a projector is past a position the check is a
- * single integer comparison that returns immediately, so a stale entry costs
- * nothing — while clearing after one use would leave concurrent requests, and
- * requests that land on a *different* instance later, unprotected.
+ * Deliberately never cleared. Once a projection is past a version the check is a
+ * single comparison that returns immediately, so a stale entry costs nothing —
+ * while clearing after one use would leave concurrent requests, and requests that
+ * land on a different instance later, unprotected.
  */
 export function awaitSeqHeader(): Record<string, string> {
   const value = Object.entries(latest)
-    .map(([stream, seq]) => `${stream}:${seq}`)
+    .map(([aggregate, version]) => `${aggregate}@${version}`)
     .join(",");
 
   return value ? { [HEADER]: value } : {};
@@ -64,52 +81,44 @@ export function demo() {
       );
   };
 
+  const A = "spot:019f0000-0000-7000-8000-000000000001";
+  const B = "booking:019f0000-0000-7000-8000-000000000002";
+
   resetSeq();
   eq(awaitSeqHeader(), {}, "no writes yet -> no header");
 
-  recordSeq("SPOTS:10");
-  eq(awaitSeqHeader(), { "X-Await-Seq": "SPOTS:10" }, "first write");
+  recordSeq(`${A}@10`);
+  eq(awaitSeqHeader(), { "X-Await-Version": `${A}@10` }, "first write");
 
-  recordSeq("SPOTS:4"); // an older ack arriving late must not rewind us
-  eq(awaitSeqHeader(), { "X-Await-Seq": "SPOTS:10" }, "never moves backwards");
+  recordSeq(`${A}@4`); // an older ack arriving late must not rewind us
+  eq(awaitSeqHeader(), { "X-Await-Version": `${A}@10` }, "never moves backwards");
 
-  recordSeq("SPOTS:11");
-  eq(awaitSeqHeader(), { "X-Await-Seq": "SPOTS:11" }, "moves forward");
+  recordSeq(`${A}@11`);
+  eq(awaitSeqHeader(), { "X-Await-Version": `${A}@11` }, "moves forward");
 
-  // A second stream is kept alongside the first, not instead of it — the whole
-  // point of the map. A login must not cost a pending spot write its position.
-  recordSeq("BOOKINGS:2");
+  // A second aggregate is kept alongside the first, not instead of it — the whole
+  // point of the map. A booking must not cost a pending spot write its position.
+  recordSeq(`${B}@2`);
   eq(
     awaitSeqHeader(),
-    { "X-Await-Seq": "SPOTS:11,BOOKINGS:2" },
-    "streams are tracked side by side",
+    { "X-Await-Version": `${A}@11,${B}@2` },
+    "aggregates are tracked side by side",
   );
 
-  recordSeq("SPOTS:12"); // and each still moves independently
+  recordSeq(`${A}@12`); // and each still moves independently
   eq(
     awaitSeqHeader(),
-    { "X-Await-Seq": "SPOTS:12,BOOKINGS:2" },
-    "one stream advancing leaves the other alone",
+    { "X-Await-Version": `${A}@12,${B}@2` },
+    "each aggregate moves on its own",
   );
 
-  for (const junk of [
-    null,
-    undefined,
-    "",
-    "SPOTS",
-    "SPOTS:",
-    ":5",
-    "spots:5",
-    "SPOTS:x",
-  ]) {
-    recordSeq(junk as string);
-    eq(
-      awaitSeqHeader(),
-      { "X-Await-Seq": "SPOTS:12,BOOKINGS:2" },
-      `junk ignored: ${junk}`,
-    );
-  }
-
+  // Junk must not land an entry. The old stream form is junk now, which is the
+  // one that would otherwise slip through: it has no `@`.
   resetSeq();
-  return "awaitSeq: all checks passed";
+  for (const bad of ["SPOTS:4712", "", "nope", `${A}@`, `${A}@x`, "@3"]) {
+    recordSeq(bad);
+  }
+  eq(awaitSeqHeader(), {}, "malformed tokens are ignored");
+
+  return "ok";
 }

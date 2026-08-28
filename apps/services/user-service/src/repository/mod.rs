@@ -22,11 +22,12 @@ pub mod user_repository;
 
 /// Round-trips both tables through a real SurrealDB.
 ///
-/// `#[ignore]`d — needs `user-service-db` on :8000 with `schemas/user-schema.surql`
-/// imported, and CI runs `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the shared SurrealDB on :8000 with
+/// `schemas/user-schema.surql` imported into the `user` database, and CI runs
+/// `cargo test --workspace` with no database:
 ///
 /// ```sh
-/// docker compose -f docker/docker-compose-dev.yml up -d user-service-db
+/// docker compose -f docker/docker-compose-dev.yml up -d surrealdb schema-import
 /// cargo test --workspace -- --ignored
 /// ```
 ///
@@ -52,9 +53,9 @@ mod live_tests {
 
     async fn db() -> Arc<Surreal<Client>> {
         Arc::new(
-            shared::db::connect("127.0.0.1:8000", "root", "root")
+            shared::db::connect("127.0.0.1:8000", "root", "root", "user")
                 .await
-                .expect("user-service-db on :8000 — see this module's docs"),
+                .expect("shared surrealdb on :8000, db `user` — see this module's docs"),
         )
     }
 
@@ -70,7 +71,7 @@ mod live_tests {
     fn a_user(id: Uuid, email: &str) -> User {
         User {
             id,
-            shard: "00".to_string(),
+            version: 1,
             first_name: "Ada".to_string(),
             last_name: "Lovelace".to_string(),
             email: email.to_string(),
@@ -117,7 +118,6 @@ mod live_tests {
         assert!(got.email_verified);
         assert_eq!(got.password, "$argon2id$vTEST", "absent columns survive");
         assert_eq!(got.first_name, "Ada");
-        assert_eq!(got.shard, "00", "shard is not patchable and must not move");
 
         drop_row(&db, "user", id).await;
     }
@@ -141,7 +141,6 @@ mod live_tests {
             .upsert(RefreshToken {
                 id: token_id,
                 user_id,
-                shard: "00".to_string(),
                 token_hash: token_hash.clone(),
                 jti: Uuid::now_v7().into(),
                 created_at: Utc::now().into(),

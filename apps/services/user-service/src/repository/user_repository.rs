@@ -31,6 +31,7 @@ impl<Q: Querier> UserRepository<Q> {
         Ok(self
             .q
             .q("SELECT record::id(id) AS id,
+                       version        ?? 0     AS version,
                        license_plates ?? []    AS license_plates,
                        email_verified ?? false AS email_verified,
                        *
@@ -46,11 +47,30 @@ impl<Q: Querier> UserRepository<Q> {
         Ok(self
             .q
             .q("SELECT record::id(id) AS id,
+                       version        ?? 0     AS version,
                        license_plates ?? []    AS license_plates,
                        email_verified ?? false AS email_verified,
                        *
                 FROM ONLY user WHERE email = $v LIMIT 1")
             .bind(("v", email))
+            .await?
+            .take(0)?)
+    }
+
+    /// Every user, for `UserService::backfill`.
+    ///
+    /// ponytail: reads the whole table into memory in one pass. Fine for a
+    /// maintenance endpoint on a table of accounts; page on `id` — `WHERE id > $after
+    /// ORDER BY id LIMIT $n` — if one ever gets big enough to notice.
+    pub async fn all(&self) -> MyResult<Vec<User>> {
+        Ok(self
+            .q
+            .q("SELECT record::id(id) AS id,
+                       version        ?? 0     AS version,
+                       license_plates ?? []    AS license_plates,
+                       email_verified ?? false AS email_verified,
+                       *
+                FROM user")
             .await?
             .take(0)?)
     }
@@ -80,9 +100,6 @@ impl<Q: Querier> UserRepository<Q> {
     /// `?? column` means absent-is-unchanged, and is also the ceiling: no patch can
     /// set a column back to NONE. The seven columns here are every column
     /// [`UserPatch`] carries — add one there and it has to be added here too.
-    ///
-    /// `shard` is absent on purpose: it selects the subject a user's whole history
-    /// is ordered on, so moving it would strand everything already published.
     pub async fn patch(&self, user_id: Uuid, patch: UserPatch) -> MyResult<()> {
         patch
             .bind(

@@ -31,12 +31,13 @@ pub mod status {
 #[derive(Clone, Debug, SurrealValue)]
 pub struct Booking {
     pub id: Uuid,
+    /// Bumped by booking-service inside the transaction that writes this row.
+    /// The token a client waits on, the key concurrent writers collide on, and
+    /// the gap detector for an out-of-order event — see `shared::events::Envelope`.
+    pub version: u64,
     /// A plain uuid, not a record link: the `spot` table lives in spot-service's
     /// database, so this one cannot hold a `record<spot>`.
     pub spot_id: Uuid,
-    /// Denormalised so the hold sweeper can rebuild this booking's NATS subject
-    /// without a second lookup.
-    pub spot_shard: String,
     /// Denormalised at create time so a booking can be scoped to the host without
     /// a cross-database dereference.
     pub owner_id: Uuid,
@@ -79,11 +80,11 @@ impl Booking {
     ///
     /// `at` is the envelope's clock, never this process's — every replica has to
     /// store the same `created_at` for the same event.
-    pub fn created(e: BookingCreated, at: DateTime<Utc>) -> Self {
+    pub fn created(e: BookingCreated, at: DateTime<Utc>, version: u64) -> Self {
         Self {
             id: e.booking_id,
+            version,
             spot_id: e.spot_id,
-            spot_shard: e.spot_shard,
             owner_id: e.owner_id,
             renter_id: e.renter_id,
             booked: e.booked,
@@ -112,7 +113,6 @@ mod tests {
         let e = BookingCreated {
             booking_id: Uuid::now_v7(),
             spot_id: Uuid::now_v7(),
-            spot_shard: "00".into(),
             owner_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: Default::default(),
@@ -120,7 +120,7 @@ mod tests {
             expires_at: "2026-08-03T12:00:00Z".parse().unwrap(),
             ends_at: "2026-08-03T18:00:00Z".parse().unwrap(),
         };
-        let row = Booking::created(e, Utc::now());
+        let row = Booking::created(e, Utc::now(), 1);
         assert_eq!(row.status, status::RESERVED);
         assert!(row.hold_until.is_some());
     }

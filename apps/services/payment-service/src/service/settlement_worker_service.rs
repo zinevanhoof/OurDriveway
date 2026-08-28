@@ -15,10 +15,12 @@
 //! its actual callers are — two routes — so that everything left in this file is
 //! worker-driven and the name stays true.
 
-use async_nats::jetstream::Context;
+use bus::outbox;
+use shared::db;
 use shared::{
+    domain_models::payment::{PaymentPatch, status},
     error::myerror::{MyError, MyResult},
-    events::{Envelope, payment::PaymentEvent, payment_subject},
+    events::{Envelope, aggregate_id, payment::PaymentEvent, payment_subject},
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -35,7 +37,6 @@ pub struct SettlementWorkerService {
     pub payments: PaymentRepository,
     pub bookings: BookingMirrorRepository,
     pub stripe: Arc<Stripe>,
-    pub js: Context,
 }
 
 impl SettlementWorkerService {
@@ -106,23 +107,47 @@ impl SettlementWorkerService {
             }
         };
 
+        let tx = db::begin(&self.payments.q).await?;
+        let version = db::next_version(&tx, "payment", &payment_id).await?;
+
+        // The row moves in the same transaction as the event. Guarded, so a
+        // redelivery that already applied is a no-op rather than a second refund.
+        match &event {
+            PaymentEvent::Refunded { refund_id, .. } => {
+                PaymentRepository { q: &tx }
+                    .transition(
+                        payment_id,
+                        &[status::SUCCEEDED],
+                        PaymentPatch::refunded(refund_id.clone()),
+                    )
+                    .await?;
+            }
+            PaymentEvent::SessionExpired { .. } => {
+                PaymentRepository { q: &tx }
+                    .transition(payment_id, &status::UNPAID, PaymentPatch::expired())
+                    .await?;
+            }
+            // `decide` yields only the two above.
+            _ => {}
+        }
+        db::set_version(&tx, "payment", &payment_id, version).await?;
+
         // Deterministic event id: a redelivery that gets this far — because the Stripe
-        // call succeeded but the publish or the ack did not — is discarded by the
-        // stream's duplicate window rather than recorded twice.
-        let mut envelope = Envelope::new(event, None);
+        // call succeeded but the commit did not — is discarded by the stream's
+        // duplicate window rather than recorded twice.
+        let mut envelope = Envelope::new(
+            event,
+            None,
+            aggregate_id("payment", &payment_id),
+            version,
+        );
         envelope.event_id = Uuid::new_v5(
             &Uuid::NAMESPACE_OID,
             format!("settle:{payment_id}:{}", booking.status).as_bytes(),
         );
 
-        // No compare-and-swap: one payment owns this subject, so there is no second
-        // writer to race.
-        bus::publish(
-            &self.js,
-            payment_subject(&payment.booking_shard, booking_id),
-            &envelope,
-        )
-        .await?;
+        outbox::enqueue(&tx, &payment_subject(booking_id), &envelope).await?;
+        tx.commit().await?;
 
         Ok(())
     }

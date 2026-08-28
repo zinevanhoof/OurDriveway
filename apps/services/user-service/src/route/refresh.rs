@@ -1,8 +1,6 @@
 use axum::{Json, extract::State, response::IntoResponse};
 use axum_extra::extract::CookieJar;
-use bus::format_seq;
 use shared::error::myerror::{ContextExt, MyResult};
-use shared::events::STREAM_SESSIONS;
 use shared::responses::user::AuthResponse;
 use uuid::Uuid;
 
@@ -14,7 +12,7 @@ pub async fn refresh(jar: CookieJar, State(state): State<AppState>) -> MyResult<
         .map(|c| c.value())
         .context_bad_request(("Bad Request", "Missing refresh token"))?;
 
-    let (jwt, new_refresh_token, seq) = state
+    let (jwt, new_refresh_token, token) = state
         .refresh_token_service
         .rotate(
             Uuid::parse_str(refresh_token)
@@ -26,6 +24,6 @@ pub async fn refresh(jar: CookieJar, State(state): State<AppState>) -> MyResult<
 
     Ok((
         jar,
-        Json(AuthResponse::new(jwt, format_seq(STREAM_SESSIONS, seq))),
+        Json(AuthResponse::new(jwt, token)),
     ))
 }

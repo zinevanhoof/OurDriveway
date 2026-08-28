@@ -16,6 +16,10 @@ use crate::events::payment::PaymentEvent;
 #[derive(Clone, Debug, SurrealValue)]
 pub struct Payout {
     pub id: Uuid,
+    /// Written once and never bumped — a payout does not change — but still read,
+    /// because a backfill re-emitting `PayoutRequested` has to stamp the version
+    /// view-service already recorded against it.
+    pub version: u64,
     pub owner_id: Uuid,
     pub amount_cents: i64,
     pub created_at: Datetime,
@@ -29,7 +33,7 @@ impl Payout {
     ///
     /// Takes the whole event rather than the four fields so the projector's arm
     /// stays a single line, and so the mapping lives next to the row it produces.
-    pub fn requested(event: &PaymentEvent) -> Option<Self> {
+    pub fn requested(event: &PaymentEvent, version: u64) -> Option<Self> {
         match event {
             PaymentEvent::PayoutRequested {
                 payout_id,
@@ -38,6 +42,7 @@ impl Payout {
                 requested_at,
             } => Some(Self {
                 id: *payout_id,
+                version,
                 owner_id: *owner_id,
                 amount_cents: *amount_cents,
                 // The requester's timestamp off the event, not this replica's clock.

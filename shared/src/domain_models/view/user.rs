@@ -21,6 +21,20 @@ use crate::events::user::{UserRegistered, UserUpdated};
 #[derive(Clone, Debug, SurrealValue)]
 pub struct ViewUser {
     pub id: Uuid,
+    /// user-service's version of this user, as last applied here. What
+    /// `bus::await_version` compares a client's `X-Await-Version` against.
+    ///
+    /// **A field on the model, not only a column**, and the difference is a bug that
+    /// took a rebuild to surface. This table is written with `CONTENT $row`, which
+    /// replaces the whole record — so a model without this column *clears* it. On a
+    /// row that does not exist yet the schema's `DEFAULT 0` fills it back in and
+    /// nothing looks wrong; on one that does, the write is a coercion failure
+    /// (`Expected int but found NONE`) that stalls the projector.
+    ///
+    /// Which means it only ever fired on a **re-applied** `Registered`: a backfill,
+    /// or a redelivery outside the stream's `duplicate_window`. Carrying the version
+    /// in the row is what makes the whole-row write total.
+    pub version: u64,
     pub first_name: String,
     pub last_name: String,
     pub profile_picture: Option<String>,
@@ -68,9 +82,10 @@ impl ViewUserPatch {
 impl ViewUser {
     /// The row a `Registered` writes. Safe to `upsert`: this table has no link
     /// column and no column any other stream owns.
-    pub fn registered(e: UserRegistered) -> Self {
+    pub fn registered(e: UserRegistered, version: u64) -> Self {
         Self {
             id: e.user_id,
+            version,
             first_name: e.first_name,
             last_name: e.last_name,
             profile_picture: None,
@@ -120,6 +135,7 @@ mod tests {
     fn no_credential_columns_reach_the_read_model() {
         let row = ViewUser {
             id: Uuid::nil(),
+            version: 1,
             first_name: String::new(),
             last_name: String::new(),
             profile_picture: None,

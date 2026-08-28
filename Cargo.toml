@@ -26,9 +26,25 @@ axum = { version = "0.8.9", features = ["macros"] }
 tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-# protocol-http is on top of the default protocol-ws: the app talks WebSocket,
-# but export/import (snapshots) are HTTP-engine only.
-surrealdb = { version = "3.2.4", features = ["protocol-http"] }
+# Just the default protocol-ws. `protocol-http` used to ride along because
+# export/import are HTTP-engine only and that is what bus/src/snapshot.rs used —
+# it was the only thing in the workspace that ever opened an HTTP client. TiKV is
+# durable, so snapshots are gone and so is the second engine.
+# `kv-mem` is for `bus/examples/clone_cost` alone — an embedded engine to compare
+# `Surreal::clone` against with no socket and no Argon2 sign-in in the replay.
+#
+# Here rather than in `bus`'s dev-dependencies deliberately. Under `resolver = "2"`
+# dev-dependency features are not unified into a non-dev build, so scoping it there
+# would give `cargo build --workspace` and `cargo build --workspace --all-targets`
+# different feature unions for surrealdb — and the two would then rebuild
+# surrealdb-core on every alternation, forever. See the top of CLAUDE.md.
+#
+# The price is that every service binary links a memory engine it never opens.
+#
+# Keep this in step with the server image in docker-compose-dev.yml. A 3.2.1 server
+# cannot read a datastore a 3.2.4 one wrote — it answers `Failed to get table` on the
+# definitions — so changing either version means `down -v`, not just a restart.
+surrealdb = { version = "3.2.4", features = ["kv-mem"] }
 rustls = "0.23"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"

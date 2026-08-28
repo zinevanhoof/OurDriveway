@@ -26,14 +26,18 @@ pub struct Spot {
     /// Stored as `spot:⟨uuid⟩`; every read unwraps it back to a plain uuid with
     /// `record::id(id) AS id`.
     pub id: Uuid,
+    /// Bumped by spot-service inside the transaction that writes this row. The
+    /// token a client waits on, the key concurrent writers collide on, and the gap
+    /// detector for an out-of-order event — see `shared::events::Envelope`.
+    ///
+    /// On the model rather than only in the schema so a whole-row write carries it,
+    /// and so a read can answer "which version is this" — which is what a backfill
+    /// re-emitting current state has to stamp on the events it raises.
+    pub version: u64,
     /// A plain uuid column, not a record link — see `spot_owner` in
     /// `schemas/spot-schema.surql`, and the note there about why this is set by
     /// the service from the verified claim rather than by `VALUE $token.ID`.
     pub owner_id: Uuid,
-    /// Read, never recomputed. `shard_of` would agree today, but this selects the
-    /// subject the spot's whole history lives on, so a changed SHARD_COUNT would
-    /// send its next event where no reader is looking.
-    pub shard: String,
     pub title: String,
     pub description: Option<String>,
     /// EUR cents. Named for its column, which predates the `_cents` suffix the
@@ -72,11 +76,11 @@ impl Spot {
     /// does not carry (`active`, `deleted`, and `created_at` equalling
     /// `updated_at`) are defaults of the model; they used to be literals in the
     /// projector's CONTENT block.
-    pub fn created(e: SpotCreated, at: DateTime<Utc>) -> Self {
+    pub fn created(e: SpotCreated, at: DateTime<Utc>, version: u64) -> Self {
         Self {
             id: e.spot_id,
+            version,
             owner_id: e.owner_id,
-            shard: e.shard,
             title: e.title,
             description: e.description,
             price_per_hour: e.price_per_hour_cents,
@@ -99,7 +103,7 @@ impl Spot {
 /// SpotPatch { active: Some(false), ..Default::default() }
 /// ```
 ///
-/// Only the columns an edit can touch. `owner_id`, `shard`, `location`, `address`,
+/// Only the columns an edit can touch. `owner_id`, `location`, `address`,
 /// `timezone` and `created_at` are written once by [`Spot::created`] and are not
 /// representable here — a spot cannot change hands or move.
 #[derive(Debug, Default)]
