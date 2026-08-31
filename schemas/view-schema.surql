@@ -1,4 +1,13 @@
-USE NS main DB main;
+-- One database per service inside the shared `main` namespace. Was DB main for
+-- every service, which was safe only while each ran its own SurrealDB over its
+-- own datastore; on TiKV they share one keyspace and this name is the isolation.
+--
+-- This one is load-bearing beyond isolation: the RECORD access below is defined
+-- ON DATABASE, and SurrealDB validates a record-access JWT against the ns/db/ac
+-- the token itself names. So `db` in `JwtClaims` (user-service/src/auth/jwt.rs)
+-- must read "view" to match this line. Change one and the other follows, or
+-- every GraphQL read 401s.
+USE NS main DB view;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- The combined read model. Projected from every service's event stream, with
@@ -59,6 +68,10 @@ DEFINE TABLE OVERWRITE user SCHEMAFULL PERMISSIONS
     FOR select WHERE true,
     FOR create, update, delete NONE;
 
+-- The owning service's version of this aggregate, as last applied here. A
+-- client echoes `user:<id>@7` and this is what the wait compares against.
+DEFINE FIELD OVERWRITE version ON user TYPE int DEFAULT 0;
+
 DEFINE FIELD OVERWRITE first_name      ON user TYPE string;
 DEFINE FIELD OVERWRITE last_name       ON user TYPE string;
 DEFINE FIELD OVERWRITE profile_picture ON user TYPE option<string>;
@@ -74,6 +87,10 @@ DEFINE FIELD OVERWRITE license_plates.* ON user TYPE string;
 DEFINE TABLE OVERWRITE spot SCHEMAFULL PERMISSIONS
     FOR select WHERE active = true OR owner_id = record::id($auth),
     FOR create, update, delete NONE;
+
+-- The owning service's version of this aggregate, as last applied here. A
+-- client echoes `spot:<id>@7` and this is what the wait compares against.
+DEFINE FIELD OVERWRITE version ON spot TYPE int DEFAULT 0;
 
 -- `owner` is the link that makes nested GraphQL work; `owner_id` is the plain
 -- uuid everything actually *depends* on. Permissions and GraphQL filters use the
@@ -161,6 +178,10 @@ DEFINE TABLE OVERWRITE booking SCHEMAFULL PERMISSIONS
                   OR status IN ['reserved', 'confirmed'],
     FOR create, update, delete NONE;
 
+-- The owning service's version of this aggregate, as last applied here. A
+-- client echoes `booking:<id>@7` and this is what the wait compares against.
+DEFINE FIELD OVERWRITE version ON booking TYPE int DEFAULT 0;
+
 -- Public, because these four ARE the availability answer: which spot, which slots,
 -- until when, and whether it still blocks.
 DEFINE FIELD OVERWRITE spot      ON booking TYPE option<record<spot>>;
@@ -244,6 +265,10 @@ DEFINE TABLE OVERWRITE payout SCHEMAFULL PERMISSIONS
     FOR select WHERE owner_id = record::id($auth),
     FOR create, update, delete NONE;
 
+-- The owning service's version of this aggregate, as last applied here. A
+-- client echoes `payout:<id>@7` and this is what the wait compares against.
+DEFINE FIELD OVERWRITE version ON payout TYPE int DEFAULT 0;
+
 -- `owner` is the link that makes nested GraphQL work; `owner_id` is the plain uuid
 -- the permission clause above compares against. Same pairing as booking.renter.
 DEFINE FIELD OVERWRITE owner      ON payout TYPE option<record<user>>;
@@ -254,9 +279,39 @@ DEFINE FIELD OVERWRITE created_at ON payout TYPE datetime;
 -- The history list: a host's own withdrawals, newest first.
 DEFINE INDEX OVERWRITE payout_owner ON payout FIELDS owner_id, created_at;
 
--- ─── projector cursors ──────────────────────────────────────────────────────
--- One row per stream (_projection:USERS, _projection:SPOTS, …), each written in
--- the same transaction as the data it describes.
-DEFINE TABLE OVERWRITE _projection SCHEMAFULL PERMISSIONS NONE;
-DEFINE FIELD OVERWRITE last_seq   ON _projection TYPE int;
-DEFINE FIELD OVERWRITE updated_at ON _projection TYPE datetime;
+
+-- ─── leader election ────────────────────────────────────────────────────────
+-- One row, `_lease:leader`, and it exists for the OUTBOX RELAY only.
+--
+-- The projectors do not need it: they pull from one durable consumer with
+-- `max_ack_pending: 1`, so JetStream itself hands out one event at a time across
+-- every replica, in stream order. The relay has no such backstop — it reads rows
+-- from this database and publishes them, and two relays could publish one
+-- entity's events out of order, which the downstream `WHERE status IN $from`
+-- guards drop rather than reorder.
+--
+-- Expiry is compared against `time::now()` INSIDE the database. Replicas do not
+-- share a clock; they do share this row.
+DEFINE TABLE OVERWRITE _lease SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD OVERWRITE holder     ON _lease TYPE string;
+DEFINE FIELD OVERWRITE expires_at ON _lease TYPE datetime;
+
+-- ─── transactional outbox ───────────────────────────────────────────────────
+-- Events written in the SAME transaction as the data that caused them, then
+-- moved to NATS by the relay. This is the one thing JetStream cannot provide on
+-- its own: its guarantees begin once a message is in the stream, and this closes
+-- the window before that.
+--
+-- The record id is the envelope's `event_id`, so enqueuing the same event twice
+-- is one row — the same property `Nats-Msg-Id` gives on the way out.
+DEFINE TABLE OVERWRITE _outbox SCHEMAFULL PERMISSIONS NONE;
+DEFINE FIELD OVERWRITE subject    ON _outbox TYPE string;
+-- The serialized envelope, as text so a stuck row can be read with a SELECT.
+DEFINE FIELD OVERWRITE payload    ON _outbox TYPE string;
+DEFINE FIELD OVERWRITE created_at ON _outbox TYPE datetime;
+-- The relay's read: oldest first. `id` is deliberately NOT in the index — it is
+-- the record key, not a field, and SurrealDB rejects it here ("The field 'id'
+-- does not exist"). The relay still ORDERs by `created_at, id` so two events
+-- enqueued in one transaction, sharing a timestamp, are retried in the order
+-- they were sent; only the leading column is indexed.
+DEFINE INDEX OVERWRITE _outbox_order ON _outbox FIELDS created_at;

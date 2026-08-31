@@ -1,10 +1,5 @@
 use chrono::{DateTime, Utc};
-use geo::Point;
-use surrealdb::types::{Datetime, SurrealValue};
 use uuid::Uuid;
-
-use surrealdb::types::vars;
-use surrealdb::{engine::remote::ws::Client, method::Query};
 
 use crate::{
     events::spot::{SpotCreated, SpotUpdated},
@@ -21,47 +16,53 @@ use crate::{
 ///
 /// Carries no methods beyond the event conversions below. Reading and writing it
 /// is `SpotRepository`'s job.
-#[derive(Clone, Debug, SurrealValue)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct Spot {
-    /// Stored as `spot:⟨uuid⟩`; every read unwraps it back to a plain uuid with
-    /// `record::id(id) AS id`.
+    /// A plain uuid primary key — there is nothing left to unwrap, so `SELECT *`
+    /// is enough where every read used to carry `record::id(id) AS id`.
     pub id: Uuid,
+    /// Bumped by spot-service inside the transaction that writes this row. The
+    /// token a client waits on, the key concurrent writers collide on, and the gap
+    /// detector for an out-of-order event — see `shared::events::Envelope`.
+    ///
+    /// On the model rather than only in the schema so a whole-row write carries it,
+    /// and so a read can answer "which version is this" — which is what a backfill
+    /// re-emitting current state has to stamp on the events it raises.
+    #[sqlx(try_from = "i64")]
+    pub version: u64,
     /// A plain uuid column, not a record link — see `spot_owner` in
     /// `schemas/spot-schema.surql`, and the note there about why this is set by
     /// the service from the verified claim rather than by `VALUE $token.ID`.
     pub owner_id: Uuid,
-    /// Read, never recomputed. `shard_of` would agree today, but this selects the
-    /// subject the spot's whole history lives on, so a changed SHARD_COUNT would
-    /// send its next event where no reader is looking.
-    pub shard: String,
     pub title: String,
     pub description: Option<String>,
     /// EUR cents. Named for its column, which predates the `_cents` suffix the
     /// events use; never a float, because this feeds what a renter is charged.
     pub price_per_hour: i64,
-    /// Absolute URLs. Rows written before the column existed hold NONE, which will
-    /// not deserialize into a Vec — hence `images ?? []` in every statement that
-    /// selects this table.
+    /// Absolute URLs. `text[]`, `NOT NULL DEFAULT '{}'`, so the `images ?? []` that
+    /// used to be in every statement selecting this table is gone.
     pub images: Vec<String>,
-    /// x = lng, y = lat, matching geo's convention and the argument order of the
-    /// `type::point([$lng, $lat])` this replaced.
+    /// Two `double precision` columns rather than a geometry.
     ///
-    /// Bound as a geometry value directly rather than assembled in SurrealQL: a
-    /// `geo::Point<f64>` *is* `Value::Geometry(Geometry::Point(_))` to the driver,
-    /// so there is nothing for a CONTENT body to construct.
-    pub location: Point<f64>,
+    /// This was a `geo::Point<f64>`, which *was* `Value::Geometry(Geometry::Point(_))`
+    /// to the SurrealDB driver. PostGIS is unavailable on YSQL, so the point is stored
+    /// as its components — lng before lat, matching geo's x/y and the argument order
+    /// the events already use.
+    pub lng: f64,
+    pub lat: f64,
     pub active: bool,
     /// Permanent, unlike `active`. The row survives so a renter's past bookings
     /// still resolve a title and an address; every list filters on this.
     ///
-    /// `deleted ?? false` when selected, for rows written before the field existed.
     pub deleted: bool,
+    #[sqlx(json)]
     pub address: Address,
+    #[sqlx(json)]
     pub availability: Availability,
     /// IANA name, derived from the geocoded point at creation.
     pub timezone: String,
-    pub created_at: Datetime,
-    pub updated_at: Datetime,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl Spot {
@@ -72,23 +73,24 @@ impl Spot {
     /// does not carry (`active`, `deleted`, and `created_at` equalling
     /// `updated_at`) are defaults of the model; they used to be literals in the
     /// projector's CONTENT block.
-    pub fn created(e: SpotCreated, at: DateTime<Utc>) -> Self {
+    pub fn created(e: SpotCreated, at: DateTime<Utc>, version: u64) -> Self {
         Self {
             id: e.spot_id,
+            version,
             owner_id: e.owner_id,
-            shard: e.shard,
             title: e.title,
             description: e.description,
             price_per_hour: e.price_per_hour_cents,
             images: e.images,
-            location: Point::new(e.lng, e.lat),
+            lng: e.lng,
+            lat: e.lat,
             active: true,
             deleted: false,
             address: e.address,
             availability: e.availability,
             timezone: e.timezone,
-            created_at: at.into(),
-            updated_at: at.into(),
+            created_at: at,
+            updated_at: at,
         }
     }
 }
@@ -99,7 +101,7 @@ impl Spot {
 /// SpotPatch { active: Some(false), ..Default::default() }
 /// ```
 ///
-/// Only the columns an edit can touch. `owner_id`, `shard`, `location`, `address`,
+/// Only the columns an edit can touch. `owner_id`, `lng`/`lat`, `address`,
 /// `timezone` and `created_at` are written once by [`Spot::created`] and are not
 /// representable here — a spot cannot change hands or move.
 #[derive(Debug, Default)]
@@ -111,29 +113,15 @@ pub struct SpotPatch {
     pub availability: Option<Availability>,
     pub active: Option<bool>,
     pub deleted: Option<bool>,
-    pub updated_at: Option<Datetime>,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 impl SpotPatch {
-    /// Binds every patchable column. Absent ones bind as NONE, which the
-    /// `?? column` in `SpotRepository::patch` turns into "leave it alone".
-    ///
-    /// Every field here has to appear in that statement's `SET` list, and vice
-    /// versa.
-    pub fn bind(self, q: Query<'_, Client>) -> Query<'_, Client> {
-        q.bind(vars! {
-            title:          self.title,
-            description:    self.description,
-            price_per_hour: self.price_per_hour,
-            images:         self.images,
-            availability:   self.availability,
-            active:         self.active,
-            deleted:        self.deleted,
-            updated_at:     self.updated_at,
-        })
-    }
+    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
+    // positionally, so the binds live beside the `$n` placeholders in
+    // `SpotRepository::patch`.
 
-    /// An edit. Absent fields stay absent — the `?? column` in the patch statement
+    /// An edit. Absent fields stay absent — the `COALESCE($n, column)` in the patch
     /// is what makes "None means unchanged" hold in the projection as well as the
     /// event.
     pub fn updated(e: SpotUpdated, at: DateTime<Utc>) -> Self {
@@ -144,7 +132,7 @@ impl SpotPatch {
             images: e.images,
             availability: e.availability,
             active: e.active,
-            updated_at: Some(at.into()),
+            updated_at: Some(at),
             ..Self::default()
         }
     }
@@ -158,7 +146,7 @@ impl SpotPatch {
         Self {
             active: Some(false),
             deleted: Some(true),
-            updated_at: Some(at.into()),
+            updated_at: Some(at),
             ..Self::default()
         }
     }
@@ -187,7 +175,8 @@ mod tests {
     ///
     /// The literal is **exhaustive on purpose** — no `..Default::default()`. Add a
     /// field to [`SpotPatch`] and this stops compiling, which is the reminder that
-    /// `bind` and the `SET` list in `patch` need it too.
+    /// the `SET` list in `patch` needs it too, and a `.bind()` in the matching
+    /// position.
     #[test]
     fn set_covers_every_patchable_column() {
         let _: SpotPatch = SpotPatch {

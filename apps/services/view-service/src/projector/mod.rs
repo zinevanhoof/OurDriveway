@@ -1,5 +1,6 @@
 use bus::Projector;
 use chrono::{DateTime, Utc};
+use shared::db;
 use shared::{
     domain_models::{
         booking::status as booking_status,
@@ -16,7 +17,7 @@ use shared::{
         payment::PaymentEvent, spot::SpotEvent, user::UserEvent,
     },
 };
-use surrealdb::{engine::remote::ws::Client, method::Transaction};
+use sqlx::PgConnection;
 
 use crate::repository::{
     booking_repository::ViewBookingRepository, payout_repository::ViewPayoutRepository,
@@ -35,29 +36,29 @@ pub struct UserProjector;
 
 impl Projector for UserProjector {
     const STREAM: &'static str = STREAM_USERS;
+    const DURABLE: &'static str = "view-users";
     type Event = UserEvent;
 
     async fn apply(
         &self,
-        tx: &Transaction<Client>,
+        conn: &mut PgConnection,
         event: UserEvent,
         _at: DateTime<Utc>,
-        _seq: u64,
+        version: u64,
     ) -> MyResult<()> {
-        let users = ViewUserRepository { q: tx };
+        let user_id = event.user_id();
 
         match event {
             UserEvent::Registered(e) => {
-                let user_id = e.user_id;
-                // `upsert` is safe here and nowhere else in this service: the `user`
-                // table has no link column and no column another stream owns.
-                users.upsert(ViewUser::registered(e)).await?;
-                users.backfill_links(&user_id).await
+                // A whole-row write, with nothing to relink afterwards. Every
+                // reference into this table is a plain uuid resolved by a LEFT JOIN at
+                // read time, so a row that pointed here before this user existed is
+                // already correct.
+                ViewUserRepository::upsert(&mut *conn, ViewUser::registered(e, version)).await
             }
 
             UserEvent::Updated(e) => {
-                let user_id = e.user_id;
-                users.patch(user_id, ViewUserPatch::from(e)).await
+                ViewUserRepository::patch(&mut *conn, user_id, ViewUserPatch::from(e)).await
             }
 
             // Nothing to project — the hash never comes near this database.
@@ -68,7 +69,13 @@ impl Projector for UserProjector {
             // `email_verified` here would publish which addresses are unconfirmed to
             // every client that can read a spot owner's profile.
             UserEvent::EmailVerified { .. } | UserEvent::VerificationRequested(_) => Ok(()),
-        }
+        }?;
+
+        // After the match, so it runs for the arms that store nothing too. "Applied"
+        // means *seen and decided about*, not *changed a column* — a version that
+        // only advanced on writes would strand a client waiting on `user:<id>@2`
+        // after an `EmailVerified` this table deliberately ignores.
+        db::set_version(conn, "user", &user_id, version).await
     }
 }
 
@@ -76,42 +83,44 @@ pub struct SpotProjector;
 
 impl Projector for SpotProjector {
     const STREAM: &'static str = STREAM_SPOTS;
+    const DURABLE: &'static str = "view-spots";
     type Event = SpotEvent;
 
     async fn apply(
         &self,
-        tx: &Transaction<Client>,
+        conn: &mut PgConnection,
         event: SpotEvent,
         at: DateTime<Utc>,
-        _seq: u64,
+        version: u64,
     ) -> MyResult<()> {
-        let spots = ViewSpotRepository { q: tx };
-
         match event {
             SpotEvent::Created(e) => {
-                let (spot_id, owner_id) = (e.spot_id, e.owner_id);
-
-                // `merge`, never `upsert`: CONTENT would drop `owner`, which this
-                // stream does not own.
-                spots.merge(spot_id, ViewSpotPatch::created(e, at)).await?;
-                spots.link_owner(&spot_id, &owner_id).await
+                let spot_id = e.spot_id;
+                // One statement. `owner_id` rides in the patch like any other column;
+                // there is no `owner` link left for a second statement to restore.
+                ViewSpotRepository::merge(&mut *conn, spot_id, ViewSpotPatch::created(e, at))
+                    .await?;
+                db::set_version(conn, "spot", &spot_id, version).await
             }
 
-            // `patch`, not `merge`, for the two below: only `Created` may bring a
-            // spot row into existence. These arrive after it on the same ordered
-            // stream, so a missing row means something is already wrong — and
-            // `UPDATE` matching nothing is a safer answer than `UPSERT` building a
-            // partial row that this SCHEMAFULL table cannot satisfy.
+            // `patch`, not `merge`, for the two below: only `Created` may bring a spot
+            // row into existence. These arrive after it on the same ordered stream, so
+            // a missing row means something is already wrong — and `UPDATE` matching
+            // nothing is a safer answer than an upsert building a partial row that the
+            // NOT NULL columns cannot satisfy.
             SpotEvent::Updated(e) => {
                 let spot_id = e.spot_id;
-                spots.patch(spot_id, ViewSpotPatch::updated(e, at)).await
+                ViewSpotRepository::patch(&mut *conn, spot_id, ViewSpotPatch::updated(e, at))
+                    .await?;
+                db::set_version(conn, "spot", &spot_id, version).await
             }
 
-            // Soft delete. The row stays selectable so `booking.spot` still resolves
-            // for a renter's past bookings — the lists filter `deleted`, the
-            // permission does not.
+            // Soft delete. The row stays selectable so a renter's past booking still
+            // resolves a title and an address — the lists filter `deleted`.
             SpotEvent::Deleted { spot_id } => {
-                spots.patch(spot_id, ViewSpotPatch::deleted(at)).await
+                ViewSpotRepository::patch(&mut *conn, spot_id, ViewSpotPatch::deleted(at))
+                    .await?;
+                db::set_version(conn, "spot", &spot_id, version).await
             }
         }
     }
@@ -121,56 +130,63 @@ pub struct BookingProjector;
 
 impl Projector for BookingProjector {
     const STREAM: &'static str = STREAM_BOOKINGS;
+    const DURABLE: &'static str = "view-bookings";
     type Event = BookingEvent;
 
     async fn apply(
         &self,
-        tx: &Transaction<Client>,
+        conn: &mut PgConnection,
         event: BookingEvent,
         at: DateTime<Utc>,
-        _seq: u64,
+        version: u64,
     ) -> MyResult<()> {
-        let bookings = ViewBookingRepository { q: tx };
-
-        // No spot to touch afterwards. Availability is a query over these rows now,
-        // so writing one is the whole of applying the event — nothing derived has to
-        // be recomputed and kept in step.
+        // No spot to touch afterwards. Availability is a query over these rows, so
+        // writing one is the whole of applying the event — nothing derived has to be
+        // recomputed and kept in step.
         match event {
             BookingEvent::Created(e) => {
-                let (booking_id, spot_id, renter_id) = (e.booking_id, e.spot_id, e.renter_id);
-                bookings.upsert(ViewBooking::created(e, at)).await?;
-                // The upsert's CONTENT cleared both links; this puts them back.
-                bookings.link_refs(&booking_id, &spot_id, &renter_id).await
+                let booking_id = e.booking_id;
+                // One statement. `spot_id` and `renter_id` ride in the row; there are
+                // no links for a second statement to restore.
+                ViewBookingRepository::upsert(
+                    &mut *conn,
+                    ViewBooking::created(e, at, version),
+                )
+                .await?;
+                db::set_version(conn, "booking", &booking_id, version).await
             }
 
             BookingEvent::Confirmed { booking_id } => {
-                bookings
-                    .settle(
-                        booking_id,
-                        booking_status::RESERVED,
-                        ViewBookingPatch::confirmed(),
-                    )
-                    .await
+                ViewBookingRepository::settle(
+                    &mut *conn,
+                    booking_id,
+                    booking_status::RESERVED,
+                    ViewBookingPatch::confirmed(),
+                )
+                .await?;
+                db::set_version(conn, "booking", &booking_id, version).await
             }
 
             BookingEvent::Released { booking_id, reason } => {
-                bookings
-                    .settle(
-                        booking_id,
-                        booking_status::RESERVED,
-                        ViewBookingPatch::released(reason),
-                    )
-                    .await
+                ViewBookingRepository::settle(
+                    &mut *conn,
+                    booking_id,
+                    booking_status::RESERVED,
+                    ViewBookingPatch::released(reason),
+                )
+                .await?;
+                db::set_version(conn, "booking", &booking_id, version).await
             }
 
             BookingEvent::Cancelled { booking_id, reason } => {
-                bookings
-                    .settle(
-                        booking_id,
-                        booking_status::CONFIRMED,
-                        ViewBookingPatch::cancelled(reason),
-                    )
-                    .await
+                ViewBookingRepository::settle(
+                    &mut *conn,
+                    booking_id,
+                    booking_status::CONFIRMED,
+                    ViewBookingPatch::cancelled(reason),
+                )
+                .await?;
+                db::set_version(conn, "booking", &booking_id, version).await
             }
         }
     }
@@ -187,14 +203,15 @@ pub struct PaymentProjector;
 
 impl Projector for PaymentProjector {
     const STREAM: &'static str = STREAM_PAYMENTS;
+    const DURABLE: &'static str = "view-payments";
     type Event = PaymentEvent;
 
     async fn apply(
         &self,
-        tx: &Transaction<Client>,
+        conn: &mut PgConnection,
         event: PaymentEvent,
         _at: DateTime<Utc>,
-        _seq: u64,
+        version: u64,
     ) -> MyResult<()> {
         let PaymentEvent::PayoutRequested {
             payout_id,
@@ -210,16 +227,21 @@ impl Projector for PaymentProjector {
             return Ok(());
         };
 
-        let payouts = ViewPayoutRepository { q: tx };
-        payouts
-            .upsert(ViewPayout {
+        ViewPayoutRepository::upsert(
+            &mut *conn,
+            ViewPayout {
                 id: payout_id,
+                version,
                 owner_id,
                 amount: amount_cents,
                 // The requester's timestamp off the event, not this replica's clock.
-                created_at: requested_at.into(),
-            })
-            .await?;
-        payouts.link_owner(&payout_id, &owner_id).await
+                created_at: requested_at,
+            },
+        )
+        .await?;
+        // `payout`, not `payment`: this database has no payment table, which is why
+        // the version write lives in each projector rather than in `bus::Tx` — a
+        // statement naming a table that does not exist is an error, not a no-op.
+        db::set_version(conn, "payout", &payout_id, version).await
     }
 }

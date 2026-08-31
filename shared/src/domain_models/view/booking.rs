@@ -1,7 +1,4 @@
 use chrono::{DateTime, Utc};
-use surrealdb::types::vars;
-use surrealdb::types::{Datetime, SurrealValue};
-use surrealdb::{engine::remote::ws::Client, method::Query};
 use uuid::Uuid;
 
 use crate::{
@@ -12,16 +9,22 @@ use crate::{
 
 /// The `booking` table in the read model.
 ///
-/// `spot` and `renter` — the two `record<>` links that make nested GraphQL work —
-/// are not on this model; see the module doc. A `CONTENT` write built from here
-/// therefore clears them, which is why `ViewBookingRepository::created` relinks in
-/// the same transaction.
-#[derive(Clone, Debug, SurrealValue)]
+/// The `spot` and `renter` record links are gone, and with them the whole
+/// clear-then-relink dance: a `CONTENT` write built from this model used to erase
+/// both, so `ViewBookingRepository::created` had to put them back in the same
+/// transaction — two halves that both had to run, with nothing in Rust connecting
+/// them. `spot_id` and `renter_id` are plain uuids and a read LEFT JOINs.
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct ViewBooking {
     pub id: Uuid,
+    /// booking-service's version of this booking, as last applied here. What
+    /// `bus::await_version` compares a client's `X-Await-Version` against.
+    #[sqlx(try_from = "i64")]
+    pub version: u64,
     pub spot_id: Uuid,
     pub owner_id: Uuid,
     pub renter_id: Uuid,
+    #[sqlx(json)]
     pub booked: Booked,
     /// EUR cents.
     pub amount: i64,
@@ -29,17 +32,18 @@ pub struct ViewBooking {
     pub hold_until: Option<DateTime<Utc>>,
     pub release_reason: Option<String>,
     pub cancel_reason: Option<String>,
-    /// The renter's score after the trip. NONE until they rate.
-    pub rating: Option<i64>,
-    pub ends_at: Datetime,
-    pub created_at: Datetime,
+    /// The renter's score after the trip. NULL until they rate.
+    pub rating: Option<i32>,
+    pub ends_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl ViewBooking {
     /// The row a `Created` writes.
-    pub fn created(e: BookingCreated, at: DateTime<Utc>) -> Self {
+    pub fn created(e: BookingCreated, at: DateTime<Utc>, version: u64) -> Self {
         Self {
             id: e.booking_id,
+            version,
             spot_id: e.spot_id,
             owner_id: e.owner_id,
             renter_id: e.renter_id,
@@ -50,8 +54,8 @@ impl ViewBooking {
             release_reason: None,
             cancel_reason: None,
             rating: None,
-            ends_at: e.ends_at.into(),
-            created_at: at.into(),
+            ends_at: e.ends_at,
+            created_at: at,
         }
     }
 }
@@ -71,15 +75,9 @@ pub struct ViewBookingPatch {
 }
 
 impl ViewBookingPatch {
-    /// Binds every patchable column. Absent ones bind as NONE, which the
-    /// `?? column` in `ViewBookingRepository::settle` turns into "leave it alone".
-    pub fn bind(self, q: Query<'_, Client>) -> Query<'_, Client> {
-        q.bind(vars! {
-            status:         self.status,
-            release_reason: self.release_reason,
-            cancel_reason:  self.cancel_reason,
-        })
-    }
+    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
+    // positionally, so the binds live beside the `$n` placeholders in
+    // `ViewBookingRepository::settle`.
 
     /// Paid.
     pub fn confirmed() -> Self {

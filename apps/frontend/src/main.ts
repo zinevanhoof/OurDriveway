@@ -4,8 +4,7 @@ import { router } from "./router/index.ts";
 import { createPinia } from "pinia";
 import { MotionPlugin } from "motion-v";
 import { autoAnimatePlugin } from "@formkit/auto-animate/vue";
-import urql from "@urql/vue";
-import { urqlClient } from "@/urql";
+import { VueQueryPlugin, QueryClient } from "@tanstack/vue-query";
 import { useAuthStore } from "@/stores/auth";
 
 import "@/main.css";
@@ -34,7 +33,35 @@ async function bootstrap() {
   const pinia = createPinia();
 
   app.use(pinia);
-  app.use(urql, urqlClient);
+
+  // Replaced the urql client and its exchange chain. Two of those three exchanges have
+  // no equivalent here because they have no job left: `authExchange` refreshed a token
+  // on a 401, which `apiFetch` already does for every request in the app; and
+  // `cacheExchange` (graphcache) normalized entities by id, which only mattered because
+  // one GraphQL document could return a `user` that another had already fetched.
+  //
+  // **That normalization is the real behavioural change.** graphcache kept one `user`
+  // entity backing every reference to that person, so updating a profile updated it
+  // everywhere at once. vue-query caches per query key instead, so a write invalidates
+  // keys — see `viewKeys` in api/viewApi.ts.
+  app.use(VueQueryPlugin, {
+    queryClient: new QueryClient({
+      defaultOptions: {
+        queries: {
+          // Reads are served from a projection that lags a write by however long the
+          // outbox relay and the projector take. `X-Await-Version` already holds a
+          // request until this client's own writes are visible, so a short stale
+          // window costs nothing and saves a refetch on every remount.
+          staleTime: 30_000,
+          // `apiFetch` returns the response for a 401 it could not refresh, and the
+          // router sends the user to login. Retrying that is noise.
+          retry: 1,
+          refetchOnWindowFocus: false,
+        },
+      },
+    }),
+  });
+
   app.use(MotionPlugin);
   app
     .use(autoAnimatePlugin)

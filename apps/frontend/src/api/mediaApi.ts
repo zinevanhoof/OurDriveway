@@ -3,13 +3,27 @@ import { readErrorDetail } from "@/lib/serverErrors";
 
 type Kind = "spot" | "avatar";
 
+/**
+ * What `POST /api/media/upload-url` answers.
+ *
+ * `url` is the field the backend actually sends — see `UploadUrlResponse` in
+ * media-service's `route.rs`. It used to be `key`, a bucket path that each screen
+ * then had to turn into something loadable; it is now the whole URL, already
+ * loadable, and it is what the create/edit request must carry because
+ * `shared::media::is_media_url` validates the origin and the path shape together.
+ *
+ * The two are NOT interchangeable and the mismatch was silent: reading a `key` that
+ * no longer exists yields `undefined`, and `JSON.stringify` renders `undefined`
+ * inside an array as `null` — so a create request went out with `images: [null]`
+ * and failed validation with nothing in the console.
+ */
 interface UploadUrlResponse {
-  key: string;
+  url: string;
   uploadUrl: string;
 }
 
 /**
- * Uploads one image straight to R2 and returns the key to store.
+ * Uploads one image straight to R2 and returns the URL to store.
  *
  * Two requests, and the second one does not go through `apiFetch`: it is a plain
  * PUT to Cloudflare against a presigned URL, so it must not carry our
@@ -35,7 +49,7 @@ export async function uploadImage(file: File, kind: Kind): Promise<string> {
     throw new Error((await readErrorDetail(minted)).join(" "));
   }
 
-  const { key, uploadUrl }: UploadUrlResponse = await minted.json();
+  const { url, uploadUrl }: UploadUrlResponse = await minted.json();
 
   const uploaded = await fetch(uploadUrl, {
     method: "PUT",
@@ -47,13 +61,13 @@ export async function uploadImage(file: File, kind: Kind): Promise<string> {
     throw new Error(`Upload failed (${uploaded.status}). Please try again.`);
   }
 
-  return key;
+  return url;
 }
 
 /**
- * Resolves a picker's mixed list to keys, uploading only what is new.
+ * Resolves a picker's mixed list to URLs, uploading only what is new.
  *
- * The spot forms hold `(string | File)[]` — strings are keys already in R2 from a
+ * The spot forms hold `(string | File)[]` — strings are URLs already in R2 from a
  * previous save, Files are freshly picked. Order is the host's, so it is
  * preserved rather than uploaded-last.
  */

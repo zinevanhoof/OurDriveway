@@ -86,7 +86,7 @@ const submit = handleSubmit(async (values) => {
         // Photos go to R2 first, and only their keys are sent below — no image
         // bytes reach the backend at all. Uploading before the create means a
         // failure here costs nothing: no spot exists yet to be left half-made.
-        const imageKeys = await uploadNewImages(images.value, 'spot')
+        const imageUrls = await uploadNewImages(images.value, 'spot')
 
         const { pricePerHour, ...rest } = values
         const request: CreateSpotRequest = {
@@ -104,7 +104,7 @@ const submit = handleSubmit(async (values) => {
                 ].filter(Boolean).join(', '),
             },
             availability: availability.value,
-            images: imageKeys,
+            images: imageUrls,
         }
 
         const response = await createSpot(request)

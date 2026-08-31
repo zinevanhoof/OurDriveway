@@ -20,6 +20,7 @@ pub mod extractors;
 pub mod general_models;
 pub mod media;
 pub mod notification;
+pub mod projections;
 pub mod requests;
 pub mod responses;
 pub mod rpc;

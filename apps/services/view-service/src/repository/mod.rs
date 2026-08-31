@@ -1,132 +1,120 @@
-//! One repository per table in the read model, each holding the SurrealQL for the
+//! One repository per table in the read model, each holding the SQL for the
 //! statements this service issues. Nothing is generated and no trait sits behind
 //! them: what a method does is the string in front of you, with no `format!` and no
 //! consts spliced in from the domain models.
 //!
-//! This service has more statements than any other, and the extra ones are all the
+//! ## This service got smaller
+//!
+//! It used to have more statements than any other, and the extra ones were all the
 //! same two kinds:
 //!
-//! - **Link resolution.** Every table but `user` carries a `record<>` link used for
-//!   nested GraphQL traversal, set from a subquery that yields NONE when the target
-//!   has not been projected yet. Streams have no cross-stream ordering, so this is
-//!   the normal case, not an edge one.
-//! - **Backfill.** The mirror of the above: when the target finally arrives, it
-//!   points the rows that were waiting for it at itself.
+//! - **Link resolution.** Every table but `user` carried a `record<>` link for nested
+//!   GraphQL traversal, and a `CONTENT $row` write cleared it — so each write was two
+//!   statements, the second putting the link back in the same transaction.
+//! - **Backfill.** The mirror of the above: when a link's target finally arrived, it
+//!   pointed the rows that had been waiting at itself.
 //!
-//! Both are idempotent, which is what makes replaying or racing another consumer
-//! harmless.
+//! Both are gone. `owner_id`, `spot_id` and `renter_id` are plain uuid columns with no
+//! foreign key — deliberately, because the streams have no cross-stream ordering and a
+//! spot is routinely projected before its owner. A read LEFT JOINs to resolve them, so
+//! a reference to a row that has not arrived is an absent join rather than a null that
+//! something has to come back and repair.
 //!
-//! Which write form a table gets follows from whether it has a link:
+//! `spot` keeps its `merge`/`patch` split — only `SpotCreated` may bring a row into
+//! existence.
 //!
-//! - `user` has none, so it is written whole with `CONTENT $row` — and it is also
-//!   the only table here ever read back whole, which is why it is the only one with
-//!   a `find_by_id`. `SELECT *` on any of the others would return an `owner`,
-//!   `spot` or `renter` column their structs deliberately do not carry.
-//! - `booking` and `payout` are written whole and **relinked in the same
-//!   transaction**, because `CONTENT` clears the links first.
-//! - `spot` is never written whole: it carries the `owner` link, which USERS
-//!   resolves, so its SPOTS writes are a `SET` list naming only the thirteen
-//!   SPOTS-owned columns.
+//! ## Where the security lives
 //!
-//! Each is generic over its querier so the same type serves both positions: the
-//! `/me` handler holds one over the pooled `Surreal<Client>`, a projector builds one
-//! over the open `&Transaction` for a single event.
+//! `migrations/view/0001_init.sql` records this as three compound clauses, one per
+//! table. That is the shape it had when the permission clauses first moved out of the
+//! schema, and the file cannot be corrected in place — `sqlx::migrate!` checksums an
+//! applied migration, comments included. **This is the current list:**
+//!
+//! | table | function | `WHERE` |
+//! |---|---|---|
+//! | `spot` | `find_public_by_id` | `id = $1 AND active` |
+//! | | `find_owner_by_id` | `id = $1 AND owner_id = $2` |
+//! | | `find_all_by_owner_id` | `owner_id = $1 AND NOT deleted` |
+//! | | `find_all_by_radius` | `active AND NOT deleted AND owner_id <> $1` |
+//! | `booking` | `find_all_public_by_spot_id` | `spot_id = $1 AND status IN ('reserved','confirmed')` |
+//! | | `find_all_owner_by_spot_id` | `spot_id = $1` — ownership already proved |
+//! | | `find_all_by_renter_id` | `renter_id = $1` |
+//! | | `find_owner_by_id` | `id = $1 AND (renter_id = $2 OR owner_id = $2)` |
+//! | `payout` | `find_all_by_owner_id` | `owner_id = $1` |
+//! | `app_user` | `find_owner_by_id` | `id = $1` — the verified claim picks the row |
+//!
+//! **One function per audience, rather than one clause serving two.** The old
+//! `(active OR owner_id = $caller)` and `(renter_id = $caller OR owner_id = $caller OR
+//! status IN (…))` each answered a stranger and a party from the same statement, with an
+//! `is_party` helper cutting the renter, the amount and the hold expiry out of the rows
+//! afterwards. Field-level scoping is the *projection type* now
+//! (`shared::projections`): a public read does not select what it may not return, so
+//! there is nothing in flight to cut and no `Option` that means "denied".
 
 pub mod booking_repository;
 pub mod payout_repository;
 pub mod spot_repository;
 pub mod user_repository;
 
-/// Round-trips the read model through a real SurrealDB.
+/// Round-trips the read model through a real YugabyteDB.
 ///
-/// `#[ignore]`d — needs `view-service-db` on :8003 with `schemas/view-schema.surql`
-/// imported, and CI runs `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, and CI runs
+/// `cargo test --workspace` with no database:
 ///
 /// ```sh
-/// docker compose -f docker/docker-compose-dev.yml up -d view-service-db
+/// docker compose -f docker/docker-compose-dev.yml up -d yugabyte
 /// cargo test --workspace -- --ignored
 /// ```
 ///
-/// The link dance is what these exist for. A `CONTENT $row` write clears `owner`,
-/// `spot` and `renter`, and the relink puts them back in the same transaction —
-/// a sequence that is correct only if both halves actually run, which no amount of
-/// Rust can show. The other half is `spot`, which must never be written whole
-/// because `owner` is resolved by a different stream.
+/// **Three tests were deleted here rather than ported**, and what they were for is
+/// worth recording. `spots_writes_never_disturb_the_link`,
+/// `a_booking_upsert_clears_then_relinks_its_refs` and
+/// `a_payout_upsert_clears_then_relinks_owner` each existed because a write was two
+/// statements that both had to run: the first cleared a record link, the second put it
+/// back. Nothing in Rust connected them, so only a database could show the pair was
+/// intact. There are no links and no second statements, so there is nothing left for
+/// those tests to observe.
+///
+/// What replaces them is `an_unresolved_reference_is_an_absent_join` — the property
+/// those two-statement dances were trying to buy in the first place.
 #[cfg(test)]
 mod live_tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use chrono::Utc;
-    use shared::db::Querier;
     use shared::domain_models::booking::status;
     use shared::domain_models::view::{
-        ViewBooking, ViewBookingPatch, ViewPayout, ViewSpotPatch, ViewUser, ViewUserPatch,
+        ViewBooking, ViewBookingPatch, ViewSpotPatch, ViewUser, ViewUserPatch,
     };
     use shared::events::booking::ReleaseReason;
     use shared::events::spot::SpotCreated;
     use shared::general_models::spot::{Address, Availability, TimeSlot, WeeklyAvailability};
-    use surrealdb::{Surreal, engine::remote::ws::Client};
+    use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::booking_repository::ViewBookingRepository;
-    use super::payout_repository::ViewPayoutRepository;
     use super::spot_repository::ViewSpotRepository;
     use super::user_repository::ViewUserRepository;
 
-    async fn db() -> Arc<Surreal<Client>> {
-        Arc::new(
-            shared::db::connect("127.0.0.1:8003", "root", "root")
-                .await
-                .expect("view-service-db on :8003 — see this module's docs"),
-        )
-    }
-
-    async fn drop_row(db: &Arc<Surreal<Client>>, table: &str, id: Uuid) {
-        db.q(format!("DELETE type::record('{table}', $v)"))
-            .bind(("v", id))
+    /// Connects and migrates, so a running container is the only prerequisite.
+    async fn db() -> PgPool {
+        let pool = shared::db::connect("postgres://yugabyte@127.0.0.1:5433/view")
             .await
-            .unwrap()
-            .check()
-            .unwrap();
-    }
-
-    /// Whether the named link column actually points somewhere.
-    ///
-    /// The `IF … != NONE` is required, not defensive: `record::id(NONE)` is an
-    /// *error* in SurrealDB 3.2.4 ("Expected `record` but found `NONE`"), not a NONE
-    /// result — and an unresolved link is the normal state this has to observe.
-    async fn link_of(db: &Arc<Surreal<Client>>, table: &str, id: Uuid, col: &str) -> Option<Uuid> {
-        db.q(format!(
-            "SELECT VALUE IF {col} != NONE THEN record::id({col}) ELSE NONE END
-             FROM ONLY type::record('{table}', $v)"
-        ))
-        .bind(("v", id))
-        .await
-        .unwrap()
-        .take(0)
-        .unwrap()
-    }
-
-    /// A booking's status, for asserting that `settle`'s guard did or did not let a
-    /// write through — the signal that used to be its `Option<Uuid>` return.
-    async fn status_of(db: &Arc<Surreal<Client>>, id: Uuid) -> String {
-        db.q("SELECT VALUE status FROM ONLY type::record('booking', $v)")
-            .bind(("v", id))
+            .expect("dev yugabyte on :5433, database `view` — see this module's docs");
+        shared::db::migrate(&pool, &sqlx::migrate!("../../../migrations/view"))
             .await
-            .unwrap()
-            .take::<Option<String>>(0)
-            .unwrap()
-            .expect("the booking row exists")
+            .expect("migrations apply");
+        pool
     }
 
     fn a_user(id: Uuid) -> ViewUser {
         ViewUser {
             id,
+            version: 1,
             first_name: "Ada".to_string(),
             last_name: "Lovelace".to_string(),
             profile_picture: None,
-            email: Some(format!("view-{id}@example.test")),
+            email: format!("view-{id}@example.test"),
             license_plates: vec![],
         }
     }
@@ -135,7 +123,6 @@ mod live_tests {
         SpotCreated {
             spot_id,
             owner_id,
-            shard: "00".to_string(),
             title: "Driveway".to_string(),
             description: None,
             price_per_hour_cents: 250,
@@ -174,16 +161,19 @@ mod live_tests {
     #[ignore]
     async fn a_view_user_round_trips_and_patches_leave_absent_columns_alone() {
         let db = db().await;
-        let repo = ViewUserRepository { q: db.clone() };
-
         let id = Uuid::now_v7();
-        repo.upsert(a_user(id)).await.unwrap();
 
-        let got = repo.find_by_id(id).await.unwrap().expect("upserted row");
-        assert_eq!(got.id, id);
+        ViewUserRepository::upsert(&db, a_user(id)).await.unwrap();
+
+        let got = ViewUserRepository::find_owner_by_id(&db, id)
+            .await
+            .unwrap()
+            .expect("upserted row");
+        assert_eq!(got.public.id, id);
         assert!(got.license_plates.is_empty());
 
-        repo.patch(
+        ViewUserRepository::patch(
+            &db,
             id,
             ViewUserPatch {
                 license_plates: Some(vec!["1-ABC-123".to_string()]),
@@ -193,80 +183,82 @@ mod live_tests {
         .await
         .unwrap();
 
-        let got = repo.find_by_id(id).await.unwrap().unwrap();
+        let got = ViewUserRepository::find_owner_by_id(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.license_plates, vec!["1-ABC-123".to_string()]);
-        assert_eq!(got.first_name, "Ada", "absent columns must survive a patch");
+        assert_eq!(
+            got.public.first_name, "Ada",
+            "absent columns must survive a patch"
+        );
+        assert_eq!(got.email, format!("view-{id}@example.test"));
 
-        drop_row(&db, "user", id).await;
+        sqlx::query("DELETE FROM app_user WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
     }
 
-    /// A SPOTS write must fill its own columns and leave `owner` alone, in either
+    /// A SPOTS write fills its own columns and leaves the rest alone, in either
     /// arrival order — which on a read model is the normal case, not an edge one.
     #[tokio::test]
     #[ignore]
-    async fn spots_writes_never_disturb_the_link() {
+    async fn a_spots_write_fills_its_own_columns_and_leaves_the_rest() {
         let db = db().await;
-        let spots = ViewSpotRepository { q: db.clone() };
-        let users = ViewUserRepository { q: db.clone() };
-
         let (spot_id, owner_id) = (Uuid::now_v7(), Uuid::now_v7());
         let at = Utc::now();
 
-        // The owner has not been projected yet, so the link cannot resolve.
-        spots
-            .merge(
-                spot_id,
-                ViewSpotPatch::created(spot_created(spot_id, owner_id), at),
-            )
+        // The owner has not been projected yet, and the spot is written anyway. That
+        // used to be the hard case — the `owner` link could only be resolved against
+        // a row that existed — and is now unremarkable: `owner_id` is a uuid.
+        ViewSpotRepository::merge(&db, spot_id, ViewSpotPatch::created(spot_created(spot_id, owner_id), at))
             .await
             .unwrap();
-        spots.link_owner(&spot_id, &owner_id).await.unwrap();
-        assert_eq!(
-            link_of(&db, "spot", spot_id, "owner").await,
-            None,
-            "the link must resolve to NONE until the user exists"
-        );
 
-        // Now the owner lands, and backfill points every waiting row at them.
-        users.upsert(a_user(owner_id)).await.unwrap();
-        users.backfill_links(&owner_id).await.unwrap();
-        assert_eq!(
-            link_of(&db, "spot", spot_id, "owner").await,
-            Some(owner_id),
-            "backfill must fill the gap the subquery left"
-        );
+        let (got_owner, lng, lat): (Uuid, f64, f64) =
+            sqlx::query_as("SELECT owner_id, lng, lat FROM spot WHERE id = $1")
+                .bind(spot_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(got_owner, owner_id);
+        assert_eq!((lng, lat), (4.35, 50.85), "lng before lat, both ways");
 
-        // A later SPOTS edit must not disturb it.
-        spots
-            .patch(
-                spot_id,
-                ViewSpotPatch {
-                    active: Some(false),
-                    ..Default::default()
-                },
-            )
+        // A later SPOTS edit must not disturb what it does not name.
+        ViewSpotRepository::patch(
+            &db,
+            spot_id,
+            ViewSpotPatch {
+                active: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (active, title, owner_after): (bool, String, Uuid) =
+            sqlx::query_as("SELECT active, title, owner_id FROM spot WHERE id = $1")
+                .bind(spot_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(!active);
+        assert_eq!(title, "Driveway", "COALESCE must hold");
+        assert_eq!(owner_after, owner_id, "an edit must not repoint the owner");
+
+        sqlx::query("DELETE FROM spot WHERE id = $1")
+            .bind(spot_id)
+            .execute(&db)
             .await
             .unwrap();
-        assert_eq!(
-            link_of(&db, "spot", spot_id, "owner").await,
-            Some(owner_id),
-            "a SPOTS write must not clear the link"
-        );
-
-        drop_row(&db, "spot", spot_id).await;
-        drop_row(&db, "user", owner_id).await;
     }
 
-    /// `CONTENT` clears the links; `link_refs` puts them back in the same
-    /// transaction. Both halves have to run, and only a database can show that.
     #[tokio::test]
     #[ignore]
-    async fn a_booking_upsert_clears_then_relinks_its_refs() {
+    async fn a_booking_round_trips_and_settle_is_guarded() {
         let db = db().await;
-        let bookings = ViewBookingRepository { q: db.clone() };
-        let spots = ViewSpotRepository { q: db.clone() };
-        let users = ViewUserRepository { q: db.clone() };
-
         let (booking_id, spot_id, renter_id, owner_id) = (
             Uuid::now_v7(),
             Uuid::now_v7(),
@@ -275,18 +267,11 @@ mod live_tests {
         );
         let at = Utc::now();
 
-        users.upsert(a_user(renter_id)).await.unwrap();
-        spots
-            .merge(
-                spot_id,
-                ViewSpotPatch::created(spot_created(spot_id, owner_id), at),
-            )
-            .await
-            .unwrap();
-
-        bookings
-            .upsert(ViewBooking {
+        ViewBookingRepository::upsert(
+            &db,
+            ViewBooking {
                 id: booking_id,
+                version: 1,
                 spot_id,
                 owner_id,
                 renter_id,
@@ -297,99 +282,555 @@ mod live_tests {
                 release_reason: None,
                 cancel_reason: None,
                 rating: None,
-                ends_at: at.into(),
-                created_at: at.into(),
-            })
-            .await
-            .unwrap();
-        bookings
-            .link_refs(&booking_id, &spot_id, &renter_id)
-            .await
-            .unwrap();
+                ends_at: at,
+                created_at: at,
+            },
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(
-            link_of(&db, "booking", booking_id, "spot").await,
-            Some(spot_id)
-        );
-        assert_eq!(
-            link_of(&db, "booking", booking_id, "renter").await,
-            Some(renter_id)
-        );
-
-        // Settling is guarded: it only leaves the status the event allows.
-        bookings
-            .settle(booking_id, status::RESERVED, ViewBookingPatch::confirmed())
+        ViewBookingRepository::settle(&db, booking_id, status::RESERVED, ViewBookingPatch::confirmed())
             .await
             .unwrap();
         assert_eq!(status_of(&db, booking_id).await, status::CONFIRMED);
 
         // Redelivery: no longer `reserved`, so the guard refuses and the row stands.
-        bookings
-            .settle(
-                booking_id,
-                status::RESERVED,
-                ViewBookingPatch::released(ReleaseReason::Expired),
-            )
-            .await
-            .unwrap();
+        ViewBookingRepository::settle(
+            &db,
+            booking_id,
+            status::RESERVED,
+            ViewBookingPatch::released(ReleaseReason::Expired),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             status_of(&db, booking_id).await,
             status::CONFIRMED,
             "the guard must have held"
         );
 
-        // And settling must not have disturbed the links.
-        assert_eq!(
-            link_of(&db, "booking", booking_id, "spot").await,
-            Some(spot_id)
-        );
-        assert_eq!(
-            link_of(&db, "booking", booking_id, "renter").await,
-            Some(renter_id)
-        );
+        // The unconditional half of `settle`: every transition ends the hold, which a
+        // COALESCE patch could never express.
+        let hold: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT hold_until FROM booking WHERE id = $1")
+                .bind(booking_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(hold, None);
 
-        drop_row(&db, "booking", booking_id).await;
-        drop_row(&db, "spot", spot_id).await;
-        drop_row(&db, "user", renter_id).await;
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn a_payout_upsert_clears_then_relinks_owner() {
-        let db = db().await;
-        let payouts = ViewPayoutRepository { q: db.clone() };
-        let users = ViewUserRepository { q: db.clone() };
-
-        let (payout_id, owner_id) = (Uuid::now_v7(), Uuid::now_v7());
-
-        payouts
-            .upsert(ViewPayout {
-                id: payout_id,
-                owner_id,
-                amount: 700,
-                created_at: Utc::now().into(),
-            })
+        sqlx::query("DELETE FROM booking WHERE id = $1")
+            .bind(booking_id)
+            .execute(&db)
             .await
             .unwrap();
-        payouts.link_owner(&payout_id, &owner_id).await.unwrap();
+    }
+
+    /// What the three deleted link tests were trying to buy, and what `MaybeJoined` now
+    /// has to deliver.
+    ///
+    /// A booking can be projected before the spot or the renter it names — the streams
+    /// advance independently, and this was the case that left a `record<>` link null
+    /// *permanently* until it was made unconditional. The read has to degrade to an
+    /// absent join rather than dropping the row or failing.
+    ///
+    /// It goes through the projections rather than raw tuples on purpose. `MaybeJoined`
+    /// turns a `ColumnDecode` into `None`, which is a narrow thing to get right: too
+    /// broad and a statement missing an `AS` would silently return `None` forever
+    /// instead of failing — see `a_missing_alias_fails_loudly` below.
+    #[tokio::test]
+    #[ignore]
+    async fn an_unresolved_reference_is_an_absent_join() {
+        let db = db().await;
+        let (booking_id, spot_id, renter_id, owner_id) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let at = Utc::now();
+
+        // Neither the spot nor the renter exists yet.
+        ViewBookingRepository::upsert(
+            &db,
+            ViewBooking {
+                id: booking_id,
+                version: 1,
+                spot_id,
+                owner_id,
+                renter_id,
+                booked: HashMap::new(),
+                amount: 500,
+                status: status::RESERVED.to_string(),
+                hold_until: None,
+                release_reason: None,
+                cancel_reason: None,
+                rating: None,
+                ends_at: at,
+                created_at: at,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Both reads LEFT JOIN, so the booking comes back with its references
+        // unresolved rather than not coming back at all.
+        let mine = ViewBookingRepository::find_all_by_renter_id(&db, renter_id)
+            .await
+            .unwrap();
+        assert_eq!(mine.len(), 1, "the booking must still be returned");
+        assert!(
+            mine[0].spot.0.is_none(),
+            "an unprojected spot is an absent join"
+        );
         assert_eq!(
-            link_of(&db, "payout", payout_id, "owner").await,
-            None,
-            "no owner projected yet, so the subquery yields NONE"
+            mine[0].spot_id, spot_id,
+            "…but its id is the booking's own column, so it always resolves"
         );
 
-        // The regression this table's backfill was added for: a payout whose owner
-        // had not been projected kept `owner = NONE` permanently, because nothing
-        // else ever revisited the row.
-        users.upsert(a_user(owner_id)).await.unwrap();
-        users.backfill_links(&owner_id).await.unwrap();
-        assert_eq!(
-            link_of(&db, "payout", payout_id, "owner").await,
-            Some(owner_id),
-            "backfill must reach payout, not just spot and booking"
+        let one = ViewBookingRepository::find_owner_by_id(&db, booking_id, renter_id)
+            .await
+            .unwrap()
+            .expect("its renter may read it");
+        assert!(
+            one.renter.0.is_none(),
+            "an unprojected renter is an absent join"
         );
 
-        drop_row(&db, "payout", payout_id).await;
-        drop_row(&db, "user", owner_id).await;
+        // The targets arrive. Nothing revisits the booking, and the joins resolve
+        // themselves — which is the property the old `link_refs`/`backfill_links` pair
+        // spent four methods and three tests approximating.
+        ViewUserRepository::upsert(&db, a_user(renter_id)).await.unwrap();
+        ViewSpotRepository::merge(&db, spot_id, ViewSpotPatch::created(spot_created(spot_id, owner_id), at))
+            .await
+            .unwrap();
+
+        let mine = ViewBookingRepository::find_all_by_renter_id(&db, renter_id)
+            .await
+            .unwrap();
+        let card = mine[0].spot.as_ref().expect("the spot resolves now");
+        assert_eq!(card.title, "Driveway");
+        assert_eq!(card.id, spot_id);
+        assert_eq!(card.timezone, "Europe/Brussels");
+
+        let one = ViewBookingRepository::find_owner_by_id(&db, booking_id, renter_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            one.renter.as_ref().expect("the renter resolves now").first_name,
+            "Ada"
+        );
+
+        sqlx::query("DELETE FROM booking WHERE id = $1")
+            .bind(booking_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM spot WHERE id = $1")
+            .bind(spot_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM app_user WHERE id = $1")
+            .bind(renter_id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+
+    /// The other half of `MaybeJoined`: a statement that forgot its `AS` must **fail**,
+    /// not quietly hand back `None`.
+    ///
+    /// This is the one thing that could go wrong with turning a decode error into an
+    /// absent join. `PublicViewUser` reads `user_*`, so a statement selecting the bare
+    /// column names is a bug in the query — and if `MaybeJoined` swallowed it, every
+    /// profile on every page would be permanently missing with nothing in the logs. It
+    /// catches `ColumnDecode` only; `ColumnNotFound` propagates.
+    #[tokio::test]
+    #[ignore]
+    async fn a_missing_alias_fails_loudly() {
+        use shared::projections::MaybeJoined;
+        use shared::projections::user::PublicViewUser;
+
+        let db = db().await;
+        let id = Uuid::now_v7();
+        ViewUserRepository::upsert(&db, a_user(id)).await.unwrap();
+
+        // No `AS user_…`, which is what a new read would get wrong.
+        let missed = sqlx::query_as::<_, MaybeJoined<PublicViewUser>>(
+            "SELECT id, first_name, last_name, profile_picture FROM app_user WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await;
+        assert!(
+            matches!(missed, Err(sqlx::Error::ColumnNotFound(_))),
+            "a missing alias must surface, not decode to None: {missed:?}"
+        );
+
+        // The same row, aliased. Present, not `None`.
+        let found = sqlx::query_as::<_, MaybeJoined<PublicViewUser>>(
+            "SELECT id              AS user_id,
+                    first_name      AS user_first_name,
+                    last_name       AS user_last_name,
+                    profile_picture AS user_profile_picture
+               FROM app_user WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(found.as_ref().expect("the row is right there").id, id);
+
+        sqlx::query("DELETE FROM app_user WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+
+    /// The SQL radius filter must return exactly what `policy::geo::haversine` says it
+    /// should.
+    ///
+    /// This is the only thing that checks the trigonometry in
+    /// `ViewSpotRepository::find_all_by_radius`. That formula is written out in SQL — six calls
+    /// to `radians`, two `power`s, an `asin` — and a transposed `lat`/`lng` or a
+    /// dropped `cos` would still return *a* plausible set of spots. Nothing else in the
+    /// system would notice; the map would just be subtly wrong.
+    ///
+    /// It also pins the two-stage design together: the bbox is an index range and the
+    /// haversine is the exact filter, so a spot inside the box but outside the circle
+    /// must be dropped, and one near the box's corner must not be lost.
+    #[tokio::test]
+    #[ignore]
+    async fn the_sql_radius_agrees_with_the_reference() {
+        use crate::policy::geo::haversine;
+
+        let db = db().await;
+        let caller = Uuid::now_v7();
+        let owner = Uuid::now_v7();
+        let (centre_lng, centre_lat) = (4.3517, 50.8466); // Brussels
+        let radius = 5_000.0;
+
+        // Spread around the centre, deliberately including points that land inside the
+        // bounding box but outside the circle — the corners are what separate the two
+        // stages. `ids` keeps them addressable for cleanup.
+        let mut ids = Vec::new();
+        let mut expected = Vec::new();
+        for (i, (d_lng, d_lat)) in [
+            (0.0, 0.0),        // dead centre
+            (0.01, 0.0),       // ~700m east
+            (0.0, 0.03),       // ~3.3km north
+            (0.05, 0.0),       // ~3.5km east
+            (0.045, 0.04),     // inside the BOX corner, outside the CIRCLE
+            (0.0, 0.06),       // ~6.7km north — outside
+            (0.5, 0.5),        // far outside
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = Uuid::now_v7();
+            let (lng, lat) = (centre_lng + d_lng, centre_lat + d_lat);
+            ids.push(id);
+            if haversine(centre_lng, centre_lat, lng, lat) <= radius {
+                expected.push(id);
+            }
+
+            let mut patch = ViewSpotPatch::created(spot_created(id, owner), Utc::now());
+            patch.lng = Some(lng);
+            patch.lat = Some(lat);
+            patch.title = Some(format!("spot {i}"));
+            ViewSpotRepository::merge(&db, id, patch).await.unwrap();
+        }
+
+        let got = ViewSpotRepository::find_all_by_radius(&db, caller, centre_lng, centre_lat, radius)
+            .await
+            .unwrap();
+
+        let mut got_ids: Vec<Uuid> = got
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| ids.contains(id))
+            .collect();
+        got_ids.sort();
+        expected.sort();
+        assert_eq!(
+            got_ids, expected,
+            "the SQL radius must select exactly what policy::geo::haversine predicts"
+        );
+        assert!(
+            !expected.is_empty() && expected.len() < ids.len(),
+            "the fixture must contain both included and excluded spots, or this \
+             asserts nothing"
+        );
+
+        // The other half of `find_all_by_radius`'s contract: a host is never shown their own
+        // driveway as somewhere to park.
+        let as_owner =
+            ViewSpotRepository::find_all_by_radius(&db, owner, centre_lng, centre_lat, radius)
+                .await
+                .unwrap();
+        assert!(
+            !as_owner.iter().any(|s| ids.contains(&s.id)),
+            "the radius search must always exclude the caller's own spots"
+        );
+
+        sqlx::query("DELETE FROM spot WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+
+    /// **The rules that used to be the schema.**
+    ///
+    /// Every assertion here was a `PERMISSIONS FOR select` clause in
+    /// view-schema.surql, enforced by SurrealDB against the browser's own JWT. They are
+    /// ordinary WHERE clauses now, which means a dropped one is a silent leak that
+    /// compiles — so this is the test that has to exist.
+    ///
+    /// Read it as the specification: if a rule is not asserted below, nothing enforces
+    /// it anywhere.
+    ///
+    /// It is now organised **one block per function**, because that is how the rules are
+    /// organised. There is no shared clause to assert once; each projection is a
+    /// different statement, and what makes it safe is which columns it selects and which
+    /// rows it matches.
+    #[tokio::test]
+    #[ignore]
+    async fn the_read_model_scopes_what_each_caller_can_see() {
+        let db = db().await;
+
+        let (owner, renter, stranger) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let (spot_id, booking_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let at = Utc::now();
+        let ends_at = at + chrono::TimeDelta::hours(4);
+
+        ViewUserRepository::upsert(&db, a_user(renter)).await.unwrap();
+        ViewSpotRepository::merge(&db, spot_id, ViewSpotPatch::created(spot_created(spot_id, owner), at))
+            .await
+            .unwrap();
+        ViewBookingRepository::upsert(
+            &db,
+            ViewBooking {
+                id: booking_id,
+                version: 1,
+                spot_id,
+                owner_id: owner,
+                renter_id: renter,
+                booked: HashMap::new(),
+                amount: 4200,
+                status: status::RESERVED.to_string(),
+                hold_until: Some(at),
+                release_reason: None,
+                cancel_reason: None,
+                rating: None,
+                ends_at,
+                created_at: at,
+            },
+        )
+        .await
+        .unwrap();
+
+        // ── find_all_public_by_spot_id: the availability answer ──────────────
+        // A reserved booking IS public, because these rows are what replaced
+        // `spot.booked` — a prospective renter has to see that a slot is taken.
+        let public = ViewBookingRepository::find_all_public_by_spot_id(&db, spot_id, at)
+            .await
+            .unwrap();
+        assert_eq!(public.len(), 1, "a blocking booking is public by design");
+
+        let b = &public[0];
+        assert_eq!(b.id, booking_id, "which booking is public");
+        assert_eq!(b.status, status::RESERVED, "and whether it still blocks");
+        // Within a microsecond, not equal. `timestamptz` stores microseconds and
+        // `Utc::now()` produces nanoseconds, so every timestamp is truncated on the way
+        // in. Nothing in the request path compares timestamps for equality — every use
+        // is `ends_at > now` or `hold_until < now` — but it is worth one assertion
+        // saying so, because the first `assert_eq!` on a round-tripped timestamp
+        // anywhere else will fail for a reason that reads like a bug.
+        assert!(
+            (b.ends_at - ends_at).num_microseconds().unwrap_or(i64::MAX).abs() <= 1,
+            "the slots' end is public, to the microsecond the column stores"
+        );
+        // The renter, the amount and the hold expiry are not asserted absent here —
+        // `PublicViewBooking` has no such fields, so the compiler is what enforces it
+        // and this statement never selects those columns at all.
+
+        // ── find_all_owner_by_spot_id: the host's own rows, in full ──────────
+        let owned = ViewBookingRepository::find_all_owner_by_spot_id(&db, spot_id, at)
+            .await
+            .unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].amount, 4200, "the host sees the amount");
+        assert!(owned[0].renter.0.is_some(), "the host sees the renter");
+        assert!(owned[0].hold_until.is_some(), "the host sees the hold expiry");
+
+        // A released booking stops blocking, so it leaves the availability answer.
+        ViewBookingRepository::settle(
+            &db,
+            booking_id,
+            status::RESERVED,
+            ViewBookingPatch::released(ReleaseReason::Expired),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ViewBookingRepository::find_all_public_by_spot_id(&db, spot_id, at)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a released booking must not block a slot"
+        );
+        assert_eq!(
+            ViewBookingRepository::find_all_owner_by_spot_id(&db, spot_id, at)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "…but the host keeps it, which is the history the manage screen shows"
+        );
+
+        // ── find_owner_by_id (booking): the two parties, and nobody else ─────
+        assert!(
+            ViewBookingRepository::find_owner_by_id(&db, booking_id, stranger)
+                .await
+                .unwrap()
+                .is_none(),
+            "a booking must not be reachable by id by a stranger"
+        );
+        for party in [owner, renter] {
+            let detail = ViewBookingRepository::find_owner_by_id(&db, booking_id, party)
+                .await
+                .unwrap()
+                .expect("both parties may read it");
+            assert_eq!(detail.amount, 4200);
+            assert_eq!(detail.public.id, booking_id);
+        }
+
+        // ── find_public_by_id vs find_owner_by_id (spot) ─────────────────────
+        ViewSpotRepository::patch(
+            &db,
+            spot_id,
+            ViewSpotPatch {
+                active: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            ViewSpotRepository::find_public_by_id(&db, spot_id, at)
+                .await
+                .unwrap()
+                .is_none(),
+            "an inactive spot is not a public spot, for anyone"
+        );
+        assert!(
+            ViewSpotRepository::find_owner_by_id(&db, spot_id, owner, at)
+                .await
+                .unwrap()
+                .is_some(),
+            "…and must still be visible to its owner, which is what the switch is for"
+        );
+        assert!(
+            ViewSpotRepository::find_owner_by_id(&db, spot_id, stranger, at)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stranger is not the owner of anything"
+        );
+
+        // ── find_all_by_owner_id: a host's own list excludes deleted ─────────
+        ViewSpotRepository::patch(&db, spot_id, ViewSpotPatch::deleted(at))
+            .await
+            .unwrap();
+        assert!(
+            !ViewSpotRepository::find_all_by_owner_id(&db, owner)
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.id == spot_id),
+            "a deleted spot must not appear in its owner's list"
+        );
+        assert!(
+            ViewSpotRepository::find_owner_by_id(&db, spot_id, owner, at)
+                .await
+                .unwrap()
+                .is_some(),
+            "…but the row must survive, so past bookings still resolve a title"
+        );
+
+        for sql in [
+            "DELETE FROM booking WHERE id = $1",
+            "DELETE FROM spot WHERE id = $1",
+        ] {
+            sqlx::query(sql)
+                .bind(if sql.contains("booking") { booking_id } else { spot_id })
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM app_user WHERE id = $1")
+            .bind(renter)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+
+    /// A host must never read another host's withdrawals.
+    ///
+    /// `payout` had the strictest clause of the four —
+    /// `FOR select WHERE owner_id = record::id($auth)`, with no public half at all —
+    /// and it is the one where a dropped predicate would expose other people's money.
+    #[tokio::test]
+    #[ignore]
+    async fn payouts_are_visible_to_their_owner_and_nobody_else() {
+        use super::payout_repository::ViewPayoutRepository;
+        use shared::domain_models::view::ViewPayout;
+
+        let db = db().await;
+        let (mine, theirs) = (Uuid::now_v7(), Uuid::now_v7());
+        let payout_id = Uuid::now_v7();
+
+        ViewPayoutRepository::upsert(
+            &db,
+            ViewPayout {
+                id: payout_id,
+                version: 1,
+                owner_id: mine,
+                amount: 9_900,
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let ours = ViewPayoutRepository::find_all_by_owner_id(&db, mine).await.unwrap();
+        assert_eq!(ours.len(), 1);
+        assert_eq!(ours[0].amount, 9_900);
+
+        assert!(
+            ViewPayoutRepository::find_all_by_owner_id(&db, theirs)
+                .await
+                .unwrap()
+                .is_empty(),
+            "another host must see none of these"
+        );
+
+        sqlx::query("DELETE FROM payout WHERE id = $1")
+            .bind(payout_id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+
+    async fn status_of(db: &PgPool, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM booking WHERE id = $1")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap()
     }
 }

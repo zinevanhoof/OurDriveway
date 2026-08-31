@@ -1,10 +1,21 @@
 //! Asking spot-service what a spot looks like.
 
 use serde::{Deserialize, Serialize};
-use surrealdb::types::SurrealValue;
 
 /// Subject spot-service answers on. Queue-subscribed, so replicas share the load.
-pub const SUBJECT_SPOT_CARD: &str = "spots.card";
+///
+/// `rpc.` and not `spots.`, which is where it used to live. A JetStream stream
+/// captures **every** message on a subject it binds, request/reply included, so
+/// `spots.card` matched the SPOTS stream's `spots.>` and every RPC request was
+/// stored as if it were an event. The projectors on that stream have no
+/// `filter_subject` narrow enough to have excluded it before partitioning, so one
+/// `SpotCard` lookup was enough to feed a bare `Uuid` to
+/// `serde_json::from_slice::<Envelope<SpotEvent>>` and stop both SPOTS projectors
+/// for good.
+///
+/// Nothing binds `rpc.>`, which is the point. `only_event_subjects_land_in_streams`
+/// in `crate::events` is what keeps it that way.
+pub const SUBJECT_SPOT_CARD: &str = "rpc.spot.card";
 
 /// A spot as something else needs to *display* it. The request is the bare `Uuid`.
 ///
@@ -12,9 +23,11 @@ pub const SUBJECT_SPOT_CARD: &str = "spots.card";
 /// spot-service's to reason about, and a consumer that wants them wants to be a consumer.
 /// This is the label on someone else's screen and nothing more, which is what keeps it
 /// safe to answer with `None` when anything at all goes wrong.
-/// `SurrealValue` so spot-service can select straight into it, as `TimeSlot` and the rest
-/// of `shared` already do. Serde is what carries it over NATS.
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+/// Serde is what carries it over NATS, and is now the only derive it needs. It used to
+/// also be `SurrealValue` so spot-service could select straight into it; the card is
+/// built from an already-read `Spot` through the `From` impl in `domain_models::spot`,
+/// so there is no second query shape to keep in step with this one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpotCard {
     pub title: String,
     /// `address.formatted` — one line, already assembled for humans.

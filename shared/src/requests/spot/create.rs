@@ -27,9 +27,13 @@ pub struct CreateSpotRequest {
     /// submission-time rules are applied here — see `super::availability`.
     #[garde(dive, custom(has_any_slot), custom(no_past_dates))]
     pub availability: Availability,
-    /// Media keys, in display order. The browser uploads each photo straight to
-    /// R2 first and sends back the keys media-service minted for them — no image
+    /// Media URLs, in display order. The browser uploads each photo straight to R2
+    /// first and sends back the whole URL media-service minted for it — no image
     /// bytes reach this service at all.
+    ///
+    /// The URL, not the bucket key: `are_spot_images` defers to
+    /// `media::is_media_url`, which checks the origin and the `{prefix}/{32 hex}.{ext}`
+    /// shape together, and a bare key satisfies neither half.
     #[garde(custom(are_spot_images))]
     pub images: Vec<String>,
 }

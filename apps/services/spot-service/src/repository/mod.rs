@@ -1,56 +1,60 @@
-//! One repository per domain, each holding the SurrealQL for the statements this
-//! service actually issues. Nothing is generated and no trait sits behind them:
-//! what a method does is the string in front of you, with no `format!` and no
-//! consts spliced in from the domain models.
+//! One repository per domain, each holding the SQL for the statements this service
+//! actually issues. Nothing is generated and no trait sits behind them: what a method
+//! does is the string in front of you, with no `format!` and no consts spliced in
+//! from the domain models. Runtime-checked `query_as`, never `query_as!`.
 //!
-//! One table here, three statements. Reads select `record::id(id) AS id` plus
-//! whatever else comes back in a shape the struct cannot deserialize, then `*`;
-//! writes bind the struct whole with `CONTENT $row`. Both mean adding a column to
-//! [`shared::domain_models::spot::Spot`] needs no edit here — only a *patchable*
-//! column does, in the one `SET` list that names it.
+//! One table here, four statements. Reads are plain `SELECT *` — the record-key
+//! unwrapping and the `?? default` fallbacks are gone with the record key and the
+//! nullable columns.
 //!
-//! Generic over the querier so the same type serves both positions: the service
-//! holds one over the pooled `Surreal<Client>`, the projector builds one over the
-//! open `&Transaction` for a single event.
+//! Writes, on the other hand, now name every column. `CONTENT $row` bound the struct
+//! whole, so adding a field to [`shared::domain_models::spot::Spot`] needed no edit
+//! here; sqlx has no equivalent, so an insert lists its columns and repeats them under
+//! `EXCLUDED`. The live test below is what catches an omission.
+//!
+//! The repositories are stateless. They were generic over a `Querier` so one type
+//! could serve a service and a projector; sqlx's `PgExecutor` covers `&PgPool` and
+//! `&mut PgConnection` alike, so each method just takes one.
 
 pub mod spot_repository;
 
-/// Round-trips the table through a real SurrealDB.
+/// Round-trips the table through a real YugabyteDB.
 ///
-/// `#[ignore]`d — needs `spot-service-db` on :8002 with `schemas/spot-schema.surql`
-/// imported, and CI runs `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, and CI runs
+/// `cargo test --workspace` with no database:
 ///
 /// ```sh
-/// docker compose -f docker/docker-compose-dev.yml up -d spot-service-db
+/// docker compose -f docker/docker-compose-dev.yml up -d yugabyte
 /// cargo test --workspace -- --ignored
 /// ```
 ///
-/// The statements above are hand-written strings, and what they rely on cannot be
-/// checked any other way: `CONTENT $row` against a SCHEMAFULL table including an
-/// `id` the statement also names, and a read that has to come back as something
-/// [`shared::domain_models::spot::Spot`] can deserialize — a `geo::Point`, an
-/// `Address`, an `Availability`, and two defaulted columns.
+/// The statements are hand-written strings, and what they rely on cannot be checked
+/// any other way: a sixteen-column insert whose `EXCLUDED` list has to match its
+/// column list, two `jsonb` columns that have to come back as an `Address` and an
+/// `Availability`, and a `text[]`. The one thing that is no longer at risk is the
+/// geometry — `location` was a `geo::Point` the driver had to recognise, and it is
+/// two `double precision` columns now.
 #[cfg(test)]
 mod live_tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use chrono::Utc;
-    use geo::Point;
-    use shared::db::Querier;
     use shared::domain_models::spot::{Spot, SpotPatch};
     use shared::general_models::spot::{Address, Availability, TimeSlot, WeeklyAvailability};
-    use surrealdb::{Surreal, engine::remote::ws::Client};
+    use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::spot_repository::SpotRepository;
 
-    async fn db() -> Arc<Surreal<Client>> {
-        Arc::new(
-            shared::db::connect("127.0.0.1:8002", "root", "root")
-                .await
-                .expect("spot-service-db on :8002 — see this module's docs"),
-        )
+    /// Connects and migrates, so a running container is the only prerequisite.
+    async fn db() -> PgPool {
+        let pool = shared::db::connect("postgres://yugabyte@127.0.0.1:5433/spot")
+            .await
+            .expect("dev yugabyte on :5433, database `spot` — see this module's docs");
+        shared::db::migrate(&pool, &sqlx::migrate!("../../../migrations/spot"))
+            .await
+            .expect("migrations apply");
+        pool
     }
 
     fn availability() -> Availability {
@@ -75,19 +79,19 @@ mod live_tests {
     #[ignore]
     async fn a_spot_round_trips_and_patches_leave_absent_columns_alone() {
         let db = db().await;
-        let repo = SpotRepository { q: db.clone() };
 
         let id = Uuid::now_v7();
         let owner_id = Uuid::now_v7();
         let row = Spot {
             id,
+            version: 1,
             owner_id,
-            shard: "00".to_string(),
             title: "Driveway".to_string(),
             description: Some("Near the station".to_string()),
             price_per_hour: 250,
             images: vec!["https://example.test/a.jpg".to_string()],
-            location: Point::new(4.35, 50.85),
+            lng: 4.35,
+            lat: 50.85,
             active: true,
             deleted: false,
             address: Address {
@@ -101,42 +105,46 @@ mod live_tests {
             },
             availability: availability(),
             timezone: "Europe/Brussels".to_string(),
-            created_at: Utc::now().into(),
-            updated_at: Utc::now().into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
 
-        repo.upsert(row.clone()).await.unwrap();
+        SpotRepository::upsert(&db, row.clone()).await.unwrap();
 
-        let got = repo.find_by_id(id).await.unwrap().expect("upserted row");
-        assert_eq!(
-            got.id, id,
-            "record::id(id) AS id must unwrap the record key"
-        );
-        // `owner_id` is a plain uuid column, not a link — if the read ever unwrapped
-        // it the way it unwraps `id`, this is what would catch it.
+        let got = SpotRepository::find_by_id(&db, id)
+            .await
+            .unwrap()
+            .expect("upserted row");
+        assert_eq!(got.id, id);
+        assert_eq!(got.version, 1, "the version must survive a whole-row write");
         assert_eq!(got.owner_id, owner_id);
-        assert_eq!(got.location, Point::new(4.35, 50.85), "geometry round-trip");
+        assert_eq!((got.lng, got.lat), (4.35, 50.85), "lng before lat, both ways");
+        // The jsonb round-trip, in both directions: written with `Json(…)`, read back
+        // through `#[sqlx(json)]`.
         assert_eq!(got.address.formatted, "Rue 1, 1000 Brussels");
+        assert_eq!(got.address.line2, None, "an absent optional stays absent");
         assert_eq!(got.availability.weekly.monday.len(), 1);
+        assert_eq!(got.availability.weekly.tuesday.len(), 0);
         assert_eq!(got.images.len(), 1);
         assert!(!got.deleted);
 
-        // A delete is also a deactivation, and must leave everything else alone.
-        repo.patch(id, SpotPatch::deleted(Utc::now()))
+        // A delete is also a deactivation, and must leave everything else alone —
+        // which is also what would catch a mis-ordered positional bind in `patch`.
+        SpotRepository::patch(&db, id, SpotPatch::deleted(Utc::now()))
             .await
             .unwrap();
-        let got = repo.find_by_id(id).await.unwrap().unwrap();
+        let got = SpotRepository::find_by_id(&db, id).await.unwrap().unwrap();
         assert!(got.deleted);
         assert!(!got.active);
         assert_eq!(got.title, "Driveway", "absent columns must survive a patch");
         assert_eq!(got.price_per_hour, 250);
         assert_eq!(got.timezone, "Europe/Brussels");
+        assert_eq!(got.availability.weekly.monday.len(), 1);
 
-        db.q("DELETE type::record('spot', $v)")
-            .bind(("v", id))
+        sqlx::query("DELETE FROM spot WHERE id = $1")
+            .bind(id)
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
     }
 }

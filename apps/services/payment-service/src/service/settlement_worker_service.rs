@@ -15,10 +15,12 @@
 //! its actual callers are — two routes — so that everything left in this file is
 //! worker-driven and the name stays true.
 
-use async_nats::jetstream::Context;
+use bus::outbox;
+use shared::db;
 use shared::{
+    domain_models::payment::{PaymentPatch, status},
     error::myerror::{MyError, MyResult},
-    events::{Envelope, payment::PaymentEvent, payment_subject},
+    events::{Envelope, aggregate_id, payment::PaymentEvent, payment_subject},
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -32,10 +34,9 @@ use crate::{
 };
 
 pub struct SettlementWorkerService {
-    pub payments: PaymentRepository,
-    pub bookings: BookingMirrorRepository,
+    /// The pool. See the note on `UserService::db` — the repositories are stateless.
+    pub db: sqlx::PgPool,
     pub stripe: Arc<Stripe>,
-    pub js: Context,
 }
 
 impl SettlementWorkerService {
@@ -51,16 +52,15 @@ impl SettlementWorkerService {
     pub async fn settle_up(&self, booking_id: &Uuid) -> MyResult<()> {
         // A payment we have never heard of is the common case, not a problem: most
         // bookings are released without anyone reaching checkout.
-        let Some(payment) = self.payments.find_by_booking_id(*booking_id).await? else {
+        let Some(payment) = PaymentRepository::find_by_booking_id(&self.db, *booking_id).await?
+        else {
             return Ok(());
         };
 
         // The booking, on the other hand, must exist — this payment was created from
         // it. Missing means our own BOOKINGS projection is behind, so fail and let the
         // redelivery find it rather than silently skipping a refund.
-        let booking = self
-            .bookings
-            .find_by_id(*booking_id)
+        let booking = BookingMirrorRepository::find_by_id(&self.db, *booking_id)
             .await?
             .ok_or_else(|| {
                 MyError::Bus(format!("booking {booking_id} not projected yet; retrying"))
@@ -106,23 +106,51 @@ impl SettlementWorkerService {
             }
         };
 
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "payment", &payment_id).await?;
+
+        // The row moves in the same transaction as the event. Guarded, so a
+        // redelivery that already applied is a no-op rather than a second refund.
+        match &event {
+            PaymentEvent::Refunded { refund_id, .. } => {
+                PaymentRepository::transition(
+                    &mut *tx,
+                    payment_id,
+                    &[status::SUCCEEDED],
+                    PaymentPatch::refunded(refund_id.clone()),
+                )
+                .await?;
+            }
+            PaymentEvent::SessionExpired { .. } => {
+                PaymentRepository::transition(
+                    &mut *tx,
+                    payment_id,
+                    &status::UNPAID,
+                    PaymentPatch::expired(),
+                )
+                .await?;
+            }
+            // `decide` yields only the two above.
+            _ => {}
+        }
+        db::set_version(&mut tx, "payment", &payment_id, version).await?;
+
         // Deterministic event id: a redelivery that gets this far — because the Stripe
-        // call succeeded but the publish or the ack did not — is discarded by the
-        // stream's duplicate window rather than recorded twice.
-        let mut envelope = Envelope::new(event, None);
+        // call succeeded but the commit did not — is discarded by the stream's
+        // duplicate window rather than recorded twice.
+        let mut envelope = Envelope::new(
+            event,
+            None,
+            aggregate_id("payment", &payment_id),
+            version,
+        );
         envelope.event_id = Uuid::new_v5(
             &Uuid::NAMESPACE_OID,
             format!("settle:{payment_id}:{}", booking.status).as_bytes(),
         );
 
-        // No compare-and-swap: one payment owns this subject, so there is no second
-        // writer to race.
-        bus::publish(
-            &self.js,
-            payment_subject(&payment.booking_shard, booking_id),
-            &envelope,
-        )
-        .await?;
+        outbox::enqueue(&mut *tx, &payment_subject(booking_id), &envelope).await?;
+        tx.commit().await?;
 
         Ok(())
     }

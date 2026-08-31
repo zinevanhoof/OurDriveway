@@ -5,11 +5,20 @@ use garde::Validate;
 // Serialize is here because these types travel inside events on the wire, not
 // just into the database.
 use serde::{Deserialize, Serialize};
-use surrealdb::types::SurrealValue;
 
 use crate::validation::require;
 
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue)]
+// These four are stored as `jsonb` columns rather than as flattened scalars and
+// nested arrays, so they need no database-specific derive at all — `Serialize` and
+// `Deserialize` are the whole contract, and the field carrying them is marked
+// `#[sqlx(json)]` on the owning model.
+//
+// That is a real simplification over what it replaced: the SurrealDB schema spelled
+// out every leaf, down to `availability.weekly.*.*.start`, because SCHEMAFULL demanded
+// it. Nothing in any query reaches into these — they are read and written whole — so
+// the leaves were declaration without leverage.
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Address {
     pub line1: String,
@@ -36,7 +45,7 @@ pub struct Address {
 /// depends on *when* it is being asked stays on the request field, because a stored
 /// grid may legitimately violate it: see `no_past_dates` in
 /// `requests::spot::availability`, which a spot listed last March fails and should.
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue, Validate)]
+#[derive(Clone, Debug, Serialize, Deserialize, Validate)]
 pub struct Availability {
     #[garde(dive)]
     pub weekly: WeeklyAvailability,
@@ -44,7 +53,7 @@ pub struct Availability {
     pub single: HashMap<String, Vec<TimeSlot>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, SurrealValue, Validate)]
+#[derive(Clone, Debug, Serialize, Deserialize, Validate)]
 pub struct WeeklyAvailability {
     #[garde(custom(validate_slots))]
     pub monday: Vec<TimeSlot>,
@@ -65,7 +74,7 @@ pub struct WeeklyAvailability {
 /// Slots are judged collectively — a slot is only wrong *relative to the others on
 /// its day* — so there are no per-field rules and no `Validate` derive. See
 /// [`validate_slots`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, SurrealValue)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeSlot {
     pub start: String, // "08:00"
     pub end: String,   // "18:00"

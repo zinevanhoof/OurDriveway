@@ -1,37 +1,28 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock},
-};
+use std::sync::{Arc, LazyLock};
 
 use axum::{Router, routing::get};
-use axum_reverse_proxy::ReverseProxy;
 use shared::{
     env,
     events::{STREAM_BOOKINGS, STREAM_PAYMENTS, STREAM_SPOTS, STREAM_USERS},
 };
 
-use bus::AppliedSeqs;
+use crate::projector::{BookingProjector, PaymentProjector, SpotProjector, UserProjector};
 
-use crate::{
-    projector::{BookingProjector, PaymentProjector, SpotProjector, UserProjector},
-    repository::user_repository::ViewUserRepository,
-};
-
+mod policy;
 mod projector;
 mod repository;
 mod route;
 
-/// The combined read model: every service's events projected into one database
-/// with real record links, serving all client reads from a single endpoint.
+/// The combined read model: every service's events projected into one database,
+/// serving all client reads.
 ///
 /// It owns no truth. Every table is rebuildable from the log, and nothing here is
 /// ever consulted to make a decision — availability, pricing and authorization
 /// are answered by the service that owns them.
 #[derive(Clone)]
 pub struct AppState {
-    /// Only the `user` table, and only for `/me`. Everything else a client reads
-    /// comes through the GraphQL proxy below, straight from the database.
-    pub users: Arc<ViewUserRepository>,
+    /// The pool. Handlers read through the repositories, which are stateless.
+    pub db: sqlx::PgPool,
 }
 
 /// Every variable this service reads, in one place.
@@ -41,24 +32,19 @@ pub struct AppState {
 /// falls back to a default, because a default is a value you cannot discover by
 /// reading the `.env`.
 pub struct Config {
-    pub surrealdb_addr: String,
-    pub surrealdb_user: String,
-    pub surrealdb_pass: String,
+    /// This service's own database in the YugabyteDB cluster, as one URL — and the
+    /// port is **5433**, not 5432. See user-service's `Config` for the full note.
+    pub database_url: String,
     pub nats_url: String,
     pub port: u16,
-    /// 0 disables snapshots entirely — see `bus::snapshot::install`.
-    pub snapshot_interval_secs: u64,
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
-    surrealdb_addr: env::require("SURREALDB_ADDR"),
-    surrealdb_user: env::require("SURREALDB_USER"),
-    surrealdb_pass: env::require("SURREALDB_PASS"),
+    database_url: env::require("DATABASE_URL"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
-    snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
     jwt_secret: env::require("JWT_SECRET"),
 });
 
@@ -78,25 +64,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     LazyLock::force(&CONFIG);
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
-    let db = shared::db::connect(
-        &CONFIG.surrealdb_addr,
-        &CONFIG.surrealdb_user,
-        &CONFIG.surrealdb_pass,
-    )
-    .await?;
+    let db = shared::db::connect(&CONFIG.database_url).await?;
+    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/view")).await?;
 
-    // One owned client per projector — four here, because `Surreal::begin` consumes
-    // one and each holds its own open transaction. That is the floor: four sessions,
-    // cloned once at boot rather than once per event.
-    let users_client = db.clone();
-    let spots_client = db.clone();
-    let bookings_client = db.clone();
-    let payments_client = db.clone();
-
-    // The `/me` handler shares one session. `Surreal::clone` would mint another and
-    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
-    // because nothing re-authenticates per request — see `shared::db::connect`.
-    let db = Arc::new(db);
+    // One pool for the whole process — four projectors × PARTITIONS lanes, the
+    // election, the relay, the handlers and the await layer all share it.
+    //
+    // This used to be 4 × 16 connections plus three more, on the theory that an open
+    // transaction blocks every other session on the socket. It did not, but a
+    // `Surreal::clone` carried a replayed sign-in that `bus/examples/clone_cost`
+    // priced at +27.5ms per transaction. A pool has neither problem: a lane borrows a
+    // connection for one event's transaction and gives it straight back.
+    let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
@@ -105,78 +84,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &[STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
     );
 
-    // No-op when SNAPSHOT_INTERVAL_SECS=0, which is how this runs with a
-    // disposable projection store: every start replays from sequence 1.
-    bus::snapshot::install(
-        &js,
-        bus::SnapshotConfig {
-            db_addr: &CONFIG.surrealdb_addr,
-            db_user: &CONFIG.surrealdb_user,
-            db_pass: &CONFIG.surrealdb_pass,
-            service: "view-service",
-            streams: vec![STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
-            every_secs: CONFIG.snapshot_interval_secs,
-        },
-    )
-    .await?;
 
-    let applied = AppliedSeqs(Arc::new(HashMap::from([
-        (STREAM_USERS, readiness.applied_rx(STREAM_USERS).unwrap()),
-        (STREAM_SPOTS, readiness.applied_rx(STREAM_SPOTS).unwrap()),
-        (
-            STREAM_BOOKINGS,
-            readiness.applied_rx(STREAM_BOOKINGS).unwrap(),
-        ),
-        (
-            STREAM_PAYMENTS,
-            readiness.applied_rx(STREAM_PAYMENTS).unwrap(),
-        ),
-    ])));
 
-    // `Tx` opens a transaction per event, applies, advances that stream's cursor
-    // inside it and commits — so none of the four below can forget any of it.
+    // For the outbox relay only. The projectors need no election: each partition is
+    // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
+    // event at a time *per partition* across every replica, in order — and different
+    // partitions are different aggregates, which have no order between them. The
+    // relay has no such backstop, so exactly one instance may run it.
+    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
+
+    // Four projectors, `PARTITIONS` lanes each, all on the one connection above.
+    // A transaction per event, on a session that lives only as long as it does.
     tokio::spawn(bus::projector::run(
         js.clone(),
-        bus::Tx::new(UserProjector, users_client),
+        Arc::new(UserProjector),
+        db.clone(),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        bus::Tx::new(SpotProjector, spots_client),
+        Arc::new(SpotProjector),
+        db.clone(),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
         js.clone(),
-        bus::Tx::new(BookingProjector, bookings_client),
+        Arc::new(BookingProjector),
+        db.clone(),
         readiness.clone(),
     ));
     tokio::spawn(bus::projector::run(
-        js,
-        bus::Tx::new(PaymentProjector, payments_client),
+        js.clone(),
+        Arc::new(PaymentProjector),
+        db.clone(),
         readiness.clone(),
     ));
 
-    // Reads reach SurrealDB with the client's own Authorization header forwarded
-    // verbatim, so they get a RECORD identity and are constrained by the table
-    // permissions in view-schema.surql. The OWNER connection above is never
-    // exposed here.
-    let proxy: Router<AppState> = ReverseProxy::new(
-        "/api/view/graphql",
-        &format!("http://{}/graphql", CONFIG.surrealdb_addr),
-    )
-    .into();
+    // view-service publishes nothing today, so this relay has nothing to carry.
+    // Spawned anyway so every service has the same shape and a future event from
+    // the read model has somewhere to go.
+    tokio::spawn(bus::outbox::run(db.clone(), js, leader.clone()));
 
+    // The GraphQL proxy is gone, and with it the security model it carried.
+    //
+    // `/api/view/graphql` reverse-proxied straight to SurrealDB with the client's own
+    // Authorization header forwarded verbatim, so a browser got a RECORD identity and
+    // was constrained by the `PERMISSIONS` clauses in view-schema.surql. Those clauses
+    // *were* the authorization, evaluated by the database against `$auth`.
+    //
+    // No browser reaches this database now, and every rule those clauses expressed is a
+    // repository function — one per audience, each selecting the columns that audience
+    // may hold and matching the rows it may see. `migrations/view/0001_init.sql` records
+    // the rules and the two problems that came with the old arrangement (a denied field
+    // nulling a whole GraphQL array, and VULN-001's indexed-equality oracle).
+    //
+    // Eight endpoints, replacing eleven GraphQL documents. One audience, one projection
+    // and one repository call each — see `route/mod.rs` for the rules that shape them.
     let app = Router::new()
         .route("/api/view/me", get(route::me::me))
-        .merge(proxy)
+        .route("/api/view/me/spots", get(route::me::spots))
+        .route("/api/view/me/bookings", get(route::me::bookings))
+        .route("/api/view/me/payouts", get(route::me::payouts))
+        .route("/api/view/spots/nearby", get(route::spot::nearby))
+        .route("/api/view/spots/{id}", get(route::spot::public))
+        .route("/api/view/spots/{id}/manage", get(route::spot::manage))
+        .route("/api/view/bookings/{id}", get(route::booking::detail))
+        // Waits on the aggregate versions a client echoes back, against this
+        // service's own database — see `bus::await_version`. Transport-level, so it is
+        // unaffected by the reads underneath it changing shape.
         .layer(axum::middleware::from_fn_with_state(
-            applied,
-            bus::await_seq::await_seq,
+            bus::AwaitVersions(await_db),
+            bus::await_version::await_version,
         ))
         .merge(bus::health::routes(readiness))
-        .with_state(AppState {
-            users: Arc::new(ViewUserRepository { q: db }),
-        });
+        .with_state(AppState { db });
 
     // PORT differs per service in local dev so several can run on one host.
     // Containerised, every service listens on 80.

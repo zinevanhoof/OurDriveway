@@ -11,34 +11,33 @@
  * total derived another way, is how the two end up disagreeing.
  */
 import { computed, onMounted, ref } from 'vue';
-import { useQuery } from '@urql/vue';
+import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { toast } from 'vue-sonner';
 import { Banknote, Wallet } from '@lucide/vue';
 import Button from '@/components/ui/button/Button.vue';
 import Separator from '@/components/ui/separator/Separator.vue';
 import Spinner from '@/components/ui/spinner/Spinner.vue';
 import { formatCents } from '@/lib/money';
-import { PAYOUTS } from '@/api/graphql/payment';
+import { fetchPayouts, viewKeys } from '@/api/viewApi';
 import * as paymentApi from '@/api/paymentApi';
-import { useAuthStore } from '@/stores/auth';
 
-const auth = useAuthStore();
+const queryClient = useQueryClient();
 
 const earnings = ref<paymentApi.Earnings | null>(null);
 const loading = ref(true);
 const busy = ref(false);
 
-const { data, executeQuery } = useQuery({
-    query: PAYOUTS,
-    variables: computed(() => ({ ownerId: auth.user?.id })),
-    pause: computed(() => !auth.user?.id),
+// No `ownerId` variable and no `pause` on it. The server takes the owner from the
+// verified token, so there is no id to wait for the auth store to supply — which is
+// what that `pause` was guarding against.
+const { data } = useQuery({
+    queryKey: viewKeys.payouts,
+    queryFn: fetchPayouts,
 });
 
-const payouts = computed(() =>
-    [...(data.value?.payouts ?? [])].sort(
-        (a: any, b: any) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
-    ),
-);
+// Already newest-first from the server (`payout_owner (owner_id, created_at)` serves
+// the ORDER BY), so the client-side sort this replaced is gone.
+const payouts = computed(() => data.value ?? []);
 
 const df = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
 
@@ -65,10 +64,10 @@ async function withdraw() {
             description: `${formatCents(amount)} on its way. Demo only — no money actually moved.`,
         });
         // Re-read both: the balance from payment-service, the list from the projection.
-        // The list may lag by a moment, which `network-only` does not fix and does not
-        // need to — the next poll or visit picks it up.
+        // The list may lag by a moment, which invalidating does not fix and does not
+        // need to — the next visit picks it up.
         await load();
-        void executeQuery({ requestPolicy: 'network-only' });
+        void queryClient.invalidateQueries({ queryKey: viewKeys.payouts });
     } catch (e: any) {
         toast.error("Couldn't withdraw", { description: e.message });
     } finally {

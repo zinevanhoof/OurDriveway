@@ -80,14 +80,30 @@ pub enum PaymentEvent {
     },
 }
 
+impl PaymentEvent {
+    /// The payment a variant is about — the aggregate half of `payment:<uuid>`.
+    ///
+    /// `None` for `PayoutRequested`, which is the one variant on this stream that
+    /// concerns no payment at all: it is its own `payout:<uuid>` aggregate, written
+    /// to a different table.
+    pub fn payment_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Created(e) => Some(e.payment_id),
+            Self::Succeeded { payment_id, .. }
+            | Self::Failed { payment_id, .. }
+            | Self::Refunded { payment_id, .. }
+            | Self::SessionExpired { payment_id, .. } => Some(*payment_id),
+            Self::PayoutRequested { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaymentCreated {
     pub payment_id: Uuid,
+    /// Selects the subject this payment lives on: one booking's payment history
+    /// (created, succeeded, refunded) stays on a single ordered subject.
     pub booking_id: Uuid,
-    /// `shard_of(&booking_id)`, echoed on every later event for this payment so the
-    /// subject is never recomputed — the same reasoning as `spot_shard` on
-    /// `BookingCreated`.
-    pub booking_shard: String,
     /// The host who earns this. Denormalized so the earnings query is one indexed
     /// scan of `payment` and never joins back through the booking projection.
     pub owner_id: Uuid,

@@ -1,15 +1,13 @@
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::{
     Router,
     routing::{delete, post},
 };
-use bus::AppliedSeqs;
 use shared::env;
 
 use crate::{
-    projector::{BookingProjector, SpotProjector},
+    projector::SpotProjector,
     service::booking_service::BookingService,
 };
 
@@ -33,24 +31,19 @@ pub struct AppState {
 /// falls back to a default, because a default is a value you cannot discover by
 /// reading the `.env`.
 pub struct Config {
-    pub surrealdb_addr: String,
-    pub surrealdb_user: String,
-    pub surrealdb_pass: String,
+    /// This service's own database in the YugabyteDB cluster, as one URL — and the
+    /// port is **5433**, not 5432. See user-service's `Config` for the full note.
+    pub database_url: String,
     pub nats_url: String,
     pub port: u16,
-    /// 0 disables snapshots entirely — see `bus::snapshot::install`.
-    pub snapshot_interval_secs: u64,
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
-    surrealdb_addr: env::require("SURREALDB_ADDR"),
-    surrealdb_user: env::require("SURREALDB_USER"),
-    surrealdb_pass: env::require("SURREALDB_PASS"),
+    database_url: env::require("DATABASE_URL"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
-    snapshot_interval_secs: env::require_parsed("SNAPSHOT_INTERVAL_SECS"),
     jwt_secret: env::require("JWT_SECRET"),
 });
 
@@ -69,84 +62,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     LazyLock::force(&CONFIG);
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
-    let db = shared::db::connect(
-        &CONFIG.surrealdb_addr,
-        &CONFIG.surrealdb_user,
-        &CONFIG.surrealdb_pass,
-    )
-    .await?;
+    let db = shared::db::connect(&CONFIG.database_url).await?;
+    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/booking")).await?;
 
-    // One owned client per projector, because `Surreal::begin` consumes one and
-    // each holds its own open transaction. That is the floor: two sessions, cloned
-    // once here rather than once per event.
-    let spots_client = db.clone();
-    let bookings_client = db.clone();
-
-    // Everything else shares one session. `Surreal::clone` would mint another and
-    // replay the root sign-in onto it; cloning the `Arc` is a refcount bump. Safe
-    // because nothing re-authenticates per request — see `shared::db::connect`.
-    let db = Arc::new(db);
+    // One pool for the whole process — projector lanes, election, relay, sweeper,
+    // handlers and the await layer all share it. `PgPool` is `Arc` inside, so a clone
+    // is a refcount bump; a connection is borrowed per statement or per transaction.
+    let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
     // SPOTS as well as BOOKINGS: this service needs a local projection of spot
     // price and availability to authorize and price a booking server-side, since
     // the spot table lives in another service's database.
-    let readiness = bus::Readiness::new(
-        js.client().clone(),
-        &[
-            shared::events::STREAM_SPOTS,
-            shared::events::STREAM_BOOKINGS,
-        ],
-    );
+    // SPOTS only. BOOKINGS is this service's own stream and it no longer projects
+    // it — those rows are written directly by the request that causes them.
+    let readiness = bus::Readiness::new(js.client().clone(), &[shared::events::STREAM_SPOTS]);
 
-    // No-op when SNAPSHOT_INTERVAL_SECS=0, which is how this runs with a
-    // disposable projection store: every start replays from sequence 1.
-    bus::snapshot::install(
-        &js,
-        bus::SnapshotConfig {
-            db_addr: &CONFIG.surrealdb_addr,
-            db_user: &CONFIG.surrealdb_user,
-            db_pass: &CONFIG.surrealdb_pass,
-            service: "booking-service",
-            streams: vec![
-                shared::events::STREAM_SPOTS,
-                shared::events::STREAM_BOOKINGS,
-            ],
-            every_secs: CONFIG.snapshot_interval_secs,
-        },
-    )
-    .await?;
-
-    // The projectors are the only writers to `db`; the service only publishes.
+    // The service writes `db` directly, inside each request's transaction.
     // No `mark_caught_up` short-circuit any more — /readyz must stay 503 until
     // these have actually replayed, or Caddy routes bookings at an instance whose
     // availability projection is still half-built.
-    // `Tx` is the adapter that opens a transaction per event, applies, advances the
-    // cursor inside it and commits — so neither projector below can forget any of
-    // that, and `react`'s publishes now sit inside the same transaction as the
-    // projection write they precede.
+    // `run` opens a transaction per event, applies and commits — so the projector
+    // below cannot forget any of that, and `react`'s publishes sit inside the same
+    // transaction as the projection write they precede.
+    // For the outbox relay only. The projectors need no election: each partition is
+    // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
+    // event at a time *per partition* across every replica, in order — and different
+    // partitions are different spots, which have no order between them. The relay has
+    // no such backstop, so exactly one instance may run it.
+    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
+
     tokio::spawn(bus::projector::run(
         js.clone(),
-        bus::Tx::new(
-            // This one also publishes: a host's edit can invalidate bookings, and
-            // withdrawing them is this stream's job. See `SpotProjector::react`.
-            SpotProjector { js: js.clone() },
-            spots_client,
-        ),
+        // A host's edit can invalidate bookings, and withdrawing them is this
+        // stream's job — see `SpotProjector::react`. It writes them and enqueues
+        // their events in the same transaction, so it needs no NATS handle.
+        //
+        // Partitioning is what makes that safe to run concurrently: SPOTS is keyed
+        // by spot, so one spot's edits stay in one lane and `react` can never race
+        // itself over the same spot's bookings.
+        Arc::new(SpotProjector),
+        db.clone(),
         readiness.clone(),
     ));
-    tokio::spawn(bus::projector::run(
-        js.clone(),
-        bus::Tx::new(BookingProjector, bookings_client),
-        readiness.clone(),
-    ));
+
+    // Carries every BOOKINGS event this service commits — the only path by which
+    // they reach NATS.
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
 
     // Nothing else frees a lapsed hold — a `reserved` row blocks regardless of its
     // `hold_until`, by design. See sweeper.rs.
-    tokio::spawn(sweeper::run(js.clone(), db.clone()));
+    tokio::spawn(sweeper::run(db.clone()));
 
-    let booking_service = Arc::new(BookingService::new(js.clone(), db.clone(), &readiness));
+    let booking_service = Arc::new(BookingService::new(db.clone()));
 
     // Payment confirms bookings. A worker rather than a projector, and this service
     // keeps no PAYMENTS projection — see worker.rs. Deliberately not registered with
@@ -157,10 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Its own service rather than the `BookingService` above: the worker path is
     // post-capture and shares none of the request path's rules. See
     // service/payment_worker_service.rs.
-    let service = Arc::new(service::payment_worker_service::PaymentWorkerService::new(
-        js.clone(),
-        db,
-    ));
+    let service = Arc::new(service::payment_worker_service::PaymentWorkerService::new(db));
     tokio::spawn(bus::worker::run(
         js,
         Arc::new(worker::PaymentWorker { service }),
@@ -176,33 +142,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/booking/{id}", delete(route::booking::release))
         .route("/api/booking/{id}/cancel", post(route::booking::cancel));
 
-    // Read-your-own-writes. Both streams, because both are read on the way in:
-    // release and cancel look the booking up on BOOKINGS, and reserve prices and
-    // authorizes against the SPOTS mirror — so a host who just listed a spot can
-    // book it, and a renter can release the hold they just took.
-    let applied = AppliedSeqs(Arc::new(HashMap::from([
-        (
-            shared::events::STREAM_BOOKINGS,
-            readiness
-                .applied_rx(shared::events::STREAM_BOOKINGS)
-                .expect("BOOKINGS is registered with Readiness above"),
-        ),
-        (
-            shared::events::STREAM_SPOTS,
-            readiness
-                .applied_rx(shared::events::STREAM_SPOTS)
-                .expect("SPOTS is registered with Readiness above"),
-        ),
-    ])));
 
     let app = Router::new()
         .merge(api_router)
         // On the API only, and before health is merged: `/readyz` reporting how far
         // behind a projector is must never itself wait for that projector.
+        // Waits on the aggregate versions a client echoes back, against this
+        // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            applied,
-            bus::await_seq::await_seq,
+            bus::AwaitVersions(await_db),
+            bus::await_version::await_version,
         ))
+        // After the layer, deliberately — a backfill is not a client read and has
+        // no version to wait on. Not under `/api` either, which is what keeps it
+        // off the ingress; see `route::booking::backfill`.
+        .route("/internal/backfill", post(route::booking::backfill))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

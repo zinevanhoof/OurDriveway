@@ -14,7 +14,6 @@ import { DateFormatter, DateValue, getLocalTimeZone, today } from "@internationa
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 
-import { plainUuid } from "@/lib/utils";
 import * as bookingApi from "@/api/bookingApi";
 import * as paymentApi from "@/api/paymentApi";
 import type { TimeSlot } from "@/types/domain/spot";
@@ -26,10 +25,16 @@ import {
 } from "@/lib/bookingAvailability";
 
 const props = defineProps<{
+    /**
+     * Structural rather than `SpotDetail`, so the form does not depend on the whole
+     * read-model shape for four fields. `pricePerHour` is now a plain number — it was
+     * `number | string` because auto GraphQL rendered an `int` column as a string often
+     * enough that both had to be accepted, hence the `Number()` at every use site.
+     */
     spot?: {
         id: string;
         title: string;
-        price_per_hour: number | string;
+        pricePerHour: number;
         address?: { formatted?: string };
         availability?: SpotAvailability;
     };
@@ -133,8 +138,9 @@ function removeSlot(i: number) {
 }
 
 // ─── Pricing + totals ───
-// price_per_hour is EUR cents (integer) — see lib/money.ts.
-const pricePerHourCents = computed(() => Number(props.spot?.price_per_hour) || 0);
+// pricePerHour is EUR cents (integer) — see lib/money.ts. No `Number()`: it arrives as
+// a number now rather than as auto GraphQL's stringified int.
+const pricePerHourCents = computed(() => props.spot?.pricePerHour ?? 0);
 // Rounded because half-hour slots on an odd cent price give a fractional cent.
 const slotCents = (s: TimeSlot) => Math.round(slotHours(s) * pricePerHourCents.value);
 const slotHours = (s: TimeSlot) => (toMin(s.end) - toMin(s.start)) / 60;
@@ -173,7 +179,7 @@ async function submit() {
     busy.value = true;
     try {
         const booking = await bookingApi.createBooking({
-            spotId: plainUuid(props.spot.id)!,
+            spotId: props.spot.id,
             booked,
             amountCents: totals.value.amountCents,
         });

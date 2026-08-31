@@ -23,13 +23,20 @@ pub enum SpotEvent {
     },
 }
 
+impl SpotEvent {
+    /// The spot every variant is about — the aggregate half of `spot:<uuid>`.
+    pub fn spot_id(&self) -> Uuid {
+        match self {
+            Self::Created(e) => e.spot_id,
+            Self::Updated(e) => e.spot_id,
+            Self::Deleted { spot_id } => *spot_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpotCreated {
     pub spot_id: Uuid,
-    /// Assigned once, here, and echoed by every later event for this spot so its
-    /// subject never moves. Recomputing it downstream would break if SHARD_COUNT
-    /// ever changed.
-    pub shard: String,
     /// From the verified JWT claim.
     pub owner_id: Uuid,
     pub title: String,

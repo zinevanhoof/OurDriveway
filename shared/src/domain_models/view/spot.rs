@@ -1,10 +1,5 @@
 use chrono::{DateTime, Utc};
-use geo::Point;
-use surrealdb::types::{Datetime, SurrealValue};
 use uuid::Uuid;
-
-use surrealdb::types::vars;
-use surrealdb::{engine::remote::ws::Client, method::Query};
 
 use crate::{
     events::spot::{SpotCreated, SpotUpdated},
@@ -13,45 +8,44 @@ use crate::{
 
 /// The `spot` table in the read model — what a map query returns.
 ///
-/// **One column is missing from this model on purpose** and must survive a write
-/// from this stream: `owner`, the `record<user>` link, resolved by a subquery that
-/// yields NONE until the owner's `UserRegistered` has been applied. See the module
-/// doc.
-///
-/// So writes here go through `ViewSpotRepository::merge` and **never** a whole-row
-/// `CONTENT`: that would erase it. The projectors advance independently, so on any
-/// cold rebuild a `SpotCreated` can land after that spot's owner.
-#[derive(Clone, Debug, SurrealValue)]
+/// There is no missing column any more. This model used to omit `owner`, the
+/// `record<user>` link, which meant writes had to go through `merge` and never a
+/// whole-row `CONTENT` — a `CONTENT` would erase a link the USERS stream owned, and
+/// the projectors advance independently so a `SpotCreated` routinely lands before its
+/// owner. The link is gone: `owner_id` is a plain uuid and a read LEFT JOINs to
+/// resolve the profile, so there is nothing a write here can clear.
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct ViewSpot {
     pub id: Uuid,
-    /// The plain uuid, which is what permissions and filters use — `owner` is only
-    /// for nested GraphQL traversal.
     pub owner_id: Uuid,
     pub title: String,
     pub description: Option<String>,
     /// EUR cents.
     pub price_per_hour: i64,
     pub images: Vec<String>,
-    /// x = lng, y = lat. Bound as a geometry value directly rather than assembled
-    /// with `type::point([$lng, $lat])` — a `geo::Point<f64>` *is* a geometry point
-    /// to the driver.
-    pub location: Point<f64>,
+    /// Two `double precision` columns rather than a geometry.
+    ///
+    /// This was a `geo::Point<f64>`, which *was* a geometry point to the SurrealDB
+    /// driver. PostGIS is unavailable on YSQL, so the point is stored as its
+    /// components and the radius query is a bounding box on `spot_bbox` followed by
+    /// an exact haversine — see `migrations/view/0001_init.sql`. lng before lat
+    /// everywhere, matching geo's x/y and the argument order of the events.
+    pub lng: f64,
+    pub lat: f64,
     pub active: bool,
-    /// Soft delete. The row stays selectable so `booking.spot` still resolves for a
-    /// renter's past bookings — the lists filter this, the permission does not.
+    /// Soft delete. The row stays selectable so a renter's past booking still
+    /// resolves a title and an address — the lists filter this.
     pub deleted: bool,
+    #[sqlx(json)]
     pub address: Address,
+    #[sqlx(json)]
     pub availability: Availability,
     pub timezone: String,
-    pub created_at: Datetime,
-    pub updated_at: Datetime,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// A partial update to a [`ViewSpot`], written with the struct-update idiom.
-///
-/// **`owner` is not a field here**, which is what makes "a SPOTS write can never
-/// disturb the link" unrepresentable rather than merely untested. It is
-/// `ViewSpotRepository::link_owner`'s, and the USERS stream's business.
 #[derive(Debug, Default)]
 pub struct ViewSpotPatch {
     pub owner_id: Option<Uuid>,
@@ -59,41 +53,24 @@ pub struct ViewSpotPatch {
     pub description: Option<String>,
     pub price_per_hour: Option<i64>,
     pub images: Option<Vec<String>>,
-    pub location: Option<Point<f64>>,
+    pub lng: Option<f64>,
+    pub lat: Option<f64>,
     pub active: Option<bool>,
     pub deleted: Option<bool>,
     pub address: Option<Address>,
     pub availability: Option<Availability>,
     pub timezone: Option<String>,
-    pub created_at: Option<Datetime>,
-    pub updated_at: Option<Datetime>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 impl ViewSpotPatch {
-    /// Binds every patchable column. Absent ones bind as NONE, which the
-    /// `?? column` in `ViewSpotRepository::merge` and `::patch` turns into "leave it
-    /// alone" — and on a row being created, into the schema's own default.
-    pub fn bind(self, q: Query<'_, Client>) -> Query<'_, Client> {
-        q.bind(vars! {
-            owner_id:       self.owner_id,
-            title:          self.title,
-            description:    self.description,
-            price_per_hour: self.price_per_hour,
-            images:         self.images,
-            location:       self.location,
-            active:         self.active,
-            deleted:        self.deleted,
-            address:        self.address,
-            availability:   self.availability,
-            timezone:       self.timezone,
-            created_at:     self.created_at,
-            updated_at:     self.updated_at,
-        })
-    }
+    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
+    // positionally, so the binds live beside the `$n` placeholders in
+    // `ViewSpotRepository::merge` and `::patch`.
 
     /// Everything a `SpotCreated` carries. Every field is `Some`, so merging this
-    /// over an existing row replaces all of them — while leaving `owner` alone,
-    /// which is the point.
+    /// over an existing row replaces all of them.
     pub fn created(e: SpotCreated, at: DateTime<Utc>) -> Self {
         Self {
             owner_id: Some(e.owner_id),
@@ -101,14 +78,15 @@ impl ViewSpotPatch {
             description: e.description,
             price_per_hour: Some(e.price_per_hour_cents),
             images: Some(e.images),
-            location: Some(Point::new(e.lng, e.lat)),
+            lng: Some(e.lng),
+            lat: Some(e.lat),
             active: Some(true),
             deleted: Some(false),
             address: Some(e.address),
             availability: Some(e.availability),
             timezone: Some(e.timezone),
-            created_at: Some(at.into()),
-            updated_at: Some(at.into()),
+            created_at: Some(at),
+            updated_at: Some(at),
         }
     }
 
@@ -122,7 +100,7 @@ impl ViewSpotPatch {
             images: e.images,
             availability: e.availability,
             active: e.active,
-            updated_at: Some(at.into()),
+            updated_at: Some(at),
             ..Self::default()
         }
     }
@@ -133,7 +111,7 @@ impl ViewSpotPatch {
         Self {
             active: Some(false),
             deleted: Some(true),
-            updated_at: Some(at.into()),
+            updated_at: Some(at),
             ..Self::default()
         }
     }
@@ -150,9 +128,10 @@ mod tests {
     /// field to [`ViewSpotPatch`] and this stops compiling, which is the reminder
     /// that `bind` and the `SET` lists in `merge` and `patch` need it too.
     ///
-    /// `owner` and `booked` are absent by construction, so the two columns this
-    /// stream must never write are not writable from here at all. That used to be a
-    /// test asserting they stayed out of `PATCH_SET`; the compiler holds it now.
+    /// `booked` is absent by construction — availability is a query over the booking
+    /// rows, not a column on this one. `owner` used to be absent for a sharper reason:
+    /// it was a record link the USERS stream owned, and a SPOTS write that touched it
+    /// would erase it. There is no link now, so only `booked` is left out.
     #[test]
     fn set_covers_every_patchable_column() {
         let _: ViewSpotPatch = ViewSpotPatch {
@@ -161,7 +140,8 @@ mod tests {
             description: None,
             price_per_hour: None,
             images: None,
-            location: None,
+            lng: None,
+            lat: None,
             active: None,
             deleted: None,
             address: None,

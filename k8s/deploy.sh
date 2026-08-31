@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Install or upgrade OurDriveway.  Usage: k8s/deploy.sh [local|prod]
 #
-# Exists for one reason: Helm templates cannot read files outside the chart, and
-# the SurrealDB schemas live in schemas/ where the Rust build already uses them.
-# `--set-file` carries them across, and that many flags is more than fits comfortably
-# in a README line. Everything else here is plain helm.
+# The reason this existed is gone: Helm templates cannot read files outside the chart,
+# and the SurrealDB schemas lived in schemas/ where the Rust build already used them, so
+# every install carried them across with a `--set-file` per service. Schemas are sqlx
+# migrations embedded in each service binary now — there is nothing to carry.
+#
+# What is left is the secret, which is deliberately not templated (see values.yaml), and
+# that is still worth a script rather than three README lines.
 set -euo pipefail
 
 ENV="${1:-local}"
@@ -28,19 +31,17 @@ kubectl create secret generic app-secrets \
   --from-env-file=k8s/secrets.env \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Deliberately no `kubectl rollout restart` here. The projection stores are
-# disposable, so restarting a pod throws its database away and replays the whole
-# log to rebuild it — too expensive to do on every deploy on the off chance a
-# secret moved. Rotating one is an explicit
-# `kubectl rollout restart deployment -n ourdriveway`; a schema change rolls
-# itself via checksum/schemas in services.yaml.
-SET_FILES=()
-for s in user booking spot view payment; do
-  SET_FILES+=(--set-file "schemas.$s=schemas/$s-schema.surql")
-done
-
+# Deliberately no `kubectl rollout restart` here. A pod picks up a rotated secret
+# at its next start, and rolling every deployment on the off chance one moved is
+# noise. Rotating one is an explicit
+# `kubectl rollout restart deployment -n ourdriveway`.
+#
+# A schema change needs no roll and no separate step: each service applies its own
+# migrations at boot from `sqlx::migrate!`, so a new image carries its schema with it.
+# Nothing about the database is done centrally any more — a service whose database does
+# not exist creates it and retries, in `shared::db::connect`. That deleted the
+# create-databases post-install hook and its second copy of the service list.
 helm upgrade --install ourdriveway k8s/chart \
   --namespace "$NS" \
   --values "k8s/values-$ENV.yaml" \
-  "${SET_FILES[@]}" \
   "${@:2}"

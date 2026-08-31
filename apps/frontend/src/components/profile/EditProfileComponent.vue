@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useQuery } from '@urql/vue'
+import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useForm, useFieldArray, Field as VeeField } from 'vee-validate'
@@ -16,23 +16,23 @@ import Avatar from '@/components/ui/avatar/Avatar.vue'
 import AvatarImage from '@/components/ui/avatar/AvatarImage.vue'
 import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue'
 
-import { ME } from '@/api/graphql/user'
+import { fetchMe as fetchMeView, viewKeys } from '@/api/viewApi'
 import { updateProfile } from '@/api/userApi'
 import { uploadImage } from '@/api/mediaApi'
 import { fetchMe } from '@/api/me'
 import { useAuthStore } from '@/stores/auth'
 import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
-import { gqlRecordId } from '@/lib/utils'
 
 const router = useRouter()
 const auth = useAuthStore()
+const queryClient = useQueryClient()
 
-const { data, executeQuery } = useQuery({
-    query: ME,
-    variables: computed(() => ({ id: gqlRecordId(auth.user?.id) })),
+const { data } = useQuery({
+    queryKey: viewKeys.me,
+    queryFn: fetchMeView,
 })
 
-const me = computed(() => data.value?.user)
+const me = computed(() => data.value?.profile)
 
 // The address the form was loaded with. Changing away from it is what makes the
 // password field appear — and what the server independently demands a password
@@ -80,11 +80,13 @@ const formErrors = ref<string[]>([])
 watch(me, (user) => {
     if (!user) return
 
-    loadedEmail.value = user.email ?? ''
+    // No `?? ''` on the email: `OwnerViewUser.email` is not nullable. The column is
+    // NOT NULL and every projected row comes from a registration that carried one.
+    loadedEmail.value = user.email
     setValues({
         firstName: user.firstName,
         lastName: user.lastName,
-        email: user.email ?? '',
+        email: user.email,
         licensePlates: [...(user.licensePlates ?? [])],
         currentPassword: '',
     })
@@ -131,11 +133,17 @@ const submit = handleSubmit(async (form) => {
             return
         }
 
-        // The write went over REST, so there is no mutation response for
-        // graphcache to merge — refetch. `recordSeq` already made the request
-        // wait for the projection, and normalization spreads the result to every
-        // other cached reference to this user.
-        await executeQuery({ requestPolicy: 'network-only' })
+        // Invalidate rather than refetch-and-forget. graphcache used to normalize by
+        // entity id, so writing a user updated every cached reference to that person
+        // at once; vue-query caches per key, so the keys that could hold a stale copy
+        // have to be named. `me` is this screen; `spots` and `bookings` embed an owner
+        // and a renter profile respectively.
+        //
+        // `recordSeq` in the write above already made the next request wait for the
+        // projection, so these refetches see the new row rather than racing it.
+        await queryClient.invalidateQueries({ queryKey: viewKeys.me })
+        await queryClient.invalidateQueries({ queryKey: viewKeys.spots })
+        await queryClient.invalidateQueries({ queryKey: viewKeys.bookings })
         // The header reads the store, not the query.
         auth.setUser(await fetchMe())
         router.back()
@@ -163,7 +171,7 @@ const submit = handleSubmit(async (form) => {
                     <label class="relative cursor-pointer">
                         <Avatar size="3xl">
                             <AvatarImage v-if="picked || me?.profilePicture"
-                                :src="picked ?? me!.profilePicture" />
+                                :src="picked ?? me!.profilePicture ?? ''" />
                             <AvatarFallback v-if="me"
                                 :name="{ firstName: values.firstName || me.firstName, lastName: values.lastName || me.lastName }" />
                         </Avatar>

@@ -4,13 +4,12 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use bus::format_seq;
 use shared::{
     error::myerror::MyResult,
-    events::STREAM_PAYMENTS,
     extract::Valid,
     extractors::authed_jwt::AuthedJwt,
     requests::payment::CreateSessionRequest,
+    responses::common::backfilled,
     responses::payment::{EarningsResponse, PayoutResponse, SessionResponse, SessionStateResponse},
 };
 
@@ -92,13 +91,24 @@ pub async fn request_payout(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
 ) -> MyResult<impl IntoResponse> {
-    let (seq, amount_cents) = state.payment_service.request_payout(&user_id).await?;
+    let (token, amount_cents) = state.payment_service.request_payout(&user_id).await?;
 
     Ok((
         StatusCode::ACCEPTED,
         Json(PayoutResponse {
-            seq: format_seq(STREAM_PAYMENTS, seq),
+            seq: token,
             amount_cents,
         }),
     ))
+}
+
+/// `POST /internal/backfill` — re-emit every payout, for rebuilding a consumer.
+///
+/// Off the ingress and unauthenticated by construction; see the same handler in
+/// user-service for why that is the whole of the access control.
+///
+/// Payouts only. `PaymentService::backfill` says why the payments themselves have
+/// nothing downstream to rebuild.
+pub async fn backfill(State(state): State<AppState>) -> MyResult<impl IntoResponse> {
+    Ok(backfilled(state.payment_service.backfill().await?))
 }

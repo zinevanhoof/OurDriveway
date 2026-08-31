@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { useQuery } from '@urql/vue';
+import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import Button from '../ui/button/Button.vue';
-import { MANAGE_SPOT } from '@/api/graphql/spot.ts';
+import { fetchSpotManage, viewKeys } from '@/api/viewApi';
+import type { OwnerViewBooking } from '@/types/view';
 import { computed, ref } from 'vue';
-import { gqlRecordId, plainUuid } from '@/lib/utils.ts';
 import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
 import { formatCents } from '@/lib/money.ts';
@@ -23,20 +23,23 @@ const { id } = defineProps<{ id: string }>()
 
 const router = useRouter()
 
-const { data, executeQuery } = useQuery({
-    query: MANAGE_SPOT,
-    // Read once per mount, not per render: a reactive clock here would refetch on
-    // every tick, and "upcoming" doesn't change meaningfully within a visit.
-    variables: computed(() => ({
-        spotId: gqlRecordId(id),
-        spotUuid: plainUuid(id),
-        now: new Date().toISOString(),
-    })),
+const queryClient = useQueryClient()
+
+// One request, one path parameter. `MANAGE_SPOT` needed three variables — the spot in
+// two different spellings plus a `now` for the bookings filter — and the "read once per
+// mount, not per render" note that went with the clock: the server holds the instant
+// now, so there is no reactive `now` to accidentally refetch on.
+//
+// The same key as every other reader of this spot, so the detail drawer and the booking
+// form share one cached copy.
+const { data } = useQuery({
+    queryKey: viewKeys.spotManage(id),
+    queryFn: () => fetchSpotManage(id),
 })
 
 const routeToSpotEdit = () => router.push({ name: 'spot-edit', params: { id } })
 
-const timezone = computed(() => data.value?.spot?.timezone)
+const timezone = computed(() => data.value?.timezone)
 
 // ─── listing is live ────────────────────────────────────────────────────────
 
@@ -44,7 +47,7 @@ const timezone = computed(() => data.value?.spot?.timezone)
 // `pending` holds what we asked for until a refetch confirms it, so the thumb
 // doesn't snap back to a stale read.
 const pending = ref<boolean>()
-const live = computed(() => pending.value ?? data.value?.spot?.active ?? false)
+const live = computed(() => pending.value ?? data.value?.active ?? false)
 const errors = ref<string[]>([])
 
 // `{ active }` and nothing else: an edit only touches the fields it carries, and a
@@ -54,9 +57,9 @@ const toggleLive = async (active: boolean) => {
     pending.value = active
     errors.value = []
     try {
-        const response = await updateSpot(plainUuid(id)!, { active })
+        const response = await updateSpot(id, { active })
         if (!response.ok) throw new Error((await readErrorDetail(response)).join(' '))
-        await executeQuery({ requestPolicy: 'network-only' })
+        await queryClient.invalidateQueries({ queryKey: viewKeys.spots })
     } catch (e) {
         errors.value = [e instanceof Error ? e.message : 'Could not change the listing.']
     } finally {
@@ -72,7 +75,7 @@ const deleting = ref(false)
 const remove = async () => {
     deleting.value = true
     try {
-        await deleteSpot(plainUuid(id)!)
+        await deleteSpot(id)
         router.replace({ name: 'spots', state: { refreshSpots: true } })
     } catch (e) {
         confirmOpen.value = false
@@ -96,14 +99,14 @@ const weekly = computed<Row[]>(() =>
         .map(day => ({
             key: day,
             label: day[0].toUpperCase() + day.slice(1),
-            slots: (data.value?.spot?.availability?.weekly?.[day] ?? []) as TimeSlot[],
+            slots: (data.value?.availability?.weekly?.[day] ?? []) as TimeSlot[],
         }))
         .filter(row => row.slots.length))
 
 // Past one-off dates are dropped: they can't be booked, and they'd pile up forever.
 const single = computed<Row[]>(() => {
     const today = todayIn(timezone.value)
-    return Object.entries(data.value?.spot?.availability?.single ?? {})
+    return Object.entries(data.value?.availability?.single ?? {})
         .filter(([date, slots]) => date >= today && (slots as TimeSlot[]).length)
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([date, slots]) => ({
@@ -136,10 +139,12 @@ const showAllBookings = ref(false)
 // Already filtered to the future by the query's ends_at comparison; sorted here
 // because "soonest first" is a presentation choice, and the list is two rows long
 // until someone asks for all of it.
-const upcoming = computed(() =>
+// The host is a party to every booking on their own spot, so `renter` and `amount`
+// come back populated here — the same rows read by a stranger would have both null.
+const upcoming = computed<OwnerViewBooking[]>(() =>
     [...(data.value?.bookings ?? [])]
-        .filter((b: any) => b?.status === 'confirmed' || b?.status === 'reserved')
-        .sort((a: any, b: any) => String(a?.endsAt).localeCompare(String(b?.endsAt))))
+        .filter((b) => b.status === 'confirmed' || b.status === 'reserved')
+        .sort((a, b) => a.endsAt.localeCompare(b.endsAt)))
 
 const visibleBookings = computed(() =>
     showAllBookings.value ? upcoming.value : upcoming.value.slice(0, PREVIEW))
@@ -175,18 +180,18 @@ const bookingWhen = (booking: any) => {
     </header>
     <div class="space-y-3 px-4 overflow-y-auto no-scrollbar">
         <div class="flex h-40 gap-2 overflow-x-auto snap-x snap-mandatory no-scrollbar">
-            <img v-for="key in data?.spot?.images" :key="key" :src="key"
+            <img v-for="key in data?.images" :key="key" :src="key"
                 class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
         </div>
         <div class="flex">
             <div class="flex-1">
-                <div class="font-bold text-lg">{{ data?.spot?.title }}</div>
+                <div class="font-bold text-lg">{{ data?.title }}</div>
                 <div class="text-xs text-muted-foreground font-medium">
-                    {{ data?.spot?.address?.formatted }}
+                    {{ data?.address?.formatted }}
                 </div>
             </div>
             <div class="flex items-baseline text-lg font-bold text-primary">
-                {{ formatCents(data?.spot?.pricePerHour) }}
+                {{ formatCents(data?.pricePerHour ?? 0) }}
                 <div class="text-xs text-muted-foreground font-medium">/hr</div>
             </div>
         </div>
@@ -259,7 +264,7 @@ const bookingWhen = (booking: any) => {
                     <Avatar size="lg">
                         <AvatarImage v-if="booking?.renter?.profilePicture" :src="booking?.renter?.profilePicture" />
                         <AvatarFallback
-                            :name="{ firstName: booking?.renter?.firstName, lastName: booking?.renter?.lastName }" />
+                            :name="{ firstName: booking?.renter?.firstName ?? '', lastName: booking?.renter?.lastName ?? '' }" />
                     </Avatar>
                     <div class="flex-1">
                         <div class="text-sm font-medium">{{ booking?.renter?.firstName }} {{ booking?.renter?.lastName
@@ -268,7 +273,10 @@ const bookingWhen = (booking: any) => {
                         <div class="text-xs text-muted-foreground font-medium">{{ bookingWhen(booking) }}</div>
                     </div>
                     <div class="text-success font-bold">
-                        +{{ formatCents(booking?.amount) }}
+                        <!-- Non-null for the host, who is a party to every booking on
+                             their own listing. `?? 0` only covers the tick before the
+                             query resolves. -->
+                        +{{ formatCents(booking?.amount ?? 0) }}
                     </div>
                 </div>
                 <div v-if="!upcoming.length" class="text-xs text-muted-foreground font-medium">
@@ -285,7 +293,7 @@ const bookingWhen = (booking: any) => {
                 <div>
                     <div class="text-lg font-bold">Delete this listing?</div>
                     <div class="text-sm text-muted-foreground font-medium">
-                        {{ data?.spot?.title }} comes off the market for good. Any booking it still
+                        {{ data?.title }} comes off the market for good. Any booking it still
                         owes is cancelled and refunded. This can't be undone — to pause it instead,
                         turn off "Listing is live".
                     </div>

@@ -1,5 +1,5 @@
-# The backends differ in two facts: some extra env, and whether they carry state
-# at all. Everything else about them is identical, so they are data here and one
+# The backends differ in some extra env and in which of two dependencies they
+# have. Everything else about them is identical, so they are data here and one
 # template in templates/services.yaml — not five near-copies that drift the first
 # time a probe changes.
 registry: ghcr.io/zinevanhoof
@@ -62,17 +62,12 @@ services:
       # safe if those rules are ever relaxed. payment-service's .env sets 0 so a payout
       # is testable locally without waiting a day.
       SETTLEMENT_SECS: "86400"
-  # The one service with no database, no NATS consumer and no schema: it mints
-  # presigned R2 upload URLs and holds nothing. `stateless` is what strips the
-  # SurrealDB sidecar, the schema mount and the wait-for-nats init container from
-  # its pod — see templates/services.yaml.
-  #
-  # This is also what removed the uploads emptyDir that used to pin spot-service
-  # to one replica: images now live in R2 rather than on a pod's local disk.
+  # The one service that talks to neither a database nor the broker: it mints
+  # presigned R2 upload URLs and holds nothing at all. Both flags off strips the
+  # SurrealDB env, the schema and both init containers — see
+  # templates/services.yaml.
   media:
-    stateless: true
-    # The only service that talks to neither a database nor the broker: it mints
-    # presigned R2 upload URLs and holds nothing.
+    db: false
     nats: false
     env:
       # Not secret, and visible in review where it belongs. The credentials for
@@ -89,12 +84,12 @@ services:
       # Per-image ceiling in bytes (20 MiB), signed into the URL so it holds no
       # matter what is proxying in front of the service.
       MAX_UPLOAD_BYTES: "20971520"
-  # Stateless like media, but it does consume the log — its consumer cursor lives
-  # in NATS rather than in a projection, which is why it needs no SurrealDB and no
-  # schema. `api: false` keeps it off the ingress: it exposes only /healthz and
-  # /readyz, so there is nothing outside the cluster should be able to reach.
+  # No database like media, but it does consume the log — its consumer cursor
+  # lives in NATS rather than in a projection, which is why it needs no SurrealDB
+  # and no schema. `api: false` keeps it off the ingress: it exposes only /healthz
+  # and /readyz, so there is nothing outside the cluster should be able to reach.
   notification:
-    stateless: true
+    db: false
     api: false
     env:
       # Not secret and better off visible in review. RESEND_API_KEY and
@@ -117,47 +112,41 @@ services:
 
 replicas: 1
 
-surrealdb:
-  # Pinned to match the `surrealdb` crate in Cargo.toml. `:latest` drifting under
-  # a projection store is not a surprise anyone wants.
-  image: surrealdb/surrealdb:v3.2.4
-  # Used for BOTH the sidecar's --user/--pass and the app's SURREALDB_USER/PASS,
-  # so the two can't drift into a boot-time auth failure. Not a secret worth
-  # hiding: the sidecar binds 127.0.0.1, so nothing outside the pod can reach it.
-  user: root
-  pass: root
-  # surrealkv on an emptyDir: a real on-disk datastore that happens to be
-  # disposable. NOT `memory` — that would hold every projection in RAM, and the
-  # read model is the largest thing here.
-  #
-  # The emptyDir is node-local scratch deleted with the pod, which is the whole
-  # trick: disk-backed like production, stateless like a cache. No PVC, no
-  # StatefulSet, no volume to back up or migrate. Every pod start replays the log
-  # from sequence 1 and rebuilds this from scratch.
-  storage: surrealkv:/data/db
-  # Sized for the projection, not the log. This is scratch — if a service ever
-  # OOMs the node's ephemeral storage, that is the signal to turn snapshots back
-  # on, not to grow this.
-  sizeLimit: 2Gi
-
-# 0 disables the snapshot/restore path entirely. Nothing worth snapshotting while
-# the datastore is disposable — a snapshot would only ever be a slower way to
-# reach the state the log already produces. Set this (900 is the code default)
-# once the log is long enough for replay to be felt, and pair it with an S3 or
-# NATS object store the objects can live in.
-snapshotIntervalSecs: 0
+# The authoritative store — see templates/yugabyte.yaml.
+#
+# This one block replaced three: a `surrealdb` query engine, a `tikv` store under it,
+# and a `pd` placement driver under that. And a `curlImage`, which existed because the
+# distroless SurrealDB image had no shell to run the schema-import loop in, and because
+# PD and TiKV had no app image to borrow for their init containers.
+#
+# `storage` is the one thing in this chart whose loss is data loss rather than a
+# rebuild. Everything else derives from it: every service database, the read model, and
+# the seven days of events in NATS.
+yugabyte:
+  # **>= 2025.2, and started through `yugabyted`.** That pair is what enables Read
+  # Committed, which booking-service's reserve path depends on to not double-book —
+  # see the header of templates/yugabyte.yaml. This is a correctness constraint, not a
+  # preference. Keep it in step with docker/docker-compose-dev.yml.
+  image: yugabytedb/yugabyte:2025.2.5.2-b5
+  storage: 20Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+  # Untuned, a tserver sizes itself to the node — right on a node it does not share,
+  # wrong on a k3d cluster sharing a laptop with a cargo build. `values-local.yaml`
+  # overrides these; production leaves them empty and lets it have the machine.
+  tserverFlags: ""
+  masterFlags: ""
+  # No `replicas` key, deliberately. This template is single-node — multi-node needs
+  # `--join` and a replication factor, which is a different template, and a knob here
+  # would make three replicas look like a supported option when it is not.
 
 # Created outside this chart, by deploy.sh, from the gitignored k8s/secrets.env.
 # Deliberately not templated: Helm stores every rendered value in the release
 # secret and prints them back with `helm get values`, so a chart is a poor place
-# to put a signing key. Rotating it needs a `kubectl rollout restart`.
-secretName: app-secrets
-
-schemaConfigMap: surreal-schemas
-# Filled at install time by deploy.sh via `--set-file schemas.<name>=…`, keyed by
-# service name. Empty here so that a plain `helm template` with no --set-file
-# fails loudly on a missing schema rather than booting a database with no tables.
-schemas: {}
+# to put a signing key — and the database password is now in there too, as
+# YSQL_PASSWORD. Rotating it needs a `kubectl rollout restart`.
 
 frontend:
   # Caddy serving the built SPA and nothing else — all routing lives in the

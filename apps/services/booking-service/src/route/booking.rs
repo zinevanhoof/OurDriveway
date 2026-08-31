@@ -1,12 +1,10 @@
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
-use bus::format_seq;
 use shared::error::myerror::MyResult;
-use shared::events::STREAM_BOOKINGS;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::booking::CreateBookingRequest;
-use shared::responses::common::accepted;
+use shared::responses::common::{accepted, backfilled};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -45,8 +43,8 @@ pub async fn release(
     State(state): State<AppState>,
     Path(booking_id): Path<Uuid>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state.booking_service.release(&user_id, &booking_id).await?;
-    Ok(accepted(format_seq(STREAM_BOOKINGS, seq)))
+    let token = state.booking_service.release(&user_id, &booking_id).await?;
+    Ok(accepted(token))
 }
 
 /// The renter withdraws a booking they already paid for, up to an hour before it
@@ -60,6 +58,18 @@ pub async fn cancel(
     State(state): State<AppState>,
     Path(booking_id): Path<Uuid>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state.booking_service.cancel(&user_id, &booking_id).await?;
-    Ok(accepted(format_seq(STREAM_BOOKINGS, seq)))
+    let token = state.booking_service.cancel(&user_id, &booking_id).await?;
+    Ok(accepted(token))
+}
+
+/// `POST /internal/backfill` — re-emit every booking, for rebuilding a consumer.
+///
+/// Off the ingress and unauthenticated by construction; see the same handler in
+/// user-service for why that is the whole of the access control.
+///
+/// The one of the four that wakes a side-effect consumer — payment-service settles
+/// on the terminal booking events. `BookingService::backfill` says why that is safe
+/// and what would make it stop being.
+pub async fn backfill(State(state): State<AppState>) -> MyResult<impl IntoResponse> {
+    Ok(backfilled(state.booking_service.backfill().await?))
 }

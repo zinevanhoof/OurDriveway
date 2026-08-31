@@ -1,99 +1,120 @@
-use std::sync::Arc;
-
-use shared::db::Querier;
 use shared::domain_models::booking::{SpotMirror, SpotMirrorPatch};
 use shared::error::myerror::MyResult;
-use surrealdb::types::vars;
-use surrealdb::{Surreal, engine::remote::ws::Client};
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// booking-service's local mirror of the `spot` table.
 ///
-/// Every SPOTS write goes through [`SpotMirrorRepository::merge`], never a
-/// whole-row `CONTENT` — see [`SpotMirror`] for why that would erase this
-/// table's one BOOKINGS-derived column.
-pub struct SpotMirrorRepository<Q: Querier = Arc<Surreal<Client>>> {
-    pub q: Q,
-}
+/// Three statements: the plain read, the read that **locks**, and the merge.
+pub struct SpotMirrorRepository;
 
-impl<Q: Querier> SpotMirrorRepository<Q> {
-    /// `*` takes every column, so a new field on [`SpotMirror`] needs no edit
-    /// here. Three are spelled out because `*` returns them in a shape the struct
-    /// cannot deserialize.
+impl SpotMirrorRepository {
+    /// `SELECT *`.
     ///
-    /// `id` is the record key `spot:⟨uuid⟩` where the struct holds a plain uuid.
-    /// The other two are the columns a partially-built row will not have — and on
-    /// *this* table that is the normal cold-rebuild case, not an edge one, because
-    /// the two projectors advance independently and either side can create the row.
-    /// Without the defaults they come back NONE and the whole read fails.
+    /// This used to spell out `record::id(id) AS id`, `deleted ?? false` and
+    /// `bookings_seq ?? 0`, because the id was a record key and — on this table
+    /// especially — a partially-built row was the normal cold-rebuild case rather than
+    /// an edge one. The columns that can legitimately be absent are `NULL`-able in the
+    /// schema and `Option` on the model, so the read needs no defaults.
+    pub async fn find_by_id(
+        ex: impl PgExecutor<'_>,
+        spot_id: Uuid,
+    ) -> MyResult<Option<SpotMirror>> {
+        Ok(sqlx::query_as("SELECT * FROM spot WHERE id = $1")
+            .bind(spot_id)
+            .fetch_optional(ex)
+            .await?)
+    }
+
+    /// The same read, holding a row lock until the transaction ends.
     ///
-    /// An explicit alias beats `*` for the same name in either order — checked
-    /// against SurrealDB 3.2.4 rather than assumed.
-    pub async fn find_by_id(&self, spot_id: Uuid) -> MyResult<Option<SpotMirror>> {
-        Ok(self
-            .q
-            .q("SELECT record::id(id) AS id,
-                       deleted      ?? false AS deleted,
-                       bookings_seq ?? 0     AS bookings_seq,
-                       *
-                FROM ONLY type::record('spot', $v)")
-            .bind(("v", spot_id))
-            .await?
-            .take(0)?)
+    /// # This is the serialisation point for double-booking
+    ///
+    /// Two renters racing one slot insert two *different* booking rows — different
+    /// keys, nothing collides — so without something to contend on, both commit and
+    /// the slot is sold twice.
+    ///
+    /// Under TiKV that something was a counter: `bookings_seq` on this row, bumped
+    /// inside the reserve transaction purely to force a write-write conflict the store
+    /// would refuse. **Read Committed does not refuse it** — the second writer blocks,
+    /// re-reads and applies — so the counter would have gone on being bumped while
+    /// silently protecting nothing.
+    ///
+    /// The lock replaces it, and it works because of what Read Committed does *after*
+    /// the wait: each statement takes a **new snapshot**. T2 blocks here until T1
+    /// commits, and T2's next statement — `BookingRepository::taken_for_spot` — then
+    /// sees T1's booking and refuses the slot with a clean 409 naming it. No retry, no
+    /// counter, and the answer the renter gets is the useful one.
+    ///
+    /// Two things this depends on, both measured on
+    /// `yugabytedb/yugabyte:2025.2.5.2-b5` before it was written:
+    ///
+    ///   - **`yb_enable_read_committed_isolation` must be true**, which it is by
+    ///     default only from v2025.2 and only when deployed through `yugabyted`. Below
+    ///     that, Read Committed silently degrades to Snapshot: the lock is still taken,
+    ///     the wait still happens, and T2 then reads its *original* snapshot — which
+    ///     does not contain T1's booking. It double-books, with no error anywhere.
+    ///   - **The availability read must come after this call**, not before. A snapshot
+    ///     taken ahead of the lock is stale no matter what is locked afterwards.
+    ///
+    /// See the notes in `docker/docker-compose-dev.yml` and
+    /// `migrations/booking/0001_init.sql`.
+    pub async fn find_for_update(
+        ex: impl PgExecutor<'_>,
+        spot_id: Uuid,
+    ) -> MyResult<Option<SpotMirror>> {
+        Ok(sqlx::query_as("SELECT * FROM spot WHERE id = $1 FOR UPDATE")
+            .bind(spot_id)
+            .fetch_optional(ex)
+            .await?)
     }
 
     /// Apply a SPOTS event to the mirror, creating the row if it is not there yet.
     ///
-    /// `UPSERT`, not `UPDATE`: the two projectors advance independently, so the
-    /// event that would have created this row is routinely *not* the first one to
-    /// arrive. And a `SET` list, not `CONTENT`: the columns named here are every
-    /// column [`SpotMirrorPatch`] carries, which is every SPOTS-owned column —
-    /// `bookings_seq` is absent by construction, so this statement cannot touch it
-    /// no matter what a caller passes.
+    /// Upsert, not update: the row may not exist when a SPOTS edit arrives, because
+    /// the streams expire and a consumer built later can see a `SpotUpdated` whose
+    /// `SpotCreated` has already aged out.
     ///
-    /// `?? column` means absent-is-unchanged. On a row being created that resolves
-    /// to NONE, so the table's own DEFAULTs decide the rest.
-    pub async fn merge(&self, spot_id: Uuid, patch: SpotMirrorPatch) -> MyResult<()> {
-        patch
-            .bind(
-                self.q
-                    .q("UPSERT type::record('spot', $v) SET
-                            owner_id       = $owner_id       ?? owner_id,
-                            shard          = $shard          ?? shard,
-                            price_per_hour = $price_per_hour ?? price_per_hour,
-                            availability   = $availability   ?? availability,
-                            timezone       = $timezone       ?? timezone,
-                            active         = $active         ?? active,
-                            deleted        = $deleted        ?? deleted;")
-                    .bind(("v", spot_id)),
-            )
-            .await?
-            .check()?;
+    /// `COALESCE($n, column)` means absent-is-unchanged. On a row being created that
+    /// resolves to `NULL`, so the table's own defaults decide the rest.
+    ///
+    /// This no longer has a second job. It was `merge` and never a whole-row write
+    /// specifically because `CONTENT` would have erased `bookings_seq`, a column this
+    /// stream does not own — that column is gone, so the only reason left is the
+    /// partial-row case above.
+    ///
+    /// **The binds are positional**, so their order must match the `$n`.
+    pub async fn merge(
+        ex: impl PgExecutor<'_>,
+        spot_id: Uuid,
+        patch: SpotMirrorPatch,
+    ) -> MyResult<()> {
+        sqlx::query(
+            "INSERT INTO spot (id, owner_id, price_per_hour, availability, timezone, active, deleted)
+                  VALUES ($1, $2, $3, $4, $5, COALESCE($6, true), COALESCE($7, false))
+             ON CONFLICT (id) DO UPDATE SET
+                 owner_id       = COALESCE(EXCLUDED.owner_id,       spot.owner_id),
+                 price_per_hour = COALESCE(EXCLUDED.price_per_hour, spot.price_per_hour),
+                 availability   = COALESCE(EXCLUDED.availability,   spot.availability),
+                 timezone       = COALESCE(EXCLUDED.timezone,       spot.timezone),
+                 active         = COALESCE($6,                      spot.active),
+                 deleted        = COALESCE($7,                      spot.deleted)",
+        )
+        .bind(spot_id)
+        .bind(patch.owner_id)
+        .bind(patch.price_per_hour)
+        .bind(patch.availability.map(sqlx::types::Json))
+        .bind(patch.timezone)
+        .bind(patch.active)
+        .bind(patch.deleted)
+        .execute(ex)
+        .await?;
         Ok(())
     }
 
-    /// Advances this spot's compare-and-swap cursor to `seq`.
-    ///
-    /// Called for every BOOKINGS event on the spot, from inside the transaction that
-    /// wrote the booking row — so the cursor can never run ahead of the rows reserve
-    /// reads, which is the invariant that used to be bought by writing the cursor
-    /// and the slot map in one statement.
-    ///
-    /// `math::max` is load-bearing rather than decorative: a redelivered older
-    /// message must not rewind `bookings_seq`, or every subsequent reserve would
-    /// assert a sequence below the subject's head and be refused forever. A bound
-    /// patch can only assign, which is why this is its own statement rather than a
-    /// column on [`SpotMirrorPatch`].
-    pub async fn advance(&self, spot_id: &Uuid, seq: u64) -> MyResult<()> {
-        self.q
-            .q("UPSERT type::record('spot', $id) SET
-                    bookings_seq = math::max([bookings_seq ?? 0, $seq]);")
-            .bind(vars! {
-                id:  *spot_id,
-                seq: seq as i64,
-            })
-            .await?
-            .check()?;
-        Ok(())
-    }
+    // `advance` is gone. It bumped `spot.bookings_seq` inside the transaction that
+    // wrote a booking row, with `math::max` so a redelivered older message could not
+    // rewind it. Its entire purpose was to manufacture a write conflict; under Read
+    // Committed there is no conflict to manufacture, and `find_for_update` above is
+    // what serialises reserve instead.
 }

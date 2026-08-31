@@ -1,4 +1,4 @@
-use surrealdb::types::{Datetime, SurrealValue};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::events::payment::PaymentEvent;
@@ -13,12 +13,17 @@ use crate::events::payment::PaymentEvent;
 /// `earnings − Σ payout.amount_cents`, computed on read. That is what makes a
 /// refunded booking drop out of a host's income for free rather than needing a
 /// compensating write here.
-#[derive(Clone, Debug, SurrealValue)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct Payout {
     pub id: Uuid,
+    /// Written once and never bumped — a payout does not change — but still read,
+    /// because a backfill re-emitting `PayoutRequested` has to stamp the version
+    /// view-service already recorded against it.
+    #[sqlx(try_from = "i64")]
+    pub version: u64,
     pub owner_id: Uuid,
     pub amount_cents: i64,
-    pub created_at: Datetime,
+    pub created_at: DateTime<Utc>,
 }
 
 impl Payout {
@@ -29,7 +34,7 @@ impl Payout {
     ///
     /// Takes the whole event rather than the four fields so the projector's arm
     /// stays a single line, and so the mapping lives next to the row it produces.
-    pub fn requested(event: &PaymentEvent) -> Option<Self> {
+    pub fn requested(event: &PaymentEvent, version: u64) -> Option<Self> {
         match event {
             PaymentEvent::PayoutRequested {
                 payout_id,
@@ -38,10 +43,11 @@ impl Payout {
                 requested_at,
             } => Some(Self {
                 id: *payout_id,
+                version,
                 owner_id: *owner_id,
                 amount_cents: *amount_cents,
                 // The requester's timestamp off the event, not this replica's clock.
-                created_at: (*requested_at).into(),
+                created_at: *requested_at,
             }),
             _ => None,
         }
@@ -49,5 +55,6 @@ impl Payout {
 }
 
 // No unit tests: there is no patch struct to keep in step and no SQL in this file.
-// `CONTENT $row` writes whatever the struct holds, so a new column needs no edit
-// anywhere — `payouts_sum_per_owner` in payment-service covers the round-trip.
+// A new column does need an edit in `PayoutRepository::upsert` now — sqlx has no
+// whole-struct write to match SurrealDB's `CONTENT $row`, so the column list is
+// spelled out there. `payouts_sum_per_owner` in payment-service covers the round-trip.

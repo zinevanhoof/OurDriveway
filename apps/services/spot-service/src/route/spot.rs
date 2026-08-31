@@ -1,12 +1,10 @@
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
-use bus::format_seq;
 use shared::error::myerror::MyResult;
-use shared::events::STREAM_SPOTS;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::spot::{CreateSpotRequest, UpdateSpotRequest};
-use shared::responses::common::accepted;
+use shared::responses::common::{accepted, backfilled};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -27,9 +25,9 @@ pub async fn create_spot(
     Valid(request): Valid<CreateSpotRequest>,
 ) -> MyResult<impl IntoResponse> {
     // Ownership comes from the verified token, never from the request body.
-    let seq = state.spot_service.create_spot(&user_id, request).await?;
+    let token = state.spot_service.create_spot(&user_id, request).await?;
 
-    Ok(accepted(format_seq(STREAM_SPOTS, seq)))
+    Ok(accepted(token))
 }
 
 /// 202 for the same reason as create: the log has it, the projections haven't.
@@ -43,12 +41,12 @@ pub async fn update_spot(
     Path(id): Path<Uuid>,
     Valid(request): Valid<UpdateSpotRequest>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state
+    let token = state
         .spot_service
         .update_spot(&user_id, &id, request)
         .await?;
 
-    Ok(accepted(format_seq(STREAM_SPOTS, seq)))
+    Ok(accepted(token))
 }
 
 pub async fn delete_spot(
@@ -56,6 +54,14 @@ pub async fn delete_spot(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state.spot_service.delete_spot(&user_id, &id).await?;
-    Ok(accepted(format_seq(STREAM_SPOTS, seq)))
+    let token = state.spot_service.delete_spot(&user_id, &id).await?;
+    Ok(accepted(token))
+}
+
+/// `POST /internal/backfill` — re-emit every spot, for rebuilding a consumer.
+///
+/// Off the ingress and unauthenticated by construction; see the same handler in
+/// user-service for why that is the whole of the access control.
+pub async fn backfill(State(state): State<AppState>) -> MyResult<impl IntoResponse> {
+    Ok(backfilled(state.spot_service.backfill().await?))
 }

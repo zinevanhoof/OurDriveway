@@ -15,7 +15,6 @@ import Separator from "@/components/ui/separator/Separator.vue";
 import SpotDetailDrawer from "@/components/spot/SpotDetailDrawer.vue";
 import { canCancel, formatDay, formatSlots, isActiveNow, sortedDays } from "@/lib/bookingDates";
 import { formatCents } from "@/lib/money";
-import { plainUuid } from "@/lib/utils";
 
 const props = defineProps<{ booking: any; past?: boolean }>();
 const emit = defineEmits<{ changed: [] }>();
@@ -106,7 +105,7 @@ function directions() {
 async function resume() {
   resuming.value = true;
   try {
-    const id = plainUuid(props.booking.id)!;
+    const id = props.booking.id;
     const session = await paymentApi.createSession(id);
     void router.push({ path: "/checkout", query: { session_id: session.sessionId } });
   } catch (e: any) {
@@ -119,7 +118,7 @@ async function resume() {
 async function cancel() {
   cancelling.value = true;
   try {
-    const id = plainUuid(props.booking.id)!;
+    const id = props.booking.id;
     // Two different endpoints behind one button: releasing an unpaid hold and
     // cancelling a paid booking are separate transitions on the server, and it
     // answers 409 if you aim the wrong one at a booking.

@@ -26,16 +26,11 @@ pub fn mint(user_id: &Uuid) -> MyResult<(String, DateTime<Utc>, Uuid)> {
         iss: ISSUER.to_string(),
         jti,
 
-        ns: "main".to_string(),
-        db: "main".to_string(),
-        ac: "account".to_string(),
-
-        // The only `user:` left in the codebase. SurrealDB parses this claim with
-        // `syn::record_id` and errors if it fails, so the uuid needs its `u'…'`
-        // literal form — that is what makes `$auth` a *uuid-keyed* record id, and
-        // what lets every permission clause compare `record::id($auth)` against a
-        // `TYPE uuid` field with no cast. A bare uuid here does not parse.
-        id: format!("user:u'{user_id}'"),
+        // A plain uuid. This carried four more claims — `ns`, `db`, `ac`, and an `id`
+        // spelled `user:u'<uuid>'` — none of which were ours: they were what SurrealDB
+        // needed to accept the token as a record-access identity when the browser
+        // authenticated against view-service's database directly. See `JwtClaims`.
+        sub: *user_id,
     };
 
     let jwt = encode(

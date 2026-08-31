@@ -11,7 +11,7 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub struct AcceptedResponse {
     /// `"SPOTS:4712"`. Built by `bus::format_seq`, and read back by the
-    /// `bus::await_seq` layer when the client echoes it as `X-Await-Seq`.
+    /// `bus::await_version` layer when the client echoes it as `X-Await-Version`.
     pub seq: String,
 }
 
@@ -28,4 +28,22 @@ pub struct AcceptedResponse {
 /// owns the log position inside it.
 pub fn accepted(seq: String) -> (StatusCode, Json<AcceptedResponse>) {
     (StatusCode::ACCEPTED, Json(AcceptedResponse { seq }))
+}
+
+/// What `POST /internal/backfill` answers: how many events it enqueued.
+#[derive(Serialize)]
+pub struct BackfilledResponse {
+    pub events: usize,
+}
+
+/// 200, not the 202 every other write here answers with.
+///
+/// The difference is real rather than cosmetic: 202 means "accepted, and the
+/// projections have not caught up", which is why it comes with a token to wait on.
+/// A backfill has no such token — it re-emits many aggregates at once, and there is
+/// no single version to wait for. What it *can* say truthfully is that the work it
+/// was asked to do is finished: the events are in `_outbox` and the relay carries
+/// them from there.
+pub fn backfilled(events: usize) -> (StatusCode, Json<BackfilledResponse>) {
+    (StatusCode::OK, Json(BackfilledResponse { events }))
 }

@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use surrealdb::types::{Datetime, SurrealValue};
 use uuid::Uuid;
 
 use crate::{events::booking::BookingCreated, general_models::booking::Booked};
@@ -7,7 +6,7 @@ use crate::{events::booking::BookingCreated, general_models::booking::Booked};
 /// A booking's lifecycle, as stored in `status`.
 ///
 /// Bare `&str` rather than an enum because that is what the column is and what
-/// every guard compares against; the schema's `ASSERT $value IN [...]` is the
+/// every guard compares against; the schema's `CHECK (status IN (…))` is the
 /// authority. Here so the strings are written once — a typo in one of them is a
 /// transition that silently never matches.
 pub mod status {
@@ -28,26 +27,34 @@ pub mod status {
 /// Read entire rather than per-use-case: this replaced a `BookingForUpdate` that
 /// selected seven columns for the write path and a `LiveBooking` that selected
 /// three for the cancel reactor, both over a row addressed by primary key.
-#[derive(Clone, Debug, SurrealValue)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct Booking {
     pub id: Uuid,
+    /// Bumped by booking-service inside the transaction that writes this row.
+    /// The token a client waits on, and the gap detector for an out-of-order event —
+    /// see `shared::events::Envelope`. No longer the key concurrent writers collide
+    /// on; see `shared::db::next_version`.
+    #[sqlx(try_from = "i64")]
+    pub version: u64,
     /// A plain uuid, not a record link: the `spot` table lives in spot-service's
     /// database, so this one cannot hold a `record<spot>`.
     pub spot_id: Uuid,
-    /// Denormalised so the hold sweeper can rebuild this booking's NATS subject
-    /// without a second lookup.
-    pub spot_shard: String,
     /// Denormalised at create time so a booking can be scoped to the host without
     /// a cross-database dereference.
     pub owner_id: Uuid,
     pub renter_id: Uuid,
     /// `"YYYY-MM-DD"` -> slots, in the spot's timezone. Bare wall-clock strings,
     /// which is why `ends_at` exists as a separate folded instant.
+    ///
+    /// A `jsonb` column. It was a SCHEMAFULL object spelled out to
+    /// `booked.*.*.start`, which bought nothing: no query has ever reached into it,
+    /// and the shape is enforced by garde on the request that creates it.
+    #[sqlx(json)]
     pub booked: Booked,
     /// EUR cents, recomputed server-side from the minutes actually authorised —
     /// never a figure the client sent.
     pub amount: i64,
-    /// One of [`status`]. A string because the schema asserts the set.
+    /// One of [`status`]. A string because the schema's CHECK constrains the set.
     pub status: String,
     /// When a hold lapses. **The only place a hold expiry is stored**, and
     /// deliberately not part of what makes this booking block a slot: a `reserved`
@@ -59,10 +66,10 @@ pub struct Booking {
     /// The last moment this booking occupies, as an instant. Folded on the write
     /// side because `booked` is wall-clock and answering "is it over" from it needs
     /// the spot's zone, which a query does not have.
-    pub ends_at: Datetime,
-    /// The renter's score after the trip. NONE until they rate.
-    pub rating: Option<i64>,
-    pub created_at: Datetime,
+    pub ends_at: DateTime<Utc>,
+    /// The renter's score after the trip. NULL until they rate.
+    pub rating: Option<i32>,
+    pub created_at: DateTime<Utc>,
 }
 
 // There is deliberately no `BookingPatch`. Every write to this table is either a
@@ -79,11 +86,11 @@ impl Booking {
     ///
     /// `at` is the envelope's clock, never this process's — every replica has to
     /// store the same `created_at` for the same event.
-    pub fn created(e: BookingCreated, at: DateTime<Utc>) -> Self {
+    pub fn created(e: BookingCreated, at: DateTime<Utc>, version: u64) -> Self {
         Self {
             id: e.booking_id,
+            version,
             spot_id: e.spot_id,
-            spot_shard: e.spot_shard,
             owner_id: e.owner_id,
             renter_id: e.renter_id,
             booked: e.booked,
@@ -112,7 +119,6 @@ mod tests {
         let e = BookingCreated {
             booking_id: Uuid::now_v7(),
             spot_id: Uuid::now_v7(),
-            spot_shard: "00".into(),
             owner_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: Default::default(),
@@ -120,7 +126,7 @@ mod tests {
             expires_at: "2026-08-03T12:00:00Z".parse().unwrap(),
             ends_at: "2026-08-03T18:00:00Z".parse().unwrap(),
         };
-        let row = Booking::created(e, Utc::now());
+        let row = Booking::created(e, Utc::now(), 1);
         assert_eq!(row.status, status::RESERVED);
         assert!(row.hold_until.is_some());
     }

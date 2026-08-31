@@ -24,8 +24,14 @@ pub enum MyError {
     },
 
     // Everything below is an unexpected failure -> 500.
+    ///
+    /// Carries the `sqlx` error whole rather than a string, which is what lets
+    /// `db::is_write_conflict` match on SQLSTATE instead of on message text. The
+    /// SurrealDB equivalent had no typed surface at all — a write conflict arrived as
+    /// an untyped `Internal` whose kind was not stable across access paths, so the
+    /// only thing to match was the substring "WriteConflict".
     #[error(transparent)]
-    Database(#[from] surrealdb::Error),
+    Database(#[from] sqlx::Error),
     #[error(transparent)]
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]

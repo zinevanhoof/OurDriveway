@@ -3,13 +3,12 @@
 // renter's booking list (where it is read-only). It owns its own query rather than
 // taking a spot object, so a caller only has to know an id — which is all either
 // caller has when the user taps.
-import { useQuery } from "@urql/vue";
+import { useQuery } from "@tanstack/vue-query";
 import { computed } from "vue";
-import { FULL_SPOT } from "@/api/graphql/spot";
+import { fetchSpot, viewKeys } from "@/api/viewApi";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import { formatDay, formatSlots, sortedDays } from "@/lib/bookingDates";
 import { formatCents } from "@/lib/money";
-import { gqlRecordId, plainUuid } from "@/lib/utils";
 import { CalendarDays, Star } from "@lucide/vue";
 import Avatar from "../ui/avatar/Avatar.vue";
 import AvatarImage from "../ui/avatar/AvatarImage.vue";
@@ -30,22 +29,21 @@ const props = defineProps<{
 const open = defineModel<boolean>("open", { default: false });
 const emit = defineEmits<{ book: [] }>();
 
-// Paused until something is selected, so nothing runs at render time and there is
+// Disabled until something is selected, so nothing runs at render time and there is
 // one query total rather than one per pin.
+//
+// The endpoint returns the bookings too; this sheet does not read them, and the picker
+// next door does the subtracting. Both share the `spots/<id>` key, so vue-query serves
+// the second from cache exactly as urql's document dedupe did — and the three variables
+// that used to be needed (a record-id spelling, a plain uuid, and a `now`) are one path
+// parameter.
 const { data } = useQuery({
-  query: FULL_SPOT,
-  // The bookings half of FULL_SPOT is not read here — this sheet shows the spot, and
-  // the picker next door does the subtracting. Both variables are still required, and
-  // urql dedupes this against the booking form's identical query.
-  variables: computed(() => ({
-    id: gqlRecordId(props.spotId),
-    spotUuid: plainUuid(props.spotId),
-    now: new Date().toISOString(),
-  })),
-  pause: computed(() => props.spotId === null),
+  queryKey: computed(() => viewKeys.spot(props.spotId ?? "")),
+  queryFn: () => fetchSpot(props.spotId!),
+  enabled: computed(() => props.spotId !== null),
 });
 
-const spot = computed(() => data.value?.spot);
+const spot = computed(() => data.value);
 
 // The spot's own zone, not the viewer's — same rule as the card. Falls back to the
 // booking's copy so the list still labels "Today" correctly before FULL_SPOT lands.
@@ -67,7 +65,7 @@ const days = computed(() => sortedDays(props.booking));
           <div class="flex items-end justify-between">
             <div class="text-lg font-bold">{{ spot?.title }}</div>
             <div class="flex items-baseline text-xl font-extrabold text-primary">{{
-              formatCents(Number(spot?.price_per_hour))
+              formatCents(spot?.pricePerHour ?? 0)
             }}
               <div class="text-xs text-muted-foreground font-medium">/hr</div>
             </div>
@@ -105,7 +103,7 @@ const days = computed(() => sortedDays(props.booking));
           <Avatar size="lg">
             <AvatarImage v-if="spot?.owner?.profilePicture" :src="spot?.owner.profilePicture" />
             <AvatarFallback
-              :name="{ firstName: spot?.owner?.firstName, lastName: spot?.owner?.lastName }" />
+              :name="{ firstName: spot?.owner?.firstName ?? '', lastName: spot?.owner?.lastName ?? '' }" />
           </Avatar>
           <div>
             <div class="font-semibold">{{ spot?.owner?.firstName }} {{ spot?.owner?.lastName }}</div>

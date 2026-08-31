@@ -1,6 +1,4 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
-use bus::format_seq;
-use shared::events::STREAM_USERS;
 use shared::responses::common::accepted;
 use shared::{
     error::myerror::MyResult,
@@ -26,8 +24,8 @@ pub async fn verify(
     State(state): State<AppState>,
     Valid(req): Valid<VerifyEmailRequest>,
 ) -> MyResult<impl IntoResponse> {
-    let seq = state.user_service.verify_email(req).await?;
-    Ok(accepted(format_seq(STREAM_USERS, seq)))
+    let token = state.user_service.verify_email(req).await?;
+    Ok(accepted(token))
 }
 
 /// Re-sends the verification email.

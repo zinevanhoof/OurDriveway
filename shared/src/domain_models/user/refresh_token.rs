@@ -1,8 +1,5 @@
 use chrono::{DateTime, Utc};
-use surrealdb::types::{Datetime, SurrealValue};
 use uuid::Uuid;
-
-use surrealdb::{engine::remote::ws::Client, method::Query};
 
 use crate::events::session::{RefreshTokenIssued, RefreshTokenRotated};
 
@@ -10,32 +7,30 @@ use crate::events::session::{RefreshTokenIssued, RefreshTokenRotated};
 ///
 /// Only ever the **hash** of a token, never the token itself — the plaintext is a
 /// bearer credential and goes to the client's cookie and nowhere else.
-#[derive(Clone, Debug, SurrealValue)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct RefreshToken {
     pub id: Uuid,
-    /// Stored as a link to `user:⟨uuid⟩` — `user_id ON refresh_token TYPE
-    /// record<user>` — but held here as the bare uuid. Reads unwrap it with
-    /// `record::id(user_id) AS user_id`, writes re-wrap it with
-    /// `type::record('user', $user_id)`.
+    /// A plain uuid with a foreign key to `app_user(id)`.
     ///
-    /// **The only linked column in the codebase**, and the reason this is the one
-    /// table whose upsert cannot be `CONTENT $row`: binding the struct whole would
-    /// send a plain uuid where the schema demands a record. Everywhere else a
-    /// cross-service id is a plain uuid, because the table it points at lives in
-    /// another database. Here both tables are in this one.
+    /// This was the codebase's **only linked column** — `record<user>` in the schema
+    /// but a bare uuid on the struct, so reads unwrapped it with
+    /// `record::id(user_id)` and writes re-wrapped it with
+    /// `type::record('user', $user_id)`. Two halves in two different statements with
+    /// nothing in Rust connecting them, which is why it was also the one table whose
+    /// upsert could not be `CONTENT $row`, and why a live test existed purely to
+    /// prove the two halves agreed.
+    ///
+    /// All of that is gone. The column is a uuid, the write binds a uuid, and the
+    /// foreign key is what enforces the relationship — so the live test can assert
+    /// something real (an orphan is rejected) instead of asserting that two hand-
+    /// written statements still match each other.
     pub user_id: Uuid,
-    /// The *user's* shard — sessions live on the user's subject so one user's
-    /// whole session history stays on one ordered subject.
-    pub shard: String,
-    /// `refresh_token_hash … UNIQUE`. The only way a token is ever looked up:
+    /// `refresh_token_hash_idx … UNIQUE`. The only way a token is ever looked up:
     /// refresh and logout both arrive holding a plaintext token and nothing else.
-    ///
-    /// The index carried no `UNIQUE` until this was marked — the lookup had always
-    /// assumed one and said `LIMIT 1`, but nothing enforced it.
     pub token_hash: String,
-    pub jti: surrealdb::types::Uuid,
-    pub created_at: Datetime,
-    pub expires_at: Datetime,
+    pub jti: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
     pub revoked: bool,
     pub revoked_reason: Option<String>,
 }
@@ -55,15 +50,9 @@ pub struct RefreshTokenPatch {
     pub revoked_reason: Option<String>,
 }
 
-impl RefreshTokenPatch {
-    /// Binds every patchable column. Absent ones bind as NONE, which the
-    /// `?? column` in `RefreshTokenRepository::patch_by_token_hash` turns into
-    /// "leave it alone".
-    pub fn bind(self, q: Query<'_, Client>) -> Query<'_, Client> {
-        q.bind(("revoked", self.revoked))
-            .bind(("revoked_reason", self.revoked_reason))
-    }
-}
+// No `bind` here any more — see the note in the sibling `user.rs`. sqlx binds
+// positionally, so the binds live beside the `$n` placeholders in
+// `RefreshTokenRepository::patch_by_token_hash`.
 
 impl RefreshToken {
     /// The row an `Issued` writes. `at` is the envelope's clock, not this
@@ -72,11 +61,10 @@ impl RefreshToken {
         Self {
             id: e.token_id,
             user_id: e.user_id,
-            shard: e.shard,
             token_hash: e.token_hash,
-            jti: e.jti.into(),
-            created_at: at.into(),
-            expires_at: e.expires_at.into(),
+            jti: e.jti,
+            created_at: at,
+            expires_at: e.expires_at,
             revoked: false,
             revoked_reason: None,
         }
@@ -89,11 +77,10 @@ impl RefreshToken {
         Self {
             id: e.token_id,
             user_id: e.user_id,
-            shard: e.shard,
             token_hash: e.token_hash,
-            jti: e.jti.into(),
-            created_at: at.into(),
-            expires_at: e.expires_at.into(),
+            jti: e.jti,
+            created_at: at,
+            expires_at: e.expires_at,
             revoked: false,
             revoked_reason: None,
         }
@@ -109,12 +96,13 @@ mod tests {
     ///
     /// The literal is **exhaustive on purpose** — no `..Default::default()`. Add a
     /// field to [`RefreshTokenPatch`] and this stops compiling, which is the
-    /// reminder that `bind` and the `SET` list in `patch_by_token_hash` need it too.
+    /// reminder that the `SET` list in `patch_by_token_hash` needs it too, and a
+    /// `.bind()` in the matching position.
     ///
-    /// `user_id` is not a field here, so a partial update cannot repoint the
-    /// foreign key — which also means the link's read/write asymmetry only has to
-    /// be got right in two statements, not three. `the_user_link_round_trips` in
-    /// user-service checks those against a real database.
+    /// `user_id` is not a field here, so a partial update cannot repoint the foreign
+    /// key. That used to matter twice over, because the link had a read/write
+    /// asymmetry to get right in every statement touching it; the column is a plain
+    /// uuid with a real FK now, so this is only about not repointing it.
     #[test]
     fn set_covers_every_patchable_column() {
         let _: RefreshTokenPatch = RefreshTokenPatch {
