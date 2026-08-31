@@ -10,7 +10,7 @@ use shared::{
     error::myerror::{MyError, MyResult},
     events::{Envelope, PARTITIONS, domain_of, partition_filter},
 };
-use surrealdb::{Surreal, engine::remote::ws::Client, method::Transaction};
+use sqlx::{PgConnection, PgPool};
 
 use crate::health::Readiness;
 
@@ -65,12 +65,19 @@ pub trait Projector: Send + Sync + 'static {
     /// means 4 was missed, which a bare `WHERE status IN $from` would have
     /// absorbed silently.
     ///
-    /// This replaced a `seq: u64` carrying the stream sequence. Its only consumer
-    /// was booking-service storing a per-spot `bookings_seq` as a compare-and-swap
-    /// precondition — a job `version` now does everywhere.
+    /// This replaced a `seq: u64` carrying the stream sequence. Its only consumer was
+    /// booking-service storing a per-spot `bookings_seq` as a compare-and-swap
+    /// precondition — a column that is now gone entirely; see
+    /// `shared::domain_models::booking::SpotMirror`.
+    ///
+    /// Takes `&mut PgConnection` rather than the transaction itself, because that is
+    /// what an implementation can actually issue several statements against —
+    /// `PgExecutor` is consumed per statement, and a projector arm routinely writes a
+    /// row and then a version. It is still the open transaction: [`Tx::apply`] owns
+    /// the begin and the commit, and this only ever sees a reborrow of it.
     fn apply(
         &self,
-        tx: &Transaction<Client>,
+        conn: &mut PgConnection,
         event: Self::Event,
         at: DateTime<Utc>,
         version: u64,
@@ -88,20 +95,23 @@ pub struct Tx<P> {
     /// The service's one connection, shared by every lane of every projector and by
     /// the request handlers besides.
     ///
-    /// `Arc`, so holding it is a refcount bump rather than a session. The session is
-    /// minted per event by [`shared::db::begin`] and dropped with the transaction,
-    /// which is what lets sixteen lanes share one socket: `Surreal::begin` consumes
-    /// its client, so each lane needs a handle of its own, but only for as long as
-    /// the transaction lasts.
-    db: Arc<Surreal<Client>>,
+    /// A `PgPool`, which is `Arc` inside — so holding one per lane is a refcount bump.
+    /// Each event's transaction borrows a connection for its lifetime and returns it
+    /// on commit.
+    ///
+    /// This was `Arc<Surreal<Client>>`, and the distinction it needed explaining for
+    /// is gone: `Surreal::begin` consumed its client, so sixteen concurrent
+    /// transactions needed sixteen *cloned* handles, and a clone minted a session and
+    /// replayed a sign-in onto it at ~27.5ms a time. A pool hands out a connection.
+    db: PgPool,
 }
 
 impl<P> Tx<P> {
-    /// Holds the connection rather than borrowing one from `projector`: this is the
-    /// only place a transaction can be opened, so this is the only thing that needs
-    /// one. A `Projector` therefore holds none at all and cannot reach the database
-    /// except through the `&Transaction` it is handed.
-    pub fn new(projector: Arc<P>, db: Arc<Surreal<Client>>) -> Self {
+    /// Holds the pool rather than borrowing one from `projector`: this is the only
+    /// place a transaction can be opened, so this is the only thing that needs one. A
+    /// `Projector` therefore holds none at all and cannot reach the database except
+    /// through the connection it is handed.
+    pub fn new(projector: Arc<P>, db: PgPool) -> Self {
         Self { projector, db }
     }
 }
@@ -126,33 +136,32 @@ impl<P: Projector> Tx<P> {
         })?;
         let at = envelope.occurred_at;
 
-        // A session of its own for this event, cloned off the shared connection and
-        // dropped with the transaction.
-        let tx = shared::db::begin(&self.db).await?;
+        // A connection of its own for this event, borrowed from the pool and returned
+        // when the transaction ends.
+        let mut tx = self.db.begin().await?;
 
-        // Kept as a `Result` rather than an early `?`: `Transaction` is #[must_use]
-        // and holds state on the server, so a dropped one keeps whatever it locked
-        // until the server times it out.
-        // The envelope's version, not the stream sequence: what the projector
-        // stores has to be the number the owning service assigned and the client
-        // is waiting on.
+        // Kept as a `Result` rather than an early `?`: the transaction holds locks
+        // until it is resolved, and the explicit branches below are what make the
+        // rollback path visible rather than implicit in a drop.
+        //
+        // The envelope's version, not the stream sequence: what the projector stores
+        // has to be the number the owning service assigned and the client is waiting
+        // on.
         let version = envelope.version;
         let applied = self
             .projector
-            .apply(&tx, envelope.payload, at, version)
+            .apply(&mut tx, envelope.payload, at, version)
             .await;
 
         match applied {
             Ok(()) => {
-                // The client `commit` hands back is dropped with its session; the
-                // next event clones a fresh one.
                 tx.commit().await?;
                 Ok(())
             }
             Err(e) => {
-                // Best effort, and no longer fatal to the lane: a rollback that
-                // fails used to take this lane's only connection with it.
-                tx.cancel().await.ok();
+                // Best effort. sqlx also rolls back on drop, so this is about doing it
+                // promptly and observably rather than about doing it at all.
+                tx.rollback().await.ok();
                 Err(e)
             }
         }
@@ -225,13 +234,9 @@ pub fn durable_name(prefix: &str, partition: u8) -> String {
 pub async fn run<P: Projector>(
     js: Context,
     projector: Arc<P>,
-    db: Arc<Surreal<Client>>,
+    db: PgPool,
     readiness: Arc<Readiness>,
 ) {
-    // The service's one connection, shared by every lane. Each event's transaction
-    // runs on a session cloned off it and thrown away afterwards, so the lanes need
-    // no connections of their own.
-    //
     // Up front, so a projector that cannot declare its consumers fails here, once,
     // rather than sixteen times inside sixteen tasks.
     let consumers = match lane_consumers::<P>(&js).await {
@@ -257,10 +262,9 @@ pub async fn run<P: Projector>(
 
     let mut lanes = tokio::task::JoinSet::new();
     for (partition, consumer) in consumers.into_iter().enumerate() {
-        // Every lane gets the same connection. `Surreal::begin` takes its handle by
-        // value, so sixteen concurrent transactions still need sixteen handles —
-        // they are just cloned per event and dropped with the transaction rather
-        // than held open for the life of the process.
+        // Every lane gets a handle on the same pool — a refcount bump each. A lane
+        // holds a connection only for the length of one event's transaction, so
+        // sixteen lanes do not mean sixteen connections held open.
         let tx = Tx::new(projector.clone(), db.clone());
         lanes.spawn(async move {
             (partition as u8, lane::<P>(consumer, tx).await)
@@ -526,9 +530,10 @@ mod live_tests {
     use super::*;
 
     const NATS: &str = "nats://127.0.0.1:4222";
-    const ADDR: &str = "127.0.0.1:8000";
+    const URL: &str = "postgres://yugabyte@127.0.0.1:5433/view";
     /// Any database with a connection; the scratch table is created below.
-    const DB: &str = "view";
+    // The database name is part of `URL` above now, rather than a separate argument to
+    // `connect` — one `DATABASE_URL` per service replaced addr/user/pass/db.
     /// Written by these tests alone, and defined up front — sixteen lanes creating it
     /// implicitly would all write the same table-definition key and take a TiKV write
     /// conflict. An earlier spike learned that the hard way.
@@ -609,7 +614,7 @@ mod live_tests {
 
         async fn record(
             &self,
-            tx: &Transaction<Client>,
+            conn: &mut PgConnection,
             event: serde_json::Value,
             version: u64,
         ) -> MyResult<()> {
@@ -635,19 +640,28 @@ mod live_tests {
             *self.entered.lock().unwrap() += 1;
             let entered = Instant::now();
 
-            // `version = version ?? 0` so the row starts at a number: `set_version`'s
-            // `WHERE version < $v` compares against it, and NONE is not less than 1.
-            // The projected tables get this from `DEFAULT 0` in their schema.
-            tx.query(format!(
-                "UPSERT type::record('{TABLE}', $i) SET
-                     applies = (applies ?? 0) + 1,
-                     version = (version ?? 0)"
+            sqlx::query(&format!(
+                "INSERT INTO {TABLE} (id, applies, version) VALUES ($1, 1, 0)
+                 ON CONFLICT (id) DO UPDATE SET applies = {TABLE}.applies + 1"
             ))
-            .bind(("i", key))
-            .await?
-            .check()?;
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
 
-            shared::db::set_version(tx, TABLE, &key, version).await?;
+            // The same statement `shared::db::set_version` issues, written out rather
+            // than called. That function resolves its table through
+            // `shared::db::table_for`, which is an allowlist of the aggregates the
+            // services own — and a scratch table that exists only for these tests has
+            // no business being in it. The gap *logic* it also carries is pure and is
+            // covered by `version_gap`'s unit tests; what these lanes need is the
+            // `WHERE version < $2` guard, which is right here.
+            sqlx::query(&format!(
+                "UPDATE {TABLE} SET version = $2 WHERE id = $1 AND version < $2"
+            ))
+            .bind(key)
+            .bind(version as i64)
+            .execute(&mut *conn)
+            .await?;
 
             if self.fail_once.lock().unwrap().remove(&key) {
                 return Err(MyError::Bus(format!(
@@ -682,12 +696,12 @@ mod live_tests {
 
                 async fn apply(
                     &self,
-                    tx: &Transaction<Client>,
+                    conn: &mut PgConnection,
                     event: serde_json::Value,
                     _at: DateTime<Utc>,
                     version: u64,
                 ) -> MyResult<()> {
-                    self.0.record(tx, event, version).await
+                    self.0.record(conn, event, version).await
                 }
             }
         };
@@ -702,24 +716,32 @@ mod live_tests {
     recorder!(DuplicateLanes, "bus-lt-duplicate");
     recorder!(GapLanes, "bus-lt-gap");
 
-    /// Defines the scratch table, tolerating the race between concurrent tests.
+    /// Creates the scratch table, tolerating the race between concurrent tests.
     ///
-    /// `IF NOT EXISTS` is not a lock: two tests starting together both find it
-    /// missing and both write the same table-definition key, which TiKV refuses as a
-    /// write conflict — the exact hazard `bus/examples/tikv_spike` exists to
-    /// demonstrate, arriving here as a flaky test. Retried rather than serialised,
-    /// because the loser's retry finds the table already there and does nothing.
-    async fn define_scratch_table(db: &Surreal<Client>) {
+    /// `IF NOT EXISTS` is not a lock, and the retry is still needed — only the error
+    /// it absorbs has changed. Two tests starting together both find the table
+    /// missing and both try to create it; under TiKV that was a write conflict on the
+    /// table-definition key, and in Postgres it surfaces as a unique violation on the
+    /// catalogue (23505) or "already exists" (42P07). Retried rather than serialised,
+    /// because the loser's retry finds the table there and does nothing.
+    async fn define_scratch_table(db: &PgPool) {
         for attempt in 0..5 {
-            let result = db
-                .query(format!("DEFINE TABLE IF NOT EXISTS {TABLE} SCHEMALESS"))
-                .await
-                .map_err(MyError::from)
-                .and_then(|r| r.check().map_err(MyError::from));
+            let result = sqlx::query(&format!(
+                "CREATE TABLE IF NOT EXISTS {TABLE} (
+                     id      uuid PRIMARY KEY,
+                     applies bigint NOT NULL DEFAULT 0,
+                     version bigint NOT NULL DEFAULT 0
+                 )"
+            ))
+            .execute(db)
+            .await;
 
             match result {
                 Ok(_) => return,
-                Err(e) if shared::db::is_write_conflict(&e) && attempt < 4 => {
+                Err(sqlx::Error::Database(e))
+                    if matches!(e.code().as_deref(), Some("23505") | Some("42P07"))
+                        && attempt < 4 =>
+                {
                     tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
                 }
                 Err(e) => panic!("scratch table: {e}"),
@@ -729,7 +751,7 @@ mod live_tests {
 
     struct Live {
         js: Context,
-        db: Arc<Surreal<Client>>,
+        db: PgPool,
         readiness: Arc<Readiness>,
     }
 
@@ -741,15 +763,15 @@ mod live_tests {
             .expect("NATS on :4222 — docker compose -f docker/docker-compose-dev.yml up -d");
         crate::ensure_streams(&js).await.expect("declare streams");
 
-        let db = shared::db::connect(ADDR, "root", "root", DB)
+        let db = shared::db::connect(URL)
             .await
-            .expect("SurrealDB on :8000 — same compose file");
+            .expect("yugabyte on :5433 — same compose file");
         define_scratch_table(&db).await;
 
         let readiness = Readiness::new(js.client().clone(), &[STREAM_SESSIONS]);
         Live {
             js,
-            db: Arc::new(db),
+            db,
             readiness,
         }
     }
@@ -834,24 +856,17 @@ mod live_tests {
         }
 
         /// `applies` and `version` as stored, for the idempotence assertions.
+        ///
+        /// One statement now, where SurrealDB needed two `SELECT VALUE`s — a row is a
+        /// tuple here rather than one scalar per query.
         async fn row(&self, key: Uuid) -> Option<(i64, i64)> {
-            let applies: Option<i64> = self
-                .db
-                .query(format!("SELECT VALUE applies FROM ONLY type::record('{TABLE}', $i)"))
-                .bind(("i", key))
-                .await
-                .ok()?
-                .take(0)
-                .ok()?;
-            let version: Option<i64> = self
-                .db
-                .query(format!("SELECT VALUE version FROM ONLY type::record('{TABLE}', $i)"))
-                .bind(("i", key))
-                .await
-                .ok()?
-                .take(0)
-                .ok()?;
-            Some((applies?, version?))
+            sqlx::query_as(&format!(
+                "SELECT applies, version FROM {TABLE} WHERE id = $1"
+            ))
+            .bind(key)
+            .fetch_optional(&self.db)
+            .await
+            .ok()?
         }
     }
 

@@ -1,166 +1,259 @@
-use std::borrow::Cow;
+use std::time::Duration;
 
-use uuid::Uuid;
-
-use surrealdb::{
-    Surreal,
-    engine::remote::ws::{Client, Ws},
-    method::{Query, Transaction},
-    opt::auth::Root,
+use sqlx::{
+    Connection, PgConnection, PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
 };
+use uuid::Uuid;
 
 use crate::error::myerror::{MyError, MyResult};
 
-/// Opens the service's own connection to its own database.
+/// Opens the service's own pool against its own database.
 ///
-/// One connection per process, authenticated once at boot with a database-level
-/// user. This replaced the old per-request `db.authenticate(client_jwt)` in
-/// `AuthedDb`, where every request re-authenticated the single shared socket —
-/// so two concurrent requests could each be running under the other's identity.
+/// One `DATABASE_URL` per service, pointing at that service's database inside the
+/// one YugabyteDB cluster — `user`, `booking`, `spot`, `payment`, `view`. The
+/// database name is what keeps one service's tables out of another's, exactly as
+/// `SURREALDB_DB` did.
 ///
-/// Because this identity has a role rather than a record, table-level
-/// `PERMISSIONS` do not constrain it. Authorization is the service's job now:
-/// verify the JWT with `AuthedJwt`, then check ownership in Rust.
+/// **YSQL listens on 5433, not 5432.** A URL that says 5432 fails to connect with a
+/// perfectly ordinary "connection refused" and looks like the container is down.
 ///
-/// Credentials come from the caller's `Config`, not from this crate reading the
-/// environment behind its back — the old `SURREALDB_USER` default of "root" was
-/// a value no `.env` file mentioned.
-/// `database` is the service's own database inside the shared `main` namespace —
-/// "user", "booking", "spot", "payment", "view". It used to be "main" for every
-/// service, which was safe only because each ran its own SurrealDB process over
-/// its own datastore. On TiKV they share one keyspace, so the database name is
-/// now the only thing separating one service's tables from another's.
-pub async fn connect(
-    addr: &str,
-    username: &str,
-    password: &str,
-    database: &str,
-) -> MyResult<Surreal<Client>> {
-    let db = Surreal::new::<Ws>(addr).await?;
+/// Authorization is the service's job: verify the JWT with `AuthedJwt`, then check
+/// ownership in Rust. There is no row-level security and no per-request identity,
+/// because there is no per-request connection.
+///
+/// ## What replaced the old socket
+///
+/// This used to be one WebSocket connection per process, with `Surreal::begin`
+/// cloning a session per transaction — and `Surreal::clone` is not a refcount bump,
+/// it mints a session id and replays `Attach`/`Signin`/`Use` onto it, which
+/// `bus/examples/clone_cost` priced at +27.5ms per transaction. A pool is a pool:
+/// `pool.begin()` takes an idle connection and gives it back on commit.
+/// ## The database creates itself
+///
+/// A service's first boot against a fresh cluster finds no database to connect to, so
+/// this creates it and retries once. That cannot be a migration: `sqlx::migrate!` runs
+/// its files on a connection to the database being migrated, so a missing one fails at
+/// connect and the files are never read. (The transaction is *not* the obstacle — sqlx
+/// honours a leading `-- no-transaction`, which is what `CREATE DATABASE` would need.)
+///
+/// It replaced a Helm `post-install` hook that looped over the service list and created
+/// all five centrally. Three things improve by moving it here:
+///
+/// * There is one list of databases — the `DATABASE_URL`s themselves — instead of a
+///   second one in a chart that could disagree with them.
+/// * `docker compose` needs no equivalent. It never had one, so `down -v` deleted the
+///   databases and every service then failed at boot with `3D000`.
+/// * A service no longer waits on a hook that runs *after* it starts, which was a
+///   CrashLoopBackOff on every fresh install.
+///
+/// It assumes the role in `DATABASE_URL` may create databases. Both environments
+/// connect as `yugabyte` — the dev `.env`s and `k8s/chart/templates/services.yaml` —
+/// so it may. Give the services a non-superuser role and this is the line that stops
+/// working, loudly, on a fresh cluster only.
+pub async fn connect(url: &str) -> MyResult<PgPool> {
+    match pool(url).await {
+        Err(e) if is_missing_database(&e) => {
+            create_database(url).await?;
+            pool(url).await
+        }
+        other => other,
+    }
+}
 
-    db.signin(Root {
-        username: username.to_string(),
-        password: password.to_string(),
+async fn pool(url: &str) -> MyResult<PgPool> {
+    Ok(PgPoolOptions::new()
+        // Sized for the shape of the work rather than guessed. A service runs
+        // PARTITIONS projector lanes, each holding a connection only for as long as
+        // one event's transaction, plus request handlers. Yugabyte's per-connection
+        // cost is closer to PostgreSQL's than to a thread pool's, so this is
+        // deliberately not large.
+        .max_connections(20)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(url)
+        .await?)
+}
+
+/// SQLSTATE 3D000: the server is up and reachable, and has no such database.
+///
+/// Deliberately narrow. A refused connection, a bad password or the wrong port must
+/// keep failing as themselves — creating a database is only ever the answer to *this*.
+fn is_missing_database(e: &MyError) -> bool {
+    matches!(
+        e,
+        MyError::Database(sqlx::Error::Database(d)) if d.code().as_deref() == Some("3D000")
+    )
+}
+
+/// Creates the database named in `url`, from a connection to the maintenance one.
+///
+/// The name is taken back off the parsed options rather than sliced out of the URL, so
+/// a password containing a `/` cannot confuse it.
+async fn create_database(url: &str) -> MyResult<()> {
+    let opts: PgConnectOptions = url
+        .parse()
+        .map_err(|e| MyError::Bus(format!("DATABASE_URL is not a postgres URL: {e}")))?;
+    let name = opts
+        .get_database()
+        .ok_or_else(|| MyError::Bus("DATABASE_URL names no database".to_string()))?
+        .to_owned();
+
+    // `yugabyte` is the cluster's own always-present database, the same one the Helm
+    // hook used to connect to. `postgres` would do; this matches the role name the
+    // URLs already carry.
+    let mut admin = PgConnection::connect_with(&opts.clone().database("yugabyte")).await?;
+
+    // Spliced, because Postgres cannot bind an identifier — the same constraint
+    // `table_for` exists for. Quoted because `user` is a reserved word, and any `"` in
+    // the name is doubled so the quoting cannot be escaped out of. The value comes from
+    // this service's own environment, never from a request.
+    let quoted = name.replace('"', "\"\"");
+    match sqlx::query(&format!("CREATE DATABASE \"{quoted}\""))
+        .execute(&mut admin)
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(database = %name, "created");
+            Ok(())
+        }
+        // 42P04: another replica booting at the same time won the race. That is the
+        // outcome we wanted, so it is a success rather than something to retry.
+        Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42P04") => {
+            tracing::info!(database = %name, "already created by another replica");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The physical table an aggregate name maps to.
+///
+/// An allowlist and not string interpolation, because **Postgres cannot bind an
+/// identifier**: `SELECT … FROM $1` is a syntax error, so the table name has to be
+/// spliced into the statement text and therefore must never come from a caller
+/// unchecked. Every name here is a literal in this file.
+///
+/// It also carries the one rename in the schema. `user` is a reserved word, and the
+/// failure is silent rather than loud — an unquoted `FROM user` reads the
+/// current-user keyword and returns a row instead of erroring — so the table is
+/// `app_user` while the aggregate stays `user`: the await token `user:<id>@7`, the
+/// events and `aggregate_id("user", …)` are all unchanged.
+///
+/// `None` means the caller passed a name no service owns, which is a typo and is
+/// reported. It does **not** mean "this database has no such table" — that is a
+/// legitimate case and is handled by [`missing_table`].
+pub fn table_for(aggregate: &str) -> Option<&'static str> {
+    Some(match aggregate {
+        "user" => "app_user",
+        "spot" => "spot",
+        "booking" => "booking",
+        "payment" => "payment",
+        "payout" => "payout",
+        "refresh_token" => "refresh_token",
+        _ => return None,
     })
-    .await?;
-
-    db.use_ns("main").use_db(database).await?;
-
-    Ok(db)
 }
 
-// A note on `warm()` — a `Surreal::clone` followed by a polled `RETURN 1`, which used
-// to live here so that a lane could hold a pre-authenticated session.
-//
-// It does not work, and the reason is worth keeping because the wrong diagnosis was
-// expensive. `clone` mints a session id and asks the engine to *replay*
-// `Attach`/`Signin`/`Use` onto it without awaiting that replay. Polling the result
-// with a query is not a fix: a query on a session the router has not finished
-// registering is never answered *or* refused, so the first `await` blocks forever and
-// the retry loop underneath it is unreachable code. That is the hang.
-//
-// It was read as "an open transaction blocks every other session on this socket",
-// which sent every lane, the lease and the relay off to open connections of their own.
-// That claim was measured directly and is false: with 64 transactions open on one
-// socket, a new session on it signs in in ~54ms and gets a permission-requiring
-// statement back in ~5ms, whether it was created before or after those transactions
-// began. What sharing a socket does cost is `bus/examples/clone_cost`: +27.5ms per
-// transaction for the replayed sign-in, against a ~1ms empty transaction on a
-// connection of its own.
-//
-// So there is nothing to warm. [`begin`] clones a session per transaction and lets the
-// replay ride ahead of `Begin` on the same ordered socket, which is what the whole
-// codebase now runs on — one connection per process.
-
-/// Opens a transaction for one write.
-///
-/// `Surreal::begin` consumes its client and hands it back on commit, so a
-/// long-lived shared connection cannot serve two concurrent transactions. Request
-/// handlers are concurrent by definition, hence a session per write.
-///
-/// **The only place a transaction is opened**, request path and projectors alike.
-/// A projector lane used to hold its own connection and cycle it through
-/// `begin`/`commit`; it calls this per event now, on the connection every other lane
-/// shares.
-///
-/// ponytail: `Surreal::clone` mints a session and replays `Attach`/`Signin`/`Use`
-/// onto it, so this costs a few round trips per *write* — reads never come here.
-/// If write latency ever shows it, the fix is a small pool of pre-authenticated
-/// clients handed out per transaction; the reason it is not one already is that a
-/// pool needs a guard that returns the client on every path, including the `?`
-/// early-returns these handlers are full of, and `Drop` cannot await a rollback.
-pub async fn begin(db: &Surreal<Client>) -> MyResult<Transaction<Client>> {
-    Ok(db.clone().begin().await?)
+fn resolve(aggregate: &str) -> MyResult<&'static str> {
+    table_for(aggregate)
+        .ok_or_else(|| MyError::Bus(format!("unknown aggregate {aggregate:?}; see db::table_for")))
 }
 
-/// The version this aggregate will have **after** the caller's write.
+/// Whether this error is "that table does not exist in this database".
 ///
-/// Must be called inside the transaction that then writes the row, because the
-/// read and the write together are the concurrency control: two writers both see
-/// version 3, both write 4 to the same record, and TiKV refuses one of them. Call
-/// it outside the transaction and that guarantee is gone.
+/// Not a fault: view-service holds `payout` but no `payment`, and a client that has
+/// written a payment still echoes `payment:<id>@1` at it. SQLSTATE 42P01.
+fn missing_table(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01"))
+}
+
+/// The version this aggregate will have **after** the caller's write, having first
+/// taken a row lock on it.
 ///
-/// Starts at 1 for a row that does not exist yet.
-pub async fn next_version(tx: &impl Querier, table: &str, id: &Uuid) -> MyResult<u64> {
-    let current: Option<i64> = tx
-        .q("SELECT VALUE version FROM ONLY type::record($t, $i)")
-        .bind(("t", table.to_string()))
-        .bind(("i", *id))
-        .await?
-        .take(0)?;
+/// ## The `FOR UPDATE` is the concurrency control, and it is here so it cannot be forgotten
+///
+/// Under TiKV this was a plain read: two writers both saw version 3, both wrote 4 to
+/// the same record, and the store refused one of them. **Read Committed does not
+/// refuse it.** The second writer blocks on the row lock, re-reads, and applies — so
+/// both would write version 4, both would publish an event at version 4, and the
+/// projector's `WHERE version < $v` would apply one and silently drop the other. A
+/// downstream projection quietly missing an edit, with no error anywhere.
+///
+/// So the lock is taken here rather than at each call site: every write path that
+/// bumps a version goes through this function, and a rule applied in one place is not
+/// a rule anyone has to remember.
+///
+/// Must still be called **inside** the transaction that then writes the row — the
+/// lock is released at commit, and a lock taken in a different transaction protects
+/// nothing.
+///
+/// Returns 1 for a row that does not exist yet. There is nothing to lock in that
+/// case and nothing to race either: a create mints its own uuid.
+///
+/// Two write paths do **not** come through here and need their own lock, because in
+/// both the racing writers touch different rows and nothing collides:
+///   - reserve, which locks the spot mirror row (`booking_service`);
+///   - `request_payout`, which takes `pg_advisory_xact_lock` on the owner id.
+pub async fn next_version(conn: &mut PgConnection, aggregate: &str, id: &Uuid) -> MyResult<u64> {
+    let table = resolve(aggregate)?;
+    let sql = format!("SELECT version FROM {table} WHERE id = $1 FOR UPDATE");
+
+    let current: Option<i64> = match sqlx::query_scalar(&sql).bind(id).fetch_optional(conn).await {
+        Ok(v) => v,
+        Err(e) if missing_table(&e) => None,
+        Err(e) => return Err(e.into()),
+    };
+
     Ok(current.unwrap_or(0).max(0) as u64 + 1)
 }
 
 /// Records the aggregate version a projector just applied.
 ///
-/// Called by the projector rather than by `bus::Tx`, because only the projector
-/// knows which table the aggregate lives in *here*: view-service holds `payout`
-/// but no `payment`, and an `UPDATE` naming a table this database does not have is
-/// an error, not a no-op. (A missing *row* in a table that exists is a clean
-/// no-op — verified against SurrealDB 3.2.4.)
+/// Called by the projector rather than by `bus::Tx`, because only the projector knows
+/// which table the aggregate lives in *here*: view-service holds `payout` but no
+/// `payment`, and a statement naming a table this database does not have is an error
+/// rather than a no-op. That error is absorbed — see [`missing_table`]. A missing
+/// *row* in a table that does exist is a clean no-op.
 ///
 /// `WHERE version < $v` so a redelivered or out-of-order event cannot wind the
-/// version backwards. A client waiting on `user:<id>@7` must never see 7 and then
-/// 6 again.
+/// version backwards. A client waiting on `user:<id>@7` must never see 7 and then 6.
 ///
 /// ## Version gaps
 ///
 /// Versions are gapless per aggregate — [`next_version`] assigns them inside the
 /// writing transaction — so applying `$v` to a row at `$v - 2` means an event was
-/// missed, and nothing else in this codebase would have said so: the `UPDATE` below
-/// absorbs it, and the status guards downstream drop the transition without a word.
+/// missed, and nothing else in this codebase would say so: the `UPDATE` absorbs it
+/// and the status guards downstream drop the transition without a word.
 ///
-/// So it is **logged at error and then applied anyway**. Not fatal, deliberately,
-/// because a gap has a legitimate cause: the streams expire (`STREAMS` max_age is
-/// seven days), so a consumer created after an aggregate's early events aged out
-/// sees its first event at version 5 with nothing before it. Stopping there would
-/// wedge that partition permanently on a projection that is merely incomplete, which
+/// So it is **logged at error and then applied anyway**. Not fatal, deliberately: the
+/// streams expire (seven days), so a consumer created after an aggregate's early
+/// events aged out legitimately sees its first event at version 5. Stopping there
+/// would wedge that partition on a projection that is merely incomplete, which
 /// `POST /internal/backfill` exists to repair.
 ///
-/// A **missing row** is not a gap — that is the create case, and the expired-history
-/// case, both of which are silent by design.
-///
-/// A `backfill` run re-emits current state at its current version, so it will log
-/// these by the tableful. Expected; see [`crate::events::Envelope::backfill`].
+/// A backfill run re-emits current state at its current version, so it will log these
+/// by the tableful. Expected.
 pub async fn set_version(
-    tx: &impl Querier,
-    table: &str,
+    conn: &mut PgConnection,
+    aggregate: &str,
     id: &Uuid,
     version: u64,
 ) -> MyResult<()> {
-    // A read before the write rather than `RETURN BEFORE` on the UPDATE itself: the
-    // update is conditional, so it returns nothing at all in exactly the duplicate
-    // case this most wants to distinguish from a gap.
-    let stored: Option<i64> = tx
-        .q("SELECT VALUE version FROM ONLY type::record($t, $i)")
-        .bind(("t", table.to_string()))
-        .bind(("i", *id))
-        .await?
-        .take(0)?;
+    let table = resolve(aggregate)?;
+
+    // A read before the write rather than `RETURNING`: the update is conditional, so
+    // it returns nothing at all in exactly the duplicate case this most wants to
+    // distinguish from a gap.
+    let read = format!("SELECT version FROM {table} WHERE id = $1");
+    let stored: Option<i64> = match sqlx::query_scalar(&read).bind(id).fetch_optional(&mut *conn).await {
+        Ok(v) => v,
+        Err(e) if missing_table(&e) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
 
     if let Some(missing) = version_gap(stored.map(|v| v.max(0) as u64), version) {
         tracing::error!(
-            aggregate = %format!("{table}:{id}"),
+            aggregate = %format!("{aggregate}:{id}"),
             stored = stored.unwrap_or(0),
             got = version,
             missing,
@@ -168,13 +261,12 @@ pub async fn set_version(
         );
     }
 
-    tx.q("UPDATE type::record($t, $i) SET version = $v WHERE version < $v")
-        .bind(("t", table.to_string()))
-        .bind(("i", *id))
-        .bind(("v", version as i64))
-        .await?
-        .check()?;
-    Ok(())
+    let write = format!("UPDATE {table} SET version = $2 WHERE id = $1 AND version < $2");
+    match sqlx::query(&write).bind(id).bind(version as i64).execute(conn).await {
+        Ok(_) => Ok(()),
+        Err(e) if missing_table(&e) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// How many events are missing between `stored` and `incoming`, if any.
@@ -182,8 +274,8 @@ pub async fn set_version(
 /// Pure, so the rule can be read and tested without a database — which matters,
 /// because every other branch of it is a *silent* one and silence is hard to assert.
 ///
-/// - `None` stored: the row does not exist. The create case, and the
-///   expired-history case, neither of which is a gap.
+/// - `None` stored: the row does not exist. The create case, and the expired-history
+///   case, neither of which is a gap.
 /// - `incoming <= stored`: a duplicate or a redelivery. Not a gap; the caller's
 ///   `WHERE version < $v` absorbs it.
 /// - `incoming == stored + 1`: the ordinary next event.
@@ -193,94 +285,85 @@ pub fn version_gap(stored: Option<u64>, incoming: u64) -> Option<u64> {
     incoming.checked_sub(stored + 1).filter(|missing| *missing > 0)
 }
 
-/// Whether this error is TiKV refusing a transaction because someone else wrote
-/// first — a retry, not a fault.
+/// A per-owner lock key for `pg_advisory_xact_lock`, from the low 64 bits of a uuid.
 ///
-/// **The one place this is decided.** Every caller that retries a contended write
-/// asks here, so there is a single string to fix if it ever changes.
+/// Used by `request_payout`, which has nothing to lock: a balance is derived
+/// (`earnings − Σ payouts`), never stored, so two double-clicked withdrawals insert
+/// two *different* payout rows and nothing collides. Locking the existing payout rows
+/// does not help either — the row that changes the answer is one that does not exist
+/// yet, and a first-time withdrawer has none. That phantom is what Read Committed
+/// permits, and it is why a `host` table used to exist purely to be bumped.
 ///
-/// A string match, reluctantly, and it is worth knowing why rather than assuming
-/// it is laziness. The conflict arrives as `surrealdb::Error { code: -32000,
-/// details: Internal, message }` — and `Internal` is explicitly the
-/// `#[surreal(other)]` catch-all for unrecognised kinds, so matching *it* would
-/// also catch every unrelated internal failure and retry things that will never
-/// succeed. The structured `WriteConflict` exists inside the message text and
-/// nowhere else. Worse, the same conflict surfaces as `kind: Query` over HTTP
-/// `/sql` but `details: Internal` over the WebSocket client, so even the kind is
-/// not stable across access paths.
+/// The lock is taken on the owner id itself instead, so the table is gone.
 ///
-/// Matches `WriteConflict` and not `"Multiple key errors"`: the sibling
-/// `already_exist` / `deadlock` / `commit_ts_expired` fields of the same
-/// `KeyError` produce that phrase too, and those must not be retried blindly.
+/// Xact-scoped (`_xact_`, never the session variant): released by COMMIT or ROLLBACK,
+/// so there is no unlock to forget on the `?` early-returns these handlers are full
+/// of — and no `Drop` that would have to await one.
 ///
-/// Version-pinned to surrealdb 3.2.4. `bus/examples/tikv_spike.rs` produces a real
-/// conflict on demand, which is what should be run after any SurrealDB upgrade — a
-/// reworded message would silently turn every contended booking into a 500.
+/// A hash collision between two owners is possible and harmless: they would briefly
+/// serialise against each other, which costs a wait and never correctness. Across 64
+/// bits of a v4/v7 uuid it is not worth engineering around.
+pub fn advisory_key(id: &Uuid) -> i64 {
+    id.as_u64_pair().1 as i64
+}
+
+/// Whether this error is the database refusing a transaction that raced another —
+/// a retry, not a fault.
+///
+/// **A backstop, not the mechanism.** Under Read Committed the ordinary contended
+/// write does not error at all: the second writer blocks, re-reads and applies. What
+/// keeps that correct is locking (see [`next_version`] and [`advisory_key`]), not
+/// this. What is left for this to catch is a genuine serialization failure and a
+/// deadlock, both of which are safe to retry once.
+///
+/// This replaced a string match on `"WriteConflict"` — the only surface a TiKV
+/// conflict had, because it arrived as an untyped `Internal` error whose kind was not
+/// even stable across access paths, with `bus/examples/tikv_spike.rs` existing purely
+/// to re-verify that string after an upgrade. SQLSTATE is typed and standard.
 pub fn is_write_conflict(e: &MyError) -> bool {
-    matches!(e, MyError::Database(_)) && e.to_string().contains("WriteConflict")
+    matches!(
+        e,
+        MyError::Database(sqlx::Error::Database(d))
+            if matches!(d.code().as_deref(), Some("40001") | Some("40P01"))
+    )
 }
 
-/// Anything a query can be issued against.
+/// Runs a service's migrations against its own database.
 ///
-/// The point is that a generated model method does not care whether it is running
-/// standalone or as one statement inside an open transaction — `Surreal<Client>`
-/// and `Transaction<Client>` both satisfy this, so the same `User::patch(…)` call
-/// works in either position.
-pub trait Querier {
-    fn q<'a>(&'a self, sql: impl Into<Cow<'a, str>>) -> Query<'a, Client>;
-}
-
-impl Querier for Surreal<Client> {
-    fn q<'a>(&'a self, sql: impl Into<Cow<'a, str>>) -> Query<'a, Client> {
-        self.query(sql)
-    }
-}
-
-impl Querier for Transaction<Client> {
-    fn q<'a>(&'a self, sql: impl Into<Cow<'a, str>>) -> Query<'a, Client> {
-        self.query(sql)
-    }
-}
-
-/// So a repository can be built over a *borrowed* querier. This is what lets a
-/// projector do `UserRepository { q: &tx }` per event.
-impl<T: Querier + ?Sized> Querier for &T {
-    fn q<'a>(&'a self, sql: impl Into<Cow<'a, str>>) -> Query<'a, Client> {
-        (**self).q(sql)
-    }
-}
-
-/// The shared-connection case, and the one every long-lived repository should
-/// use.
+/// Called by every replica at boot, which is safe: `sqlx` takes an advisory lock
+/// around the run, migrations are versioned and applied once, and each service owns
+/// its own database so there is no contention between services at all — only between
+/// replicas of one, which is exactly what that lock covers.
 ///
-/// `Surreal` is already `Arc<Inner>` internally, but its `Clone` is **not** a
-/// refcount bump: it mints a new session id and has the engine replay every
-/// `replayable()` command onto it — `Attach`, `Signin`, `Use`. So handing
-/// `db.clone()` to five things costs five sessions and five root sign-ins over
-/// the socket. `Arc<Surreal<Client>>` clones the pointer instead, and everything
-/// shares one session.
-///
-/// Safe here precisely because nothing re-authenticates per request: the
-/// connection signs in once at boot (see [`connect`]) and every query carries its
-/// own `bind` parameters rather than session-level `SET`. A codebase that called
-/// `use_ns` or `authenticate` per request would need the separate sessions.
-impl<T: Querier + ?Sized> Querier for std::sync::Arc<T> {
-    fn q<'a>(&'a self, sql: impl Into<Cow<'a, str>>) -> Query<'a, Client> {
-        (**self).q(sql)
-    }
+/// This replaced applying schemas from *outside* the application: a ConfigMap of
+/// `.surql` files, a `--set-file` loop in `deploy.sh` because Helm cannot read
+/// outside its chart directory, and a post-install Job that POSTed them to `/sql`.
+/// `sqlx::migrate!` embeds the SQL in the binary, so there is nothing to mount and
+/// nothing to keep in step with the image.
+pub async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) -> MyResult<()> {
+    migrator
+        .run(pool)
+        .await
+        .map_err(|e| MyError::Bus(format!("migrate: {e}")))
 }
 
-// `Cursor` is gone, along with the `_projection` table it wrote.
+// `Querier` is gone, and so is the alias that briefly stood in for it. It existed so a
+// repository method could run against either the shared connection or an open
+// transaction, because `Surreal<Client>` and `Transaction<Client>` shared no trait.
+// sqlx already has one: `sqlx::PgExecutor` is implemented for `&PgPool` and for
+// `&mut PgConnection`, so a method taking `impl PgExecutor<'_>` serves both positions
+// with nothing of ours in between. A transaction reaches it as `&mut *tx` — `Transaction`
+// derefs to `PgConnection` — which is what every projector and service call site passes.
 //
-// It recorded how far a projection had consumed its stream, and had to be bumped
-// in the same transaction as the data — a cursor that ran ahead of the rows would
-// silently skip events on restart. That was necessary while each replica owned a
-// private database and had to track where *its own copy* had reached.
+// The one wrinkle is that `PgExecutor` is consumed per statement, so a method issuing
+// two of them takes `&mut PgConnection` and reborrows — which is why `next_version`
+// and `set_version` above do, and why they are honest about only ever running inside
+// a transaction.
 //
-// Every replica now shares one database and pulls from one durable consumer per
-// partition, so the position lives in NATS: an unacked message is redelivered and
-// reapplied, and every apply is idempotent. `/readyz` reads whether every partition
-// is drained; a client's read-your-own-writes reads the `version` column above.
+// `Cursor` is still gone, along with the `_projection` table it wrote: every replica
+// shares one database and pulls from one durable consumer per partition, so the
+// position lives in NATS. An unacked message is redelivered and reapplied, and every
+// apply is idempotent.
 
 #[cfg(test)]
 mod tests {
@@ -305,9 +388,35 @@ mod tests {
         assert_eq!(version_gap(Some(7), 7), None);
         assert_eq!(version_gap(Some(7), 3), None);
 
-        // Genuinely missed events — the one case nothing else in the system says
-        // anything about.
+        // Genuinely missed events — the one case nothing else says anything about.
         assert_eq!(version_gap(Some(16), 18), Some(1));
         assert_eq!(version_gap(Some(1), 5), Some(3));
+    }
+
+    /// The allowlist is what stands between an aggregate name and spliced SQL, so
+    /// it must answer for exactly the names the services use and nothing else.
+    #[test]
+    fn every_aggregate_resolves_and_nothing_else_does() {
+        for aggregate in ["user", "spot", "booking", "payment", "payout", "refresh_token"] {
+            assert!(table_for(aggregate).is_some(), "{aggregate}");
+        }
+
+        // The rename, and the reason it exists: `user` is reserved, and an unquoted
+        // `FROM user` returns the current-user keyword rather than erroring.
+        assert_eq!(table_for("user"), Some("app_user"));
+
+        // Anything else is a typo, and must be reported rather than spliced.
+        assert_eq!(table_for("app_user"), None, "the aggregate is `user`, not the table name");
+        assert_eq!(table_for("host"), None, "the host table is gone; see advisory_key");
+        assert_eq!(table_for(""), None);
+        assert_eq!(table_for("spot; DROP TABLE spot--"), None);
+    }
+
+    /// Two different owners must not share a lock key by construction.
+    #[test]
+    fn advisory_keys_differ_per_owner() {
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        assert_ne!(advisory_key(&a), advisory_key(&b));
+        assert_eq!(advisory_key(&a), advisory_key(&a), "must be stable per owner");
     }
 }

@@ -13,7 +13,7 @@ import Button from '@/components/ui/button/Button.vue';
 
 defineProps<{ imageErrors: string[] }>()
 
-// One list for both kinds: a `string` is a photo already in R2 (its media key), a
+// One list for both kinds: a `string` is a photo already in R2 (its media URL), a
 // `File` is one just picked and not uploaded yet. Editing a listing mixes them
 // freely, and keeping them in separate models would mean two sets of previews, two
 // remove buttons, and no single answer to "what order are the photos in".

@@ -15,26 +15,31 @@ import CardContent from '@/components/ui/card/CardContent.vue';
 import ItemMedia from '@/components/ui/item/ItemMedia.vue';
 import ItemGroup from '@/components/ui/item/ItemGroup.vue';
 import { useRouter } from 'vue-router';
-import { useAuthStore } from '@/stores/auth';
-import { SPOTS_OWNED } from '@/api/graphql/spot';
-import { useQuery } from '@urql/vue';
+import { fetchMySpots, viewKeys } from '@/api/viewApi';
+import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { computed, onMounted } from 'vue';
 
 const router = useRouter()
+const queryClient = useQueryClient()
 
-const auth = useAuthStore()
-
-// Declarative subscription: fetches on mount, exposes reactive `data`.
-// Must be set up here in setup(), not inside an event handler.
-const { data, executeQuery } = useQuery({
-    query: SPOTS_OWNED,
-    variables: computed(() => ({ id: auth.user?.id })),
+// No owner variable: `GET /api/view/me/spots` takes the owner from the token.
+// Deleted listings are already excluded server-side, which the `deleted: { eq: false }`
+// in the document this replaces had to say explicitly — an owner's own *inactive*
+// spots are still returned, because that is what the live switch is for.
+const { data } = useQuery({
+    queryKey: viewKeys.mySpots,
+    queryFn: fetchMySpots,
 })
 
-// urql serves the cached list on mount, so a spot just created in AddSpotView
-// wouldn't show up without forcing a network fetch.
+const spots = computed(() => data.value ?? [])
+
+// A spot created in AddSpotView would otherwise be served from cache on arrival here.
+// `recordSeq` already made the request wait for the projection; this is only about the
+// client's own cache being fresher than `staleTime`.
 onMounted(() => {
-    if (history.state.refreshSpots) executeQuery({ requestPolicy: 'network-only' })
+    if (history.state.refreshSpots) {
+        void queryClient.invalidateQueries({ queryKey: viewKeys.spots })
+    }
 })
 </script>
 
@@ -68,7 +73,7 @@ onMounted(() => {
         </div>
         <div class="text-xs text-muted-foreground font-semibold">All listings</div>
         <ItemGroup class="cursor-pointer gap-2">
-            <Item @click="() => router.push({ name: 'spot', params: { id: spot.id } })" v-for="spot in data?.spots"
+            <Item @click="() => router.push({ name: 'spot', params: { id: spot.id } })" v-for="spot in spots"
                 :key="spot.id" variant="outline" class="bg-card">
                 <ItemMedia variant="image"
                     class="group-has-data-[slot=item-description]/item:self-center group-has-data-[slot=item-description]/item:translate-y-0">
@@ -92,7 +97,7 @@ onMounted(() => {
                 </ItemContent>
                 <ItemContent class="items-end">
                     <div class="flex items-baseline text-lg font-semibold">{{
-                        formatCents(Number(spot.price_per_hour)) }}
+                        formatCents(spot.pricePerHour) }}
                         <div class="text-xs text-muted-foreground font-medium">/hr</div>
                     </div>
                     <ChevronRight class="text-muted-foreground" />

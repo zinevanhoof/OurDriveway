@@ -2,11 +2,10 @@
 import Separator from '@/components/ui/separator/Separator.vue';
 import Button from '@/components/ui/button/Button.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer';
-import { useQuery } from '@urql/vue';
-import { ME } from '@/api/graphql/user.ts';
+import { useQuery } from '@tanstack/vue-query';
+import { fetchMe, viewKeys } from '@/api/viewApi';
 import { useAuthStore } from '@/stores/auth.ts';
 import { computed, ref } from 'vue';
-import { gqlRecordId } from '@/lib/utils.ts';
 import Avatar from '@/components/ui/avatar/Avatar.vue';
 import AvatarImage from '@/components/ui/avatar/AvatarImage.vue';
 import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue';
@@ -19,14 +18,18 @@ import PayoutsComponent from '@/components/profile/PayoutsComponent.vue';
 const auth = useAuthStore()
 const router = useRouter()
 
+// No id variable: the server picks the row from the verified claim. The `ME` document
+// this replaces passed `gqlRecordId(auth.user?.id)`, which needed the `u'<uuid>'`
+// spelling a record lookup takes — a distinction that no longer exists.
 const { data } = useQuery({
-    query: ME,
-    variables: computed(() => ({ id: gqlRecordId(auth.user?.id) })),
+    queryKey: viewKeys.me,
+    queryFn: fetchMe,
 })
 
 // No `!` here: the query has not resolved on first render, so this really is
-// undefined for a tick and the template has to say so.
-const me = computed(() => data.value?.user)
+// undefined for a tick and the template has to say so. `profile` is additionally null
+// for the moment between registering and that projection landing.
+const me = computed(() => data.value?.profile)
 
 // Server first — revoking the refresh token needs the cookie, and clearing the
 // store synchronously trips the `isAuthenticated` watcher in main.ts, which is

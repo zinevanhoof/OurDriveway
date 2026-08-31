@@ -29,7 +29,7 @@ pub struct UpdateSpotRequest {
     pub price_per_hour_cents: Option<i64>,
     #[garde(dive, custom(has_slots_if_present), custom(dates_not_past))]
     pub availability: Option<Availability>,
-    /// Media keys, in display order — the ones the host kept and the ones they
+    /// Media URLs, in display order — the ones the host kept and the ones they
     /// just uploaded, already merged by the client. Same rules as create.
     #[garde(inner(custom(are_spot_images)))]
     pub images: Option<Vec<String>>,

@@ -1,22 +1,23 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { useQuery } from '@urql/vue';
+import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { formatCents } from '@/lib/money';
 import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDates';
 import { locateUser, nearer, type Position } from '@/lib/geo';
-import { gqlRecordId, plainUuid } from '@/lib/utils';
 import { mergeBooked } from '@/lib/bookingAvailability';
 import { useAuthStore } from '@/stores/auth';
-import { BOOKINGS_RENTED } from '@/api/graphql/booking';
 import * as paymentApi from '@/api/paymentApi';
-import { FULL_SPOT, SPOTS_NEARBY } from '@/api/graphql/spot';
+import { fetchMyBookings, fetchSpot, fetchSpotsNear, viewKeys } from '@/api/viewApi';
+import type { BookingListItem } from '@/types/view';
+import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import BookingFormComponent from '@/components/BookingFormComponent.vue';
 import { CarFront, ChevronRight, CirclePlus, MapPin, Search, Star, Wallet } from '@lucide/vue';
 
 const auth = useAuthStore()
 const router = useRouter()
+const queryClient = useQueryClient()
 
 // Every query here waits on the session: main.ts rehydrates it asynchronously, and
 // without this they all fire once with an undefined id first.
@@ -36,10 +37,9 @@ const paused = computed(() => !auth.user?.id)
 // `where: { ends_at: { gt: $now } }, limit: 1` document (booking_ends is already
 // indexed) the day someone has hundreds of bookings.
 const { data: bookings } = useQuery({
-    query: BOOKINGS_RENTED,
-    variables: computed(() => ({ renterId: auth.user?.id })),
-    pause: paused,
-    requestPolicy: 'network-only',
+    queryKey: viewKeys.myBookings,
+    queryFn: fetchMyBookings,
+    staleTime: 0,
 })
 
 // Confirmed only: a 'reserved' hold is an unfinished checkout, not somewhere you
@@ -49,12 +49,19 @@ const { data: bookings } = useQuery({
 // ponytail: candidates are ranked by wall-clock string, so two bookings in
 // different zones within a day of each other can order wrong. Compare instants if
 // this ever shows more than the single next one.
-const next = computed(() => {
-    const upcoming = (bookings.value?.bookings ?? [])
-        .filter((b: any) => b?.status === 'confirmed')
-        .map((b: any) => ({ booking: b, slot: nextSlot(b, b?.spot?.timezone) }))
-        .filter((row: any) => row.slot !== null)
-    return upcoming.sort((a: any, b: any) =>
+// The `slot !== null` filter needs a type predicate to narrow, which it did not while
+// the query result was `any` — every row here was untyped, so the template read
+// `next.slot[0]` off something the compiler knew nothing about. `nextSlot` returns null
+// for a booking whose slots have all passed, and that was always reachable; it just was
+// not visible until the responses acquired types.
+type NextUp = { booking: BookingListItem; slot: [string, TimeSlot] }
+
+const next = computed<NextUp | null>(() => {
+    const upcoming = (bookings.value ?? [])
+        .filter((b) => b.status === 'confirmed')
+        .map((b) => ({ booking: b, slot: nextSlot(b, b.spot?.timezone) }))
+        .filter((row): row is NextUp => row.slot !== null)
+    return upcoming.sort((a, b) =>
         `${a.slot[0]}T${a.slot[1].start}`.localeCompare(`${b.slot[0]}T${b.slot[1].start}`),
     )[0] ?? null
 })
@@ -92,25 +99,23 @@ const locate = async () => {
 }
 onMounted(locate)
 
+// The `me` variable is gone: excluding the caller's own spots is unconditional
+// server-side now, so this and the map's radius query differ in nothing but the radius
+// — which is why they share one endpoint and one key shape.
 const { data: nearby } = useQuery({
-    query: SPOTS_NEARBY,
-    variables: computed(() => ({
-        lng: here.value?.[0],
-        lat: here.value?.[1],
-        meters: 5000,
-        me: auth.user?.id,
-    })),
-    pause: computed(() => here.value === null || !auth.user?.id),
+    queryKey: computed(() => viewKeys.nearby(here.value?.[0] ?? 0, here.value?.[1] ?? 0, 5000)),
+    queryFn: () => fetchSpotsNear(here.value![0], here.value![1], 5000),
+    enabled: computed(() => here.value !== null),
 })
 
-// Sorted here because auto GraphQL cannot order by a function — `order` takes an
-// enum of defined field names. Two cards out of one radius query is nothing to sort.
+// Still sorted client-side, and still for a reason: ordering by distance would mean an
+// ORDER BY over the same haversine the WHERE already computes, on a result the caller
+// then truncates to two. Two cards out of one radius query is nothing to sort.
 const nearest = computed(() => {
     const origin = here.value
     if (!origin) return []
-    return [...(nearby.value?.spots ?? [])]
-        .sort((a: any, b: any) =>
-            nearer(origin, a.location.coordinates) - nearer(origin, b.location.coordinates))
+    return [...(nearby.value ?? [])]
+        .sort((a, b) => nearer(origin, [a.lng, a.lat]) - nearer(origin, [b.lng, b.lat]))
         .slice(0, 2)
 })
 
@@ -143,23 +148,24 @@ const openSpot = (id: string) => {
 // Freshness, not correctness. A row that landed a moment ago can already be wrong; the
 // authority is the server's availability check, published under compare-and-swap. This
 // only stops the picker offering slots it then has to retract.
-const { data: selectedSpot, executeQuery: reexecuteSpot } = useQuery({
-    query: FULL_SPOT,
-    variables: computed(() => ({
-        id: gqlRecordId(selectedId.value),
-        spotUuid: plainUuid(selectedId.value),
-        now: new Date().toISOString(),
-    })),
-    pause: computed(() => selectedId.value === null),
-    requestPolicy: 'network-only',
+const { data: selectedSpot } = useQuery({
+    queryKey: computed(() => viewKeys.spot(selectedId.value ?? '')),
+    queryFn: () => fetchSpot(selectedId.value!),
+    enabled: computed(() => selectedId.value !== null),
+    staleTime: 0,
 })
 
-// The policy alone is not enough: `selectedId` is never cleared on close, so reopening
-// the *same* spot changes neither variables nor pause state and urql does not re-execute
-// — the picker would keep whatever it read the first time, including slots this renter
-// has since held and abandoned. Opening the form is therefore an explicit refetch.
+const reexecuteSpot = () =>
+    queryClient.invalidateQueries({ queryKey: viewKeys.spot(selectedId.value ?? '') })
+
+// `staleTime: 0` alone is not enough: `selectedId` is never cleared on close, so
+// reopening the *same* spot changes neither the key nor the enabled state, and a query
+// that is already mounted does not refetch on its own — the picker would keep whatever
+// it read the first time, including slots this renter has since held and abandoned.
+// Opening the form is therefore an explicit invalidation. (Same reasoning as under
+// urql, where the equivalent was that neither the variables nor the pause changed.)
 watch(bookingOpen, (isOpen) => {
-    if (isOpen) reexecuteSpot({ requestPolicy: 'network-only' })
+    if (isOpen) void reexecuteSpot()
 })
 
 const openBooking = () => {
@@ -265,7 +271,7 @@ const openBooking = () => {
                     </div>
                     <div
                         class="absolute left-2 top-2 bg-primary text-primary-foreground text-xs font-bold rounded-sm px-2 py-0.5">
-                        {{ formatCents(spot.price_per_hour) }}/hr
+                        {{ formatCents(spot.pricePerHour) }}/hr
                     </div>
                 </div>
             </div>
@@ -273,8 +279,8 @@ const openBooking = () => {
 
         <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" :booking="selectedBooking"
             :bookable="!selectedBooking" @book="bookingOpen = true" />
-        <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot?.spot"
+        <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot"
             :booked="mergeBooked(selectedSpot?.bookings)"
-            @booked="() => reexecuteSpot({ requestPolicy: 'network-only' })" />
+            @booked="() => reexecuteSpot()" />
     </div>
 </template>

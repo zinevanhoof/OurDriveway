@@ -8,14 +8,11 @@
 //!
 //! Nothing here takes a caller id, because there is no caller — Stripe acted.
 
-use std::sync::Arc;
-
 use shared::{
     domain_models::booking::status,
     error::myerror::{ContextExt, MyResult},
     events::{Envelope, aggregate_id, booking::BookingEvent, booking_subject},
 };
-use surrealdb::{Surreal, engine::remote::ws::Client};
 use uuid::Uuid;
 
 use crate::policy::access::NOT_FOUND;
@@ -24,14 +21,12 @@ use crate::repository::booking_repository::BookingRepository;
 /// Publishes `Confirmed` off a settled payment. Reads the booking only to address
 /// its subject — `PaymentEvent::Succeeded` does not carry the spot.
 pub struct PaymentWorkerService {
-    pub bookings: BookingRepository,
+    pub db: sqlx::PgPool,
 }
 
 impl PaymentWorkerService {
-    pub fn new(db: Arc<Surreal<Client>>) -> Self {
-        Self {
-            bookings: BookingRepository { q: db },
-        }
+    pub fn new(db: sqlx::PgPool) -> Self {
+        Self { db }
     }
 
     /// Payment succeeded, as reported by a signature-verified Stripe webhook.
@@ -56,22 +51,26 @@ impl PaymentWorkerService {
     /// `payment_id` only names the event, so a redelivered webhook is discarded by the
     /// stream's duplicate window instead of appending a second `Confirmed`.
     pub async fn confirm_paid(&self, booking_id: Uuid, payment_id: Uuid) -> MyResult<u64> {
-        let booking = self
-            .bookings
-            .find_by_id(booking_id)
+        let booking = BookingRepository::find_by_id(&self.db, booking_id)
             .await?
             .context_not_found(NOT_FOUND)?;
 
-        let tx = shared::db::begin(&self.bookings.q).await?;
-        let version = shared::db::next_version(&tx, "booking", &booking_id).await?;
+        let mut tx = self.db.begin().await?;
+        let version = shared::db::next_version(&mut tx, "booking", &booking_id).await?;
 
-        // `WHERE status IN ['reserved']` is what keeps this idempotent: a
-        // redelivered webhook, or a payment landing after the hold already lapsed,
-        // applies to nothing.
-        BookingRepository { q: &tx }
-            .transition(booking_id, status::CONFIRMED, &[status::RESERVED], None, None)
-            .await?;
-        shared::db::set_version(&tx, "booking", &booking_id, version).await?;
+        // `status = ANY(['reserved'])` is what keeps this idempotent: a redelivered
+        // webhook, or a payment landing after the hold already lapsed, applies to
+        // nothing.
+        BookingRepository::transition(
+            &mut *tx,
+            booking_id,
+            status::CONFIRMED,
+            &[status::RESERVED],
+            None,
+            None,
+        )
+        .await?;
+        shared::db::set_version(&mut tx, "booking", &booking_id, version).await?;
 
         // `actor_id: None` — Stripe acted, not a user holding a token.
         let mut envelope = Envelope::new(
@@ -85,7 +84,7 @@ impl PaymentWorkerService {
             format!("payment-confirm:{payment_id}").as_bytes(),
         );
 
-        bus::outbox::enqueue(&tx, &booking_subject(&booking.spot_id), &envelope).await?;
+        bus::outbox::enqueue(&mut *tx, &booking_subject(&booking.spot_id), &envelope).await?;
         tx.commit().await?;
 
         Ok(version)

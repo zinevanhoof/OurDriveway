@@ -1,50 +1,60 @@
-use std::sync::Arc;
-
-use shared::db::Querier;
 use shared::domain_models::view::payout::ViewPayout;
 use shared::error::myerror::MyResult;
-use surrealdb::{Surreal, engine::remote::ws::Client};
+use shared::projections::payout::PayoutListItem;
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// The `payout` table in the read model — withdrawal history, nothing else.
-pub struct ViewPayoutRepository<Q: Querier = Arc<Surreal<Client>>> {
-    pub q: Q,
-}
+pub struct ViewPayoutRepository;
 
-impl<Q: Querier> ViewPayoutRepository<Q> {
-    /// Insert-or-replace the whole row.
+impl ViewPayoutRepository {
+    /// The caller's own withdrawals, newest first.
     ///
-    /// `CONTENT` clears the `owner` link, which [`ViewPayoutRepository::link_owner`]
-    /// puts back in the same transaction. That is deliberate rather than a hazard:
-    /// the link resolves to NONE when the host has not been projected yet, so it
-    /// cannot be written from the row shape.
-    pub async fn upsert(&self, payout: ViewPayout) -> MyResult<()> {
-        let id = payout.id;
-        self.q
-            .q("UPSERT type::record('payout', $id) CONTENT $row")
-            .bind(("id", id))
-            .bind(("row", payout))
-            .await?
-            .check()?;
-        Ok(())
+    /// **The `payout` table's select rule**, which was
+    /// `FOR select WHERE owner_id = record::id($auth)` in view-schema.surql. Unlike
+    /// `spot` and `booking` it has no public half at all: a payout is visible to
+    /// exactly one person, so the predicate is the whole query rather than a clause
+    /// appended to it.
+    ///
+    /// Served by `payout_owner (owner_id, created_at)`.
+    pub async fn find_all_by_owner_id(
+        ex: impl PgExecutor<'_>,
+        owner_id: Uuid,
+    ) -> MyResult<Vec<PayoutListItem>> {
+        Ok(sqlx::query_as(
+            "SELECT id, amount, created_at FROM payout
+              WHERE owner_id = $1
+              ORDER BY created_at DESC",
+        )
+        .bind(owner_id)
+        .fetch_all(ex)
+        .await?)
     }
 
-    /// Points `owner` at the host's row.
+    /// Insert-or-replace the whole row.
     ///
-    /// Written unconditionally rather than resolved through a subquery — see
-    /// `ViewBookingRepository::link_refs` for why that subquery was the bug and not
-    /// the safety.
-    ///
-    /// Runs straight after the `upsert` that cleared it, in the same transaction, so
-    /// there is no existing link to preserve and no `= NONE` scope needed.
-    pub async fn link_owner(&self, payout_id: &Uuid, owner_id: &Uuid) -> MyResult<()> {
-        self.q
-            .q("UPDATE type::record('payout', $id)
-                SET owner = type::record('user', $owner);")
-            .bind(("id", *payout_id))
-            .bind(("owner", *owner_id))
-            .await?
-            .check()?;
+    /// One statement, where this used to be two. A `CONTENT $row` write cleared the
+    /// `owner` record link, so `link_owner` had to put it back in the same transaction
+    /// — two halves that both had to run, with nothing in Rust connecting them, and a
+    /// live test existing solely to prove they did. `owner_id` is a plain uuid column
+    /// written by this statement like any other.
+    pub async fn upsert(ex: impl PgExecutor<'_>, payout: ViewPayout) -> MyResult<()> {
+        sqlx::query(
+            "INSERT INTO payout (id, version, owner_id, amount, created_at)
+                  VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (id) DO UPDATE SET
+                 version    = EXCLUDED.version,
+                 owner_id   = EXCLUDED.owner_id,
+                 amount     = EXCLUDED.amount,
+                 created_at = EXCLUDED.created_at",
+        )
+        .bind(payout.id)
+        .bind(payout.version as i64)
+        .bind(payout.owner_id)
+        .bind(payout.amount)
+        .bind(payout.created_at)
+        .execute(ex)
+        .await?;
         Ok(())
     }
 }

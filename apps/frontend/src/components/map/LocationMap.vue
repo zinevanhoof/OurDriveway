@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useQuery } from "@urql/vue";
+import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { formatCents } from '@/lib/money';
 import { onMounted, onBeforeUnmount, ref, computed, watch, h, render } from "vue";
 import maplibregl from "maplibre-gl";
@@ -8,12 +8,11 @@ import type { FeatureCollection } from "geojson";
 import { pinsFromFeatures, type PinData } from "@/lib/mapPins";
 import { useDebounceFn } from "@vueuse/core";
 import { toast } from "vue-sonner";
-import { FULL_SPOT, SPOTS_IN_RADIUS } from "@/api/graphql/spot";
+import { fetchSpot, fetchSpotsNear, viewKeys } from "@/api/viewApi";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import type { SpotFilter } from "@/types/SpotFilter";
 import { spotMatches } from "@/lib/spotFilter";
 import { mergeBooked } from "@/lib/bookingAvailability";
-import { gqlRecordId, plainUuid } from "@/lib/utils";
 import { locateUser } from "@/lib/geo";
 import MapPinComponent from "./MapPinComponent.vue";
 import MapSearchComponent from "./MapSearchComponent.vue";
@@ -47,42 +46,47 @@ const filter = ref<SpotFilter>({ single: {} });
 // divs (Vue patches in place) so the raised/shrink tween runs on live DOM nodes.
 const selectedId = ref<string | null>(null);
 
+const queryClient = useQueryClient();
+
+// The caller's own spots are excluded server-side and unconditionally now — that used
+// to be true of `SPOTS_NEARBY` and not of this one, so the map showed a host their own
+// driveway as somewhere to park.
 const { data: spotsInRadius } = useQuery({
-  query: SPOTS_IN_RADIUS,
-  variables: computed(() => ({
-    lng: center.value?.[0],
-    lat: center.value?.[1],
-    meters: meters.value,
-  })),
-  pause: computed(() => center.value === null),
+  queryKey: computed(() =>
+    viewKeys.nearby(center.value?.[0] ?? 0, center.value?.[1] ?? 0, meters.value),
+  ),
+  queryFn: () => fetchSpotsNear(center.value![0], center.value![1], meters.value),
+  enabled: computed(() => center.value !== null),
 });
 
-// Full detail for the selected pin, fetched on click (paused until then) so nothing
-// runs at render time and there's one query total, not one per pin. The owner's
-// profile nests in the same query — the view's `spot.owner` record link resolves it.
-// `network-only` because this is the one query someone books against, and cached
-// availability is stale by construction: every write in this app goes through REST, so
-// there are no GraphQL mutations for graphcache to invalidate on. The radius query
-// stays cached and re-runs on every pan.
+// Full detail for the selected pin, fetched on click (disabled until then) so nothing
+// runs at render time and there is one query total, not one per pin. The owner's
+// profile comes back on the same response — a LEFT JOIN now rather than a record link.
 //
-// Freshness, not correctness. The authority is the server's availability check, published
-// under compare-and-swap; this only stops the picker offering slots it then has to
-// retract.
-const { data: selectedSpot, executeQuery: reexecuteSpot } = useQuery({
-  query: FULL_SPOT,
-  variables: computed(() => ({
-    id: gqlRecordId(selectedId.value),
-    spotUuid: plainUuid(selectedId.value),
-    now: new Date().toISOString(),
-  })),
-  pause: computed(() => selectedId.value === null),
-  requestPolicy: "network-only",
+// `staleTime: 0` because this is the one read someone books against, and cached
+// availability is stale by construction: a booking's status changes through events on
+// the log, never through anything this client did, so there is nothing to invalidate
+// on. The radius query keeps the default and re-runs on every pan.
+//
+// Freshness, not correctness. The authority is the server's availability check inside
+// the reserve transaction; this only stops the picker offering slots it then retracts.
+const { data: selectedSpot } = useQuery({
+  queryKey: computed(() => viewKeys.spot(selectedId.value ?? "")),
+  queryFn: () => fetchSpot(selectedId.value!),
+  enabled: computed(() => selectedId.value !== null),
+  staleTime: 0,
 });
 
-// The map filter is applied client-side (availability is selectable but not filterable
-// via auto GraphQL). Recomputes on filter change without a refetch.
+const reexecuteSpot = () =>
+  queryClient.invalidateQueries({
+    queryKey: viewKeys.spot(selectedId.value ?? ""),
+  });
+
+// The map filter stays client-side: which weekday and time slot a spot is open on is a
+// fold over its availability, which a query cannot express. Recomputes on filter change
+// without a refetch.
 const matchedSpots = computed(() =>
-  (spotsInRadius.value?.spots ?? []).filter((s: any) => spotMatches(s.availability, filter.value)),
+  (spotsInRadius.value ?? []).filter((s) => spotMatches(s.availability, filter.value)),
 );
 
 // Refetch spots whenever the viewport settles. Radius = center → NE corner, so
@@ -109,7 +113,7 @@ const bookingOpen = ref(false);
 // the picker would keep whatever it read the first time, including slots this renter has
 // since held and abandoned. Opening the form is therefore an explicit refetch.
 watch(bookingOpen, (isOpen) => {
-  if (isOpen) reexecuteSpot({ requestPolicy: "network-only" });
+  if (isOpen) void reexecuteSpot();
 });
 
 // ─── Clustering ────────────────────────────────────────────────────────────────
@@ -138,8 +142,11 @@ function toFeatureCollection(spots: any[]): FeatureCollection {
     // cluster list renders has to live here — supercluster only keeps these.
     features: spots.map((s: any) => ({
       type: "Feature",
-      geometry: { type: "Point", coordinates: s.location.coordinates },
-      properties: { id: s.id, title: s.title, price: s.price_per_hour },
+      // Two columns, not a geometry. `location { coordinates }` was a GeoJSON point
+      // the database assembled; PostGIS is unavailable on YSQL, so lng/lat are stored
+      // and returned separately — and GeoJSON wants them in exactly that order anyway.
+      geometry: { type: "Point", coordinates: [s.lng, s.lat] },
+      properties: { id: s.id, title: s.title, price: s.pricePerHour },
     })),
   };
 }
@@ -320,8 +327,8 @@ onBeforeUnmount(() => {
     </Drawer>
     <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable
       @book="bookingOpen = true" />
-    <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot?.spot"
+    <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot"
       :booked="mergeBooked(selectedSpot?.bookings)"
-      @booked="() => reexecuteSpot({ requestPolicy: 'network-only' })" />
+      @booked="() => reexecuteSpot()" />
   </div>
 </template>

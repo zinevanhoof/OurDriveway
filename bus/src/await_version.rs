@@ -34,11 +34,11 @@
 //! about one aggregate. So the two collapsed into [`reached`], and this module
 //! answers both.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use axum::{extract::Request, http::HeaderName, middleware::Next, response::Response};
 use shared::events::{parse_version, split_aggregate};
-use surrealdb::{Surreal, engine::remote::ws::Client};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Header a client echoes back after a write: `X-Await-Version: spot:019f…@3`.
@@ -60,7 +60,7 @@ const POLL: Duration = Duration::from_millis(25);
 /// The database this service serves reads from — the same one its projectors
 /// write. Wrapped so it is a distinct extractor from any other `Surreal` state.
 #[derive(Clone)]
-pub struct AwaitVersions(pub Arc<Surreal<Client>>);
+pub struct AwaitVersions(pub PgPool);
 
 pub async fn await_version(
     axum::extract::State(db): axum::extract::State<AwaitVersions>,
@@ -80,8 +80,8 @@ pub async fn await_version(
     next.run(request).await
 }
 
-/// Blocks until `table:id` has reached `want`, or the caller's timeout fires.
-async fn wait_one(db: &Surreal<Client>, table: &str, id: &Uuid, want: u64) {
+/// Blocks until `aggregate:id` has reached `want`, or the caller's timeout fires.
+async fn wait_one(db: &PgPool, table: &str, id: &Uuid, want: u64) {
     // The outer [`TIMEOUT`] in the middleware caps the whole header, so this one is
     // only a backstop for a single entry.
     let _ = reached(db, table, id, want, TIMEOUT).await;
@@ -99,15 +99,24 @@ async fn wait_one(db: &Surreal<Client>, table: &str, id: &Uuid, want: u64) {
 /// and it was always the coarser question, since a worker holding one event cares
 /// about one aggregate rather than about everything published before it.
 pub async fn reached(
-    db: &Surreal<Client>,
-    table: &str,
+    db: &PgPool,
+    aggregate: &str,
     id: &Uuid,
     want: u64,
     timeout: Duration,
 ) -> bool {
+    // Resolved once, outside the loop: an aggregate name no service owns is a caller
+    // bug, not something to retry until the timeout. Also the only thing standing
+    // between a client-supplied token and a table name spliced into SQL — Postgres
+    // cannot bind an identifier, so this must never be interpolated unchecked.
+    let Some(table) = shared::db::table_for(aggregate) else {
+        return false;
+    };
+    let sql = format!("SELECT version FROM {table} WHERE id = $1");
+
     tokio::time::timeout(timeout, async {
         loop {
-            match current(db, table, id).await {
+            match current(db, &sql, id).await {
                 Ok(Some(have)) if have >= want => return true,
                 // The row is not there yet — its creating event has not been applied
                 // — so keep waiting. This is the common case for a read that follows
@@ -127,17 +136,8 @@ pub async fn reached(
     .unwrap_or(false)
 }
 
-async fn current(
-    db: &Surreal<Client>,
-    table: &str,
-    id: &Uuid,
-) -> Result<Option<u64>, surrealdb::Error> {
-    let version: Option<i64> = db
-        .query("SELECT VALUE version FROM ONLY type::record($t, $i)")
-        .bind(("t", table.to_string()))
-        .bind(("i", *id))
-        .await?
-        .take(0)?;
+async fn current(db: &PgPool, sql: &str, id: &Uuid) -> Result<Option<u64>, sqlx::Error> {
+    let version: Option<i64> = sqlx::query_scalar(sql).bind(id).fetch_optional(db).await?;
     Ok(version.map(|v| v.max(0) as u64))
 }
 

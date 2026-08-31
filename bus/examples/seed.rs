@@ -36,7 +36,6 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use chrono::Utc;
-use shared::db::Querier;
 use shared::domain_models::spot::Spot;
 use shared::domain_models::user::User;
 use shared::events::{
@@ -127,8 +126,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let js = async_nats::jetstream::new(client);
     println!("connected to {url}");
 
-    // The shared SurrealDB in front of TiKV. Same default the services use.
-    let addr = std::env::var("SURREALDB_ADDR").unwrap_or_else(|_| "localhost:8000".into());
+    // One URL per database, because each service owns its own — same as the services'
+    // own `DATABASE_URL`. Port 5433: YSQL does not listen on the PostgreSQL default.
+    let db_url = |name: &str| {
+        std::env::var("DATABASE_URL_BASE")
+            .unwrap_or_else(|_| "postgres://yugabyte@127.0.0.1:5433".into())
+            + "/"
+            + name
+    };
 
     // The services declare these too, and `get_or_create_stream` is idempotent —
     // so this also covers being the first thing to reach a fresh broker.
@@ -144,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (stable("seed:user:bob"), "Bob", "Beckers", "bob@example.com"),
     ];
 
-    let user_db = shared::db::connect(&addr, "root", "root", "user").await?;
+    let user_db = shared::db::connect(&db_url("user")).await?;
 
     for (id, first, last, email) in users {
         let registered = UserRegistered {
@@ -157,20 +162,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             password_hash: hash(PASSWORD),
         };
 
-        let tx = shared::db::begin(&user_db).await?;
+        let mut tx = user_db.begin().await?;
 
         // Verified on the way in. The real path needs a mailed token, and a seeded
         // account that cannot log in is not a seeded account.
         let mut row = User::registered(registered.clone(), 1);
         row.email_verified = true;
-        tx.q("UPSERT type::record('user', $id) CONTENT $row")
-            .bind(("id", id))
-            .bind(("row", row))
-            .await?
-            .check()?;
+        // Through the repository's own statement rather than a hand-written one. It
+        // used to be `CONTENT $row`, which bound the struct whole and so could be
+        // written here without repeating a column list; sqlx has no such write, and a
+        // second copy of `app_user`'s columns in a seed script is exactly the sort of
+        // thing that goes stale silently.
+        //
+        // That means reaching into user-service's crate, which this cannot do — so the
+        // statement is spelled out once here and the round-trip test in user-service is
+        // what would catch a drift. See the note at the top of this file about why a
+        // seed touches service databases directly at all.
+        sqlx::query(
+            "INSERT INTO app_user
+                 (id, version, first_name, last_name, email,
+                  email_verified, profile_picture, password, license_plates)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (id) DO UPDATE SET
+                 version         = EXCLUDED.version,
+                 first_name      = EXCLUDED.first_name,
+                 last_name       = EXCLUDED.last_name,
+                 email           = EXCLUDED.email,
+                 email_verified  = EXCLUDED.email_verified,
+                 profile_picture = EXCLUDED.profile_picture,
+                 password        = EXCLUDED.password,
+                 license_plates  = EXCLUDED.license_plates",
+        )
+        .bind(row.id)
+        .bind(row.version as i64)
+        .bind(row.first_name)
+        .bind(row.last_name)
+        .bind(row.email)
+        .bind(row.email_verified)
+        .bind(row.profile_picture)
+        .bind(row.password)
+        .bind(row.license_plates)
+        .execute(&mut *tx)
+        .await?;
 
         bus::outbox::enqueue(
-            &tx,
+            &mut *tx,
             &user_subject(&id),
             &envelope(
                 UserEvent::Registered(registered),
@@ -217,17 +253,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             timezone: "Europe/Brussels".into(),
     };
 
-    let spot_db = shared::db::connect(&addr, "root", "root", "spot").await?;
-    let tx = shared::db::begin(&spot_db).await?;
+    let spot_db = shared::db::connect(&db_url("spot")).await?;
+    let mut tx = spot_db.begin().await?;
 
-    tx.q("UPSERT type::record('spot', $id) CONTENT $row")
-        .bind(("id", spot_id))
-        .bind(("row", Spot::created(spot_created.clone(), Utc::now(), 1)))
-        .await?
-        .check()?;
+    let row = Spot::created(spot_created.clone(), Utc::now(), 1);
+    sqlx::query(
+        "INSERT INTO spot
+             (id, version, owner_id, title, description, price_per_hour, images,
+              lng, lat, active, deleted, address, availability, timezone,
+              created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+         ON CONFLICT (id) DO UPDATE SET
+             version        = EXCLUDED.version,
+             owner_id       = EXCLUDED.owner_id,
+             title          = EXCLUDED.title,
+             description    = EXCLUDED.description,
+             price_per_hour = EXCLUDED.price_per_hour,
+             images         = EXCLUDED.images,
+             lng            = EXCLUDED.lng,
+             lat            = EXCLUDED.lat,
+             active         = EXCLUDED.active,
+             deleted        = EXCLUDED.deleted,
+             address        = EXCLUDED.address,
+             availability   = EXCLUDED.availability,
+             timezone       = EXCLUDED.timezone,
+             created_at     = EXCLUDED.created_at,
+             updated_at     = EXCLUDED.updated_at",
+    )
+    .bind(row.id)
+    .bind(row.version as i64)
+    .bind(row.owner_id)
+    .bind(row.title)
+    .bind(row.description)
+    .bind(row.price_per_hour)
+    .bind(row.images)
+    .bind(row.lng)
+    .bind(row.lat)
+    .bind(row.active)
+    .bind(row.deleted)
+    .bind(sqlx::types::Json(row.address))
+    .bind(sqlx::types::Json(row.availability))
+    .bind(row.timezone)
+    .bind(row.created_at)
+    .bind(row.updated_at)
+    .execute(&mut *tx)
+    .await?;
 
     bus::outbox::enqueue(
-        &tx,
+        &mut *tx,
         &spot_subject(&spot_id),
         &envelope(
             SpotEvent::Created(spot_created),

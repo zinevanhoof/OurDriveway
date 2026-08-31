@@ -4,6 +4,7 @@ import { computed, type HTMLAttributes } from 'vue'
 import { reactiveOmit } from '@vueuse/core'
 import { AvatarFallback } from 'reka-ui'
 import { cn } from '@/lib/utils'
+import { initialsOf } from '@/lib/initials'
 
 const props = defineProps<AvatarFallbackProps & {
   class?: HTMLAttributes['class']
@@ -12,13 +13,9 @@ const props = defineProps<AvatarFallbackProps & {
 
 const delegatedProps = reactiveOmit(props, 'class', 'name')
 
-// One letter per word: { firstName: "Zine", lastName: "Van Hoof" } -> "ZVH".
-// Empty when no name (slot used).
-const initials = computed(() =>
-  props.name
-    ? `${props.name.firstName} ${props.name.lastName}`.trim().split(/\s+/).map(w => w[0].toUpperCase()).join('')
-    : ''
-)
+// Empty when no name (slot used), and empty rather than throwing when the person
+// has not loaded yet — see `initialsOf`, which is where that case is tested.
+const initials = computed(() => initialsOf(props.name))
 </script>
 
 <template>

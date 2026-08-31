@@ -24,7 +24,6 @@ use shared::{
     requests::payment::CreateSessionRequest,
     rpc::spot::{SUBJECT_SPOT_CARD, SpotCard},
 };
-use surrealdb::{Surreal, engine::remote::ws::Client};
 use uuid::Uuid;
 
 use axum::http::StatusCode;
@@ -45,11 +44,9 @@ pub struct PaymentService {
     /// Events go into `_outbox` in the same transaction as the rows, and the relay
     /// carries them.
     nc: async_nats::Client,
-    payments: PaymentRepository,
-    bookings: BookingMirrorRepository,
-    /// Read-only, and only for `earnings` — payout *rows* are written by this service's
-    /// projector, never here.
-    payouts: PayoutRepository,
+    /// The pool. See the note on `UserService::db` — the repositories are stateless,
+    /// so this service no longer holds one per table.
+    db: sqlx::PgPool,
     stripe: Arc<Stripe>,
     /// How long after a booking ends its money becomes withdrawable.
     settlement_secs: i64,
@@ -58,15 +55,13 @@ pub struct PaymentService {
 impl PaymentService {
     pub fn new(
         js: Context,
-        db: Arc<Surreal<Client>>,
+        db: sqlx::PgPool,
         stripe: Arc<Stripe>,
         settlement_secs: i64,
     ) -> Self {
         Self {
             nc: js.client().clone(),
-            payments: PaymentRepository { q: db.clone() },
-            bookings: BookingMirrorRepository { q: db.clone() },
-            payouts: PayoutRepository { q: db },
+            db,
             stripe,
             settlement_secs,
         }
@@ -94,9 +89,7 @@ impl PaymentService {
         request: CreateSessionRequest,
     ) -> MyResult<NewSession> {
         let booking_id = &request.booking_id;
-        let booking = self
-            .bookings
-            .find_by_id(*booking_id)
+        let booking = BookingMirrorRepository::find_by_id(&self.db, *booking_id)
             .await?
             .context_not_found(("Not Found", "That booking doesn't exist."))?;
 
@@ -129,7 +122,7 @@ impl PaymentService {
         // note on layer 1 above — re-creating it is not merely wasteful, it is the thing
         // that breaks. A session that has since expired falls through, where the guards
         // above have already refused anything whose hold is gone.
-        if let Some(payment) = self.payments.find_by_booking_id(*booking_id).await? {
+        if let Some(payment) = PaymentRepository::find_by_booking_id(&self.db, *booking_id).await? {
             let state = self.stripe.retrieve_session(&payment.session_id).await?;
             if let Some(client_secret) = state.client_secret {
                 return Ok(NewSession {
@@ -181,12 +174,10 @@ impl PaymentService {
             created_at: Utc::now(),
         };
 
-        let tx = db::begin(&self.payments.q).await?;
-        let version = db::next_version(&tx, "payment", &payment_id).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "payment", &payment_id).await?;
 
-        PaymentRepository { q: &tx }
-            .upsert(Payment::created(created.clone(), version))
-            .await?;
+        PaymentRepository::upsert(&mut *tx, Payment::created(created.clone(), version)).await?;
 
         // Deterministic event id, so a resubmitted checkout is discarded by the
         // stream's duplicate window instead of appended twice. The `_outbox` row is
@@ -202,7 +193,7 @@ impl PaymentService {
             format!("payment-created:{payment_id}").as_bytes(),
         );
 
-        outbox::enqueue(&tx, &payment_subject(booking_id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &payment_subject(booking_id), &envelope).await?;
         tx.commit().await?;
 
         Ok(session)
@@ -226,9 +217,7 @@ impl PaymentService {
         // caller's — a 403 would confirm it exists to someone who cannot see it.
         const NOT_FOUND: (&str, &str) = ("Not Found", "No such checkout.");
 
-        let payment = self
-            .payments
-            .find_by_session_id(session_id.to_string())
+        let payment = PaymentRepository::find_by_session_id(&self.db, session_id.to_string())
             .await?
             .context_not_found(NOT_FOUND)?;
 
@@ -292,32 +281,35 @@ impl PaymentService {
             Outcome::Ignored => return Ok(()),
         };
 
-        let tx = db::begin(&self.payments.q).await?;
-        let payments = PaymentRepository { q: &tx };
-        let version = db::next_version(&tx, "payment", &payment_id).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "payment", &payment_id).await?;
 
-        // `WHERE status IN UNPAID` is the guard that makes a redelivered webhook a
-        // no-op, and it now runs in the same transaction as the event rather than a
+        // `status = ANY(UNPAID)` is the guard that makes a redelivered webhook a
+        // no-op, and it runs in the same transaction as the event rather than a
         // projector's moment later.
         match &event {
             PaymentEvent::Succeeded { intent_id, .. } => {
-                payments
-                    .transition(
-                        payment_id,
-                        &status::UNPAID,
-                        PaymentPatch::succeeded(intent_id.clone()),
-                    )
-                    .await?;
+                PaymentRepository::transition(
+                    &mut *tx,
+                    payment_id,
+                    &status::UNPAID,
+                    PaymentPatch::succeeded(intent_id.clone()),
+                )
+                .await?;
             }
             PaymentEvent::Failed { reason, .. } => {
-                payments
-                    .transition(payment_id, &status::UNPAID, PaymentPatch::failed(reason.clone()))
-                    .await?;
+                PaymentRepository::transition(
+                    &mut *tx,
+                    payment_id,
+                    &status::UNPAID,
+                    PaymentPatch::failed(reason.clone()),
+                )
+                .await?;
             }
             // `handle_webhook` builds only the two above.
             _ => {}
         }
-        db::set_version(&tx, "payment", &payment_id, version).await?;
+        db::set_version(&mut tx, "payment", &payment_id, version).await?;
 
         // Same as above: the id is what makes a redelivered webhook a no-op.
         let mut envelope = Envelope::new(
@@ -328,7 +320,7 @@ impl PaymentService {
         );
         envelope.event_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, dedupe.as_bytes());
 
-        outbox::enqueue(&tx, &payment_subject(&booking_id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &payment_subject(&booking_id), &envelope).await?;
         tx.commit().await?;
 
         Ok(())
@@ -338,27 +330,71 @@ impl PaymentService {
     ///
     /// Two queries over two tables rather than one join: each repository answers for
     /// its own table, and the subtraction is arithmetic that belongs here.
-    pub async fn earnings(&self, owner_id: &Uuid) -> MyResult<Earnings> {
+    ///
+    /// Takes a connection rather than reaching for `self.db`, which is what lets
+    /// `request_payout` run it **inside** its transaction, after the lock.
+    ///
+    /// `&mut PgConnection` and not `impl PgExecutor<'_>`: this issues two statements, and an
+    /// executor is consumed per statement — so the two halves have to share one
+    /// borrow, reborrowed for each.
+    pub async fn earnings_with(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        owner_id: &Uuid,
+    ) -> MyResult<Earnings> {
         let cutoff = Utc::now() - chrono::Duration::seconds(self.settlement_secs);
         Ok(Earnings {
-            earned_cents: self.payments.earned(owner_id, cutoff).await?,
-            paid_out_cents: self.payouts.total_for(owner_id).await?,
+            earned_cents: PaymentRepository::earned(&mut *conn, owner_id, cutoff).await?,
+            paid_out_cents: PayoutRepository::total_for(&mut *conn, owner_id).await?,
         })
     }
 
-    /// Whether a host may withdraw, and how much. Derived, never stored.
-    async fn available_for(&self, owner_id: &Uuid) -> MyResult<i64> {
-        Ok(self.earnings(owner_id).await?.available_cents())
+    /// The read-only version, for the endpoint that just reports a balance.
+    ///
+    /// Borrows a connection for the pair, so both halves see one snapshot each rather
+    /// than being answered from two different pooled connections.
+    pub async fn earnings(&self, owner_id: &Uuid) -> MyResult<Earnings> {
+        let mut conn = self.db.acquire().await?;
+        self.earnings_with(&mut conn, owner_id).await
     }
 
     /// "Take the money out." Nothing leaves any real account.
     ///
-    /// The amount is computed here and a client-supplied figure is never read. Two
-    /// concurrent requests both see the same affordable balance, which is why this
-    /// publishes under compare-and-swap on the host's own subject: exactly one wins and
-    /// the loser gets a 409 to retry against the reduced balance.
+    /// The amount is computed here and a client-supplied figure is never read.
+    ///
+    /// # The two halves that stop a double withdrawal
+    ///
+    /// A balance is derived, never stored, so two double-clicked requests read the
+    /// same available amount and insert two *different* payout rows — different keys,
+    /// nothing collides, money out twice. Both of the following are needed, and
+    /// neither works alone:
+    ///
+    /// 1. **The advisory lock**, taken first. There is no row to lock: the row that
+    ///    changes the answer is the payout that does not exist yet. A `host` table used
+    ///    to exist purely to hold a version to bump, which under TiKV manufactured a
+    ///    write conflict — under Read Committed it would not conflict at all, so the
+    ///    table is gone and the lock is taken on the owner id instead. See
+    ///    `PayoutRepository::lock_owner`.
+    /// 2. **The balance read, moved inside the transaction and below the lock.** It
+    ///    used to run before the transaction opened, which made the loser's figure stale no matter
+    ///    what was locked afterwards. Read Committed gives this statement a fresh
+    ///    snapshot containing the winner's payout, so the loser computes 0 and falls
+    ///    into the 422 below.
+    ///
+    /// The loser therefore gets "You have no settled earnings yet" rather than a
+    /// conflict to retry — which is the honest answer, because by then there genuinely
+    /// is nothing left to withdraw.
     pub async fn request_payout(&self, owner_id: &Uuid) -> MyResult<(String, i64)> {
-        let amount_cents = self.available_for(owner_id).await?;
+        let mut tx = self.db.begin().await?;
+
+        // First statement in the transaction. Everything below depends on it.
+        PayoutRepository::lock_owner(&mut *tx, owner_id).await?;
+
+        // AFTER the lock, never before.
+        let amount_cents = self
+            .earnings_with(&mut *tx, owner_id)
+            .await?
+            .available_cents();
 
         (amount_cents > 0).context_unprocessable_entity((
             "Nothing to Withdraw",
@@ -373,26 +409,13 @@ impl PaymentService {
             requested_at: Utc::now(),
         };
 
-        let tx = db::begin(&self.payouts.q).await?;
-
-        // THE serialisation point, and the reason the `host` table exists. Two
-        // double-clicked withdrawals create two different payout rows, so nothing
-        // else in this transaction collides — bumping the host's version does, and
-        // TiKV refuses one of them. This replaced a compare-and-swap on the host's
-        // NATS subject, which the write moving into the database made impossible.
-        let host_version = db::next_version(&tx, "host", owner_id).await?;
-        db::set_version(&tx, "host", owner_id, host_version).await?;
-
-        // No `set_version` after this one: the row carries its own version and this
-        // is a whole-row write. The `host` bump above still needs it — that row has
-        // no model at all, it is only ever a counter.
-        let payout_version = db::next_version(&tx, "payout", &payout_id).await?;
-        PayoutRepository { q: &tx }
-            .upsert(
-                Payout::requested(&requested, payout_version)
-                    .ok_or_else(|| MyError::Bus("payout event is not a PayoutRequested".into()))?,
-            )
-            .await?;
+        let payout_version = db::next_version(&mut tx, "payout", &payout_id).await?;
+        PayoutRepository::upsert(
+            &mut *tx,
+            Payout::requested(&requested, payout_version)
+                .ok_or_else(|| MyError::Bus("payout event is not a PayoutRequested".into()))?,
+        )
+        .await?;
 
         let envelope = Envelope::new(
             requested,
@@ -404,7 +427,7 @@ impl PaymentService {
         // records that, not the host counter this transaction contended over.
         let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        outbox::enqueue(&tx, &payout_subject(owner_id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &payout_subject(owner_id), &envelope).await?;
         tx.commit().await?;
 
         Ok((await_token, amount_cents))
@@ -424,11 +447,11 @@ impl PaymentService {
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
 
-        for payout in self.payouts.all().await? {
+        for payout in PayoutRepository::all(&self.db).await? {
             let requested_at = payout.created_at.into();
 
             sent += outbox::backfill(
-                &self.payouts.q,
+                &self.db,
                 // Keyed by host, like the original — that subject is what serialises
                 // one host's withdrawals, and a backfill has no business landing on
                 // a different one.

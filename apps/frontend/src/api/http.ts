@@ -59,11 +59,15 @@ export function installNativeFetch() {
 
     const url = parsed.toString();
 
-    // plugin-http breaks urql two ways ("resource id is invalid"): urql probes
-    // response.body (frees the read-once native body) and aborts on teardown
-    // (fetch_cancel on a consumed rid rejects uncaught). Drain the body once into a
-    // plain Response and drop the signal. Harmless for the REST path, required for
-    // urql — and doing it here covers both without either caller knowing.
+    // Drain the body once into a plain Response and drop the signal.
+    //
+    // This was written for urql, which broke plugin-http two ways ("resource id is
+    // invalid"): it probed `response.body`, freeing the read-once native body, and
+    // aborted on teardown, so `fetch_cancel` on an already-consumed rid rejected
+    // uncaught. urql is gone — but **do not remove this**. vue-query also aborts
+    // in-flight queries on unmount and passes a signal, so the second half applies
+    // unchanged; and a native `Response` whose body can only be read once is a sharp
+    // edge for any caller, not just that one.
     if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const { signal: _signal, ...rest } = init ?? {};
 

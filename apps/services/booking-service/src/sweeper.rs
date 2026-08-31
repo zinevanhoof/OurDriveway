@@ -13,7 +13,6 @@
 //! filter behind it, a sweeper that stops means holds that never release. Hence
 //! `run` below can only ever log and continue — nothing propagates out of the loop.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use shared::{
@@ -28,7 +27,7 @@ use shared::{
 use uuid::Uuid;
 
 use crate::repository::booking_repository::BookingRepository;
-use surrealdb::{Surreal, engine::remote::ws::Client};
+use sqlx::PgPool;
 
 const TICK: Duration = Duration::from_secs(60);
 
@@ -38,21 +37,20 @@ const MAX_PER_SWEEP: usize = 200;
 
 /// Sweeps forever. `tokio::spawn` is the caller's, like the projectors' and the
 /// worker's — this loop is no more special than theirs.
-pub async fn run(db: Arc<Surreal<Client>>) {
-    let bookings = BookingRepository { q: db };
+pub async fn run(db: PgPool) {
     let mut ticker = tokio::time::interval(TICK);
     loop {
         ticker.tick().await;
         // Deliberately swallowed. A failed tick is retried a minute later; a
         // propagated error would end the task, and nothing else frees a hold.
-        if let Err(e) = sweep(&bookings).await {
+        if let Err(e) = sweep(&db).await {
             tracing::error!(error = %e, "sweep failed; retrying next tick");
         }
     }
 }
 
-async fn sweep(bookings: &BookingRepository) -> MyResult<()> {
-    let lapsed = bookings.lapsed_holds(MAX_PER_SWEEP).await?;
+async fn sweep(db: &PgPool) -> MyResult<()> {
+    let lapsed = BookingRepository::lapsed_holds(db, MAX_PER_SWEEP).await?;
     if lapsed.is_empty() {
         return Ok(());
     }
@@ -65,14 +63,14 @@ async fn sweep(bookings: &BookingRepository) -> MyResult<()> {
             booking_id,
             reason: ReleaseReason::Expired,
         };
-        let tx = match shared::db::begin(&bookings.q).await {
+        let mut tx = match db.begin().await {
             Ok(tx) => tx,
             Err(e) => {
                 tracing::error!(booking = %booking_id, error = %e, "could not open transaction");
                 continue;
             }
         };
-        let version = match shared::db::next_version(&tx, "booking", &booking_id).await {
+        let version = match shared::db::next_version(&mut tx, "booking", &booking_id).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(booking = %booking_id, error = %e, "could not read version");
@@ -83,20 +81,20 @@ async fn sweep(bookings: &BookingRepository) -> MyResult<()> {
         // Scoped to `reserved`, which is what stops this undoing a payment that
         // landed in the same instant — the sweeper and `confirm_paid` genuinely
         // race, and the guard is the whole answer to it.
-        let moved = BookingRepository { q: &tx }
-            .transition(
-                booking_id,
-                status::RELEASED,
-                &[status::RESERVED],
-                Some(ReleaseReason::Expired.as_str()),
-                None,
-            )
-            .await;
+        let moved = BookingRepository::transition(
+            &mut *tx,
+            booking_id,
+            status::RELEASED,
+            &[status::RESERVED],
+            Some(ReleaseReason::Expired.as_str()),
+            None,
+        )
+        .await;
         if let Err(e) = moved {
             tracing::error!(booking = %booking_id, error = %e, "could not release");
             continue;
         }
-        if let Err(e) = shared::db::set_version(&tx, "booking", &booking_id, version).await {
+        if let Err(e) = shared::db::set_version(&mut tx, "booking", &booking_id, version).await {
             tracing::error!(booking = %booking_id, error = %e, "could not set version");
             continue;
         }
@@ -117,7 +115,8 @@ async fn sweep(bookings: &BookingRepository) -> MyResult<()> {
         // race in a way that matters. Applying it is guarded on the booking still
         // being 'reserved', which is what stops it undoing a payment that landed in
         // the same instant.
-        if let Err(e) = bus::outbox::enqueue(&tx, &booking_subject(&spot_id), &envelope).await {
+        if let Err(e) = bus::outbox::enqueue(&mut *tx, &booking_subject(&spot_id), &envelope).await
+        {
             tracing::error!(booking = %booking_id, error = %e, "could not enqueue release");
             continue;
         }

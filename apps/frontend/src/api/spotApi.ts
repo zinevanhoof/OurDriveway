@@ -17,7 +17,7 @@ export async function createSpot(request: object): Promise<Response> {
 
 /**
  * Saves an edit. The edit form sends its whole state: `images` is the host's whole
- * list of media keys, kept and newly uploaded alike, already in display order — so
+ * list of media URLs, kept and newly uploaded alike, already in display order — so
  * the server never has to diff anything to tell "unchanged" from "removed".
  *
  * Every field is optional server-side, and an omitted one means "leave alone". The

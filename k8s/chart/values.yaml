@@ -112,83 +112,41 @@ services:
 
 replicas: 1
 
-# The query engine over TiKV. Stores nothing itself, so these are ordinary
-# replaceable pods behind one ClusterIP — see templates/surrealdb.yaml.
-surrealdb:
-  # Pinned to match the `surrealdb` crate in Cargo.toml, and doubly worth pinning
-  # now: `shared::db::is_write_conflict` string-matches SurrealDB's error message
-  # because a TiKV write conflict has no typed surface, so a version that rewords
-  # it turns every contended booking into a 500. `bus/examples/tikv_spike` is the
-  # check to run before moving this.
-  image: surrealdb/surrealdb:v3.2.4
-  # Reads scale here. Writes are TiKV's problem, not this pod's.
-  replicas: 1
-  resources:
-    requests:
-      cpu: 100m
-      memory: 256Mi
-  # `user`/`pass` are gone from this file. They used to be unremarkable in plain
-  # sight because the sidecar bound 127.0.0.1 and was private to its pod; a shared
-  # ClusterIP makes them the only thing between any pod in the namespace and a root
-  # session, so they live in k8s/secrets.env as SURREALDB_USER / SURREALDB_PASS.
-  # Helm also stores every value it renders in the release secret and hands them
-  # back to `helm get values`, which is the same reason JWT_SECRET was never here.
-
-# The authoritative store — see templates/tikv.yaml.
+# The authoritative store — see templates/yugabyte.yaml.
 #
-# `storage` on both is the one thing in this chart whose loss is data loss rather
-# than a rebuild. Everything else is derived from it: a service database, the read
-# model, and the seven days of events in NATS.
-tikv:
-  # Stores. `max-replicas` in PD's config is derived from this and capped at 3, so
-  # a single-node cluster is placeable and a three-node one is durable without
-  # anyone having to know that PD defaults to 3 and hangs when it cannot meet it.
-  replicas: 1
-  image: pingcap/tikv:v8.5.7
+# This one block replaced three: a `surrealdb` query engine, a `tikv` store under it,
+# and a `pd` placement driver under that. And a `curlImage`, which existed because the
+# distroless SurrealDB image had no shell to run the schema-import loop in, and because
+# PD and TiKV had no app image to borrow for their init containers.
+#
+# `storage` is the one thing in this chart whose loss is data loss rather than a
+# rebuild. Everything else derives from it: every service database, the read model, and
+# the seven days of events in NATS.
+yugabyte:
+  # **>= 2025.2, and started through `yugabyted`.** That pair is what enables Read
+  # Committed, which booking-service's reserve path depends on to not double-book —
+  # see the header of templates/yugabyte.yaml. This is a correctness constraint, not a
+  # preference. Keep it in step with docker/docker-compose-dev.yml.
+  image: yugabytedb/yugabyte:2025.2.5.2-b5
   storage: 20Gi
   resources:
     requests:
-      cpu: 200m
-      memory: 512Mi
-  # Extra TiKV config, appended as tikv.toml. Empty on purpose: untuned, TiKV
-  # sizes itself to the machine, which is what you want on a node it does not
-  # share. `k8s/deploy.sh local` passes docker/tikv/tikv.toml through --set-file,
-  # because a k3d cluster shares a laptop with a cargo build and TiKV would
-  # otherwise take ~45% of its memory for the block cache alone.
-  config: ""
-  # Cluster metadata, region placement, and the timestamp oracle every transaction
-  # takes its start and commit timestamps from. Small, and the thing everything
-  # else dials.
-  pd:
-    # Raft. Go to 3 for an odd quorum the day losing this pod means an outage.
-    replicas: 1
-    image: pingcap/pd:v8.5.7
-    storage: 5Gi
-    resources:
-      requests:
-        cpu: 100m
-        memory: 256Mi
-# curl with a shell. Used for applying the schemas — the surrealdb image is
-# distroless, so there is no shell in it to run a loop — and for the three init
-# containers around the storage layer, which the services cover with bash's
-# /dev/tcp but PD, TiKV and SurrealDB have no app image to borrow.
-#
-# Not busybox, which would be the obvious small choice: its `nc` resolves through
-# its own resolver rather than the pod's DNS search list, so `nc -z pd 2379` says
-# `bad address 'pd'` forever. Measured, on a real install.
-curlImage: curlimages/curl:8.11.1
+      cpu: 500m
+      memory: 2Gi
+  # Untuned, a tserver sizes itself to the node — right on a node it does not share,
+  # wrong on a k3d cluster sharing a laptop with a cargo build. `values-local.yaml`
+  # overrides these; production leaves them empty and lets it have the machine.
+  tserverFlags: ""
+  masterFlags: ""
+  # No `replicas` key, deliberately. This template is single-node — multi-node needs
+  # `--join` and a replication factor, which is a different template, and a knob here
+  # would make three replicas look like a supported option when it is not.
 
 # Created outside this chart, by deploy.sh, from the gitignored k8s/secrets.env.
 # Deliberately not templated: Helm stores every rendered value in the release
 # secret and prints them back with `helm get values`, so a chart is a poor place
-# to put a signing key. Rotating it needs a `kubectl rollout restart`.
-secretName: app-secrets
-
-schemaConfigMap: surreal-schemas
-# Filled at install time by deploy.sh via `--set-file schemas.<name>=…`, keyed by
-# service name. Empty here so that a plain `helm template` with no --set-file
-# fails loudly on a missing schema rather than booting a database with no tables.
-schemas: {}
+# to put a signing key — and the database password is now in there too, as
+# YSQL_PASSWORD. Rotating it needs a `kubectl rollout restart`.
 
 frontend:
   # Caddy serving the built SPA and nothing else — all routing lives in the

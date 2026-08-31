@@ -18,17 +18,14 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { useQuery } from "@urql/vue";
+import { useQuery } from "@tanstack/vue-query";
 import { toast } from "vue-sonner";
 import { CircleCheck, CircleX, ShieldCheck, Timer } from "@lucide/vue";
 import Button from "@/components/ui/button/Button.vue";
 import Separator from "@/components/ui/separator/Separator.vue";
 import Spinner from "@/components/ui/spinner/Spinner.vue";
 import { stripe } from "@/lib/stripe";
-import { gqlRecordId } from "@/lib/utils";
-import { useAuthStore } from "@/stores/auth";
-import { ME } from "@/api/graphql/user";
-import { BOOKING_STATUS } from "@/api/graphql/booking";
+import { fetchBooking, fetchMe, viewKeys } from "@/api/viewApi";
 import * as paymentApi from "@/api/paymentApi";
 import * as bookingApi from "@/api/bookingApi";
 import type {
@@ -38,7 +35,8 @@ import type {
 
 const route = useRoute();
 const router = useRouter();
-const auth = useAuthStore();
+// No `useAuthStore()` here any more: the only thing it supplied was the caller's id for
+// the `ME` document's `user(id:)` lookup, and `/me` takes that from the token.
 
 /** Everything this screen knows on arrival. */
 const sessionId = computed(() => String(route.query.session_id ?? ""));
@@ -68,12 +66,12 @@ let actions: StripeCheckoutLoadActionsSuccess | null = null;
 // and `catch_deep_link` in src-tauri/src/lib.rs.
 
 // Prefill the email Stripe requires, so a logged-in renter doesn't retype an address we
-// already hold. `email` is scoped at field level in view-schema, so this only ever
-// resolves for the asking user.
+// already hold. `/me` is the only endpoint that returns it, and it picks the row from
+// the verified claim — where this used to ask for a user by id and rely on a
+// field-level permission to blank the address for anyone else.
 const { data: me } = useQuery({
-  query: ME,
-  variables: computed(() => ({ id: gqlRecordId(auth.user?.id) })),
-  pause: computed(() => !auth.user?.id),
+  queryKey: viewKeys.me,
+  queryFn: fetchMe,
 });
 
 onMounted(load);
@@ -115,7 +113,9 @@ async function load() {
 async function mount(clientSecret: string) {
   const sdk = (await stripe()).initCheckoutElementsSdk({
     clientSecret,
-    defaultValues: { email: me.value?.user?.email ?? undefined },
+    // `profile` is still optional — null between signup and its projection — but the
+    // email on it is not.
+    defaultValues: { email: me.value?.profile?.email },
   });
 
   // Themed off the app's own tokens so the Element doesn't read as a third-party panel.
@@ -211,17 +211,17 @@ const POLL_MS = 1_500;
 const GIVE_UP_MS = 30_000;
 let poller: ReturnType<typeof setInterval> | undefined;
 
-const { data: booking, executeQuery: refetchBooking } = useQuery({
-  query: BOOKING_STATUS,
-  variables: computed(() => ({ id: gqlRecordId(bookingId.value) })),
-  requestPolicy: "network-only",
-  pause: computed(() => !bookingId.value),
+const { data: booking, refetch: refetchBooking } = useQuery({
+  queryKey: computed(() => viewKeys.booking(bookingId.value ?? "")),
+  queryFn: () => fetchBooking(bookingId.value!),
+  enabled: computed(() => !!bookingId.value),
+  staleTime: 0,
 });
 
 async function awaitConfirmation() {
   const started = Date.now();
   poller = setInterval(() => {
-    if (booking.value?.booking?.status === "confirmed") {
+    if (booking.value?.status === "confirmed") {
       screen.value = "booked";
       stopPolling();
       return;
@@ -233,7 +233,7 @@ async function awaitConfirmation() {
       stopPolling();
       return;
     }
-    void refetchBooking({ requestPolicy: "network-only" });
+    void refetchBooking();
   }, POLL_MS);
 }
 

@@ -31,13 +31,9 @@ pub struct AppState {
 /// falls back to a default, because a default is a value you cannot discover by
 /// reading the `.env`.
 pub struct Config {
-    pub surrealdb_addr: String,
-    pub surrealdb_user: String,
-    pub surrealdb_pass: String,
-    /// This service's own database inside the shared `main` namespace. Every
-    /// service used to be "main"; on TiKV they share one keyspace, so this is
-    /// what keeps their tables apart.
-    pub surrealdb_db: String,
+    /// This service's own database in the YugabyteDB cluster, as one URL — and the
+    /// port is **5433**, not 5432. See user-service's `Config` for the full note.
+    pub database_url: String,
     pub nats_url: String,
     pub port: u16,
     /// Verification only. This service mints no tokens; user-service does.
@@ -45,10 +41,7 @@ pub struct Config {
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
-    surrealdb_addr: env::require("SURREALDB_ADDR"),
-    surrealdb_user: env::require("SURREALDB_USER"),
-    surrealdb_pass: env::require("SURREALDB_PASS"),
-    surrealdb_db: env::require("SURREALDB_DB"),
+    database_url: env::require("DATABASE_URL"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
     jwt_secret: env::require("JWT_SECRET"),
@@ -69,20 +62,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     LazyLock::force(&CONFIG);
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
-    let db = shared::db::connect(
-        &CONFIG.surrealdb_addr,
-        &CONFIG.surrealdb_user,
-        &CONFIG.surrealdb_pass,
-        &CONFIG.surrealdb_db,
-    )
-    .await?;
+    let db = shared::db::connect(&CONFIG.database_url).await?;
+    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/booking")).await?;
 
-    // One connection for the whole process — projector lanes, election, relay,
-    // sweeper, handlers and the await layer all share it. `Surreal::clone` would mint
-    // a session and replay the root sign-in onto it; cloning the `Arc` is a refcount
-    // bump. The sessions that do get minted are per *transaction*, in
-    // `shared::db::begin`, and die with it.
-    let db = Arc::new(db);
+    // One pool for the whole process — projector lanes, election, relay, sweeper,
+    // handlers and the await layer all share it. `PgPool` is `Arc` inside, so a clone
+    // is a refcount bump; a connection is borrowed per statement or per transaction.
     let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;

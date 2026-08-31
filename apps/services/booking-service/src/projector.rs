@@ -11,7 +11,7 @@ use shared::{
     },
     general_models::{booking::Booked, spot::Availability},
 };
-use surrealdb::{engine::remote::ws::Client, method::Transaction};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::policy::availability;
@@ -40,42 +40,42 @@ impl Projector for SpotProjector {
 
     async fn apply(
         &self,
-        tx: &Transaction<Client>,
+        conn: &mut PgConnection,
         event: SpotEvent,
         at: DateTime<Utc>,
         version: u64,
     ) -> MyResult<()> {
-        let bookings = BookingRepository { q: tx };
-        let spots = SpotMirrorRepository { q: tx };
         let spot_id = event.spot_id();
 
-        // React before projecting. Both now sit inside one transaction, so on any
-        // failure the cursor stays put and the whole thing runs again — the cancels
-        // are deduped by their deterministic event ids and the mirror write is an
-        // idempotent merge.
+        // React before projecting. Both sit inside one transaction, so on any failure
+        // nothing is acked and the whole thing runs again — the cancels are deduped by
+        // their deterministic event ids and the mirror write is an idempotent merge.
         //
         // Nothing is read from the projection that the event doesn't already carry,
         // so running first costs nothing in accuracy.
-        Self::react(tx, &bookings, &event, at).await?;
+        Self::react(conn, &event, at).await?;
 
-        // `merge`, never `upsert`: CONTENT would erase `booked` and `bookings_seq`,
-        // which this stream does not own and the BOOKINGS projector may already
-        // have written.
+        // `merge`, never a whole-row write: this stream does not own every column, and
+        // the row may already exist. It used to also be about not erasing
+        // `bookings_seq`; that column is gone with the compare-and-swap it served.
         match event {
-            SpotEvent::Created(e) => spots.merge(e.spot_id, SpotMirrorPatch::created(e)).await,
+            SpotEvent::Created(e) => {
+                SpotMirrorRepository::merge(&mut *conn, e.spot_id, SpotMirrorPatch::created(e))
+                    .await
+            }
             SpotEvent::Updated(e) => {
                 let spot_id = e.spot_id;
-                spots.merge(spot_id, SpotMirrorPatch::updated(e)).await
+                SpotMirrorRepository::merge(&mut *conn, spot_id, SpotMirrorPatch::updated(e)).await
             }
             SpotEvent::Deleted { spot_id } => {
-                spots.merge(spot_id, SpotMirrorPatch::deleted()).await
+                SpotMirrorRepository::merge(&mut *conn, spot_id, SpotMirrorPatch::deleted()).await
             }
         }?;
 
-        // The SPOTS aggregate version, kept beside `bookings_seq` on the same mirror
-        // row. Two counters, two jobs: this one tracks spot-service's writes, that
-        // one is this service's per-spot booking cursor.
-        shared::db::set_version(tx, "spot", &spot_id, version).await
+        // spot-service's version of this aggregate, as last applied here. The only
+        // counter on this row now — `bookings_seq` used to sit beside it doing an
+        // entirely different job.
+        shared::db::set_version(conn, "spot", &spot_id, version).await
     }
 }
 
@@ -92,8 +92,7 @@ impl SpotProjector {
     /// payment — and losing that race means cancelling a booking that was paid for a
     /// moment later. A hold that *is* paid after this runs is the gap named below.
     async fn react(
-        tx: &Transaction<Client>,
-        bookings: &BookingRepository<&Transaction<Client>>,
+        conn: &mut PgConnection,
         event: &SpotEvent,
         at: DateTime<Utc>,
     ) -> MyResult<()> {
@@ -121,13 +120,16 @@ impl SpotProjector {
         // `confirm_paid` publishes unconditionally and re-checks nothing.
         // Close both with a reconciliation sweep over confirmed future bookings,
         // shaped like sweeper.rs, if it ever shows up in practice.
-        for booking in bookings.upcoming_confirmed(&spot_id, at).await? {
+        // Collected before the loop: the cancels below write through the same
+        // connection, and a streaming read would still be borrowing it.
+        let upcoming = BookingRepository::upcoming_confirmed(&mut *conn, &spot_id, at).await?;
+        for booking in upcoming {
             if let Some(availability) = availability
                 && fits(availability, &booking)
             {
                 continue;
             }
-            Self::cancel(tx, bookings, &booking, at).await?;
+            Self::cancel(&mut *conn, &booking, at).await?;
         }
         Ok(())
     }
@@ -141,25 +143,24 @@ impl SpotProjector {
     /// view-service and payment-service both showed it cancelled. Exactly the wrong
     /// way round.
     async fn cancel(
-        tx: &Transaction<Client>,
-        bookings: &BookingRepository<&Transaction<Client>>,
+        conn: &mut PgConnection,
         booking: &Booking,
         at: DateTime<Utc>,
     ) -> MyResult<()> {
-        let version = shared::db::next_version(tx, "booking", &booking.id).await?;
+        let version = shared::db::next_version(&mut *conn, "booking", &booking.id).await?;
 
         // Scoped to `confirmed`, so a redelivered SpotUpdated is a no-op — the same
         // guard the projector arm used to carry.
-        bookings
-            .transition(
-                booking.id,
-                status::CANCELLED,
-                &[status::CONFIRMED],
-                None,
-                Some(CancelReason::SpotUnavailable.as_str()),
-            )
-            .await?;
-        shared::db::set_version(tx, "booking", &booking.id, version).await?;
+        BookingRepository::transition(
+            &mut *conn,
+            booking.id,
+            status::CANCELLED,
+            &[status::CONFIRMED],
+            None,
+            Some(CancelReason::SpotUnavailable.as_str()),
+        )
+        .await?;
+        shared::db::set_version(&mut *conn, "booking", &booking.id, version).await?;
 
         let event = BookingEvent::Cancelled {
             booking_id: booking.id,
@@ -190,7 +191,7 @@ impl SpotProjector {
         // In the projector's own transaction, so the row and the event commit
         // together. This was the last NATS publish inside a database transaction —
         // the one genuine dual write left from before the rewrite.
-        bus::outbox::enqueue(tx, &booking_subject(&booking.spot_id), &envelope).await?;
+        bus::outbox::enqueue(conn, &booking_subject(&booking.spot_id), &envelope).await?;
         Ok(())
     }
 }
@@ -207,9 +208,9 @@ fn fits(availability: &Availability, booking: &Booking) -> bool {
 // `BookingProjector` is gone. This service's own BOOKINGS events are no longer
 // projected back in: `booking_service`, `sweeper` and `payment_worker_service`
 // write the `booking` rows directly, inside the transaction that enqueues the
-// event. It also advanced `spot.bookings_seq`; that bump now happens in
-// `create_booking`'s transaction, where it is the serialisation point rather than
-// a cursor.
+// event. It also advanced `spot.bookings_seq` — a column that no longer exists at
+// all. What serialises reserve now is a row lock on the spot mirror, taken by
+// `create_booking` itself; see `SpotMirrorRepository::find_for_update`.
 //
 // What remains above is the SPOTS mirror — a *foreign* stream, which is what a
 // projector is still for.

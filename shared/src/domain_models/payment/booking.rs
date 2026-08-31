@@ -1,7 +1,4 @@
 use chrono::{DateTime, Utc};
-use surrealdb::types::vars;
-use surrealdb::types::{Datetime, SurrealValue};
-use surrealdb::{engine::remote::ws::Client, method::Query};
 use uuid::Uuid;
 
 use crate::{
@@ -22,7 +19,7 @@ use crate::{
 /// genuinely optional columns**. `BookingCreated` is always the first event for a
 /// booking and BOOKINGS never expires (`max_age` None), so a replay from sequence 1
 /// can only ever create this row complete.
-#[derive(Clone, Debug, SurrealValue)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct BookingMirror {
     pub id: Uuid,
     /// Which spot, so checkout can ask spot-service what to call it. The id alone —
@@ -37,12 +34,12 @@ pub struct BookingMirror {
     ///
     /// Rendered literally, so this service still needs no timezone.
     ///
-    /// A row written before this column existed holds NONE, which will not
-    /// deserialize into a map — hence the `booked ?? {}` in every statement that
-    /// selects this table.
+    /// A `jsonb` column, `NOT NULL DEFAULT '{}'` — so the `booked ?? {}` that used to
+    /// be in every statement selecting this table is gone with the absent case.
+    #[sqlx(json)]
     pub booked: Booked,
     /// One of `domain_models::booking::status`. `completed` is deliberately absent
-    /// from this table's ASSERT — nothing publishes it, and "the host has earned
+    /// from this table's CHECK — nothing publishes it, and "the host has earned
     /// this" is `confirmed` plus an `ends_at` past the settlement window.
     pub status: String,
     /// When the hold lapses; NONE once the booking is no longer reserved. Read when
@@ -51,7 +48,7 @@ pub struct BookingMirror {
     /// The last moment the booking occupies. The field the settlement window is
     /// measured against, projected rather than recomputed from `booked` because that
     /// map is wall-clock strings that cannot be compared to `now` without the zone.
-    pub ends_at: Datetime,
+    pub ends_at: DateTime<Utc>,
     /// Why it was withdrawn, when it was. Carried so a refund policy could one day
     /// distinguish a host cancelling from a renter cancelling; today every refund is
     /// the full amount and these are written but unread.
@@ -71,7 +68,7 @@ impl BookingMirror {
             booked: e.booked,
             status: status::RESERVED.to_string(),
             hold_until: Some(e.expires_at),
-            ends_at: e.ends_at.into(),
+            ends_at: e.ends_at,
             cancel_reason: None,
             release_reason: None,
         }
@@ -96,26 +93,16 @@ pub struct BookingMirrorPatch {
 }
 
 impl BookingMirrorPatch {
-    /// Binds every patchable column. Absent ones bind as NONE, which the
-    /// `?? column` in `BookingMirrorRepository::transition` turns into "leave it
-    /// alone".
-    ///
-    /// Every field here has to appear in that statement's `SET` list, and vice
-    /// versa. Nothing checks that at compile time — the live round-trip in
-    /// payment-service is what would catch a mismatch.
-    pub fn bind(self, q: Query<'_, Client>) -> Query<'_, Client> {
-        q.bind(vars! {
-            status:         self.status,
-            cancel_reason:  self.cancel_reason,
-            release_reason: self.release_reason,
-        })
-    }
+    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
+    // positionally, so the binds live beside the `$n` placeholders in
+    // `BookingMirrorRepository::transition`. The live round-trip in payment-service
+    // is what would catch a mismatch.
 
     /// Paid. Clears the hold, which no longer means anything.
     ///
-    /// `hold_until` cannot be cleared through a patch — `?? column` can only leave a
-    /// value alone — so the projector's conditional update sets it to NONE
-    /// alongside. See `BookingMirrorRepository::transition`.
+    /// `hold_until` cannot be cleared through a patch — `COALESCE($n, column)` can
+    /// only leave a value alone — so the projector's conditional update sets it to
+    /// NULL alongside. See `BookingMirrorRepository::transition`.
     pub fn status(to: &str) -> Self {
         Self {
             status: Some(to.to_string()),

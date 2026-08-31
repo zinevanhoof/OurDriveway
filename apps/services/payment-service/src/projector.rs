@@ -8,7 +8,7 @@ use shared::{
     error::myerror::MyResult,
     events::{STREAM_BOOKINGS, booking::BookingEvent},
 };
-use surrealdb::{engine::remote::ws::Client, method::Transaction};
+use sqlx::PgConnection;
 
 use crate::repository::booking_mirror_repository::BookingMirrorRepository;
 
@@ -35,52 +35,54 @@ impl Projector for BookingProjector {
 
     async fn apply(
         &self,
-        tx: &Transaction<Client>,
+        conn: &mut PgConnection,
         event: BookingEvent,
         _at: DateTime<Utc>,
         version: u64,
     ) -> MyResult<()> {
-        let bookings = BookingMirrorRepository { q: tx };
         let booking_id = event.booking_id();
 
         match event {
-            // `upsert`, not `merge`: BookingCreated is always the first event for a
-            // booking and BOOKINGS never expires, so this row is only ever created
-            // whole — which is also why nothing on this table is `option<>`.
-            BookingEvent::Created(e) => bookings.upsert(BookingMirror::created(e)).await,
+            // A whole-row write, not a merge: BookingCreated is always the first event
+            // for a booking and BOOKINGS never expires, so this row is only ever
+            // created complete — which is also why nothing on this table is `Option`
+            // except the genuinely optional columns.
+            BookingEvent::Created(e) => {
+                BookingMirrorRepository::upsert(&mut *conn, BookingMirror::created(e)).await
+            }
 
             BookingEvent::Confirmed { booking_id } => {
-                bookings
-                    .transition(
-                        booking_id,
-                        &[booking_status::RESERVED],
-                        BookingMirrorPatch::status(booking_status::CONFIRMED),
-                    )
-                    .await
+                BookingMirrorRepository::transition(
+                    &mut *conn,
+                    booking_id,
+                    &[booking_status::RESERVED],
+                    BookingMirrorPatch::status(booking_status::CONFIRMED),
+                )
+                .await
             }
 
             BookingEvent::Released { booking_id, reason } => {
-                bookings
-                    .transition(
-                        booking_id,
-                        &[booking_status::RESERVED],
-                        BookingMirrorPatch::released(reason),
-                    )
-                    .await
+                BookingMirrorRepository::transition(
+                    &mut *conn,
+                    booking_id,
+                    &[booking_status::RESERVED],
+                    BookingMirrorPatch::released(reason),
+                )
+                .await
             }
 
             BookingEvent::Cancelled { booking_id, reason } => {
-                bookings
-                    .transition(
-                        booking_id,
-                        &[booking_status::CONFIRMED],
-                        BookingMirrorPatch::cancelled(reason),
-                    )
-                    .await
+                BookingMirrorRepository::transition(
+                    &mut *conn,
+                    booking_id,
+                    &[booking_status::CONFIRMED],
+                    BookingMirrorPatch::cancelled(reason),
+                )
+                .await
             }
         }?;
 
-        shared::db::set_version(tx, "booking", &booking_id, version).await
+        shared::db::set_version(conn, "booking", &booking_id, version).await
     }
 }
 

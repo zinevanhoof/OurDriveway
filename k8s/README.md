@@ -10,7 +10,7 @@ boundary and values files replace overlays.
 k8s/
   chart/              the chart — every backend is data in values.yaml,
                       one template in templates/services.yaml;
-                      storage is tikv.yaml + surrealdb.yaml + schema-import.yaml
+                      storage is yugabyte.yaml, and that is all of it
   values-local.yaml   dev cluster: no TLS, 1 replica each
   values-prod.yaml    TLS, 2 replicas
   deploy.sh
@@ -85,15 +85,23 @@ echo "127.0.0.1 ourdriveway.local" | sudo tee -a /etc/hosts
 ```
 
 Then http://ourdriveway.local. `kubectl get pods -n ourdriveway -w` while it comes
-up, and expect it in this order: `pd` → `tikv` → `surrealdb` → the `schema-import`
-Job → the services. Each stage waits on the one before it in an init container —
-this chart's `depends_on` — so a cold cluster should reach Running with **zero
-restarts**. A pod stuck in `Init` is waiting, not broken; `kubectl logs <pod> -c
-<init-container>` says what for.
+up, and expect it in this order: `yugabyte` → the services, each creating and
+migrating its own database. Two stages where there used to be five. A pod stuck in
+`Init` is waiting, not broken; `kubectl logs <pod> -c <init-container>` says what
+for.
 
-`k8s/deploy.sh local` also passes `docker/tikv/tikv.toml` to TiKV, which caps the
-block cache at 128 MB. Untuned, TiKV sizes itself to the machine — about 45% of
-system memory — and a k3d cluster shares that machine with your build.
+**A restart on a cold install is still possible, for a smaller reason than it used
+to be.** The init container dials `yugabyte:5433` through a *headless* Service,
+which does no readiness filtering, so it proves something is listening rather than
+that the cluster is serving. A service that starts in that window fails at
+`connect` and is fine on the retry. What no longer causes it is a missing database
+— the service creates its own — so this is now only about the cluster being up,
+not about anything having run before it. A deliberate trade against ordering every
+service behind a second gate; see the note in `templates/services.yaml`.
+
+`values-local.yaml` caps the tserver's memory. Untuned, YugabyteDB sizes itself to
+the machine, and a k3d cluster shares that machine with your build. Production
+leaves the caps empty and lets it have the node.
 
 Skip step 2 to run the last images CI published instead — they pull fine, they
 are just whatever was last merged to `main`.
@@ -114,17 +122,32 @@ k8s/deploy.sh local      # or: k8s/deploy.sh prod
 ```
 
 The script creates the namespace, applies the Secret from `k8s/secrets.env`, and
-runs `helm upgrade --install` with the five `--set-file` flags that carry the
-schemas in — plus, for `local` only, the TiKV memory tuning. Extra arguments are
-passed through, so `k8s/deploy.sh prod --dry-run` works. Point `ourdriveway.local`
-at your ingress controller's IP in `/etc/hosts`.
+runs `helm upgrade --install`. Extra arguments are passed through, so
+`k8s/deploy.sh prod --dry-run` works. Point `ourdriveway.local` at your ingress
+controller's IP in `/etc/hosts`.
 
-The schemas are applied by a `schema-import` Job — a Helm hook, so it re-runs on
-every upgrade — rather than by each pod at boot. Against one shared TiKV keyspace,
-N instances issuing the same `DEFINE … OVERWRITE` concurrently is a write conflict:
-measured, six concurrent imports of one schema produced 90 errors, one sequential
-import produces zero. A schema change therefore needs no `rollout restart`; nothing
-holds a copy to go stale.
+It used to carry five `--set-file` flags, one per schema, because Helm templates
+cannot read files outside the chart and the `.surql` schemas lived in `schemas/`.
+**Schemas are not files any more.** Each service embeds its own migrations with
+`sqlx::migrate!` and applies them at boot, so a new image carries its schema with
+it — that deleted the ConfigMap, the `--set-file` plumbing, and the import Job.
+
+Every replica running migrations at boot is safe: sqlx takes an advisory lock
+around the run, migrations are versioned and applied once, and each service owns
+its own database so the only contention is between replicas of one service.
+
+**Nor is `CREATE DATABASE` a central step.** `shared::db::connect` creates the
+database named in `DATABASE_URL` if connecting finds none (SQLSTATE `3D000`) and
+retries once, so a service brings up its own. That deleted the `create-databases`
+post-install hook, the second copy of the service list inside it, and the window
+where every service crash-looped waiting for a hook that runs *after* they start.
+Two replicas racing is fine: the loser gets `42P04` and treats it as success.
+
+It cannot be a migration instead. `sqlx::migrate!` runs its files on a connection
+to the database being migrated, so a missing one fails at `connect` and the files
+are never read — the transaction is not the obstacle, since sqlx honours a leading
+`-- no-transaction`. It does assume the role in `DATABASE_URL` may create
+databases, which `yugabyte` may.
 
 The Secret is created by kubectl rather than templated, because Helm stores every
 value it renders in the release secret and hands them back to anyone who runs
@@ -141,7 +164,7 @@ pod that has not caught up out of that endpoint list — the job the old
 it actually works.
 
 That probe answers much sooner than it used to. A pod no longer rebuilds a
-database before it can serve — its rows are already in TiKV — so what is left to
+database before it can serve — its rows are already in the cluster — so what is left to
 wait for is a foreign projection, and user-, spot- and payment-service register no
 streams at all: `/readyz` there reduces to "is NATS reachable", which the outbox
 relay still needs.
@@ -157,22 +180,26 @@ JWT. It authenticates by signature instead — see `route/webhook.rs`.
 ## Where the state lives
 
 ```
-services  ──►  surrealdb (Deployment, stores nothing)  ──►  TiKV + PD (StatefulSets)
-   │                                                            ▲
-   └──►  NATS JetStream ── integration events, 7 days ──────────┘ (rebuild path)
+services  ──►  yugabyte (StatefulSet, one database per service)
+   │                    ▲
+   └──►  NATS JetStream ─┘ integration events, 7 days (rebuild path)
 ```
 
-**TiKV is the authoritative store, and the only thing here whose loss is data
-loss.** Everything else is derived from it or replaceable.
+**YugabyteDB is the authoritative store, and the only thing here whose loss is
+data loss.** Everything else is derived from it or replaceable.
 
-This used to be the other way round. Every service pod carried its own SurrealDB
-sidecar on an `emptyDir`, because `bus/src/projector.rs` gave each instance an
-*ephemeral* consumer that replayed the whole log into a private database and kept
-its cursor there — so `replicas: N` had to mean N databases, and the log was the
-source of truth. None of that holds now: services write their own rows inside the
-request's transaction, projectors share durable consumers, and the log is a
-seven-day bus. So the sidecars, the `emptyDir`s and the schema mounts are gone and
-every service pod is an app container and nothing else.
+Two layers where there were four. SurrealDB stored nothing itself and needed TiKV
+underneath it, which needed a placement driver underneath *that*; the schemas
+needed a fifth object to apply them. One process does all of it, and the schemas
+travel inside the service binaries.
+
+Before that it was arranged the other way round entirely: every service pod
+carried its own SurrealDB sidecar on an `emptyDir`, because `bus/src/projector.rs`
+gave each instance an *ephemeral* consumer that replayed the whole log into a
+private database and kept its cursor there — so `replicas: N` had to mean N
+databases, and the log was the source of truth. None of that holds: services write
+their own rows inside the request's transaction, projectors share durable
+consumers, and the log is a seven-day bus.
 
 ### Projector throughput is `PARTITIONS`, not `replicas`
 
@@ -191,11 +218,16 @@ availability and request throughput; raising `PARTITIONS` is what buys projectio
 throughput. It is a `const` in `shared`, not a value, because every service
 declares the streams at boot and they must agree.
 
-It is also what a projector costs in SurrealDB connections: one per lane, so 16 per
-projector and 64 from view-service, which runs four. They cannot be sessions on a
-shared socket — `Surreal::clone` races its own sign-in, and a warmed clone deadlocks
-behind another lane's open transaction. Both were observed; see the note in
-`shared/src/db.rs`. Raising `PARTITIONS` raises the connection count with it.
+It no longer costs what it used to in connections. Each lane needed its own
+SurrealDB connection — 16 per projector, 64 from view-service, which runs four —
+because they could not be sessions on a shared socket: `Surreal::clone` raced its
+own sign-in, and a warmed clone deadlocked behind another lane's open transaction.
+Both were observed.
+
+A lane now borrows a connection from the pool for the length of one event's
+transaction and gives it straight back, so 16 lanes do not mean 16 connections
+held open. `max_connections` in `shared/src/db.rs` is the ceiling, and raising
+`PARTITIONS` raises concurrent demand on it rather than the count directly.
 
 Changing it needs the streams **drained** first — every `-pNN` durable at 0 pending
 in `nats consumer report <STREAM>` — and then a deploy. The stream config is
@@ -206,7 +238,7 @@ Projectors normally sit at the head, so this is a check rather than a wait.
 
 Two consequences worth knowing:
 
-- **`docker compose down -v` / deleting the TiKV PVCs is data loss**, not a
+- **`docker compose down -v` / deleting the `yugabyte` PVC is data loss**, not a
   replay. There is no log to rebuild from any more.
 - **Kubernetes ≥ 1.29 is no longer required.** That floor existed for the native
   sidecar (`initContainer` + `restartPolicy: Always`) that ordered SurrealDB ahead
@@ -216,8 +248,7 @@ Two consequences worth knowing:
 
 | Volume | Holds | Losing it |
 |---|---|---|
-| `tikv` | every service database and the read model | **data loss** |
-| `pd` | cluster metadata and region placement | data loss (TiKV cannot be read without it) |
+| `yugabyte` | every service database and the read model | **data loss** |
 | NATS | up to 7 days of undelivered events | consumers miss what they had not read; re-derive with the backfill below |
 
 ### Rebuilding a projection
@@ -241,15 +272,16 @@ deterministic and land inside the stream's `duplicate_window`.
 
 ## Known ceilings
 
-- **Single TiKV store, single PD.** `tikv.replicas: 1` means one copy of the
-  authoritative data — fine for a demo, a data-loss risk in production. PD's
-  `max-replicas` is derived from that count and capped at 3, so raising
-  `tikv.replicas` to 3 is genuinely all it takes. Do that before anything real
-  lives here, and add a backup story (TiKV's own BR); nothing in this repository
-  has ever needed one before.
-- **SurrealDB is reachable from every pod in the namespace.** It was loopback-only
-  when it was a sidecar. The root credentials in `app-secrets` are now the only
-  control; a NetworkPolicy admitting just the service pods is the next rung.
+- **Single YugabyteDB node.** One copy of the authoritative data — fine for a
+  demo, a data-loss risk in production. This is **not** a `replicas: 3` away, and
+  the template says so: multi-node needs `--join` and a replication factor, which
+  is a different template. Do that before anything real lives here, and add a
+  backup story (`ysql_dump`, or YugabyteDB's own snapshots); nothing in this
+  repository has ever needed one before.
+- **The database is reachable from every pod in the namespace.** `YSQL_PASSWORD`
+  in `app-secrets` is the only control; a NetworkPolicy admitting just the service
+  pods is the next rung. Unchanged in substance from the SurrealDB arrangement —
+  the credential is one key now instead of two.
 - **Single NATS node.** Set `nats.config.cluster.enabled` and three replicas the
   day an outage would mean losing undelivered events rather than downtime.
 - **No resource limits, only requests.** Enough to schedule sensibly, not enough

@@ -1,109 +1,113 @@
-use std::sync::Arc;
-
-use chrono::DateTime;
-use chrono::Utc;
-use shared::db::Querier;
+use chrono::{DateTime, Utc};
 use shared::domain_models::payment::{Payment, PaymentPatch};
 use shared::error::myerror::MyResult;
-use surrealdb::{Surreal, engine::remote::ws::Client, types::Datetime};
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 /// The `payment` table.
 ///
-/// Every method is a statement written out in full. There are five of them because
-/// five is what this service calls — a lookup by each of the two UNIQUE columns, the
-/// write, the conditional transition, and the earnings sum.
-///
-/// Generic over its querier so the same type serves both positions: the service
-/// holds one over the pooled `Surreal<Client>`, a projector builds one over the open
-/// `&Transaction` for a single event.
-pub struct PaymentRepository<Q: Querier = Arc<Surreal<Client>>> {
-    pub q: Q,
-}
+/// Five statements: a lookup by each of the two UNIQUE columns, the write, the
+/// conditional transition, and the earnings sum.
+pub struct PaymentRepository;
 
-impl<Q: Querier> PaymentRepository<Q> {
-    /// `payment_booking … UNIQUE`, so `LIMIT 1` here is a fact about the schema and
-    /// not a hope about the data.
-    ///
-    /// `*` takes every column, so a new field on [`Payment`] needs no edit here.
-    /// Only `id` is spelled out, because SurrealDB returns it as the record key
-    /// `payment:⟨uuid⟩` while the struct holds a plain uuid — and an explicit alias
-    /// beats `*` for the same name in either order, checked against 3.2.4 rather
-    /// than assumed.
-    pub async fn find_by_booking_id(&self, booking_id: Uuid) -> MyResult<Option<Payment>> {
-        Ok(self
-            .q
-            .q("SELECT record::id(id) AS id, * FROM ONLY payment
-                WHERE booking_id = $v LIMIT 1")
-            .bind(("v", booking_id))
-            .await?
-            .take(0)?)
+impl PaymentRepository {
+    /// `payment_booking … UNIQUE`, so at most one row can match — a fact about the
+    /// schema rather than a hope about the data.
+    pub async fn find_by_booking_id(
+        ex: impl PgExecutor<'_>,
+        booking_id: Uuid,
+    ) -> MyResult<Option<Payment>> {
+        Ok(sqlx::query_as("SELECT * FROM payment WHERE booking_id = $1")
+            .bind(booking_id)
+            .fetch_optional(ex)
+            .await?)
     }
 
     /// `payment_session … UNIQUE`. The checkout screen knows only a session id.
-    pub async fn find_by_session_id(&self, session_id: String) -> MyResult<Option<Payment>> {
-        Ok(self
-            .q
-            .q("SELECT record::id(id) AS id, * FROM ONLY payment
-                WHERE session_id = $v LIMIT 1")
-            .bind(("v", session_id))
-            .await?
-            .take(0)?)
+    pub async fn find_by_session_id(
+        ex: impl PgExecutor<'_>,
+        session_id: String,
+    ) -> MyResult<Option<Payment>> {
+        Ok(sqlx::query_as("SELECT * FROM payment WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_optional(ex)
+            .await?)
     }
 
     /// Insert-or-replace the whole row, keyed by its own id.
     ///
     /// Idempotent by construction, which is what lets a projector replay the same
-    /// event. `CONTENT $row` binds the struct whole rather than column by column, so
-    /// adding a field to [`Payment`] needs no change here.
-    ///
-    /// The row carries its own `id` and the statement also names one. SurrealDB
-    /// requires them to agree and errors if they do not — verified against 3.2.4,
-    /// which makes this a free assertion rather than a risk.
-    pub async fn upsert(&self, payment: Payment) -> MyResult<()> {
-        let id = payment.id;
-        self.q
-            .q("UPSERT type::record('payment', $id) CONTENT $row")
-            .bind(("id", id))
-            .bind(("row", payment))
-            .await?
-            .check()?;
+    /// event.
+    pub async fn upsert(ex: impl PgExecutor<'_>, payment: Payment) -> MyResult<()> {
+        sqlx::query(
+            "INSERT INTO payment
+                 (id, version, booking_id, owner_id, renter_id, amount_cents,
+                  session_id, intent_id, status, refund_id, failure_reason, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             ON CONFLICT (id) DO UPDATE SET
+                 version        = EXCLUDED.version,
+                 booking_id     = EXCLUDED.booking_id,
+                 owner_id       = EXCLUDED.owner_id,
+                 renter_id      = EXCLUDED.renter_id,
+                 amount_cents   = EXCLUDED.amount_cents,
+                 session_id     = EXCLUDED.session_id,
+                 intent_id      = EXCLUDED.intent_id,
+                 status         = EXCLUDED.status,
+                 refund_id      = EXCLUDED.refund_id,
+                 failure_reason = EXCLUDED.failure_reason,
+                 created_at     = EXCLUDED.created_at",
+        )
+        .bind(payment.id)
+        .bind(payment.version as i64)
+        .bind(payment.booking_id)
+        .bind(payment.owner_id)
+        .bind(payment.renter_id)
+        .bind(payment.amount_cents)
+        .bind(payment.session_id)
+        .bind(payment.intent_id)
+        .bind(payment.status)
+        .bind(payment.refund_id)
+        .bind(payment.failure_reason)
+        .bind(payment.created_at)
+        .execute(ex)
+        .await?;
         Ok(())
     }
 
     /// Patch a payment only if it is currently in one of `from`.
     ///
-    /// The whole value is the `WHERE`. Money states only ever move forwards, which
-    /// is what makes a redelivered event a no-op instead of, say, un-refunding a
-    /// payment.
+    /// The whole value is the `WHERE`. Money states only ever move forwards, which is
+    /// what makes a redelivered event a no-op instead of, say, un-refunding a payment.
     ///
-    /// `?? column` is what makes an absent field mean "unchanged" rather than
-    /// "clear it", and is also the ceiling: no patch can set a column back to NONE.
-    /// The four columns here are every column [`PaymentPatch`] carries — add one
-    /// there and it has to be added here too.
+    /// `COALESCE($n, column)` is absent-is-unchanged, and is also the ceiling: no
+    /// patch can set a column back to NULL.
+    ///
+    /// **The binds are positional**, so their order must match the `$n`. All four are
+    /// `Option<String>`, so a swapped pair compiles and writes the wrong column —
+    /// `set_covers_every_patchable_column` in the model is the reminder to come here,
+    /// and the live round-trip is what would catch it.
     pub async fn transition(
-        &self,
+        ex: impl PgExecutor<'_>,
         payment_id: Uuid,
         from: &[&str],
         patch: PaymentPatch,
     ) -> MyResult<()> {
-        patch
-            .bind(
-                self.q
-                    .q("UPDATE type::record('payment', $v) SET
-                            status         = $status         ?? status,
-                            intent_id      = $intent_id      ?? intent_id,
-                            refund_id      = $refund_id      ?? refund_id,
-                            failure_reason = $failure_reason ?? failure_reason
-                        WHERE status IN $from;")
-                    .bind(("v", payment_id))
-                    .bind((
-                        "from",
-                        from.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    )),
-            )
-            .await?
-            .check()?;
+        sqlx::query(
+            "UPDATE payment SET
+                 status         = COALESCE($3, status),
+                 intent_id      = COALESCE($4, intent_id),
+                 refund_id      = COALESCE($5, refund_id),
+                 failure_reason = COALESCE($6, failure_reason)
+             WHERE id = $1 AND status = ANY($2)",
+        )
+        .bind(payment_id)
+        .bind(from.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .bind(patch.status)
+        .bind(patch.intent_id)
+        .bind(patch.refund_id)
+        .bind(patch.failure_reason)
+        .execute(ex)
+        .await?;
         Ok(())
     }
 
@@ -112,26 +116,40 @@ impl<Q: Querier> PaymentRepository<Q> {
     ///
     /// Two conditions and both are needed. The payment must have succeeded; the
     /// *booking* must still be confirmed and old enough to have settled. The booking
-    /// half is what stops a host withdrawing money for a booking that has not
-    /// happened yet — see SETTLEMENT_SECS in `Config`.
+    /// half is what stops a host withdrawing money for a booking that has not happened
+    /// yet — see `SETTLEMENT_SECS`.
+    ///
+    /// A join rather than the nested `booking_id IN (SELECT …)` this replaced. Same
+    /// two conditions, one pass, and `booking_owner (owner_id, status, ends_at)` serves
+    /// the inner half.
     ///
     /// `cutoff` is passed in rather than read from a clock here, so this stays a pure
     /// query and the caller owns the window.
-    pub async fn earned(&self, owner_id: &Uuid, cutoff: DateTime<Utc>) -> MyResult<i64> {
-        let sum: Option<i64> = self
-            .q
-            .q("SELECT VALUE math::sum(amount_cents) FROM ONLY (
-                    SELECT amount_cents FROM payment
-                    WHERE owner_id = $o AND status = 'succeeded'
-                      AND booking_id IN (
-                          SELECT VALUE record::id(id) FROM booking
-                          WHERE owner_id = $o AND status = 'confirmed' AND ends_at < $cutoff
-                      )
-                ) GROUP ALL")
-            .bind(("o", *owner_id))
-            .bind(("cutoff", Datetime::from(cutoff)))
-            .await?
-            .take(0)?;
-        Ok(sum.unwrap_or(0))
+    pub async fn earned(
+        ex: impl PgExecutor<'_>,
+        owner_id: &Uuid,
+        cutoff: DateTime<Utc>,
+    ) -> MyResult<i64> {
+        // Two things in that one expression, and both are needed:
+        //
+        //   COALESCE  SUM over no rows is NULL, not 0 — a host who has earned nothing
+        //             is the ordinary case on a fresh account.
+        //   ::bigint  `SUM(bigint)` returns **numeric**, which sqlx will not decode
+        //             into an i64. Postgres widens to avoid overflow; cents in an i64
+        //             cannot get near it, so casting back is safe.
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(SUM(p.amount_cents), 0)::bigint
+               FROM payment p
+               JOIN booking b ON b.id = p.booking_id
+              WHERE p.owner_id = $1
+                AND p.status = 'succeeded'
+                AND b.owner_id = $1
+                AND b.status = 'confirmed'
+                AND b.ends_at < $2",
+        )
+        .bind(owner_id)
+        .bind(cutoff)
+        .fetch_one(ex)
+        .await?)
     }
 }

@@ -6,12 +6,7 @@ use axum::{
 };
 use shared::env;
 
-use crate::{
-    repository::{
-        refresh_token_repository::RefreshTokenRepository, user_repository::UserRepository,
-    },
-    service::{refresh_token_service::RefreshTokenService, user_service::UserService},
-};
+use crate::service::{refresh_token_service::RefreshTokenService, user_service::UserService};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,13 +26,16 @@ pub struct Config {
     /// user could point their picture at any host. Same value as media-service's
     /// MEDIA_BASE and spot-service's — see `shared::media`.
     pub media_base: String,
-    pub surrealdb_addr: String,
-    pub surrealdb_user: String,
-    pub surrealdb_pass: String,
-    /// This service's own database inside the shared `main` namespace. Every
-    /// service used to be "main"; on TiKV they share one keyspace, so this is
-    /// what keeps their tables apart.
-    pub surrealdb_db: String,
+    /// This service's own database in the YugabyteDB cluster, as one URL:
+    /// `postgres://user:pass@host:5433/user`.
+    ///
+    /// Four variables became one. The database NAME in it is what keeps this
+    /// service's tables out of another's, exactly as `SURREALDB_DB` did.
+    ///
+    /// **The port is 5433, not 5432.** YSQL does not listen on the PostgreSQL
+    /// default, and a URL that says 5432 fails with an ordinary "connection refused"
+    /// that reads like the container being down.
+    pub database_url: String,
     pub nats_url: String,
     pub port: u16,
     pub jwt_secret: String,
@@ -54,10 +52,7 @@ pub struct Config {
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     media_base: env::require("MEDIA_BASE"),
-    surrealdb_addr: env::require("SURREALDB_ADDR"),
-    surrealdb_user: env::require("SURREALDB_USER"),
-    surrealdb_pass: env::require("SURREALDB_PASS"),
-    surrealdb_db: env::require("SURREALDB_DB"),
+    database_url: env::require("DATABASE_URL"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
     jwt_secret: env::require("JWT_SECRET"),
@@ -91,19 +86,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared::media::init_base(&CONFIG.media_base);
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
-    let db = shared::db::connect(
-        &CONFIG.surrealdb_addr,
-        &CONFIG.surrealdb_user,
-        &CONFIG.surrealdb_pass,
-        &CONFIG.surrealdb_db,
-    )
-    .await?;
+    let db = shared::db::connect(&CONFIG.database_url).await?;
 
-    // One connection for the whole process — election, relay, handlers and the await
-    // layer all share it. `Surreal::clone` would mint a session and replay the root
-    // sign-in onto it; cloning the `Arc` is a refcount bump. The sessions that do get
-    // minted are per *transaction*, in `shared::db::begin`, and die with it.
-    let db = Arc::new(db);
+    // Applied by every replica at boot, which is safe: sqlx takes an advisory lock
+    // around the run, and each service owns its own database so the only contention
+    // is between replicas of this one. This replaced a ConfigMap of schema files, a
+    // `--set-file` loop in deploy.sh, and a post-install Job that POSTed them — the
+    // SQL is embedded in this binary, so there is nothing to mount and nothing that
+    // can drift from the image.
+    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/user")).await?;
+
+    // One pool for the whole process — election, relay, handlers and the await layer
+    // all share it. `PgPool` is `Arc` inside, so a clone is a refcount bump; a
+    // connection is borrowed per statement or per transaction and returned.
     let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
@@ -127,12 +122,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 
     let state = AppState {
-        user_service: Arc::new(UserService {
-            users: UserRepository { q: db.clone() },
-        }),
-        refresh_token_service: Arc::new(RefreshTokenService {
-            tokens: RefreshTokenRepository { q: db },
-        }),
+        user_service: Arc::new(UserService { db: db.clone() }),
+        refresh_token_service: Arc::new(RefreshTokenService { db }),
     };
 
     let api_router = Router::new()

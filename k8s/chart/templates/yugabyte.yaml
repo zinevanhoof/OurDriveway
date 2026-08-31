@@ -1,0 +1,144 @@
+{{/*
+YugabyteDB: the authoritative store, and the only stateful thing in this chart.
+
+It replaced four templates — tikv.yaml, surrealdb.yaml, schemas.yaml and
+schema-import.yaml. SurrealDB needed a separate distributed store underneath it (TiKV,
+which needed a placement driver of its own) and a separate pass to apply the schemas.
+This is all of that in one process, and the schemas ship inside the service binaries as
+sqlx migrations.
+
+⚠ SINGLE NODE. `yugabyted start` with one replica is right for this chart's scale and
+wrong for anything that must survive losing a node: there is one copy of every tablet.
+Multi-node is `replicas: 3` plus `--join`, and it is a different template — do not read
+this one as production-shaped just because it is a StatefulSet.
+
+A StatefulSet and not a Deployment, unlike the SurrealDB it replaces: that one stored
+nothing and was disposable, this one holds the data. Stable identity and a
+volumeClaimTemplate are the point.
+
+## The version is a correctness constraint
+
+`>= 2025.2` **and** started through `yugabyted`. That pair is what sets the tserver
+gflag `yb_enable_read_committed_isolation=true`, which booking-service's reserve path
+depends on: it locks the spot row and relies on Read Committed giving the next statement
+a fresh snapshot. Below it, Read Committed silently degrades to Snapshot, the second
+transaction re-reads its original snapshot, and the slot is sold twice — with no error
+anywhere. Measured; see docker/docker-compose-dev.yml for the three cases.
+
+Verify after any bump:
+
+  kubectl exec -n ourdriveway sts/yugabyte -- \
+    bash -lc 'curl -s http://$(hostname -i):9000/varz?raw | grep read_committed'
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: yugabyte
+spec:
+  # Headless: a StatefulSet member is addressed as yugabyte-0.yugabyte, and the
+  # services dial the Service name for the single-node case.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: yugabyte
+  ports:
+    - name: ysql
+      port: 5433
+      targetPort: ysql
+    - name: ui
+      port: 15433
+      targetPort: ui
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: yugabyte
+  labels:
+    app.kubernetes.io/name: yugabyte
+spec:
+  serviceName: yugabyte
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: yugabyte
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: yugabyte
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: yugabyte
+          image: {{ .Values.yugabyte.image }}
+          # `--advertise_address` must be the stable DNS name, not 0.0.0.0: it is what
+          # the cluster records as this node's location and hands back to clients. The
+          # same mistake the old PD `--advertise-client-urls` note warned about.
+          command: ["bin/yugabyted"]
+          args:
+            - start
+            - --background=false
+            - --advertise_address=$(POD_NAME).yugabyte.$(POD_NAMESPACE).svc.cluster.local
+            {{- with .Values.yugabyte.tserverFlags }}
+            - --tserver_flags={{ . }}
+            {{- end }}
+            {{- with .Values.yugabyte.masterFlags }}
+            - --master_flags={{ . }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The password for the `yugabyte` role. Read by the services from the same
+            # secret, as one entry in DATABASE_URL, so the two cannot drift.
+            - name: YSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: YSQL_PASSWORD
+          ports:
+            - name: ysql
+              containerPort: 5433
+            - name: ui
+              containerPort: 15433
+            - name: tserver
+              containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /home/yugabyte/var
+          # `yugabyted status` exits non-zero until every process is actually serving,
+          # which is the question a client's first connection asks a moment later.
+          #
+          # The startup probe is what makes the other two safe. A cold first boot
+          # initialises the cluster before anything listens, and a liveness probe with
+          # no start delay spends that whole window collecting failures and then kills
+          # a container that was seconds from being fine — the same trap the SurrealDB
+          # template documented from a real install.
+          startupProbe:
+            exec:
+              command: ["bin/yugabyted", "status"]
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["bin/yugabyted", "status"]
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["bin/yugabyted", "status"]
+            periodSeconds: 20
+            # Deliberately slack. A blip must not restart the only copy of the data.
+            failureThreshold: 12
+          resources: {{- toYaml .Values.yugabyte.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.yugabyte.storage }}

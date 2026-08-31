@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -16,7 +15,6 @@ use shared::{
     requests::booking::CreateBookingRequest,
     responses::booking::CreatedResponse,
 };
-use surrealdb::{Surreal, engine::remote::ws::Client};
 use uuid::Uuid;
 
 use crate::policy::{
@@ -34,11 +32,12 @@ use crate::repository::{
 /// abandoned checkout frees a popular slot quickly.
 pub const HOLD: Duration = Duration::from_secs(15 * 60);
 
-/// Attempts before giving up and telling the renter to try again.
-///
-/// Contention is per-spot and rare. The bound exists because compare-and-swap
-/// guarantees safety, not liveness: under real contention this could spin.
-const ATTEMPTS: usize = 3;
+// `ATTEMPTS` is gone, and so is the loop it bounded. Reserve was optimistic: it read
+// the spot, decided, wrote, and re-ran the whole thing when the store refused the
+// write. Locking the spot row first makes the losing request *wait* rather than fail,
+// and its availability read then sees the winner's booking — so the second renter gets
+// the 409 naming the taken slot on the first pass, which is the answer they wanted.
+// See `SpotMirrorRepository::find_for_update`.
 
 /// Answered whenever the spot's mirror is too incomplete to price or authorize
 /// against. Fails closed: booking against an availability we cannot see is worse
@@ -59,19 +58,14 @@ const NOT_READY: (&str, &str) = (
 /// Every method takes the caller's id first, then what it is acting on, then the
 /// request body. The id comes from the verified JWT and never from the body.
 pub struct BookingService {
-    pub bookings: BookingRepository,
-    /// Read-only here, and only for the four columns reserve needs plus the
-    /// compare-and-swap cursor — see
-    /// [`shared::domain_models::booking::SpotMirror`].
-    pub spots: SpotMirrorRepository,
+    /// The pool. See the note on `UserService::db` — the repositories are stateless,
+    /// so this service no longer holds one per table.
+    pub db: sqlx::PgPool,
 }
 
 impl BookingService {
-    pub fn new(db: Arc<Surreal<Client>>) -> Self {
-        Self {
-            bookings: BookingRepository { q: db.clone() },
-            spots: SpotMirrorRepository { q: db },
-        }
+    pub fn new(db: sqlx::PgPool) -> Self {
+        Self { db }
     }
 
     /// Creates a booking, which starts life as a hold on its slots.
@@ -98,115 +92,99 @@ impl BookingService {
         let spot_key = request.spot_id;
         let requested = request.booked;
 
-        // Stable across attempts: it's the idempotency key. If an ack is lost after
-        // the event landed, the retry sees this booking already projected and
-        // returns success instead of double-booking the renter.
+        // The idempotency key. If an ack is lost after the transaction committed, a
+        // client resubmitting the same form gets its booking back rather than a
+        // second one.
         let booking_id = Uuid::now_v7();
 
-        for _ in 0..ATTEMPTS {
-            let tx = db::begin(&self.bookings.q).await?;
-            let bookings = BookingRepository { q: &tx };
-            let spots = SpotMirrorRepository { q: &tx };
+        let mut tx = self.db.begin().await?;
 
-            // Everything below reads and writes inside ONE transaction, which is
-            // what the compare-and-swap on the NATS subject used to buy. The read
-            // order no longer matters for correctness the way it did — the version
-            // bump at the end is what two racers collide on — but the spot is still
-            // read first because the rest of the decision hangs off it.
-            let spot = spots
-                .find_by_id(spot_key)
-                .await?
-                .context_not_found(("Not Found", "That spot doesn't exist."))?;
+        // ── THE SERIALISATION POINT ──────────────────────────────────────────
+        // Everything below reads and writes inside ONE transaction, and this is the
+        // first statement in it on purpose.
+        //
+        // Two renters racing one slot insert two *different* booking rows — different
+        // keys, nothing collides — so without contending on something, both commit.
+        // The lock is that something. A second request blocks here until the first
+        // commits, and because Read Committed gives each statement a **new snapshot**,
+        // `taken_for_spot` below then sees the winner's booking and refuses the slot
+        // by name.
+        //
+        // The ORDER is the whole trick and is easy to undo by accident: any read of
+        // availability placed above this line is taken on a stale snapshot and the
+        // lock protects nothing. See `SpotMirrorRepository::find_for_update` for what
+        // was measured, and what happens on a cluster where Read Committed silently
+        // degrades to Snapshot.
+        let spot = SpotMirrorRepository::find_for_update(&mut *tx, spot_key)
+            .await?
+            .context_not_found(("Not Found", "That spot doesn't exist."))?;
 
-            // A previous attempt committed and we simply never heard back. Because
-            // `booking_id` is stable across attempts this is recognisable, and the
-            // renter gets their booking instead of a second one.
-            if let Some(existing) = bookings.find_by_id(booking_id).await? {
-                tx.cancel().await?;
-                return Ok(CreatedResponse {
-                    id: booking_id,
-                    seq: format_version(&aggregate_id("booking", &booking_id), existing.version),
-                });
-            }
-
-            // The SPOTS mirror may not have caught up with this spot yet. Fail
-            // closed rather than booking against an availability we cannot see.
-            let (availability, price, owner_id) = spot.bookable().context_conflict(NOT_READY)?;
-
-            spot.active
-                .context_conflict(("Unavailable", "This spot is no longer accepting bookings."))?;
-            (owner_id != *renter_id)
-                .context_unprocessable_entity(("Not allowed", "You can't book your own spot."))?;
-
-            let taken = bookings.taken_for_spot(&spot_key, Utc::now()).await?;
-            let minutes = availability::check(availability, &taken, &requested).map_err(reject)?;
-
-            // Truncating division rounds in the renter's favour. Slots are on a
-            // 30-minute grid, so it only bites on a hand-crafted request.
-            let amount_cents = minutes * price / 60;
-
-            // Folded here rather than by a reader: the zone is a spot field, and
-            // "is it over yet" cannot be asked of wall-clock strings without it.
-            let ends_at = spot
-                .timezone
-                .as_deref()
-                .and_then(|tz| schedule::ends_at(&requested, tz))
-                .context_unprocessable_entity(NOT_READY)?;
-
-            let created = BookingCreated {
-                booking_id,
-                spot_id: spot_key,
-                owner_id,
-                renter_id: *renter_id,
-                booked: requested.clone(),
-                amount_cents,
-                expires_at: Utc::now() + HOLD,
-                ends_at,
-            };
-
-            bookings
-                .upsert(Booking::created(created.clone(), Utc::now(), 1))
-                .await?;
-
-            // THE serialisation point, and the whole reason this is safe. Two
-            // renters racing the same slot both read the same free availability and
-            // both insert a *different* booking row — different keys, no conflict.
-            // Bumping the spot's counter makes them write one shared key, and TiKV
-            // refuses one of them. Verified in `bus/examples/tikv_spike.rs`, which
-            // reproduces the double-booking without this line.
-            spots.advance(&spot_key, spot.bookings_seq + 1).await?;
-
-            let envelope = Envelope::new(
-                BookingEvent::Created(created),
-                Some(*renter_id),
-                aggregate_id("booking", &booking_id),
-                1,
-            );
-            outbox::enqueue(&tx, &booking_subject(&spot_key), &envelope).await?;
-
-            match tx.commit().await {
-                Ok(_) => {
-                    return Ok(CreatedResponse {
-                        id: booking_id,
-                        // The booking's own version, not the spot counter that
-                        // serialised it.
-                        seq: format_version(&aggregate_id("booking", &booking_id), 1),
-                    });
-                }
-                // Somebody else booked this spot first. Not an error: re-read and
-                // decide again against what they left behind — which may well be a
-                // clean 409 naming the slot they took.
-                Err(e) => {
-                    let e = MyError::from(e);
-                    if !db::is_write_conflict(&e) {
-                        return Err(e);
-                    }
-                    tracing::info!(spot = %spot_key, "lost a reserve race; retrying");
-                }
-            }
+        // A previous request committed and the client never heard back. `booking_id`
+        // comes from the caller's retry of the same form, so this is recognisable.
+        if let Some(existing) = BookingRepository::find_by_id(&mut *tx, booking_id).await? {
+            tx.rollback().await?;
+            return Ok(CreatedResponse {
+                id: booking_id,
+                seq: format_version(&aggregate_id("booking", &booking_id), existing.version),
+            });
         }
 
-        Err(taken_now())
+        // The SPOTS mirror may not have caught up with this spot yet. Fail closed
+        // rather than booking against an availability we cannot see.
+        let (availability, price, owner_id) = spot.bookable().context_conflict(NOT_READY)?;
+
+        spot.active
+            .context_conflict(("Unavailable", "This spot is no longer accepting bookings."))?;
+        (owner_id != *renter_id)
+            .context_unprocessable_entity(("Not allowed", "You can't book your own spot."))?;
+
+        // Reads on a snapshot taken AFTER the lock was granted — which is what makes
+        // the loser of a race see the winner's booking here rather than a stale empty
+        // set. `availability::check` then produces the 409 naming the taken slot,
+        // which is the answer the renter actually wants; the old code reached the
+        // same place only after losing a write conflict and re-running.
+        let taken = BookingRepository::taken_for_spot(&mut *tx, &spot_key, Utc::now()).await?;
+        let minutes = availability::check(availability, &taken, &requested).map_err(reject)?;
+
+        // Truncating division rounds in the renter's favour. Slots are on a
+        // 30-minute grid, so it only bites on a hand-crafted request.
+        let amount_cents = minutes * price / 60;
+
+        // Folded here rather than by a reader: the zone is a spot field, and
+        // "is it over yet" cannot be asked of wall-clock strings without it.
+        let ends_at = spot
+            .timezone
+            .as_deref()
+            .and_then(|tz| schedule::ends_at(&requested, tz))
+            .context_unprocessable_entity(NOT_READY)?;
+
+        let created = BookingCreated {
+            booking_id,
+            spot_id: spot_key,
+            owner_id,
+            renter_id: *renter_id,
+            booked: requested.clone(),
+            amount_cents,
+            expires_at: Utc::now() + HOLD,
+            ends_at,
+        };
+
+        BookingRepository::upsert(&mut *tx, Booking::created(created.clone(), Utc::now(), 1))
+            .await?;
+
+        let envelope = Envelope::new(
+            BookingEvent::Created(created),
+            Some(*renter_id),
+            aggregate_id("booking", &booking_id),
+            1,
+        );
+        outbox::enqueue(&mut *tx, &booking_subject(&spot_key), &envelope).await?;
+        tx.commit().await?;
+
+        Ok(CreatedResponse {
+            id: booking_id,
+            seq: format_version(&aggregate_id("booking", &booking_id), 1),
+        })
     }
 
     /// The renter backed out of checkout. Frees the slots immediately rather than
@@ -223,9 +201,7 @@ impl BookingService {
     /// booked over a lapsed hold are both reasons to let the hold go, not to refuse
     /// and leave it blocking the spot for the rest of [`HOLD`].
     pub async fn release(&self, renter_id: &Uuid, booking_id: &Uuid) -> MyResult<String> {
-        let booking = self
-            .bookings
-            .find_by_id(*booking_id)
+        let booking = BookingRepository::find_by_id(&self.db, *booking_id)
             .await?
             .context_not_found(NOT_FOUND)?;
 
@@ -260,16 +236,12 @@ impl BookingService {
     /// The deadline below is the one thing this adds, and it is about the host's
     /// evening rather than about the slots.
     pub async fn cancel(&self, renter_id: &Uuid, booking_id: &Uuid) -> MyResult<String> {
-        let booking = self
-            .bookings
-            .find_by_id(*booking_id)
+        let booking = BookingRepository::find_by_id(&self.db, *booking_id)
             .await?
             .context_not_found(NOT_FOUND)?;
         authorize(&booking, renter_id, status::CONFIRMED)?;
 
-        let timezone = self
-            .spots
-            .find_by_id(booking.spot_id)
+        let timezone = SpotMirrorRepository::find_by_id(&self.db, booking.spot_id)
             .await?
             .and_then(|s| s.timezone);
 
@@ -323,13 +295,11 @@ impl BookingService {
         cancel: Option<&str>,
         event: BookingEvent,
     ) -> MyResult<String> {
-        let tx = db::begin(&self.bookings.q).await?;
-        let version = db::next_version(&tx, "booking", &booking_id).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "booking", &booking_id).await?;
 
-        BookingRepository { q: &tx }
-            .transition(booking_id, to, from, release, cancel)
-            .await?;
-        db::set_version(&tx, "booking", &booking_id, version).await?;
+        BookingRepository::transition(&mut *tx, booking_id, to, from, release, cancel).await?;
+        db::set_version(&mut tx, "booking", &booking_id, version).await?;
 
         let envelope = Envelope::new(
             event,
@@ -339,7 +309,7 @@ impl BookingService {
         );
         let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        outbox::enqueue(&tx, &booking_subject(&spot_id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &booking_subject(&spot_id), &envelope).await?;
         tx.commit().await?;
 
         Ok(await_token)
@@ -362,14 +332,14 @@ impl BookingService {
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
 
-        for booking in self.bookings.all().await? {
+        for booking in BookingRepository::all(&self.db).await? {
             // One timestamp for the whole chain. Unlike a spot's, a booking's row
             // keeps no record of when it settled — `created_at` is the only clock
             // there is, and nothing downstream stores a settlement time anyway.
             let at = booking.created_at.clone().into();
 
             sent += outbox::backfill(
-                &self.bookings.q,
+                &self.db,
                 &booking_subject(&booking.spot_id),
                 &aggregate_id("booking", &booking.id),
                 booking.version,
@@ -383,13 +353,13 @@ impl BookingService {
     }
 }
 
-fn taken_now() -> MyError {
-    MyError::api(
-        StatusCode::CONFLICT,
-        "Just taken",
-        "Someone booked those times a moment ago. Please pick again.",
-    )
-}
+// `taken_now` is gone with the retry loop. It answered "Someone booked those times a
+// moment ago. Please pick again." after `ATTEMPTS` lost write conflicts — a message
+// that had to be vague, because by then the request had no idea *which* slot went.
+//
+// A losing request now waits on the row lock instead of failing, and its availability
+// read sees the winner's booking, so it falls through to `Rejection::Taken` below and
+// names the slot. Better answer, and one fewer error shape.
 
 fn reject(rejection: Rejection) -> MyError {
     match rejection {

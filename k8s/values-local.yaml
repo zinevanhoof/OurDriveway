@@ -8,3 +8,19 @@ ingress:
 # default Always, the `latest` tag would send kubelet to ghcr for the last image
 # CI published and your local build would never run.
 imagePullPolicy: IfNotPresent
+
+# Untuned, a tserver sizes itself to the machine. On a k3d cluster that machine is a
+# laptop also running a cargo build, which CLAUDE.md pins `jobs = 4` to survive — so it
+# gets a hard cap here and nowhere else. Production leaves these empty and lets the
+# database have the node.
+#
+# The same numbers as docker/docker-compose-dev.yml, which is the other place a
+# developer's laptop runs this. `yb_num_shards_per_tserver=1` keeps a single node from
+# splitting every table into eight tablets it cannot use.
+yugabyte:
+  tserverFlags: "memory_limit_hard_bytes=1500000000,yb_num_shards_per_tserver=1"
+  masterFlags: "memory_limit_hard_bytes=500000000"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi

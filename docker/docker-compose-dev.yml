@@ -3,22 +3,15 @@
 # VS Code task), which is why none of them appear below — including media-service,
 # which is reached on :3004 through the Caddy route in Caddyfile-dev.
 #
-# The five per-service SurrealDB containers are gone. They existed because each
-# service owned a private surrealkv datastore and rebuilt it from the log on every
-# boot; TiKV is authoritative now, so there is one stateless SurrealDB in front of
-# it and the per-service split is a database name (SURREALDB_DB) rather than a
-# process. Ports 8001-8004 are free as a result — everything is on 8000.
+# Storage is ONE container now. It was four — pd, tikv, surrealdb and a schema-import
+# job — because SurrealDB needed a separate distributed store underneath it and a
+# separate pass to apply the schemas. YugabyteDB is both halves in one process, and
+# the schemas are sqlx migrations the services carry themselves.
 #
 # The one container here that is neither a database nor a proxy is stripe-cli, which
 # forwards webhooks *inward* to payment-service on :3006 — see the note on it below.
 #
 # Production is Kubernetes, not compose. See k8s/.
-
-# The x-surrealdb anchor is gone with the five per-service databases it templated.
-# It existed because each service ran its OWN SurrealDB over its own surrealkv
-# datastore — one process per service, five private copies. On TiKV, SurrealDB
-# stores nothing at all: it is a stateless query engine, so one of it serves every
-# service and the databases below are logical names inside one keyspace.
 
 services:
   # The event log. Published on the host port because in this topology the Rust
@@ -39,146 +32,70 @@ services:
 
   # ─── storage ──────────────────────────────────────────────────────────────
   #
-  # PD + TiKV are the authoritative store now, and the only thing in this file
-  # holding a volume that matters. The five SurrealDB containers that used to sit
-  # here were caches: `docker compose down -v` cost a replay. These are not — down
-  # -v is data loss.
-
-  # The placement driver: cluster metadata, region placement, and the timestamp
-  # oracle every transaction takes its start and commit timestamps from.
-  pd:
-    image: pingcap/pd:v8.5.7
+  # The authoritative store, and the only thing in this file holding a volume that
+  # matters. `docker compose down -v` is data loss, not a replay.
+  #
+  # There is deliberately nothing here creating the per-service databases. Each
+  # service creates its own on first connect — see `shared::db::connect` — so a
+  # wiped volume comes back empty and correct with no step to remember. This file
+  # used to need the equivalent of the chart's `create-databases` hook and never
+  # had one, which made `down -v` fail every service at boot with `3D000`.
+  yugabyte:
+    # >= 2025.2 (LTS), and started through `yugabyted`. That PAIR is what sets the
+    # tserver gflag `yb_enable_read_committed_isolation=true`, and the whole reserve
+    # path depends on it: booking-service locks the spot row with SELECT … FOR UPDATE
+    # and relies on Read Committed giving the NEXT statement a fresh snapshot, so the
+    # loser of a race sees the winner's booking and answers a clean 409.
+    #
+    # Measured on this exact image before any of it was written, two ysqlsh sessions
+    # racing one lock row:
+    #
+    #   FOR UPDATE + read committed    B blocks, then SEES A's insert    correct
+    #   no FOR UPDATE                  B sees 0, both insert             DOUBLE BOOKS
+    #   FOR UPDATE + repeatable read   B locks, still sees 0             DOUBLE BOOKS
+    #
+    # That last row is the pre-2025.2 fallback: Read Committed silently degrades to
+    # Snapshot and reserve double-books with no error anywhere. So this tag is a
+    # correctness constraint, not a preference. Verify after any bump with:
+    #
+    #   docker compose -f docker/docker-compose-dev.yml exec yugabyte \
+    #     bash -lc 'curl -s http://$(hostname -i):9000/varz?raw | grep read_committed'
+    #
+    # `SHOW yb_enable_read_committed_isolation` does NOT answer this — it is a tserver
+    # gflag, not a session GUC, and ysqlsh replies "unrecognized configuration
+    # parameter". `BEGIN; SHOW transaction_isolation;` is the session-level check and
+    # must say "read committed".
+    image: yugabytedb/yugabyte:2025.2.5.2-b5
     restart: unless-stopped
-    command:
-      - --name=pd0
-      - --data-dir=/data/pd
-      - --client-urls=http://0.0.0.0:2379
-      # Must be the service name, not 0.0.0.0: this is the address PD hands back
-      # to clients, and SurrealDB dials whatever it is told. With 0.0.0.0 the
-      # connection succeeds and then every request goes nowhere.
-      - --advertise-client-urls=http://pd:2379
-      - --peer-urls=http://0.0.0.0:2380
-      - --advertise-peer-urls=http://pd:2380
-      - --initial-cluster=pd0=http://pd:2380
-      # `[replication] max-replicas = 1`. Not optional on one TiKV node — the
-      # default of 3 leaves every region unplaceable, the cluster never reports
-      # healthy, and writes hang rather than fail. See the file.
-      - --config=/pd.toml
-    volumes:
-      - ./tikv/pd.toml:/pd.toml:ro
-      - pd-data:/data
+    # `--advertise_address` is not optional: without it every process binds the
+    # container's own IP and nothing resolves it by name. Same class of mistake the
+    # old PD `--advertise-client-urls=0.0.0.0` note warned about.
+    #
+    # The memory caps are not tuning-for-later. Untuned, a tserver sizes itself to the
+    # host — this is the same 16 GB box CLAUDE.md pins `jobs = 4` for, and a build and
+    # an unbounded tserver do not fit on it together. `yb_num_shards_per_tserver=1`
+    # keeps a single node from splitting every table into eight tablets it cannot use.
+    command: >
+      bin/yugabyted start --background=false --advertise_address=yugabyte
+      --tserver_flags=memory_limit_hard_bytes=1500000000,yb_num_shards_per_tserver=1
+      --master_flags=memory_limit_hard_bytes=500000000
     ports:
-      - "2379:2379"
-    healthcheck:
-      test: ["CMD", "/pd-ctl", "-u", "http://127.0.0.1:2379", "health"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-      start_period: 10s
-
-  tikv:
-    image: pingcap/tikv:v8.5.7
-    restart: unless-stopped
-    command:
-      - --addr=0.0.0.0:20160
-      # Same reasoning as PD's advertise-client-urls: this is what PD records and
-      # hands to clients as the location of this store.
-      - --advertise-addr=tikv:20160
-      - --status-addr=0.0.0.0:20180
-      - --data-dir=/data/tikv
-      - --pd-endpoints=pd:2379
-      # Caps the block cache. Untuned, TiKV sizes itself to the host and collides
-      # with the build budget CLAUDE.md pins `jobs = 4` for.
-      - --config=/tikv.toml
+      # YSQL is 5433, NOT 5432 — every DATABASE_URL in the .env files says so.
+      - "5433:5433"
+      # The yugabyted web UI, worth having when a query plan is a surprise.
+      - "15433:15433"
     volumes:
-      - ./tikv/tikv.toml:/tikv.toml:ro
-      - tikv-data:/data
-    depends_on:
-      pd:
-        condition: service_healthy
-
-  # One SurrealDB for every service, because on TiKV it holds nothing — the five
-  # separate processes only ever existed to own five separate datastores. Each
-  # service selects its own database (SURREALDB_DB in its .env); the namespace is
-  # `main` for all of them.
-  #
-  # No volume, and no --import-file: the data lives in TiKV, and the schemas are
-  # applied once by schema-import below rather than by every boot of every
-  # instance.
-  surrealdb:
-    # Pinned to the same version as the `surrealdb` crate in the workspace Cargo.toml.
-    # Move both together — a client/server version split makes any result here mean two
-    # things at once — and wipe with `down -v` when you do: a 3.2.1 server cannot read
-    # a datastore 3.2.4 wrote, and fails with `Failed to get table` rather than saying
-    # anything about versions.
-    image: surrealdb/surrealdb:v3.2.4
-    restart: unless-stopped
-    command:
-      - start
-      - --log=info
-      - --user=root
-      - --pass=root
-      - tikv://pd:2379
-    ports:
-      - "8000:8000"
-    depends_on:
-      - tikv
+      - yb-data:/home/yugabyte/var
     healthcheck:
-      # Distroless image (no shell), so exec form only. Subcommand is `is-ready`.
-      test:
-        ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
+      # Exits non-zero until every process is actually serving, which is the same
+      # question each service's boot asks a moment later.
+      test: ["CMD", "bin/yugabyted", "status"]
       interval: 5s
-      timeout: 3s
-      retries: 30
-      start_period: 15s
-
-  # Applies each schema to its own database, once, then exits.
-  #
-  # This used to be `--import-file` on every SurrealDB container's boot, which was
-  # free because each wrote to its own private datastore. Against one shared TiKV
-  # keyspace that becomes N instances issuing the same `DEFINE ... OVERWRITE`
-  # statements concurrently — the exact optimistic write conflict the booking path
-  # has to defend against. So it runs exactly once, from one place.
-  #
-  # `restart: "no"` because this is a job, not a service: compose would otherwise
-  # treat its clean exit as a crash and run it forever.
-  # curl, not the surrealdb image: that one is distroless, so there is no shell to
-  # run a loop in. And POST /sql rather than the `surreal import` CLI or POST
-  # /import — /import rejects anything without an `OPTION IMPORT;` preamble the
-  # schemas do not carry, and /sql runs DEFINE statements with full side effects,
-  # which is what applying a schema is.
-  #
-  # The `surreal-db` header is only a fallback. Each schema opens with
-  # `USE NS main DB <service>;` and that statement wins, so this loop needs no
-  # per-file configuration and the file stays the single source of its own
-  # database name. Verified: importing user-schema.surql with `surreal-db: other`
-  # still lands the tables in `user` and never creates `other`.
-  schema-import:
-    image: curlimages/curl:latest
-    restart: "no"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        for s in user spot booking payment view; do
-          echo "applying $$s-schema.surql"
-          out=$$(curl -sS --fail-with-body -X POST http://surrealdb:8000/sql \
-            -u root:root \
-            -H 'surreal-ns: main' -H 'surreal-db: main' \
-            -H 'Accept: application/json' \
-            --data-binary "@/schemas/$$s-schema.surql")
-          # /sql answers 200 even when individual statements fail, so the status
-          # code alone would let a broken schema through silently.
-          case "$$out" in
-            *'"status":"ERR"'*) echo "FAILED: $$out"; exit 1 ;;
-          esac
-        done
-        echo "all schemas applied"
-    volumes:
-      - ../schemas:/schemas:ro
-    depends_on:
-      surrealdb:
-        condition: service_healthy
+      timeout: 5s
+      retries: 40
+      # Deliberately generous. A cold first boot initialises the cluster before it
+      # listens at all, and a tight window here just turns that into a restart loop.
+      start_period: 30s
 
   # Delivers Stripe webhooks to payment-service without a public URL.
   #
@@ -238,9 +155,8 @@ services:
       - ./Caddyfile-dev:/etc/caddy/Caddyfile:ro
       - ../apps/frontend/dist:/srv/dist:ro
 
-# The authoritative data. Named volumes rather than the container's own layer,
-# because unlike every SurrealDB container this file used to run, these do NOT
-# rebuild from the log — `docker compose down -v` is data loss, not a replay.
+# The authoritative data. A named volume rather than the container's own layer,
+# because this does NOT rebuild from the log — `docker compose down -v` is data
+# loss, not a replay.
 volumes:
-  pd-data:
-  tikv-data:
+  yb-data:

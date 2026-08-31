@@ -1,49 +1,43 @@
-use surrealdb::types::SurrealValue;
 use uuid::Uuid;
-
-use surrealdb::types::vars;
-use surrealdb::{engine::remote::ws::Client, method::Query};
 
 use crate::events::user::{UserRegistered, UserUpdated};
 
-/// The `user` table in the read model.
+/// The `app_user` table in the read model.
 ///
-/// Note what is **absent: no password hash, ever.** This table is world-readable
-/// (`FOR select WHERE true`), so the projection is the first thing deciding what can
-/// possibly leak. `email` is the one sensitive field here and it is guarded at the
-/// *field* level in view-schema.surql — a row stays selectable by anyone, the
-/// address does not.
+/// Note what is **absent: no password hash, ever.** Every row here is readable by
+/// anyone — spot-owner profiles have to resolve for everyone — so the projection is
+/// the first thing deciding what can possibly leak. `email` is the one sensitive
+/// field, and it is cut per-caller in the response type rather than filtered per-row.
 ///
 /// `email_verified` is absent for the same reason and is not an oversight: it is an
 /// authentication concern that stays in user-service's private projection. Adding it
 /// here would publish which addresses are unconfirmed to every client that can read
 /// a spot owner's profile.
-#[derive(Clone, Debug, SurrealValue)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct ViewUser {
     pub id: Uuid,
     /// user-service's version of this user, as last applied here. What
     /// `bus::await_version` compares a client's `X-Await-Version` against.
     ///
-    /// **A field on the model, not only a column**, and the difference is a bug that
-    /// took a rebuild to surface. This table is written with `CONTENT $row`, which
-    /// replaces the whole record — so a model without this column *clears* it. On a
-    /// row that does not exist yet the schema's `DEFAULT 0` fills it back in and
-    /// nothing looks wrong; on one that does, the write is a coercion failure
-    /// (`Expected int but found NONE`) that stalls the projector.
-    ///
-    /// Which means it only ever fired on a **re-applied** `Registered`: a backfill,
-    /// or a redelivery outside the stream's `duplicate_window`. Carrying the version
-    /// in the row is what makes the whole-row write total.
+    /// It stays a field on the model, though the reason has changed. It used to be
+    /// load-bearing against a `CONTENT $row` write that replaced the whole record: a
+    /// model missing this column *cleared* it, which on an existing row was a
+    /// coercion failure that stalled the projector — and only ever on a re-applied
+    /// `Registered`, so it took a rebuild to surface. Writes name their columns
+    /// explicitly now, so an omission would be a compile error rather than a silent
+    /// clear. The field remains because the version is genuinely read.
+    #[sqlx(try_from = "i64")]
     pub version: u64,
     pub first_name: String,
     pub last_name: String,
     pub profile_picture: Option<String>,
-    pub email: Option<String>,
+    /// Not an `Option`, and `app_user.email` is `NOT NULL` — see
+    /// `migrations/view/0002_user_email_not_null.sql`. Every row here is created by
+    /// `UserRegistered`, which carries a `String`; `UserUpdated` only reaches
+    /// `ViewUserRepository::patch`, which is an `UPDATE` and cannot create one.
+    pub email: String,
     /// Deliberately public: a host has to be able to recognise the car that turns up
     /// on their driveway, so this is not scoped the way `email` is.
-    ///
-    /// `license_plates ?? []` when selected, for rows written before the column
-    /// existed.
     pub license_plates: Vec<String>,
 }
 
@@ -65,23 +59,12 @@ pub struct ViewUserPatch {
     pub license_plates: Option<Vec<String>>,
 }
 
-impl ViewUserPatch {
-    /// Binds every patchable column. Absent ones bind as NONE, which the
-    /// `?? column` in `ViewUserRepository::patch` turns into "leave it alone".
-    pub fn bind(self, q: Query<'_, Client>) -> Query<'_, Client> {
-        q.bind(vars! {
-            first_name:      self.first_name,
-            last_name:       self.last_name,
-            profile_picture: self.profile_picture,
-            email:           self.email,
-            license_plates:  self.license_plates,
-        })
-    }
-}
+// No `bind` — see the note in `domain_models::user::user`. sqlx binds positionally,
+// so the binds live beside the `$n` placeholders in `ViewUserRepository::patch`.
 
 impl ViewUser {
-    /// The row a `Registered` writes. Safe to `upsert`: this table has no link
-    /// column and no column any other stream owns.
+    /// The row a `Registered` writes. Safe to `upsert`: this table has no column any
+    /// other stream owns.
     pub fn registered(e: UserRegistered, version: u64) -> Self {
         Self {
             id: e.user_id,
@@ -89,7 +72,7 @@ impl ViewUser {
             first_name: e.first_name,
             last_name: e.last_name,
             profile_picture: None,
-            email: Some(e.email),
+            email: e.email,
             license_plates: Vec::new(),
         }
     }
@@ -126,11 +109,10 @@ mod tests {
     /// The whole reason this model exists separately from
     /// `domain_models::user::User`. A password column here would be world-readable.
     ///
-    /// This used to assert on the derived `COLUMNS` string. It now asserts on the
-    /// struct, which is the stronger place: `ViewUserRepository::upsert` writes this
-    /// row with `CONTENT $row`, so the struct's fields **are** the columns written.
     /// The literal is exhaustive on purpose — a new field breaks compilation, and
-    /// this is the test that should be read before adding one.
+    /// this is the test that should be read before adding one. It asserts on the
+    /// struct rather than on any generated SQL, which is the stronger place: nothing
+    /// reaches the read model that is not a field here.
     #[test]
     fn no_credential_columns_reach_the_read_model() {
         let row = ViewUser {
@@ -139,7 +121,7 @@ mod tests {
             first_name: String::new(),
             last_name: String::new(),
             profile_picture: None,
-            email: None,
+            email: String::new(),
             license_plates: Vec::new(),
         };
         let written = format!("{row:?}");

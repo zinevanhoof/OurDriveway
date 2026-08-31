@@ -161,6 +161,8 @@ mod tests {
         let Some(BookingEvent::Created(created)) = events(&row).into_iter().next() else {
             panic!("expected a create");
         };
-        assert_eq!(created.expires_at, row.created_at.into());
+        // No `.into()`: `created_at` is a plain `DateTime<Utc>` now rather than the
+        // driver's own datetime newtype, so both sides are already the same type.
+        assert_eq!(created.expires_at, row.created_at);
     }
 }

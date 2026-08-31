@@ -8,17 +8,22 @@ that replayed the whole stream into its own database and kept its cursor there, 
 two replicas sharing one database meant two projectors racing over one cursor.
 Sidecar-per-pod made "a database per replica" fall out of `replicas: N`.
 
-None of that is true any more. The databases are authoritative and live in TiKV,
+None of that is true any more. The databases are authoritative and live in YugabyteDB,
 projectors share a durable consumer per partition, and a service writes its own rows
 inside the request's transaction. So the sidecar, the `fsGroup` that let it write a fresh
 emptyDir, the data volume, the schema mount and the startup probe are all gone, and
 "stateless" stopped being a property that told two services apart — everything here
 is stateless.
 
+The schema mount went for a second reason worth knowing: schemas are no longer files
+at all. Each service embeds its own migrations with `sqlx::migrate!` and applies them at
+boot, which is what deleted the ConfigMap, the `--set-file` plumbing in deploy.sh, and
+the import Job that used to POST them.
+
 What is left are two facts about a service, spelled the same way and defaulting to
 the common case, so an ordinary service still declares nothing:
 
-  db: false      no SURREALDB_* env, no schema, no wait-for-surrealdb
+  db: false      no DATABASE_URL, no database created for it, no wait-for-yugabyte
                  (media and notification — one holds nothing at all, the other's
                  only cursor lives in NATS)
   nats: false    no NATS_URL and no wait-for-nats  (media only)
@@ -60,11 +65,16 @@ spec:
         CrashLoopBackOffs until it happens to win the race.
 
         Both reuse the app image, already pulled for this pod, and bash's /dev/tcp
-        builtin: no netcat, no CLI, no second image to keep pinned. Dialling the
-        ClusterIP Service rather than a pod is what makes a bare TCP check enough —
-        kube-proxy only routes to endpoints that passed their own readiness probe,
-        which for SurrealDB means TiKV is reachable and for NATS means JetStream is
-        up.
+        builtin: no netcat, no CLI, no second image to keep pinned.
+
+        A bare TCP check is enough for NATS, whose Service only routes to endpoints
+        that passed their own readiness probe. It is weaker for YugabyteDB, whose
+        Service is HEADLESS — kube-proxy does no readiness filtering there, so this
+        only proves something is listening on 5433. That is deliberate rather than
+        overlooked: the databases are created by the post-install hook, which may not
+        have run yet either, and a service that starts too early fails loudly at
+        `connect` and is fine on the CrashLoopBackOff retry. The init container turns
+        the common case into a wait instead of a restart; it is not a guarantee.
         */}}
         {{- if $needsNats }}
         - name: wait-for-nats
@@ -77,13 +87,14 @@ spec:
             - 'until : </dev/tcp/{{ $.Release.Name }}-nats/4222; do echo "waiting for nats"; sleep 2; done'
         {{- end }}
         {{- if $needsDb }}
-        - name: wait-for-surrealdb
+        - name: wait-for-yugabyte
           image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
           imagePullPolicy: {{ $.Values.imagePullPolicy }}
           command:
             - bash
             - -c
-            - 'until : </dev/tcp/surrealdb/8000; do echo "waiting for surrealdb"; sleep 2; done'
+            # 5433, not 5432 — YSQL does not listen on the PostgreSQL default.
+            - 'until : </dev/tcp/yugabyte/5433; do echo "waiting for yugabyte"; sleep 2; done'
         {{- end }}
       {{- end }}
       containers:
@@ -100,17 +111,22 @@ spec:
             - name: PORT
               value: {{ $.Values.port | quote }}
             {{- if $needsDb }}
-            # The shared query engine, not a sidecar. SURREALDB_USER and
-            # SURREALDB_PASS come from the secret below, which is also where
-            # SurrealDB itself reads them — see templates/surrealdb.yaml.
-            - name: SURREALDB_ADDR
-              value: "surrealdb:8000"
-            # This service's own database inside the shared `main` namespace. On
-            # TiKV every service shares one keyspace, so this is what keeps their
-            # tables apart — and it is the service name, which is also the schema
-            # key and the ingress path.
-            - name: SURREALDB_DB
-              value: {{ $name | quote }}
+            # One URL where there used to be four variables. The database NAME in it is
+            # what keeps this service's tables out of another's — the job SURREALDB_DB
+            # did — and it is the service name, which is also the ingress path.
+            #
+            # The password is interpolated from the same secret entry YugabyteDB itself
+            # reads (YSQL_PASSWORD in templates/yugabyte.yaml), so the two cannot drift.
+            # It lands in the pod spec as a `$(VAR)` reference rather than a literal:
+            # Kubernetes expands it from the env var below at container start, so
+            # `kubectl get pod -o yaml` shows the reference, not the password.
+            - name: YSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: YSQL_PASSWORD
+            - name: DATABASE_URL
+              value: "postgres://yugabyte:$(YSQL_PASSWORD)@yugabyte:5433/{{ $name }}"
             {{- end }}
             {{- if $needsNats }}
             - name: NATS_URL
@@ -120,9 +136,9 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
-          # JWT_SECRET for every service, the SurrealDB root credentials, plus
-          # LOCATIONIQ_API_KEY, the R2 credentials and the Stripe keys. See
-          # secrets.env.example.
+          # JWT_SECRET for every service, plus LOCATIONIQ_API_KEY, the R2 credentials
+          # and the Stripe keys. See secrets.env.example. YSQL_PASSWORD is also in
+          # here, but is named explicitly above because DATABASE_URL interpolates it.
           envFrom:
             - secretRef:
                 name: {{ $.Values.secretName }}
@@ -130,7 +146,7 @@ spec:
           # pod that is still catching up out of the Service's endpoint list.
           #
           # It answers much sooner than it used to. A pod no longer rebuilds a
-          # database from sequence 1 — its rows are already in TiKV — so what is
+          # database from sequence 1 — its rows are already in the cluster — so what is
           # left to wait for is a foreign projection, and for user-, spot- and
           # payment-service not even that: they register no streams at all, and
           # /readyz there reduces to "is NATS reachable" for the outbox relay.

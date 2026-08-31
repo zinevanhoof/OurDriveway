@@ -1,4 +1,4 @@
-use surrealdb::types::{Datetime, SurrealValue};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 // No `ViewPayoutPatch`: a payout is written once and never edited. Reversing one
@@ -12,21 +12,24 @@ use uuid::Uuid;
 /// beside it another. What belongs here is the list, so it can be queried alongside
 /// the rest of a profile like everything else.
 ///
-/// `owner` — the `record<user>` link — is not on this model; see the module doc.
-#[derive(Clone, Debug, SurrealValue)]
+/// There is no `owner` link column any more, and nothing to relink: the read model
+/// holds plain uuids and resolves references with a LEFT JOIN at read time.
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct ViewPayout {
     pub id: Uuid,
-    /// The owning service's version of this aggregate, carried so a `CONTENT $row`
-    /// write does not clear the column — see [`super::user::ViewUser::version`] for
-    /// what happens when it does.
+    /// The owning service's version of this aggregate. What `bus::await_version`
+    /// compares a client's `X-Await-Version` against.
+    #[sqlx(try_from = "i64")]
     pub version: u64,
     pub owner_id: Uuid,
     /// EUR cents.
     pub amount: i64,
-    pub created_at: Datetime,
+    pub created_at: DateTime<Utc>,
 }
 
-// No unit tests: no patch struct to keep in step and no SQL in this file. That the
-// `owner` link is not a field here — so a `CONTENT $row` write clears it and
-// `ViewPayoutRepository::link_owner` puts it back in the same transaction — is
-// checked against a real database by `a_payout_upsert_clears_then_relinks_owner`.
+// No unit tests: no patch struct to keep in step and no SQL in this file.
+//
+// `a_payout_upsert_clears_then_relinks_owner` is gone with the thing it tested. It
+// existed because a `CONTENT $row` write CLEARED the `owner` record link and
+// `link_owner` had to put it back in the same transaction — a two-halves-must-both-run
+// sequence that only a database could check. There is no link and no second half now.

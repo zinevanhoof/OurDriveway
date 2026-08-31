@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useQuery } from '@urql/vue';
+import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useForm } from 'vee-validate'
@@ -17,26 +17,23 @@ import CreateSpotBasicInfo from '@/components/forms/create-spot-form/CreateSpotB
 import CreateSpotAvailability from '@/components/forms/create-spot-form/CreateSpotAvailability.vue';
 import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImages.vue';
 
-import { EDIT_SPOT } from '@/api/graphql/spot';
+import { fetchSpotManage, viewKeys } from '@/api/viewApi';
 import { deleteSpot, updateSpot } from '@/api/spotApi';
 import { uploadNewImages } from '@/api/mediaApi';
 import { bookedOutside, mergeBooked } from '@/lib/bookingAvailability';
 import { formatDay, formatSlots, todayIn } from '@/lib/bookingDates';
 import { centsToEuros, eurosToCents } from '@/lib/money';
-import { gqlRecordId, plainUuid } from '@/lib/utils';
 import type { Availability } from '@/types/domain/spot'
 
 const { id } = defineProps<{ id: string }>()
 
 const router = useRouter()
 
+const queryClient = useQueryClient()
+
 const { data } = useQuery({
-    query: EDIT_SPOT,
-    variables: computed(() => ({
-        id: gqlRecordId(id),
-        spotUuid: plainUuid(id),
-        now: new Date().toISOString(),
-    })),
+    queryKey: viewKeys.spotManage(id),
+    queryFn: () => fetchSpotManage(id),
 })
 
 // Same rules as the create form, minus the address: a spot's location is fixed at
@@ -77,13 +74,13 @@ const slotErrors = ref<string[]>([])
 const imageErrors = ref<string[]>([])
 const formErrors = ref<string[]>([])
 
-const timezone = computed(() => data.value?.spot?.timezone)
+const timezone = computed(() => data.value?.timezone)
 const today = computed(() => todayIn(timezone.value))
 
 // Prefills once the query lands, and again if it refetches while untouched. The
 // spot itself is the source of truth for the initial state; everything after is
 // the host's edit.
-watch(() => data.value?.spot, (spot) => {
+watch(() => data.value, (spot) => {
     if (!spot) return
 
     setValues({
@@ -120,6 +117,11 @@ const hasSlots = () =>
 const casualties = computed(() =>
     bookedOutside(availability.value, mergeBooked(data.value?.bookings), today.value))
 
+// The spot's own key covers the edit; `spots` also clears the owner's list and any
+// radius result this listing appears in.
+const invalidateSpot = () =>
+    queryClient.invalidateQueries({ queryKey: viewKeys.spots })
+
 const submit = handleSubmit(async (values) => {
     formErrors.value = []
     slotErrors.value = []
@@ -138,19 +140,20 @@ const submit = handleSubmit(async (values) => {
         // Kept photos are already keys and pass straight through; only the newly
         // picked Files are uploaded. One list, in the host's display order, so the
         // server never has to work out what changed.
-        const imageKeys = await uploadNewImages(images.value, 'spot')
+        const imageUrls = await uploadNewImages(images.value, 'spot')
 
         const { pricePerHour, ...rest } = values
-        const response = await updateSpot(plainUuid(id)!, {
+        const response = await updateSpot(id, {
             ...rest,
             pricePerHourCents: eurosToCents(pricePerHour),
             availability: availability.value,
-            images: imageKeys,
+            images: imageUrls,
         })
         if (!response.ok) {
             showServerErrors(await response.json().catch(() => ({})))
             return
         }
+        await invalidateSpot()
         router.back()
     } catch (error) {
         // A failed upload leaves the listing exactly as it was — nothing was saved.
@@ -163,7 +166,7 @@ const submit = handleSubmit(async (values) => {
 const remove = async () => {
     deleting.value = true
     try {
-        await deleteSpot(plainUuid(id)!)
+        await deleteSpot(id)
         // Past the manage screen, which is about to 404 on a spot that no longer
         // lists. `refreshSpots` makes the list refetch instead of serving its cache.
         router.replace({ name: 'spots', state: { refreshSpots: true } })
@@ -205,7 +208,7 @@ const showServerErrors = (body: {
 </script>
 
 <template>
-    <FullScreenLayoutComponent @close="router.back()" title="Edit listing" :description="data?.spot?.title">
+    <FullScreenLayoutComponent @close="router.back()" title="Edit listing" :description="data?.title">
         <template #main>
             <form id="edit-spot-form" @submit="submit" class="space-y-4">
                 <CreateSpotBasicInfo />
@@ -260,7 +263,7 @@ const showServerErrors = (body: {
                 <div>
                     <div class="text-lg font-bold">Delete this listing?</div>
                     <div class="text-sm text-muted-foreground font-medium">
-                        {{ data?.spot?.title }} comes off the market for good. Any booking it still
+                        {{ data?.title }} comes off the market for good. Any booking it still
                         owes is cancelled and refunded. This can't be undone.
                     </div>
                 </div>

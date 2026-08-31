@@ -40,8 +40,9 @@ pub struct UpdateUserRequest {
     /// changed.
     #[garde(dive)]
     pub new_password: Option<Password>,
-    /// A media key the browser just uploaded to R2, or `None` for "unchanged" —
-    /// the form only sends it when the user actually picked a new picture.
+    /// The media URL the browser just uploaded to R2, or `None` for "unchanged" —
+    /// the form only sends it when the user actually picked a new picture. The whole
+    /// URL, not a bucket key: `is_avatar` below defers to `media::is_media_url`.
     ///
     /// `None` is not "clear": that matches `UserUpdated`'s semantics and the
     /// repository's `?? profile_picture` coalescing. There is no remove-picture UI,

@@ -26,41 +26,60 @@ axum = { version = "0.8.9", features = ["macros"] }
 tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-# Just the default protocol-ws. `protocol-http` used to ride along because
-# export/import are HTTP-engine only and that is what bus/src/snapshot.rs used —
-# it was the only thing in the workspace that ever opened an HTTP client. TiKV is
-# durable, so snapshots are gone and so is the second engine.
-# `kv-mem` is for `bus/examples/clone_cost` alone — an embedded engine to compare
-# `Surreal::clone` against with no socket and no Argon2 sign-in in the replay.
+# Replaced surrealdb, and the whole feature-unification argument at the top of
+# CLAUDE.md went with it — that file exists because `surrealdb-core` is a ~680 MB
+# rlib that got compiled eight times over. Nothing here is remotely that size.
 #
-# Here rather than in `bus`'s dev-dependencies deliberately. Under `resolver = "2"`
-# dev-dependency features are not unified into a non-dev build, so scoping it there
-# would give `cargo build --workspace` and `cargo build --workspace --all-targets`
-# different feature unions for surrealdb — and the two would then rebuild
-# surrealdb-core on every alternation, forever. See the top of CLAUDE.md.
+# `macros` is for the DERIVES only — `FromRow`, and the `#[sqlx(try_from)]` /
+# `#[sqlx(json)]` field attributes. One feature gates those together with the
+# `query!`/`query_as!` macros, so it has to be on; that does NOT drag in compile-time
+# SQL checking, which only happens where those macros are actually invoked.
 #
-# The price is that every service binary links a memory engine it never opens.
+# They are not, anywhere. Every statement goes through runtime-checked
+# `sqlx::query_as::<_, T>(…)`, so `cargo check` never needs a live database and there
+# is no `.sqlx` cache to go stale in a way nobody notices. That also keeps the
+# repository layer's existing promise: what a method does is the string in front of
+# you, with no macro rewriting it.
 #
-# Keep this in step with the server image in docker-compose-dev.yml. A 3.2.1 server
-# cannot read a datastore a 3.2.4 one wrote — it answers `Failed to get table` on the
-# definitions — so changing either version means `down -v`, not just a restart.
-surrealdb = { version = "3.2.4", features = ["kv-mem"] }
+# `tls-rustls-aws-lc-rs` and not plain `tls-rustls`: the provider must match
+# `shared::install_default_crypto_provider` and jsonwebtoken's `aws_lc_rs`, or two
+# providers end up in one process and rustls panics on first use — the exact failure
+# that function exists to prevent.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-aws-lc-rs",
+    "postgres",
+    "macros",
+    "uuid",
+    "chrono",
+    "json",
+    "migrate",
+] }
 rustls = "0.23"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 thiserror = "2.0.18"
 axum-extra = { version = "0.12.6", features = ["typed-header", "cookie"] }
 cookie = "0.18.1"
-axum-reverse-proxy = "1.3.0"
+# `axum-reverse-proxy` is gone with the GraphQL endpoint it fronted. view-service used
+# it to forward /api/view/graphql to SurrealDB with the client's own Authorization
+# header, so the browser got a RECORD identity and the schema's PERMISSIONS clauses did
+# the authorizing. Those reads are ordinary handlers now.
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
-chrono = "0.4.45"
+# `serde` is explicit now and must stay so. It used to arrive for free through
+# surrealdb, which depends on chrono-with-serde — so every `#[derive(Serialize)]` on a
+# struct holding a DateTime compiled only because of a dependency that never mentioned
+# it. Removing surrealdb broke 26 derives across `shared` and pointed straight at it.
+chrono = { version = "0.4.45", features = ["serde"] }
 # IANA name -> offset, which is the opposite of what tzf-rs below does (point ->
 # name). `booked` is bare local wall-clock strings, so a cancel deadline computed
 # without this is off by the spot's whole UTC offset — two hours in Brussels in
 # summer. chrono alone ships no tz database, and iana-time-zone only ever answers
 # for the *host*, which must not decide a renter's deadline.
 chrono-tz = "0.10"
-uuid = { version = "1.23.4", features = ["v4", "v5", "v7"] }
+# `serde` for the same reason as chrono above: it rode in on surrealdb, and 130
+# derives across the events and domain models depended on it without saying so.
+uuid = { version = "1.23.4", features = ["v4", "v5", "v7", "serde"] }
 dotenvy = "0.15.7"
 reqwest = { version = "0.13.4", features = ["json", "query"] }
 geo = "=0.32.0"

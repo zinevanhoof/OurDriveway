@@ -1,30 +1,30 @@
 <script setup lang="ts">
-import { BOOKINGS_RENTED } from '@/api/graphql/booking';
+import { fetchMyBookings, viewKeys } from '@/api/viewApi';
+import type { BookingListItem } from '@/types/view';
 import {
     Tabs,
     TabsContent,
     TabsList,
     TabsTrigger,
 } from '@/components/ui/tabs'
-import { useAuthStore } from '@/stores/auth';
-import { useQuery } from '@urql/vue';
+import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { computed } from 'vue';
 import BookedSpotRow from './BookedSpotRow.vue';
 
-const auth = useAuthStore()
+const queryClient = useQueryClient()
 
-// `network-only`, and not as an optimisation to skip: a booking's status changes
-// underneath this list constantly and never through a GraphQL mutation. A webhook
-// confirms it, the expiry sweeper releases it, the host withdraws the spot — every one of
-// those is an event on the log, so graphcache has nothing to invalidate on and would keep
-// serving whatever the tab saw last. Cached, this list shows holds that lapsed hours ago.
-const { data, executeQuery } = useQuery({
-    query: BOOKINGS_RENTED,
-    variables: computed(() => ({ renterId: auth.user?.id })),
-    // Otherwise this fires once with renterId: undefined, before main.ts has
-    // rehydrated the session.
-    pause: computed(() => !auth.user?.id),
-    requestPolicy: 'network-only',
+// `staleTime: 0`, and not as an optimisation to skip: a booking's status changes
+// underneath this list constantly and never through anything this client did. A webhook
+// confirms it, the expiry sweeper releases it, the host withdraws the spot — every one
+// of those is an event on the log, so there is nothing here to invalidate on and a
+// cached list shows holds that lapsed hours ago.
+//
+// The `renterId` variable and the `pause` that guarded it are gone: the server takes the
+// renter from the token, so there is no id to wait for the session to rehydrate.
+const { data } = useQuery({
+    queryKey: viewKeys.myBookings,
+    queryFn: fetchMyBookings,
+    staleTime: 0,
 })
 
 // A booking that ended without happening is not history the renter wants a tab
@@ -32,23 +32,23 @@ const { data, executeQuery } = useQuery({
 // exception is a booking the *host* withdrew: that one has to stay visible, or a
 // trip someone paid for just disappears without ever saying why.
 const live = computed(() =>
-    (data.value?.bookings ?? []).filter(
-        (b: any) =>
-            b?.status !== 'released' &&
-            (b?.status !== 'cancelled' || b?.cancelReason === 'spot_unavailable'),
+    (data.value ?? []).filter(
+        (b) =>
+            b.status !== 'released' &&
+            (b.status !== 'cancelled' || b.cancelReason === 'spot_unavailable'),
     ),
 )
 
 // One comparison against the server-folded end instant, in place of walking every
 // booking's date map. `Date.parse` rather than a string compare: the server emits
 // RFC 3339 with an offset, which doesn't sort against an ISO "Z" string.
-const stillToCome = (booking: any) => Date.parse(booking?.endsAt) > Date.now()
+const stillToCome = (booking: BookingListItem) => Date.parse(booking.endsAt) > Date.now()
 
 const upcoming = computed(() => live.value.filter(stillToCome))
-const past = computed(() => live.value.filter((b: any) => !stillToCome(b)))
+const past = computed(() => live.value.filter((b) => !stillToCome(b)))
 
 /** After a cancel, re-read past the projection rather than trusting the cache. */
-const refresh = () => executeQuery({ requestPolicy: 'network-only' })
+const refresh = () => queryClient.invalidateQueries({ queryKey: viewKeys.bookings })
 </script>
 
 <template>

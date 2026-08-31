@@ -1,6 +1,4 @@
-use surrealdb::types::vars;
-use surrealdb::types::{Datetime, SurrealValue};
-use surrealdb::{engine::remote::ws::Client, method::Query};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::events::payment::PaymentCreated;
@@ -8,7 +6,7 @@ use crate::events::payment::PaymentCreated;
 /// Where a payment is, as stored in `status`.
 ///
 /// Bare `&str` because that is what the column is and what every guard compares
-/// against; the schema's `ASSERT $value IN [...]` is the authority. Written once
+/// against; the schema's `CHECK (status IN (…))` is the authority. Written once
 /// here so a typo is a compile error rather than a transition that silently never
 /// matches.
 pub mod status {
@@ -37,10 +35,11 @@ pub mod status {
 ///
 /// Read entire rather than per-use-case: this replaced a `PaymentRow` that selected
 /// ten of the eleven columns anyway, on a row always addressed by a unique index.
-#[derive(Clone, Debug, SurrealValue)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct Payment {
     pub id: Uuid,
-    /// See `Booking::version` — same field, same three jobs.
+    /// See `Booking::version` — same field, same jobs.
+    #[sqlx(try_from = "i64")]
     pub version: u64,
     /// `payment_booking … UNIQUE`, and load-bearing: one booking gets at most one
     /// PaymentIntent, so a second row for one booking means the renter could be
@@ -72,7 +71,7 @@ pub struct Payment {
     /// rendered to a renter — the Payment Element already told them, in their
     /// language.
     pub failure_reason: Option<String>,
-    pub created_at: Datetime,
+    pub created_at: DateTime<Utc>,
 }
 
 impl Payment {
@@ -92,7 +91,7 @@ impl Payment {
             failure_reason: None,
             // The event's own timestamp, not this process's: every replica must
             // store the same one.
-            created_at: e.created_at.into(),
+            created_at: e.created_at,
         }
     }
 }
@@ -115,21 +114,11 @@ pub struct PaymentPatch {
 }
 
 impl PaymentPatch {
-    /// Binds every patchable column. Absent ones bind as NONE, which the `?? column`
-    /// in `PaymentRepository::transition` turns into "leave it alone".
-    ///
-    /// Every field here has to appear in that statement's `SET` list, and vice
-    /// versa. Nothing checks that at compile time — `set_covers_every_patchable_column`
-    /// is the reminder, and the live round-trip in payment-service is what would
-    /// actually catch a mismatch.
-    pub fn bind(self, q: Query<'_, Client>) -> Query<'_, Client> {
-        q.bind(vars! {
-            status:         self.status,
-            intent_id:      self.intent_id,
-            refund_id:      self.refund_id,
-            failure_reason: self.failure_reason,
-        })
-    }
+    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
+    // positionally, so the binds live beside the `$n` placeholders in
+    // `PaymentRepository::transition`. `set_covers_every_patchable_column` below is
+    // what still points at that statement, and the live round-trip in payment-service
+    // is what would actually catch a mismatch.
 
     /// Paid — and the one place `intent_id` becomes known.
     ///
@@ -197,7 +186,8 @@ mod tests {
     ///
     /// The literal is **exhaustive on purpose** — no `..Default::default()`. Add a
     /// field to [`PaymentPatch`] and this stops compiling, which is the reminder
-    /// that `bind` and the `SET` list in `transition` need it too.
+    /// that the `SET` list in `transition` needs it too, and a `.bind()` in the
+    /// matching position.
     #[test]
     fn set_covers_every_patchable_column() {
         let _: PaymentPatch = PaymentPatch {

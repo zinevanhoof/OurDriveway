@@ -29,7 +29,8 @@ use crate::{
 /// the projection too early is covered by the layer on whichever replica takes it —
 /// which the old per-instance wait never was.
 pub struct RefreshTokenService {
-    pub tokens: RefreshTokenRepository,
+    /// The pool. See the note on `UserService::db` — the repositories are stateless.
+    pub db: sqlx::PgPool,
 }
 
 impl RefreshTokenService {
@@ -61,13 +62,15 @@ impl RefreshTokenService {
             expires_at,
         };
 
-        let tx = db::begin(&self.tokens.q).await?;
-        let version = db::next_version(&tx, "refresh_token", &token_id).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "refresh_token", &token_id).await?;
 
-        RefreshTokenRepository { q: &tx }
-            .upsert(RefreshToken::issued(issued.clone(), Utc::now()))
-            .await?;
-        db::set_version(&tx, "refresh_token", &token_id, version).await?;
+        RefreshTokenRepository::upsert(
+            &mut *tx,
+            RefreshToken::issued(issued.clone(), Utc::now()),
+        )
+        .await?;
+        db::set_version(&mut tx, "refresh_token", &token_id, version).await?;
 
         let envelope = Envelope::new(
             SessionEvent::Issued(issued),
@@ -79,7 +82,7 @@ impl RefreshTokenService {
 
         // Still the user's subject: one user's whole session history stays on one
         // ordered subject, even though each session versions independently.
-        outbox::enqueue(&tx, &session_subject(&user.id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &session_subject(&user.id), &envelope).await?;
         tx.commit().await?;
 
         Ok((jwt, refresh_token.to_string(), await_token))
@@ -92,11 +95,11 @@ impl RefreshTokenService {
         // differ — a 404 for unknown, a 401 for the rest — which told an
         // unauthenticated caller which token values had once existed. Same reason
         // `revoke` shrugs at a token it cannot find.
-        let existing = self
-            .tokens
-            .find_by_token_hash(old_hash.clone())
+        let existing = RefreshTokenRepository::find_by_token_hash(&self.db, old_hash.clone())
             .await?
-            .filter(|t| !t.revoked && t.expires_at.into_inner() >= Utc::now())
+            // `expires_at` is a plain `DateTime<Utc>` now, so no `into_inner()` to
+            // unwrap a driver newtype first.
+            .filter(|t| !t.revoked && t.expires_at >= Utc::now())
             .context_unauthorized(("Unauthorized", "Invalid refresh token"))?;
 
         let user_uuid = existing.user_id;
@@ -118,26 +121,27 @@ impl RefreshTokenService {
             expires_at,
         };
 
-        let tx = db::begin(&self.tokens.q).await?;
-        let tokens = RefreshTokenRepository { q: &tx };
-        let version = db::next_version(&tx, "refresh_token", &token_id).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "refresh_token", &token_id).await?;
 
         // Revoke-and-issue in one transaction, mirroring the single event: there is
         // no instant at which the old token is dead and the new one does not exist.
-        tokens
-            .patch_by_token_hash(
-                rotated.old_token_hash.clone(),
-                RefreshTokenPatch {
-                    revoked: Some(true),
-                    revoked_reason: Some("Rotation".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        tokens
-            .upsert(RefreshToken::rotated(rotated.clone(), Utc::now()))
-            .await?;
-        db::set_version(&tx, "refresh_token", &token_id, version).await?;
+        RefreshTokenRepository::patch_by_token_hash(
+            &mut *tx,
+            rotated.old_token_hash.clone(),
+            RefreshTokenPatch {
+                revoked: Some(true),
+                revoked_reason: Some("Rotation".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        RefreshTokenRepository::upsert(
+            &mut *tx,
+            RefreshToken::rotated(rotated.clone(), Utc::now()),
+        )
+        .await?;
+        db::set_version(&mut tx, "refresh_token", &token_id, version).await?;
 
         let envelope = Envelope::new(
             SessionEvent::Rotated(rotated),
@@ -147,7 +151,7 @@ impl RefreshTokenService {
         );
         let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        outbox::enqueue(&tx, &session_subject(&user_uuid), &envelope).await?;
+        outbox::enqueue(&mut *tx, &session_subject(&user_uuid), &envelope).await?;
         tx.commit().await?;
 
         Ok((jwt, new_refresh.to_string(), await_token))
@@ -158,7 +162,9 @@ impl RefreshTokenService {
     /// which tokens exist.
     pub async fn revoke(&self, refresh_token: Uuid) -> MyResult<()> {
         let hash = token::hash(&refresh_token);
-        let Some(existing) = self.tokens.find_by_token_hash(hash.clone()).await? else {
+        let Some(existing) = RefreshTokenRepository::find_by_token_hash(&self.db, hash.clone())
+            .await?
+        else {
             return Ok(());
         };
 
@@ -169,25 +175,24 @@ impl RefreshTokenService {
             reason: "logout".to_string(),
         };
 
-        let tx = db::begin(&self.tokens.q).await?;
-        let tokens = RefreshTokenRepository { q: &tx };
-        let version = db::next_version(&tx, "refresh_token", &existing.id).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "refresh_token", &existing.id).await?;
 
-        tokens
-            .patch_by_token_hash(
-                revoked.token_hash.clone(),
-                RefreshTokenPatch {
-                    revoked: Some(true),
-                    revoked_reason: Some(revoked.reason.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        RefreshTokenRepository::patch_by_token_hash(
+            &mut *tx,
+            revoked.token_hash.clone(),
+            RefreshTokenPatch {
+                revoked: Some(true),
+                revoked_reason: Some(revoked.reason.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
         // `Utc::now()` is this process's clock, which is fine now that this is the
         // only writer — it used to have to be the envelope's, because every replica
         // replayed the same event and had to drop exactly the same rows.
-        tokens.delete_expired(Utc::now()).await?;
-        db::set_version(&tx, "refresh_token", &existing.id, version).await?;
+        RefreshTokenRepository::delete_expired(&mut *tx, Utc::now()).await?;
+        db::set_version(&mut tx, "refresh_token", &existing.id, version).await?;
 
         let envelope = Envelope::new(
             SessionEvent::Revoked(revoked),
@@ -196,7 +201,7 @@ impl RefreshTokenService {
             version,
         );
 
-        outbox::enqueue(&tx, &session_subject(&existing.user_id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &session_subject(&existing.user_id), &envelope).await?;
         tx.commit().await?;
 
         Ok(())

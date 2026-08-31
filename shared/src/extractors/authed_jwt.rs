@@ -54,35 +54,13 @@ where
                 .context_unauthorized(("Unauthorized", "JWT"))?;
 
         let claims = token_data.claims;
-        // The claim is a SurrealDB record id (`user:u'<uuid>'`) because that is what
-        // makes `$auth` resolve for the GraphQL permission clauses. Nothing past this
-        // point cares — unwrap it to the uuid once, here.
-        let user_id = parse_claim_id(&claims.id).context_unauthorized(("Unauthorized", "JWT"))?;
+        // `sub` is already the uuid. It used to be a SurrealDB record id spelled
+        // `user:u'<uuid>'` — the form that made `$auth` resolve for the GraphQL
+        // permission clauses — which had to be parsed apart here, with a
+        // `parse_claim_id` and a unit test covering the shapes an attacker might send.
+        // Both are gone with the claim.
+        let user_id = claims.sub;
 
         Ok(AuthedJwt { user_id, claims })
-    }
-}
-
-/// `user:u'0199…'` -> the uuid. `None` on any other shape.
-fn parse_claim_id(claim: &str) -> Option<Uuid> {
-    claim
-        .strip_prefix("user:u'")
-        .and_then(|rest| rest.strip_suffix('\''))
-        .and_then(|uuid| Uuid::parse_str(uuid).ok())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_the_record_id_claim_and_nothing_else() {
-        let id = Uuid::now_v7();
-        assert_eq!(parse_claim_id(&format!("user:u'{id}'")), Some(id));
-        // The shapes this replaced, and the shapes an attacker might try.
-        assert_eq!(parse_claim_id(&format!("user:{id}")), None);
-        assert_eq!(parse_claim_id(&id.simple().to_string()), None);
-        assert_eq!(parse_claim_id("user:u'not-a-uuid'"), None);
-        assert_eq!(parse_claim_id(""), None);
     }
 }

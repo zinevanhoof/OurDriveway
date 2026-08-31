@@ -33,17 +33,16 @@
 //! order — which matters, because the projector guards transitions with
 //! `WHERE status IN $from` and simply drops one that does not match.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use async_nats::jetstream::{Context, message::PublishMessage};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use shared::{
-    db::Querier,
     error::myerror::{MyError, MyResult},
     events::Envelope,
 };
-use surrealdb::{Surreal, engine::remote::ws::Client, types::SurrealValue};
+use sqlx::{PgExecutor, PgPool};
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -58,7 +57,7 @@ const IDLE: Duration = Duration::from_millis(200);
 const BATCH: usize = 128;
 
 /// One pending event. The envelope is stored encoded, exactly as it will be sent.
-#[derive(Debug, SurrealValue)]
+#[derive(Debug, sqlx::FromRow)]
 pub struct Pending {
     pub id: Uuid,
     pub subject: String,
@@ -74,10 +73,11 @@ pub struct Pending {
 
 /// Writes an event into the caller's **open transaction**.
 ///
-/// Takes a `&Transaction` (via [`Querier`]) rather than a connection, because
-/// being in the caller's transaction is the entire point: if their write rolls
+/// Callers pass their open transaction as `&mut *tx` rather than a pooled connection,
+/// because being in the caller's transaction is the entire point: if their write rolls
 /// back, so does this, and no event is ever published for a change that did not
-/// happen.
+/// happen. The signature is `impl PgExecutor<'_>`, which admits both — `backfill`
+/// below is the one caller that legitimately passes the pool.
 ///
 /// The record id is the envelope's `event_id`, so enqueuing the same event twice
 /// is one row rather than two — the same property the `Nats-Msg-Id` dedupe gives
@@ -97,30 +97,34 @@ pub struct Pending {
 /// row reads stale until its next real event. The `id` tiebreak does not help: a
 /// UUIDv7 comes off the same skewed clock.
 ///
-/// `time::now()` is evaluated inside the database, which every replica shares — the
-/// same reason `lease::acquire` evaluates expiry there rather than against a caller's
-/// clock.
+/// `now()` is evaluated inside the database, which every replica shares — the same
+/// reason `lease::acquire` evaluates expiry there rather than against a caller's
+/// clock. (Transaction-start time, not `clock_timestamp()`: two events enqueued in one
+/// transaction then share a timestamp, which is exactly why [`drain`] breaks the tie
+/// on `id`.)
 ///
 /// This also separates two things that were only ever coincidentally equal:
 /// `occurred_at` is when the thing happened and stays in the envelope for projectors
 /// to read, `created_at` is where the row sits in the relay queue.
 pub async fn enqueue<T: Serialize>(
-    tx: &impl Querier,
+    ex: impl PgExecutor<'_>,
     subject: &str,
     envelope: &Envelope<T>,
 ) -> MyResult<()> {
     let payload = serde_json::to_string(envelope)
         .map_err(|e| MyError::Bus(format!("serialize outbox event: {e}")))?;
 
-    tx.q("UPSERT type::record('_outbox', $id) SET
-             subject    = $subject,
-             payload    = $payload,
-             created_at = time::now()")
-        .bind(("id", envelope.event_id))
-        .bind(("subject", subject.to_string()))
-        .bind(("payload", payload))
-        .await?
-        .check()?;
+    sqlx::query(
+        "INSERT INTO _outbox (id, subject, payload, created_at)
+              VALUES ($1, $2, $3, now())
+         ON CONFLICT (id) DO UPDATE
+             SET subject = EXCLUDED.subject, payload = EXCLUDED.payload",
+    )
+    .bind(envelope.event_id)
+    .bind(subject)
+    .bind(payload)
+    .execute(ex)
+    .await?;
     Ok(())
 }
 
@@ -134,10 +138,10 @@ pub async fn enqueue<T: Serialize>(
 /// events for it, so the re-derive runs through the same projectors as live traffic
 /// instead of a one-off script that duplicates their denormalization rules.
 ///
-/// Takes a plain [`Querier`] rather than a transaction, unlike [`enqueue`]: there is
-/// no accompanying write to be atomic with, and a whole-table backfill in one
-/// transaction would be a write set the size of the table. Each row is its own
-/// statement, and a run that dies half way is resumed by running it again.
+/// Takes the pool rather than a transaction, unlike [`enqueue`]: there is no
+/// accompanying write to be atomic with, and a whole-table backfill in one transaction
+/// would be a write set the size of the table. Each row is its own statement, and a
+/// run that dies half way is resumed by running it again.
 ///
 /// Event ids are derived from `<aggregate>@<version>:<step>`, so a second run writes
 /// the same `_outbox` rows and — inside the stream's `duplicate_window` — publishes
@@ -155,7 +159,7 @@ pub async fn enqueue<T: Serialize>(
 /// stale until its next real event. Compare versions inside each projector if this
 /// ever needs to be safe concurrently.
 pub async fn backfill<T: Serialize>(
-    q: &impl Querier,
+    pool: &PgPool,
     subject: &str,
     aggregate: &str,
     version: u64,
@@ -177,7 +181,7 @@ pub async fn backfill<T: Serialize>(
             backfill: true,
             payload,
         };
-        enqueue(q, subject, &envelope).await?;
+        enqueue(pool, subject, &envelope).await?;
         sent += 1;
     }
     Ok(sent)
@@ -201,7 +205,7 @@ pub async fn backfill<T: Serialize>(
 /// This does not close the window entirely — a stall *inside* a single publish still
 /// gets one message out — but one message is bounded and a whole backlog is not.
 pub async fn drain(
-    db: &Surreal<Client>,
+    pool: &PgPool,
     js: &Context,
     leader: &watch::Receiver<bool>,
 ) -> MyResult<usize> {
@@ -211,15 +215,22 @@ pub async fn drain(
             return Ok(sent);
         }
 
-        // `created_at` then `id`: two events enqueued in the same transaction can
-        // share a timestamp, and the id breaks the tie deterministically so a
-        // retry after a crash sends them in the same order as the first attempt.
-        let batch: Vec<Pending> = db
-            .q("SELECT record::id(id) AS id, subject, payload, created_at
-                FROM _outbox ORDER BY created_at, id LIMIT $n")
-            .bind(("n", BATCH as i64))
-            .await?
-            .take(0)?;
+        // `created_at` then `id`: two events enqueued in the same transaction share a
+        // timestamp (`now()` is transaction-start time), and the id breaks the tie
+        // deterministically so a retry after a crash sends them in the same order as
+        // the first attempt.
+        //
+        // Deliberately NOT `FOR UPDATE SKIP LOCKED`, which is the reflex for a queue
+        // table and would be wrong here: skipping locked rows lets a second relay take
+        // the *next* batch and publish it first, which is precisely the reordering the
+        // lease exists to prevent. Order matters more than throughput on this table.
+        let batch: Vec<Pending> = sqlx::query_as(
+            "SELECT id, subject, payload, created_at
+               FROM _outbox ORDER BY created_at, id LIMIT $1",
+        )
+        .bind(BATCH as i64)
+        .fetch_all(pool)
+        .await?;
 
         if batch.is_empty() {
             return Ok(sent);
@@ -228,13 +239,13 @@ pub async fn drain(
         for row in batch {
             append(js, row.subject.clone(), &row.id.to_string(), row.payload).await?;
 
-            // Only after the ack. A crash in this gap republishes on restart,
-            // which is what makes this at-least-once rather than at-most-once —
-            // the safer side to be wrong on, given the consumers are idempotent.
-            db.q("DELETE type::record('_outbox', $id)")
-                .bind(("id", row.id))
-                .await?
-                .check()?;
+            // Only after the ack. A crash in this gap republishes on restart, which is
+            // what makes this at-least-once rather than at-most-once — the safer side
+            // to be wrong on, given the consumers are idempotent.
+            sqlx::query("DELETE FROM _outbox WHERE id = $1")
+                .bind(row.id)
+                .execute(pool)
+                .await?;
 
             sent += 1;
         }
@@ -249,7 +260,7 @@ pub async fn drain(
 ///
 /// A follower parks on `leader.changed()` and costs nothing at all; the election
 /// task is already paying the one query every ten seconds.
-pub async fn run(db: Arc<Surreal<Client>>, js: Context, mut leader: watch::Receiver<bool>) {
+pub async fn run(pool: PgPool, js: Context, mut leader: watch::Receiver<bool>) {
     loop {
         while !*leader.borrow() {
             if leader.changed().await.is_err() {
@@ -259,7 +270,7 @@ pub async fn run(db: Arc<Surreal<Client>>, js: Context, mut leader: watch::Recei
 
         tracing::info!("outbox relay started");
         while *leader.borrow() {
-            match drain(&db, &js, &leader).await {
+            match drain(&pool, &js, &leader).await {
                 Ok(0) => tokio::time::sleep(IDLE).await,
                 Ok(n) => tracing::debug!(count = n, "relayed outbox events"),
                 Err(e) => {

@@ -34,13 +34,9 @@ pub struct AppState {
 /// falls back to a default, because a default is a value you cannot discover by
 /// reading the `.env`.
 pub struct Config {
-    pub surrealdb_addr: String,
-    pub surrealdb_user: String,
-    pub surrealdb_pass: String,
-    /// This service's own database inside the shared `main` namespace. Every
-    /// service used to be "main"; on TiKV they share one keyspace, so this is
-    /// what keeps their tables apart.
-    pub surrealdb_db: String,
+    /// This service's own database in the YugabyteDB cluster, as one URL — and the
+    /// port is **5433**, not 5432. See user-service's `Config` for the full note.
+    pub database_url: String,
     pub nats_url: String,
     pub port: u16,
     /// Verification only. This service mints no tokens; user-service does.
@@ -56,10 +52,7 @@ pub struct Config {
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
-    surrealdb_addr: env::require("SURREALDB_ADDR"),
-    surrealdb_user: env::require("SURREALDB_USER"),
-    surrealdb_pass: env::require("SURREALDB_PASS"),
-    surrealdb_db: env::require("SURREALDB_DB"),
+    database_url: env::require("DATABASE_URL"),
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
     jwt_secret: env::require("JWT_SECRET"),
@@ -87,21 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared::media::init_base(&CONFIG.media_base);
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
-    let db = shared::db::connect(
-        &CONFIG.surrealdb_addr,
-        &CONFIG.surrealdb_user,
-        &CONFIG.surrealdb_pass,
-        &CONFIG.surrealdb_db,
-    )
-    .await?;
+    let db = shared::db::connect(&CONFIG.database_url).await?;
+    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/spot")).await?;
 
-    // The projector is gone — this service writes its own rows. What is left
-    // needing an owned session is the election and the outbox relay.
-    // One connection for the whole process — election, relay, handlers and the await
-    // layer all share it. `Surreal::clone` would mint a session and replay the root
-    // sign-in onto it; cloning the `Arc` is a refcount bump. The sessions that do get
-    // minted are per *transaction*, in `shared::db::begin`, and die with it.
-    let db = Arc::new(db);
+    // One pool for the whole process — election, relay, handlers, the card RPC and
+    // the await layer all share it. `PgPool` is `Arc` inside, so a clone is a
+    // refcount bump; a connection is borrowed per statement or per transaction.
     let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
@@ -143,9 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             SUBJECT_SPOT_CARD,
             "spot-service",
             move |spot_id: Uuid| {
-                // Constructing the repository is an `Arc` bump, so it happens per
-                // call rather than being held: there is no state in it to share.
-                let spots = SpotRepository { q: db.clone() };
+                // A pool handle per call — a refcount bump. The repository itself is
+                // stateless, so there is nothing else to construct.
+                let db = db.clone();
                 // `images` is already absolute — stored that way, so nothing is
                 // resolved here. This used to join MEDIA_BASE onto each key at the
                 // edge, purely because the caller hands them to Stripe.
@@ -154,8 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // row is one point read either way, and a second projection shape
                 // was one more thing to keep in step with the table.
                 async move {
-                    spots
-                        .find_by_id(spot_id)
+                    SpotRepository::find_by_id(&db, spot_id)
                         .await
                         .ok()
                         .flatten()
@@ -166,9 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let state = AppState {
-        spot_service: Arc::new(SpotService {
-            spots: SpotRepository { q: db },
-        }),
+        spot_service: Arc::new(SpotService { db }),
     };
 
     let api_router: Router<AppState> = Router::new()

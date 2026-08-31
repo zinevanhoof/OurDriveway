@@ -18,7 +18,7 @@ use shared::{
         Envelope, STREAM_BOOKINGS, STREAM_PAYMENTS, booking::BookingEvent, payment::PaymentEvent,
     },
 };
-use surrealdb::{Surreal, engine::remote::ws::Client};
+use sqlx::PgPool;
 
 use crate::service::settlement_worker_service::SettlementWorkerService;
 
@@ -33,7 +33,7 @@ pub struct BookingWorker {
     pub service: Arc<SettlementWorkerService>,
     /// Read to check the booking mirror's version before deciding. Not written —
     /// that is `BookingProjector`'s job, on the same rows.
-    pub db: Arc<Surreal<Client>>,
+    pub db: PgPool,
 }
 
 impl Worker for BookingWorker {

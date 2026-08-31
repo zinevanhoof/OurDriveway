@@ -29,7 +29,10 @@ use crate::{CONFIG, auth::password, repository::user_repository::UserRepository}
 /// following read until this service's own rows have reached it. Reading back what
 /// this service just wrote needs no wait at all — the transaction committed.
 pub struct UserService {
-    pub users: UserRepository,
+    /// The pool, not a repository. The repositories are stateless now — sqlx's
+    /// `PgExecutor` covers both `&PgPool` and the `&mut PgConnection` inside an open
+    /// transaction, so there is nothing for a repository to hold.
+    pub db: sqlx::PgPool,
 }
 
 impl UserService {
@@ -46,8 +49,7 @@ impl UserService {
         // layer holds it until the row is there. Without the echo it falls through
         // to the dedupe window below, which is silent — the same account, answered
         // twice with success.
-        self.users
-            .find_by_email(req.email.to_string())
+        UserRepository::find_by_email(&self.db, req.email.to_string())
             .await?
             .is_none()
             .context_conflict((
@@ -101,15 +103,13 @@ impl UserService {
         // The row and its event, in one transaction. This is the whole shape of
         // the rewrite: the database is authoritative, and the event is a durable
         // side effect of the same commit rather than the thing that caused it.
-        let tx = db::begin(&self.users.q).await?;
-        let version = db::next_version(&tx, "user", &user_id).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "user", &user_id).await?;
 
         // No `set_version` after this: the row carries its own version and this is
         // a whole-row write. The separate statement is still needed wherever a
         // *patch* moves a row, since a patch does not touch the column.
-        UserRepository { q: &tx }
-            .upsert(User::registered(registered.clone(), version))
-            .await?;
+        UserRepository::upsert(&mut *tx, User::registered(registered.clone(), version)).await?;
 
         let mut envelope = Envelope::new(
             UserEvent::Registered(registered),
@@ -120,7 +120,7 @@ impl UserService {
         envelope.event_id = event_id;
         let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        outbox::enqueue(&tx, &user_subject(&user_id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &user_subject(&user_id), &envelope).await?;
         tx.commit().await?;
 
         Ok(await_token)
@@ -132,7 +132,7 @@ impl UserService {
     /// Keeping the two apart is what stops the session service from needing to
     /// know how a password is stored.
     pub async fn authenticate(&self, req: LoginRequest) -> MyResult<User> {
-        let found = self.users.find_by_email(req.email.to_string()).await?;
+        let found = UserRepository::find_by_email(&self.db, req.email.to_string()).await?;
 
         // Verify even when no user matched, against a throwaway hash, so a missing
         // account and a wrong password take the same time to answer.
@@ -193,31 +193,32 @@ impl UserService {
             shared::email_token::Purpose::VerifyEmail,
         )?;
 
-        let tx = db::begin(&self.users.q).await?;
-        let users = UserRepository { q: &tx };
+        let mut tx = self.db.begin().await?;
 
         // Read inside the transaction: the token proves which account, but this
         // must refuse one naming a user who no longer exists rather than writing
         // for them.
-        users
-            .find_by_id(user_id)
+        UserRepository::find_by_id(&mut *tx, user_id)
             .await?
             .context_not_found(("Not Found", "Could not find user"))?;
 
-        let version = db::next_version(&tx, "user", &user_id).await?;
+        // Takes `FOR UPDATE` on the row, which is what serialises two of these
+        // against each other now that a contended write no longer conflicts on its
+        // own. See `shared::db::next_version`.
+        let version = db::next_version(&mut tx, "user", &user_id).await?;
         // Idempotent by construction — setting `true` twice is setting `true`.
         // That matters because mail scanners prefetch links, so this endpoint is
         // deliberately re-runnable.
-        users
-            .patch(
-                user_id,
-                UserPatch {
-                    email_verified: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        db::set_version(&tx, "user", &user_id, version).await?;
+        UserRepository::patch(
+            &mut *tx,
+            user_id,
+            UserPatch {
+                email_verified: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+        db::set_version(&mut tx, "user", &user_id, version).await?;
 
         let envelope = Envelope::new(
             UserEvent::EmailVerified { user_id },
@@ -227,7 +228,7 @@ impl UserService {
         );
         let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        outbox::enqueue(&tx, &user_subject(&user_id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &user_subject(&user_id), &envelope).await?;
         tx.commit().await?;
 
         Ok(await_token)
@@ -244,7 +245,8 @@ impl UserService {
     // money to deliver. Add a per-user cooldown (last-sent timestamp on the row,
     // checked here) if this ever gets pointed at.
     pub async fn resend_verification(&self, req: ResendVerificationRequest) -> MyResult<()> {
-        let Some(user) = self.users.find_by_email(req.email.to_string()).await? else {
+        let Some(user) = UserRepository::find_by_email(&self.db, req.email.to_string()).await?
+        else {
             return Ok(());
         };
 
@@ -258,9 +260,9 @@ impl UserService {
         // A transaction for an event that writes no row, which looks odd until you
         // ask where else the outbox row would go: the enqueue *is* the write, and it
         // still has to be atomic with the version it claims.
-        let tx = db::begin(&self.users.q).await?;
-        let version = db::next_version(&tx, "user", &user.id).await?;
-        db::set_version(&tx, "user", &user.id, version).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "user", &user.id).await?;
+        db::set_version(&mut tx, "user", &user.id, version).await?;
 
         let envelope = Envelope::new(
             UserEvent::VerificationRequested(VerificationRequested {
@@ -276,7 +278,7 @@ impl UserService {
             version,
         );
 
-        outbox::enqueue(&tx, &user_subject(&user.id), &envelope).await?;
+        outbox::enqueue(&mut *tx, &user_subject(&user.id), &envelope).await?;
         tx.commit().await?;
 
         Ok(())
@@ -299,9 +301,7 @@ impl UserService {
     ///
     /// No ownership lookup: the target is always the caller's own record.
     pub async fn update_user(&self, uid: &Uuid, req: UpdateUserRequest) -> MyResult<String> {
-        let existing = self
-            .users
-            .find_by_id(*uid)
+        let existing = UserRepository::find_by_id(&self.db, *uid)
             .await?
             .context_not_found(("Not Found", "Could not find user"))?;
         let user_uuid = existing.id;
@@ -376,8 +376,7 @@ impl UserService {
                     // Same as signup: the unique index is the real guard, this only
                     // turns the common case into a 409 rather than a projector
                     // failure on an event that is already in the log.
-                    self.users
-                        .find_by_email(email.to_string())
+                    UserRepository::find_by_email(&self.db, email.to_string())
                         .await?
                         .is_none()
                         .context_conflict((
@@ -400,21 +399,20 @@ impl UserService {
             }
         };
 
-        let tx = db::begin(&self.users.q).await?;
-        let users = UserRepository { q: &tx };
-        let version = db::next_version(&tx, "user", &user_uuid).await?;
+        let mut tx = self.db.begin().await?;
+        let version = db::next_version(&mut tx, "user", &user_uuid).await?;
 
         match &event {
             UserEvent::PasswordChanged(e) => {
-                users
-                    .patch(
-                        user_uuid,
-                        UserPatch {
-                            password: Some(e.password_hash.clone()),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
+                UserRepository::patch(
+                    &mut *tx,
+                    user_uuid,
+                    UserPatch {
+                        password: Some(e.password_hash.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
             }
 
             // Order is the point, and it used to be the projector's: the submitted
@@ -424,24 +422,24 @@ impl UserService {
             // the whole feature decorative.
             UserEvent::Updated(e) => {
                 if e.email.as_ref().is_some_and(|new| *new != existing.email) {
-                    users
-                        .patch(
-                            user_uuid,
-                            UserPatch {
-                                email_verified: Some(false),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
+                    UserRepository::patch(
+                        &mut *tx,
+                        user_uuid,
+                        UserPatch {
+                            email_verified: Some(false),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
                 }
-                users.patch(user_uuid, e.clone().into()).await?;
+                UserRepository::patch(&mut *tx, user_uuid, e.clone().into()).await?;
             }
 
             // `update_user` builds only the two variants above.
             _ => {}
         }
 
-        db::set_version(&tx, "user", &user_uuid, version).await?;
+        db::set_version(&mut tx, "user", &user_uuid, version).await?;
 
         let envelope = Envelope::new(
             event,
@@ -451,7 +449,7 @@ impl UserService {
         );
         let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        outbox::enqueue(&tx, &user_subject(&user_uuid), &envelope).await?;
+        outbox::enqueue(&mut *tx, &user_subject(&user_uuid), &envelope).await?;
         tx.commit().await?;
 
         Ok(await_token)
@@ -474,7 +472,7 @@ impl UserService {
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
 
-        for user in self.users.all().await? {
+        for user in UserRepository::all(&self.db).await? {
             let user_id = user.id;
 
             let registered = UserRegistered {
@@ -501,7 +499,7 @@ impl UserService {
             let now = Utc::now();
 
             sent += outbox::backfill(
-                &self.users.q,
+                &self.db,
                 &user_subject(&user_id),
                 &aggregate_id("user", &user_id),
                 user.version,
