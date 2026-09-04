@@ -31,6 +31,20 @@ imagePullPolicy: Always
 # Checkout Session and Stripe may fetch them server-side.
 mediaBase: &mediaBase https://images.ourdriveway.example.com
 
+# SECONDS. How long after a booking ends its money counts as settled — one day.
+#
+# Aliased into two services for the same reason as mediaBase: they must agree. payment
+# decides what `POST /api/payment/payout` actually hands over; view decides what the
+# wallet SHOWS as available rather than pending. Two different numbers means a balance
+# that offers money the withdraw endpoint refuses, or hides money it would have paid.
+#
+# A renter cannot cancel inside an hour of the start and the host-side withdrawal only
+# touches bookings that haven't ended, so a confirmed booking with a past `ends_at` is
+# already safe to pay out today. This is the margin that keeps it safe if those rules
+# are ever relaxed. Both `.env` files set 0 so a payout is testable locally without
+# waiting a day.
+settlementSecs: &settlementSecs "86400"
+
 # Keys are load-bearing three times over: the image is
 # ourdriveway-<name>-service, the schema key is <name>-schema.surql, and the
 # ingress path is /api/<name>. Rename one and all three follow.
@@ -49,19 +63,16 @@ services:
       # Validates that a host's submitted listing photos are on our origin — without
       # it a listing could point its photos at any host. See shared/src/media.rs.
       MEDIA_BASE: *mediaBase
-  view: {}
+  view:
+    env:
+      # The read side of the same rule — see the anchor above. This one decides whether
+      # the wallet calls a host's income available or pending.
+      SETTLEMENT_SECS: *settlementSecs
   payment:
     env:
-      # SECONDS. How long after a booking ends its money becomes withdrawable by the
-      # host — one day. Not secret and better off visible in review; the Stripe keys
-      # come from secrets.env instead.
-      #
-      # A renter cannot cancel inside an hour of the start and the host-side withdrawal
-      # only touches bookings that haven't ended, so a confirmed booking with a past
-      # `ends_at` is already safe to pay out today. This is the margin that keeps it
-      # safe if those rules are ever relaxed. payment-service's .env sets 0 so a payout
-      # is testable locally without waiting a day.
-      SETTLEMENT_SECS: "86400"
+      # The write side: what a withdrawal actually pays out. Not secret and better off
+      # visible in review; the Stripe keys come from secrets.env instead.
+      SETTLEMENT_SECS: *settlementSecs
   # The one service that talks to neither a database nor the broker: it mints
   # presigned R2 upload URLs and holds nothing at all. Both flags off strips the
   # SurrealDB env, the schema and both init containers — see

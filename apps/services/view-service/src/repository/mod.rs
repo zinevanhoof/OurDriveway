@@ -40,8 +40,21 @@
 //! | | `find_all_owner_by_spot_id` | `spot_id = $1` — ownership already proved |
 //! | | `find_all_by_renter_id` | `renter_id = $1` |
 //! | | `find_owner_by_id` | `id = $1 AND (renter_id = $2 OR owner_id = $2)` |
-//! | `payout` | `find_all_by_owner_id` | `owner_id = $1` |
+//! | `payment` + `payout` | `wallet::find_month` | `owner_id = $1 OR renter_id = $1`, as five separately-indexed branches |
+//! | | `wallet::find_previous_month` | the same, as four `max()`es |
+//! | | `wallet::balance` | `owner_id = $1` |
 //! | `app_user` | `find_owner_by_id` | `id = $1` — the verified claim picks the row |
+//!
+//! `payout`'s own `find_all_by_owner_id` is gone with the endpoint it served. Its rule
+//! — `owner_id = $1`, the whole query rather than a clause, because a withdrawal is
+//! visible to exactly one person — is now the wallet's payout branch.
+//!
+//! **`payment` is new here, and it reverses what 0001_init.sql says.** That file records
+//! payments as deliberately absent from the read model. They are present now, because
+//! reading is this service's job; what stops the old objection coming true is that no
+//! money is ever *spent* against these rows — `PaymentService::request_payout` computes
+//! what it pays out from its own tables, in its own transaction, under a lock. See
+//! `migrations/view/0003_payment.sql`.
 //!
 //! **One function per audience, rather than one clause serving two.** The old
 //! `(active OR owner_id = $caller)` and `(renter_id = $caller OR owner_id = $caller OR
@@ -52,9 +65,11 @@
 //! there is nothing in flight to cut and no `Option` that means "denied".
 
 pub mod booking_repository;
+pub mod payment_repository;
 pub mod payout_repository;
 pub mod spot_repository;
 pub mod user_repository;
+pub mod wallet_repository;
 
 /// Round-trips the read model through a real YugabyteDB.
 ///
@@ -81,7 +96,7 @@ pub mod user_repository;
 mod live_tests {
     use std::collections::HashMap;
 
-    use chrono::Utc;
+    use chrono::{Datelike, Timelike, Utc};
     use shared::domain_models::booking::status;
     use shared::domain_models::view::{
         ViewBooking, ViewBookingPatch, ViewSpotPatch, ViewUser, ViewUserPatch,
@@ -116,6 +131,7 @@ mod live_tests {
             profile_picture: None,
             email: format!("view-{id}@example.test"),
             license_plates: vec![],
+            country: None,
         }
     }
 
@@ -213,9 +229,13 @@ mod live_tests {
         // The owner has not been projected yet, and the spot is written anyway. That
         // used to be the hard case — the `owner` link could only be resolved against
         // a row that existed — and is now unremarkable: `owner_id` is a uuid.
-        ViewSpotRepository::merge(&db, spot_id, ViewSpotPatch::created(spot_created(spot_id, owner_id), at))
-            .await
-            .unwrap();
+        ViewSpotRepository::merge(
+            &db,
+            spot_id,
+            ViewSpotPatch::created(spot_created(spot_id, owner_id), at),
+        )
+        .await
+        .unwrap();
 
         let (got_owner, lng, lat): (Uuid, f64, f64) =
             sqlx::query_as("SELECT owner_id, lng, lat FROM spot WHERE id = $1")
@@ -289,9 +309,14 @@ mod live_tests {
         .await
         .unwrap();
 
-        ViewBookingRepository::settle(&db, booking_id, status::RESERVED, ViewBookingPatch::confirmed())
-            .await
-            .unwrap();
+        ViewBookingRepository::settle(
+            &db,
+            booking_id,
+            status::RESERVED,
+            ViewBookingPatch::confirmed(),
+        )
+        .await
+        .unwrap();
         assert_eq!(status_of(&db, booking_id).await, status::CONFIRMED);
 
         // Redelivery: no longer `reserved`, so the guard refuses and the row stands.
@@ -400,10 +425,16 @@ mod live_tests {
         // The targets arrive. Nothing revisits the booking, and the joins resolve
         // themselves — which is the property the old `link_refs`/`backfill_links` pair
         // spent four methods and three tests approximating.
-        ViewUserRepository::upsert(&db, a_user(renter_id)).await.unwrap();
-        ViewSpotRepository::merge(&db, spot_id, ViewSpotPatch::created(spot_created(spot_id, owner_id), at))
+        ViewUserRepository::upsert(&db, a_user(renter_id))
             .await
             .unwrap();
+        ViewSpotRepository::merge(
+            &db,
+            spot_id,
+            ViewSpotPatch::created(spot_created(spot_id, owner_id), at),
+        )
+        .await
+        .unwrap();
 
         let mine = ViewBookingRepository::find_all_by_renter_id(&db, renter_id)
             .await
@@ -418,7 +449,10 @@ mod live_tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            one.renter.as_ref().expect("the renter resolves now").first_name,
+            one.renter
+                .as_ref()
+                .expect("the renter resolves now")
+                .first_name,
             "Ada"
         );
 
@@ -519,13 +553,13 @@ mod live_tests {
         let mut ids = Vec::new();
         let mut expected = Vec::new();
         for (i, (d_lng, d_lat)) in [
-            (0.0, 0.0),        // dead centre
-            (0.01, 0.0),       // ~700m east
-            (0.0, 0.03),       // ~3.3km north
-            (0.05, 0.0),       // ~3.5km east
-            (0.045, 0.04),     // inside the BOX corner, outside the CIRCLE
-            (0.0, 0.06),       // ~6.7km north — outside
-            (0.5, 0.5),        // far outside
+            (0.0, 0.0),    // dead centre
+            (0.01, 0.0),   // ~700m east
+            (0.0, 0.03),   // ~3.3km north
+            (0.05, 0.0),   // ~3.5km east
+            (0.045, 0.04), // inside the BOX corner, outside the CIRCLE
+            (0.0, 0.06),   // ~6.7km north — outside
+            (0.5, 0.5),    // far outside
         ]
         .into_iter()
         .enumerate()
@@ -544,9 +578,10 @@ mod live_tests {
             ViewSpotRepository::merge(&db, id, patch).await.unwrap();
         }
 
-        let got = ViewSpotRepository::find_all_by_radius(&db, caller, centre_lng, centre_lat, radius)
-            .await
-            .unwrap();
+        let got =
+            ViewSpotRepository::find_all_by_radius(&db, caller, centre_lng, centre_lat, radius)
+                .await
+                .unwrap();
 
         let mut got_ids: Vec<Uuid> = got
             .iter()
@@ -607,10 +642,16 @@ mod live_tests {
         let at = Utc::now();
         let ends_at = at + chrono::TimeDelta::hours(4);
 
-        ViewUserRepository::upsert(&db, a_user(renter)).await.unwrap();
-        ViewSpotRepository::merge(&db, spot_id, ViewSpotPatch::created(spot_created(spot_id, owner), at))
+        ViewUserRepository::upsert(&db, a_user(renter))
             .await
             .unwrap();
+        ViewSpotRepository::merge(
+            &db,
+            spot_id,
+            ViewSpotPatch::created(spot_created(spot_id, owner), at),
+        )
+        .await
+        .unwrap();
         ViewBookingRepository::upsert(
             &db,
             ViewBooking {
@@ -651,7 +692,11 @@ mod live_tests {
         // saying so, because the first `assert_eq!` on a round-tripped timestamp
         // anywhere else will fail for a reason that reads like a bug.
         assert!(
-            (b.ends_at - ends_at).num_microseconds().unwrap_or(i64::MAX).abs() <= 1,
+            (b.ends_at - ends_at)
+                .num_microseconds()
+                .unwrap_or(i64::MAX)
+                .abs()
+                <= 1,
             "the slots' end is public, to the microsecond the column stores"
         );
         // The renter, the amount and the hold expiry are not asserted absent here —
@@ -665,7 +710,10 @@ mod live_tests {
         assert_eq!(owned.len(), 1);
         assert_eq!(owned[0].amount, 4200, "the host sees the amount");
         assert!(owned[0].renter.0.is_some(), "the host sees the renter");
-        assert!(owned[0].hold_until.is_some(), "the host sees the hold expiry");
+        assert!(
+            owned[0].hold_until.is_some(),
+            "the host sees the hold expiry"
+        );
 
         // A released booking stops blocking, so it leaves the availability answer.
         ViewBookingRepository::settle(
@@ -767,7 +815,11 @@ mod live_tests {
             "DELETE FROM spot WHERE id = $1",
         ] {
             sqlx::query(sql)
-                .bind(if sql.contains("booking") { booking_id } else { spot_id })
+                .bind(if sql.contains("booking") {
+                    booking_id
+                } else {
+                    spot_id
+                })
                 .execute(&db)
                 .await
                 .unwrap();
@@ -779,51 +831,256 @@ mod live_tests {
             .unwrap();
     }
 
-    /// A host must never read another host's withdrawals.
+    /// The wallet, end to end against a real database: four sources in one ordered
+    /// list, the right sign on each, and nothing of anyone else's.
     ///
-    /// `payout` had the strictest clause of the four —
-    /// `FOR select WHERE owner_id = record::id($auth)`, with no public half at all —
-    /// and it is the one where a dropped predicate would expose other people's money.
+    /// The signs are the part that only a database can check. Each is a different
+    /// branch of one `UNION ALL`, and swapping two of them compiles, passes every unit
+    /// test, and shows a host their income as an expense.
+    ///
+    /// `payout` also had the strictest select rule of any table here —
+    /// `FOR select WHERE owner_id = record::id($auth)`, with no public half at all — so
+    /// the "and nobody else's" half of this is what that rule became.
     #[tokio::test]
     #[ignore]
-    async fn payouts_are_visible_to_their_owner_and_nobody_else() {
+    async fn a_wallet_month_carries_every_source_with_the_callers_own_signs() {
+        use super::payment_repository::ViewPaymentRepository;
         use super::payout_repository::ViewPayoutRepository;
-        use shared::domain_models::view::ViewPayout;
+        use super::wallet_repository::WalletRepository;
+        use shared::domain_models::payment::payout::status as payout_status;
+        use shared::domain_models::view::{ViewPayment, ViewPaymentPatch, ViewPayout};
+        use shared::projections::wallet::kind;
 
         let db = db().await;
-        let (mine, theirs) = (Uuid::now_v7(), Uuid::now_v7());
-        let payout_id = Uuid::now_v7();
+        let (host, renter, stranger) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let (spot_id, booking_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let (charged, refunded, payout_id) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+
+        // Mid-month, so the month's bounds are nowhere near the timestamps and a
+        // half-open-range bug shows up as a missing row rather than a lucky pass.
+        let at = Utc::now()
+            .with_day(15)
+            .expect("every month has a 15th")
+            .with_hour(12)
+            .unwrap();
+        let (start, end) =
+            crate::policy::wallet::bounds(&crate::policy::wallet::label(at)).unwrap();
+
+        ViewSpotRepository::merge(
+            &db,
+            spot_id,
+            ViewSpotPatch::created(spot_created(spot_id, host), at),
+        )
+        .await
+        .unwrap();
+        ViewBookingRepository::upsert(
+            &db,
+            ViewBooking {
+                id: booking_id,
+                version: 1,
+                spot_id,
+                owner_id: host,
+                renter_id: renter,
+                booked: HashMap::new(),
+                amount: 2_000,
+                status: status::CONFIRMED.to_string(),
+                hold_until: None,
+                release_reason: None,
+                cancel_reason: None,
+                rating: None,
+                // Already over, so the host's income counts as settled rather than
+                // pending — the `pending` assertion below is on this.
+                ends_at: at - chrono::Duration::days(2),
+                created_at: at,
+            },
+        )
+        .await
+        .unwrap();
+
+        for (id, amount) in [(charged, 2_000), (refunded, 700)] {
+            ViewPaymentRepository::upsert(
+                &db,
+                ViewPayment {
+                    id,
+                    version: 1,
+                    booking_id,
+                    owner_id: host,
+                    renter_id: renter,
+                    amount,
+                    status: shared::domain_models::payment::status::SUCCEEDED.to_string(),
+                    created_at: at,
+                    refunded_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        ViewPaymentRepository::transition(&db, refunded, ViewPaymentPatch::refunded(at))
+            .await
+            .unwrap();
 
         ViewPayoutRepository::upsert(
             &db,
             ViewPayout {
                 id: payout_id,
                 version: 1,
-                owner_id: mine,
+                owner_id: host,
                 amount: 9_900,
-                created_at: Utc::now(),
+                status: payout_status::PAID.to_string(),
+                created_at: at,
             },
         )
         .await
         .unwrap();
 
-        let ours = ViewPayoutRepository::find_all_by_owner_id(&db, mine).await.unwrap();
-        assert_eq!(ours.len(), 1);
-        assert_eq!(ours[0].amount, 9_900);
+        // Settled a day ago: everything above is older than that, so nothing is pending.
+        let settled_before = at - chrono::Duration::days(1);
+
+        let hosts = WalletRepository::find_month(&db, host, start, end, settled_before)
+            .await
+            .unwrap();
+        let of = |k: &str, amount: i64| {
+            hosts
+                .iter()
+                .any(|t| t.kind == k && t.amount_cents == amount)
+        };
+
+        assert!(of(kind::IN, 2_000), "the charge is income to the host");
+        assert!(of(kind::IN, 700), "so is the one later refunded");
+        assert!(
+            of(kind::REFUND, -700),
+            "and giving it back takes it away again"
+        );
+        assert!(of(kind::PAYOUT, -9_900), "a withdrawal is money leaving");
+        assert!(
+            hosts.iter().all(|t| !t.pending),
+            "every booking here ended before the settlement cutoff"
+        );
+        assert!(
+            hosts.iter().any(|t| t.title.as_deref() == Some("Driveway")),
+            "the spot join must resolve"
+        );
+
+        let renters = WalletRepository::find_month(&db, renter, start, end, settled_before)
+            .await
+            .unwrap();
+        assert!(
+            renters
+                .iter()
+                .any(|t| t.kind == kind::OUT && t.amount_cents == -2_000),
+            "the same charge is an expense to the renter"
+        );
+        assert!(
+            renters
+                .iter()
+                .any(|t| t.kind == kind::REFUND && t.amount_cents == 700),
+            "and their refund is money back"
+        );
+        assert!(
+            !renters.iter().any(|t| t.kind == kind::PAYOUT),
+            "a renter must not see the host's withdrawals"
+        );
+
+        // Ordering is the whole list's, across the union — not per branch.
+        assert!(
+            hosts
+                .windows(2)
+                .all(|w| w[0].occurred_at >= w[1].occurred_at),
+            "newest first"
+        );
+
+        // Two rows off one payment, so the ids have to differ or the list has duplicate
+        // keys — which is what the `:kind` suffix is for.
+        let ids: Vec<&str> = hosts.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            "every row needs its own id"
+        );
 
         assert!(
-            ViewPayoutRepository::find_all_by_owner_id(&db, theirs)
+            WalletRepository::find_month(&db, stranger, start, end, settled_before)
                 .await
                 .unwrap()
                 .is_empty(),
-            "another host must see none of these"
+            "none of this is anyone else's business"
         );
 
-        sqlx::query("DELETE FROM payout WHERE id = $1")
-            .bind(payout_id)
-            .execute(&db)
+        // The cursor: nothing older than this month exists for these three.
+        assert_eq!(
+            WalletRepository::find_previous_month(&db, host, start)
+                .await
+                .unwrap(),
+            None,
+            "there is no earlier month to walk to"
+        );
+
+        // Balance: 2000 earned and settled, 700 refunded (its payment is no longer
+        // `succeeded`), 9900 withdrawn.
+        let mut conn = db.acquire().await.unwrap();
+        let balance = WalletRepository::balance(&mut conn, host, settled_before)
             .await
             .unwrap();
+        assert_eq!(balance.earned_cents, 2_000);
+        assert_eq!(balance.paid_out_cents, 9_900);
+        assert_eq!(
+            balance.available_cents, -7_900,
+            "overdrawn is the honest answer"
+        );
+        assert_eq!(balance.pending_cents, 0);
+
+        // Where the withdrawal got to, which is the same question asked twice — once by
+        // the list and once by the balance. Both must agree with payment-service's
+        // `PayoutRepository::total_for`, which is the authority on the same three
+        // statuses.
+        for (status, counts, pending) in [
+            (payout_status::REQUESTED, true, true),
+            (payout_status::PAID, true, false),
+            (payout_status::FAILED, false, false),
+        ] {
+            ViewPayoutRepository::set_status(&db, payout_id, status)
+                .await
+                .unwrap();
+
+            let rows = WalletRepository::find_month(&db, host, start, end, settled_before)
+                .await
+                .unwrap();
+            let row = rows.iter().find(|t| t.kind == kind::PAYOUT);
+            assert_eq!(
+                row.is_some(),
+                counts,
+                "a {status} withdrawal's place in the list"
+            );
+            assert_eq!(
+                row.map(|t| t.pending),
+                counts.then_some(pending),
+                "a {status} withdrawal's PENDING chip"
+            );
+
+            let balance = WalletRepository::balance(&mut conn, host, settled_before)
+                .await
+                .unwrap();
+            assert_eq!(
+                balance.paid_out_cents,
+                if counts { 9_900 } else { 0 },
+                "a failed withdrawal must hand the money back — there is no other \
+                 mechanism, the balance is derived on every read"
+            );
+        }
+
+        for (table, id) in [
+            ("payment", charged),
+            ("payment", refunded),
+            ("payout", payout_id),
+            ("booking", booking_id),
+            ("spot", spot_id),
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE id = $1"))
+                .bind(id)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
     }
 
     async fn status_of(db: &PgPool, id: Uuid) -> String {

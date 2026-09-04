@@ -1,16 +1,18 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-// No `ViewPayoutPatch`: a payout is written once and never edited. Reversing one
-// would be another row, not a change to this one.
+// No `ViewPayoutPatch`, even though a payout is no longer written once: the only column
+// that changes is `status`, and the projector's two arms set it directly rather than
+// through a struct with one populated field. `transfer_id` and `failure_reason` are
+// deliberately NOT projected — they are Stripe handles and a log message, and nothing a
+// browser can reach has any use for either, exactly as with `payment.intent_id`.
 
-/// The `payout` table in the read model — a host's withdrawal *history*.
+/// The `payout` table in the read model — a host's withdrawals.
 ///
-/// This is the only thing PAYMENTS contributes to the read model, deliberately. A
-/// renter's charges and a host's balance are payment-service's to answer, and
-/// projecting them here too would give the payout button one number and the balance
-/// beside it another. What belongs here is the list, so it can be queried alongside
-/// the rest of a profile like everything else.
+/// One of the two tables PAYMENTS feeds; [`super::payment::ViewPayment`] is the other,
+/// and the note there records why that stopped being a rule against. These rows are
+/// read as one of the four sources of a wallet month rather than as a list of their
+/// own: withdrawals beside the charges they came from is the point.
 ///
 /// There is no `owner` link column any more, and nothing to relink: the read model
 /// holds plain uuids and resolves references with a LEFT JOIN at read time.
@@ -24,6 +26,13 @@ pub struct ViewPayout {
     pub owner_id: Uuid,
     /// EUR cents.
     pub amount: i64,
+    /// `requested`, `paid` or `failed`, mirrored from payment-service. No enum and no
+    /// CHECK: that service's table is the authority, and a status it adds must be a row
+    /// this wallet ignores rather than a projector that stops.
+    ///
+    /// The wallet reads it twice — as the PENDING chip (`requested`) and as the filter
+    /// that keeps failed withdrawals out of both the list and the balance.
+    pub status: String,
     pub created_at: DateTime<Utc>,
 }
 

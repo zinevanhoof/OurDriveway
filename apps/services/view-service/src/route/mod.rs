@@ -1,6 +1,6 @@
 //! HTTP shape only: extract, call one repository function, pick a status.
 //!
-//! Eight endpoints, and **each one has a single responsibility**. Three rules shape all
+//! Nine endpoints, and **each one has a single responsibility**. Three rules shape all
 //! of them:
 //!
 //! - **One route, one audience, one projection, one repository call.** A handler never

@@ -50,6 +50,14 @@ export type PublicViewUser = {
 export type OwnerViewUser = PublicViewUser & {
   email: string;
   licensePlates: string[];
+  /**
+   * ISO 3166-1 alpha-2, or null until the profile sets it.
+   *
+   * Scoped like `email` rather than like `licensePlates`: only its owner sees it.
+   * It exists because Stripe will not open a connected account without a country and
+   * fixes it permanently at creation, so a host sets it once, before onboarding.
+   */
+  country: string | null;
 };
 
 /** `GET /api/view/me`. `profile` is null only between signup and its projection. */
@@ -148,10 +156,58 @@ export type BookingListItem = {
   spot: SpotCard | null;
 };
 
-/** `GET /api/view/me/payouts`. */
-export type PayoutListItem = {
+/**
+ * One line of the wallet: a single movement of money involving the caller.
+ *
+ * `GET /api/view/me/payouts` and its `PayoutListItem` are gone — withdrawals are one of
+ * the four kinds below, in the same list as everything else that moved.
+ */
+export type WalletTransaction = {
+  /** `<uuid>:<kind>`. One payment yields two rows — the charge and its refund. */
   id: string;
-  /** EUR cents. */
-  amount: number;
-  createdAt: string;
+  /**
+   * What it is, which decides the icon. The *direction* is the sign of `amountCents`,
+   * because a refund is money back to a renter and money away from a host.
+   */
+  kind: "in" | "out" | "refund" | "payout";
+  /** Signed EUR cents, from the caller's point of view: what their balance did. */
+  amountCents: number;
+  /** ISO 8601. What the month grouping and the ordering are on. */
+  occurredAt: string;
+  /** Host income that has not settled yet, so it is not withdrawable. */
+  pending: boolean;
+  /** The spot's title. Null on a payout, and on a spot not projected yet. */
+  title: string | null;
+  /** The booking's slots, in the spot's own wall clock. Null on a payout. */
+  booked: Booked | null;
+  /** The spot's IANA zone, which is what `booked` is written in. */
+  timezone: string | null;
+};
+
+/**
+ * `GET /api/view/me/wallet?month=YYYY-MM` — one month, which is also one page.
+ *
+ * `nextMonth` is the cursor: the next older month that holds anything, or null at the
+ * end of the history. Asking for the month after it would be asking for nothing.
+ */
+export type WalletMonth = {
+  /** `"YYYY-MM"`. */
+  month: string;
+  /** Everything that came in, positive. */
+  inCents: number;
+  /** Everything that went out, **positive**, and not counting withdrawals. */
+  outCents: number;
+  nextMonth: string | null;
+  transactions: WalletTransaction[];
+};
+
+/** `GET /api/view/me/balance` — a host's money. */
+export type Balance = {
+  /** Withdrawable now: settled income minus what has already been taken out. */
+  availableCents: number;
+  /** Everything earned and settled, ever. */
+  earnedCents: number;
+  paidOutCents: number;
+  /** Earned but not settled yet — what `availableCents` will grow by. */
+  pendingCents: number;
 };

@@ -10,7 +10,7 @@ const route = useRoute()
 
 <template>
     <component :is="route.meta.header" v-if="auth.isAuthenticated && route.meta.header" />
-    <main class="flex flex-1 flex-col overflow-y-auto bg-background text-foreground">
+    <main class="no-scrollbar flex flex-1 flex-col overflow-y-auto bg-background text-foreground">
         <RouterView />
     </main>
 

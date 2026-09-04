@@ -1,9 +1,10 @@
 //! The combined read model: the one database a browser can reach.
 //!
-//! Four tables, one per stream view-service consumes, and every one of them a
-//! *different* table from the same-named one in the owning service's private
-//! database — hence the `View` prefix throughout. `ViewSpot` is what a map query
-//! returns; `domain_models::spot::Spot` is what spot-service stores.
+//! Five tables over the four streams view-service consumes — PAYMENTS contributes
+//! two, `payment` and `payout` — and every one of them a *different* table from the
+//! same-named one in the owning service's private database, hence the `View` prefix
+//! throughout. `ViewSpot` is what a map query returns; `domain_models::spot::Spot` is
+//! what spot-service stores.
 //!
 //! **None of these models carry their `record<>` link columns.** `spot.owner`,
 //! `booking.spot`, `booking.renter` and `payout.owner` are set by a subquery that
@@ -21,11 +22,13 @@
 //! same transaction — each model says which.
 
 pub mod booking;
+pub mod payment;
 pub mod payout;
 pub mod spot;
 pub mod user;
 
 pub use booking::{ViewBooking, ViewBookingPatch};
+pub use payment::{ViewPayment, ViewPaymentPatch};
 pub use payout::ViewPayout;
 pub use spot::{ViewSpot, ViewSpotPatch};
 pub use user::{ViewUser, ViewUserPatch};

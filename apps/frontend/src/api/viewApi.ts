@@ -1,12 +1,13 @@
 import { apiFetch } from "@/api/king";
 import type {
+  Balance,
   BookingListItem,
   Me,
   OwnerViewBooking,
   OwnerViewSpot,
-  PayoutListItem,
   PublicViewSpot,
   SpotListItem,
+  WalletMonth,
 } from "@/types/view";
 
 // Every read the client makes, over plain REST.
@@ -60,7 +61,9 @@ export const viewKeys = {
   bookings: ["bookings"] as const,
   myBookings: ["bookings", "mine"] as const,
   booking: (id: string) => ["bookings", id] as const,
-  payouts: ["payouts"] as const,
+  /** Every page of the wallet: `useInfiniteQuery` holds all its months under this. */
+  wallet: ["wallet"] as const,
+  balance: ["balance"] as const,
 };
 
 /** The caller's own profile, chosen by the server from the verified claim. */
@@ -73,8 +76,31 @@ export const fetchMySpots = () => get<SpotListItem[]>("/api/view/me/spots");
 export const fetchMyBookings = () =>
   get<BookingListItem[]>("/api/view/me/bookings");
 
-/** The caller's own withdrawal history, newest first. */
-export const fetchPayouts = () => get<PayoutListItem[]>("/api/view/me/payouts");
+/**
+ * One month of the caller's money: charges as a host, charges as a renter, refunds
+ * either way, and withdrawals — in one list, newest first.
+ *
+ * Omit `month` for the current one. The response says which month it is and which one
+ * to ask for next, so a client never has to guess a date or walk through empty months.
+ *
+ * This replaced `fetchPayouts`. Withdrawal history was its own endpoint off its own
+ * table; it is one of the four kinds here now, because a list of what left your balance
+ * that omits what entered it is not a wallet.
+ */
+export const fetchWallet = (month?: string) =>
+  get<WalletMonth>(
+    month ? `/api/view/me/wallet?month=${month}` : "/api/view/me/wallet",
+  );
+
+/**
+ * What the caller has earned, withdrawn, and is still waiting on.
+ *
+ * This was `GET /api/payment/earnings`. It moved here with every other read — but the
+ * figure a withdrawal actually pays out is still computed by payment-service inside the
+ * transaction that pays it, so this one being a moment behind the projector can never
+ * overpay anyone.
+ */
+export const fetchBalance = () => get<Balance>("/api/view/me/balance");
 
 /**
  * Spots within `meters` of a point.

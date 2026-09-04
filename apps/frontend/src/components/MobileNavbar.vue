@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { cn } from '@/lib/utils';
-import { Home, ParkingSquare, Search, User } from '@lucide/vue';
+import { Home, ParkingSquare, Search, Wallet } from '@lucide/vue';
 import { motion } from 'motion-v';
 import { RouterLink, useRoute } from 'vue-router';
 
@@ -10,7 +10,7 @@ const items = [
     { id: "Home", path: "/", icon: Home },
     { id: "Search", path: "/search", icon: Search },
     { id: "Spots", path: "/spots", icon: ParkingSquare },
-    { id: "Profile", path: "/profile", icon: User }
+    { id: "Wallet", path: "/wallet", icon: Wallet }
 ]
 </script>
 

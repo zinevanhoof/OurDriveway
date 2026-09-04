@@ -7,5 +7,11 @@
 //!
 //! It exists because PostGIS is unavailable on YSQL. With a geometry type and a GiST
 //! index the database would own this entirely; without one, the narrowing is ours.
+//!
+//! `wallet` joined it for the same kind of reason: which instants a month covers, and
+//! which rows count towards which total, are decisions a wallet is wrong about in ways
+//! nobody would notice — an off-by-one on a month boundary or a withdrawal counted as
+//! spending. Both are arithmetic, so both are testable with nothing running.
 
 pub mod geo;
+pub mod wallet;

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
-import { computed, onScopeDispose, ref, watch } from 'vue'
+import { computed, inject, onScopeDispose, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useForm, useFieldArray, Field as VeeField } from 'vee-validate'
 import { z } from 'zod'
@@ -10,6 +10,7 @@ import { Camera, Plus, Trash2 } from '@lucide/vue'
 import FullScreenLayoutComponent from '../FullScreenLayoutComponent.vue'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
 import { Spinner } from '@/components/ui/spinner'
 import Avatar from '@/components/ui/avatar/Avatar.vue'
@@ -22,6 +23,7 @@ import { uploadImage } from '@/api/mediaApi'
 import { fetchMe } from '@/api/me'
 import { useAuthStore } from '@/stores/auth'
 import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
+import { countryOptions } from '@/lib/countries'
 
 const router = useRouter()
 const auth = useAuthStore()
@@ -33,6 +35,13 @@ const { data } = useQuery({
 })
 
 const me = computed(() => data.value?.profile)
+
+// Built once: the list is fixed and the names only depend on the browser's locale.
+const countries = countryOptions()
+
+// Provided in `main.ts` off `--safe-bottom`. Same injection the availability popover
+// uses, so every floating layer on a phone stops at the same line.
+const safeBottom = inject<number>('safeBottom')
 
 // The address the form was loaded with. Changing away from it is what makes the
 // password field appear — and what the server independently demands a password
@@ -50,6 +59,10 @@ const formSchema = toTypedSchema(
                 .min(1, 'License plate cannot be empty.')
                 .max(16, 'License plate must be at most 16 characters.'),
         ),
+        // Optional, and stays optional: only hosts need it, and demanding it of
+        // everyone would block a renter from saving their name. The empty string is
+        // the "not chosen" option in the select, and is dropped on submit.
+        country: z.string().optional(),
         currentPassword: z.string().optional(),
     }).superRefine((values, ctx) => {
         // Only a changed email needs it, so an empty box is not an error on a
@@ -65,7 +78,7 @@ const formSchema = toTypedSchema(
 
 const { handleSubmit, setValues, setErrors, values } = useForm({
     validationSchema: formSchema,
-    initialValues: { firstName: '', lastName: '', email: '', licensePlates: [], currentPassword: '' },
+    initialValues: { firstName: '', lastName: '', email: '', licensePlates: [], country: '', currentPassword: '' },
 })
 
 const { fields: plates, push: addPlate, remove: removePlate } = useFieldArray<string>('licensePlates')
@@ -88,6 +101,8 @@ watch(me, (user) => {
         lastName: user.lastName,
         email: user.email,
         licensePlates: [...(user.licensePlates ?? [])],
+        // Null until a host sets it, and the select's empty option is `''`.
+        country: user.country ?? '',
         currentPassword: '',
     })
 }, { immediate: true })
@@ -118,6 +133,10 @@ const submit = handleSubmit(async (form) => {
             // Trimmed here because the schema validates the trimmed length but
             // zod's .trim() doesn't rewrite the value bound to the input.
             licensePlates: form.licensePlates.map(p => p.trim()),
+            // `undefined` is "unchanged" all the way to the projection, so the empty
+            // option sends nothing rather than trying to clear a country — which the
+            // server could not honour anyway once Stripe holds a copy of it.
+            country: form.country || undefined,
             currentPassword: form.currentPassword || undefined,
             // Omitted entirely when they didn't pick one: `undefined` means
             // "unchanged" all the way through to the projection, and sending a
@@ -231,6 +250,40 @@ const submit = handleSubmit(async (form) => {
                             </Field>
                         </VeeField>
                     </div>
+                </FieldGroup>
+
+                <FieldGroup class="gap-4">
+                    <div>
+                        <div class="font-bold">Payouts</div>
+                        <div class="text-xs text-muted-foreground font-medium">
+                            Only needed if you rent out a driveway.
+                        </div>
+                    </div>
+
+                    <VeeField v-slot="{ value, handleChange, errors }" name="country">
+                        <Field :data-invalid="!!errors.length" class="gap-1">
+                            <FieldLabel for="edit-profile-country">Country you bank in</FieldLabel>
+                            <Select :model-value="value || undefined" @update:model-value="handleChange">
+                                <SelectTrigger id="edit-profile-country" :aria-invalid="!!errors.length"
+                                    class="bg-card">
+                                    <SelectValue placeholder="Not set" />
+                                </SelectTrigger>
+                                <SelectContent position="popper" :collision-padding="{ top: 60 }">
+                                    <SelectGroup>
+                                        <SelectItem v-for="country in countries" :key="country.code"
+                                            :value="country.code">
+                                            {{ country.name }}
+                                        </SelectItem>
+                                    </SelectGroup>
+                                </SelectContent>
+                            </Select>
+                            <FieldDescription>
+                                Stripe needs this to open your payout account, and it can't be
+                                changed once that account exists.
+                            </FieldDescription>
+                            <FieldError v-if="errors.length" :errors="errors" />
+                        </Field>
+                    </VeeField>
                 </FieldGroup>
 
                 <FieldGroup class="gap-4">

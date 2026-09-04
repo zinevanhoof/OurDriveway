@@ -1,0 +1,16 @@
+-- When a refund happened, as opposed to when the payment it reverses was created.
+--
+-- A refund reuses the payment row and flips `status`, so before this column the only
+-- instant on the row was `created_at` — the moment the CHECKOUT SESSION was made. A
+-- history that places a refund there puts it in the month the booking was paid for
+-- rather than the month the money came back, which for a booking cancelled near the
+-- turn of a month is simply the wrong month.
+--
+-- Set in the same statement as `refund_id` (`PaymentPatch::refunded`), the same way
+-- `intent_id` is set with `status = 'succeeded'`. Keep the two writes together: a row
+-- with one and not the other is a refund nothing can date.
+--
+-- Nullable, and null for every payment refunded before this migration ran. Backfilling
+-- it from `created_at` would be inventing a timestamp, so those rows are simply absent
+-- from a wallet's refund line — see `WalletRepository::find_month`.
+ALTER TABLE payment ADD COLUMN refunded_at timestamptz;

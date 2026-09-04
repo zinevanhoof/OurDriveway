@@ -16,8 +16,12 @@ const props = defineProps<{
   size?: "sm" | "default"
 }>()
 
+// The tuple is the payload list, and it has to be one: a bare type here declares an
+// event that takes *no arguments*, so `v-model` and any typed `@update:model-value`
+// handler fail to typecheck against it. Nothing caught it because the only caller until
+// now — the calendar's month select — listens to the native `change` event instead.
 const emit = defineEmits<{
-  "update:modelValue": AcceptableValue
+  "update:modelValue": [value: AcceptableValue]
 }>()
 
 const modelValue = useVModel(props, "modelValue", emit, {

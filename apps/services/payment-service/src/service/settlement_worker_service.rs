@@ -16,6 +16,7 @@
 //! worker-driven and the name stays true.
 
 use bus::outbox;
+use chrono::Utc;
 use shared::db;
 use shared::{
     domain_models::payment::{PaymentPatch, status},
@@ -93,6 +94,11 @@ impl SettlementWorkerService {
                     booking_id: *booking_id,
                     refund_id,
                     amount_cents: payment.amount_cents,
+                    // Read once, here, and used for both the row and the event below —
+                    // not read again at either write. A second `Utc::now()` would give
+                    // this service's table and view-service's a different answer for
+                    // the same refund.
+                    refunded_at: Utc::now(),
                 }
             }
 
@@ -112,12 +118,16 @@ impl SettlementWorkerService {
         // The row moves in the same transaction as the event. Guarded, so a
         // redelivery that already applied is a no-op rather than a second refund.
         match &event {
-            PaymentEvent::Refunded { refund_id, .. } => {
+            PaymentEvent::Refunded {
+                refund_id,
+                refunded_at,
+                ..
+            } => {
                 PaymentRepository::transition(
                     &mut *tx,
                     payment_id,
                     &[status::SUCCEEDED],
-                    PaymentPatch::refunded(refund_id.clone()),
+                    PaymentPatch::refunded(refund_id.clone(), *refunded_at),
                 )
                 .await?;
             }
@@ -138,12 +148,8 @@ impl SettlementWorkerService {
         // Deterministic event id: a redelivery that gets this far — because the Stripe
         // call succeeded but the commit did not — is discarded by the stream's
         // duplicate window rather than recorded twice.
-        let mut envelope = Envelope::new(
-            event,
-            None,
-            aggregate_id("payment", &payment_id),
-            version,
-        );
+        let mut envelope =
+            Envelope::new(event, None, aggregate_id("payment", &payment_id), version);
         envelope.event_id = Uuid::new_v5(
             &Uuid::NAMESPACE_OID,
             format!("settle:{payment_id}:{}", booking.status).as_bytes(),

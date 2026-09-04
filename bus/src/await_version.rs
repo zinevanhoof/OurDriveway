@@ -123,10 +123,16 @@ pub async fn reached(
                 // a create closely.
                 Ok(_) => {}
                 // The table does not exist in *this* database, which is not a fault:
-                // view-service holds `payout` but no `payment`, and a client that has
-                // written a payment will still echo `payment:<id>@1` at it. There is
-                // nothing here to wait for, so stop rather than spin until the
-                // timeout.
+                // every service answers this header against its own schema, and a
+                // client that has written a booking echoes `booking:<id>@N` at all of
+                // them. There is nothing here to wait for, so stop rather than spin
+                // until the timeout.
+                //
+                // `payment` used to be the example — view-service held `payout` and no
+                // `payment`, so echoing a payment's version at it returned immediately.
+                // It holds both now, which means that wait is real: a client that has
+                // just paid, or just withdrawn, waits for the projector rather than
+                // reading a wallet without the thing it did in it.
                 Err(_) => return false,
             }
             tokio::time::sleep(POLL).await;
@@ -171,7 +177,10 @@ mod tests {
 
         // Every shape that used to be valid under the old stream-position header,
         // and every shape a client could mangle.
-        assert!(parsed("SPOTS:4712").is_empty(), "old stream form must not parse");
+        assert!(
+            parsed("SPOTS:4712").is_empty(),
+            "old stream form must not parse"
+        );
         assert!(parsed("user:not-a-uuid@7").is_empty());
         assert!(parsed(&format!("user:{id}@notanumber")).is_empty());
         assert!(parsed(&format!("user:{id}")).is_empty(), "no version");

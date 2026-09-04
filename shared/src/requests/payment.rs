@@ -2,6 +2,7 @@ use garde::Validate;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::domain_models::payment::payout::MIN_CENTS;
 use crate::validation::require;
 
 /// What the checkout step posts to start paying.
@@ -36,8 +37,34 @@ pub struct CreateSessionRequest {
     pub return_url: String,
 }
 
+/// What the withdraw screen posts.
+///
+/// Unlike [`CreateSessionRequest`] this one *does* carry an amount, and the difference
+/// is who the money belongs to: a renter choosing what to be charged would be picking a
+/// price, while a host choosing what to withdraw is picking how much of their own
+/// balance to take. It is still never trusted — the server recomputes the available
+/// figure under an advisory lock and only ever narrows this one.
+#[derive(Deserialize, Validate)]
+#[serde(rename_all = "camelCase")]
+pub struct PayoutRequest {
+    /// EUR cents. The upper bound is deliberately **not** here: a maximum is the
+    /// host's balance, which this crate cannot see and which is only true for the
+    /// instant it is read. That check belongs under the lock, in
+    /// `payment-service`'s `policy::payout`.
+    #[garde(custom(at_least_minimum))]
+    pub amount_cents: i64,
+}
+
 /// Spelled out rather than `length(min = 1)`: garde 0.23 has no message override on
 /// its built-ins, and this reaches the client verbatim.
 fn not_blank(value: &String, _: &()) -> garde::Result {
     require(!value.trim().is_empty(), "Required.")
+}
+
+/// Same reason as `not_blank`: garde's `range` would phrase this in cents.
+fn at_least_minimum(value: &i64, _: &()) -> garde::Result {
+    require(
+        *value >= MIN_CENTS,
+        "The smallest withdrawal is €10.",
+    )
 }

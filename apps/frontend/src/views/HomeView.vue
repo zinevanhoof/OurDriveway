@@ -7,8 +7,7 @@ import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDate
 import { locateUser, nearer, type Position } from '@/lib/geo';
 import { mergeBooked } from '@/lib/bookingAvailability';
 import { useAuthStore } from '@/stores/auth';
-import * as paymentApi from '@/api/paymentApi';
-import { fetchMyBookings, fetchSpot, fetchSpotsNear, viewKeys } from '@/api/viewApi';
+import { fetchBalance, fetchMyBookings, fetchSpot, fetchSpotsNear, viewKeys } from '@/api/viewApi';
 import type { BookingListItem } from '@/types/view';
 import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
@@ -71,18 +70,15 @@ const happeningNow = computed(() => isActiveNow(next.value?.booking, nextTimezon
 
 // ─── available to withdraw ──────────────────────────────────────────────────
 //
-// From payment-service, not from the booking read model. It used to be a GraphQL
-// aggregate over bookings windowed on `created_at` — which was the wrong field (when
-// the booking was *made*, not when the money was earned) and, worse, a second answer to
-// "what have I earned" sitting next to a withdraw button that spends the first one.
-//
-// One source now: the same endpoint the payout section reads, so the figure here and
-// the amount that button withdraws cannot disagree.
+// One endpoint answers this everywhere it appears — here and in the wallet — so the tile
+// and the screen it opens cannot show two different numbers. It used to be a GraphQL
+// aggregate over bookings windowed on `created_at`, which was the wrong field: when the
+// booking was *made*, not when the money was earned.
 const available = ref(0)
 onMounted(async () => {
     if (paused.value) return
     try {
-        available.value = (await paymentApi.earnings()).availableCents
+        available.value = (await fetchBalance()).availableCents
     } catch {
         // A tile that can't load its number shows zero rather than breaking the screen.
     }
@@ -227,8 +223,8 @@ const openBooking = () => {
                 <div class="text-xl font-bold">{{ formatCents(available) }}</div>
             </div>
             <div class="flex items-center gap-1 text-primary text-sm font-semibold"
-                @click="router.push({ name: 'spots' })">
-                Manage
+                @click="router.push({ name: 'wallet' })">
+                Wallet
                 <ChevronRight />
             </div>
         </div>

@@ -69,8 +69,8 @@ impl UserRepository {
         sqlx::query(
             "INSERT INTO app_user
                  (id, version, first_name, last_name, email,
-                  email_verified, profile_picture, password, license_plates)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                  email_verified, profile_picture, password, license_plates, country)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (id) DO UPDATE SET
                  version         = EXCLUDED.version,
                  first_name      = EXCLUDED.first_name,
@@ -79,7 +79,8 @@ impl UserRepository {
                  email_verified  = EXCLUDED.email_verified,
                  profile_picture = EXCLUDED.profile_picture,
                  password        = EXCLUDED.password,
-                 license_plates  = EXCLUDED.license_plates",
+                 license_plates  = EXCLUDED.license_plates,
+                 country         = EXCLUDED.country",
         )
         .bind(user.id)
         .bind(user.version as i64)
@@ -90,6 +91,7 @@ impl UserRepository {
         .bind(user.profile_picture)
         .bind(user.password)
         .bind(user.license_plates)
+        .bind(user.country)
         .execute(ex)
         .await?;
         Ok(())
@@ -114,7 +116,8 @@ impl UserRepository {
                  password        = COALESCE($5, password),
                  profile_picture = COALESCE($6, profile_picture),
                  license_plates  = COALESCE($7, license_plates),
-                 email_verified  = COALESCE($8, email_verified)
+                 email_verified  = COALESCE($8, email_verified),
+                 country         = COALESCE($9, country)
              WHERE id = $1",
         )
         .bind(user_id)
@@ -125,6 +128,7 @@ impl UserRepository {
         .bind(patch.profile_picture)
         .bind(patch.license_plates)
         .bind(patch.email_verified)
+        .bind(patch.country)
         .execute(ex)
         .await?;
         Ok(())

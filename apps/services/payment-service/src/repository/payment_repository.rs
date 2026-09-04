@@ -17,10 +17,12 @@ impl PaymentRepository {
         ex: impl PgExecutor<'_>,
         booking_id: Uuid,
     ) -> MyResult<Option<Payment>> {
-        Ok(sqlx::query_as("SELECT * FROM payment WHERE booking_id = $1")
-            .bind(booking_id)
-            .fetch_optional(ex)
-            .await?)
+        Ok(
+            sqlx::query_as("SELECT * FROM payment WHERE booking_id = $1")
+                .bind(booking_id)
+                .fetch_optional(ex)
+                .await?,
+        )
     }
 
     /// `payment_session … UNIQUE`. The checkout screen knows only a session id.
@@ -28,9 +30,27 @@ impl PaymentRepository {
         ex: impl PgExecutor<'_>,
         session_id: String,
     ) -> MyResult<Option<Payment>> {
-        Ok(sqlx::query_as("SELECT * FROM payment WHERE session_id = $1")
-            .bind(session_id)
-            .fetch_optional(ex)
+        Ok(
+            sqlx::query_as("SELECT * FROM payment WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_optional(ex)
+                .await?,
+        )
+    }
+
+    /// Every payment, for `PaymentService::backfill`.
+    ///
+    /// Ordered by `created_at` so a rebuild replays a payment's history in the order it
+    /// happened. Not required for correctness — each payment is its own aggregate and
+    /// its two backfilled events are enqueued together — but a log that reads
+    /// chronologically is worth the `ORDER BY`.
+    ///
+    /// ponytail: whole table in one pass, same ceiling and same fix as the others —
+    /// keyset on `created_at` if this ever has to run against a table that does not fit
+    /// in memory.
+    pub async fn all(ex: impl PgExecutor<'_>) -> MyResult<Vec<Payment>> {
+        Ok(sqlx::query_as("SELECT * FROM payment ORDER BY created_at")
+            .fetch_all(ex)
             .await?)
     }
 
@@ -42,8 +62,9 @@ impl PaymentRepository {
         sqlx::query(
             "INSERT INTO payment
                  (id, version, booking_id, owner_id, renter_id, amount_cents,
-                  session_id, intent_id, status, refund_id, failure_reason, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                  session_id, intent_id, status, refund_id, refunded_at,
+                  failure_reason, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT (id) DO UPDATE SET
                  version        = EXCLUDED.version,
                  booking_id     = EXCLUDED.booking_id,
@@ -54,6 +75,7 @@ impl PaymentRepository {
                  intent_id      = EXCLUDED.intent_id,
                  status         = EXCLUDED.status,
                  refund_id      = EXCLUDED.refund_id,
+                 refunded_at    = EXCLUDED.refunded_at,
                  failure_reason = EXCLUDED.failure_reason,
                  created_at     = EXCLUDED.created_at",
         )
@@ -67,6 +89,7 @@ impl PaymentRepository {
         .bind(payment.intent_id)
         .bind(payment.status)
         .bind(payment.refund_id)
+        .bind(payment.refunded_at)
         .bind(payment.failure_reason)
         .bind(payment.created_at)
         .execute(ex)
@@ -82,10 +105,10 @@ impl PaymentRepository {
     /// `COALESCE($n, column)` is absent-is-unchanged, and is also the ceiling: no
     /// patch can set a column back to NULL.
     ///
-    /// **The binds are positional**, so their order must match the `$n`. All four are
-    /// `Option<String>`, so a swapped pair compiles and writes the wrong column —
-    /// `set_covers_every_patchable_column` in the model is the reminder to come here,
-    /// and the live round-trip is what would catch it.
+    /// **The binds are positional**, so their order must match the `$n`. Four of the
+    /// five are `Option<String>`, so a swapped pair compiles and writes the wrong
+    /// column — `set_covers_every_patchable_column` in the model is the reminder to
+    /// come here, and the live round-trip is what would catch it.
     pub async fn transition(
         ex: impl PgExecutor<'_>,
         payment_id: Uuid,
@@ -97,7 +120,8 @@ impl PaymentRepository {
                  status         = COALESCE($3, status),
                  intent_id      = COALESCE($4, intent_id),
                  refund_id      = COALESCE($5, refund_id),
-                 failure_reason = COALESCE($6, failure_reason)
+                 refunded_at    = COALESCE($6, refunded_at),
+                 failure_reason = COALESCE($7, failure_reason)
              WHERE id = $1 AND status = ANY($2)",
         )
         .bind(payment_id)
@@ -105,6 +129,7 @@ impl PaymentRepository {
         .bind(patch.status)
         .bind(patch.intent_id)
         .bind(patch.refund_id)
+        .bind(patch.refunded_at)
         .bind(patch.failure_reason)
         .execute(ex)
         .await?;

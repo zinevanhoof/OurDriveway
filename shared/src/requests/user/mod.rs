@@ -16,7 +16,7 @@ mod signup;
 mod update_user;
 
 pub use email::{ResendVerificationRequest, VerifyEmailRequest};
-pub use fields::{Email, Password};
+pub use fields::{Country, Email, Password};
 pub use login::LoginRequest;
 pub use signup::SignupRequest;
 pub use update_user::UpdateUserRequest;

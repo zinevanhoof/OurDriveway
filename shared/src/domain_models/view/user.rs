@@ -39,6 +39,13 @@ pub struct ViewUser {
     /// Deliberately public: a host has to be able to recognise the car that turns up
     /// on their driveway, so this is not scoped the way `email` is.
     pub license_plates: Vec<String>,
+    /// ISO 3166-1 alpha-2, or `None` until the profile is filled in.
+    ///
+    /// Scoped like `email`, not like `license_plates`: it is cut per-caller in
+    /// [`crate::projections::user::OwnerViewUser`], so only the profile screen ever
+    /// sees it. Where somebody banks is nobody else's business, and no screen but
+    /// their own has a use for it.
+    pub country: Option<String>,
 }
 
 /// A partial update to a [`ViewUser`], written with the struct-update idiom:
@@ -57,6 +64,7 @@ pub struct ViewUserPatch {
     pub profile_picture: Option<String>,
     pub email: Option<String>,
     pub license_plates: Option<Vec<String>>,
+    pub country: Option<String>,
 }
 
 // No `bind` — see the note in `domain_models::user::user`. sqlx binds positionally,
@@ -74,6 +82,9 @@ impl ViewUser {
             profile_picture: None,
             email: e.email,
             license_plates: Vec::new(),
+            // Never carried by `Registered` — it is asked for on the profile screen,
+            // long after signup, and only by hosts.
+            country: None,
         }
     }
 }
@@ -86,6 +97,7 @@ impl From<UserUpdated> for ViewUserPatch {
             profile_picture: e.profile_picture,
             email: e.email,
             license_plates: e.license_plates,
+            country: e.country,
             ..Self::default()
         }
     }
@@ -103,6 +115,7 @@ mod tests {
             profile_picture: None,
             email: None,
             license_plates: None,
+            country: None,
         };
     }
 
@@ -123,6 +136,7 @@ mod tests {
             profile_picture: None,
             email: String::new(),
             license_plates: Vec::new(),
+            country: None,
         };
         let written = format!("{row:?}");
         for forbidden in ["password", "email_verified"] {

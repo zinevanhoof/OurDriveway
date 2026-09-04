@@ -162,6 +162,23 @@ async-stripe-checkout = { version = "=1.0.0-rc.8", features = [
     "deserialize",
     "redact-generated-debug",
 ] }
+# Connect: the host side of the money. `account` + `account_session` are onboarding —
+# an Express account per host and the short-lived secret its embedded components mount
+# against — and `transfer` is the withdrawal itself, platform balance to connected
+# account. `external_account` is only for the bank's last four digits on the withdraw
+# screen's summary line.
+#
+# `account_link` is deliberately ABSENT. It is the hosted-redirect alternative to the
+# embedded components, and carrying both would be two onboarding flows to keep in step.
+async-stripe-connect = { version = "=1.0.0-rc.8", features = [
+    "account",
+    "account_session",
+    "external_account",
+    "transfer",
+    "serialize",
+    "deserialize",
+    "redact-generated-debug",
+] }
 # `async-stripe-core` here is an optional *dependency* exposed as a feature: without it
 # the crate can parse an event envelope but not the PaymentIntent inside it, which is
 # the only part we actually read.

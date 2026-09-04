@@ -72,6 +72,12 @@ pub struct UserUpdated {
     /// submits every plate it knows about, so a diff would mean the client
     /// deciding what "unchanged" is.
     pub license_plates: Option<Vec<String>>,
+    /// ISO 3166-1 alpha-2, uppercase, or `None` for unchanged.
+    ///
+    /// The one field on this event that another *service* needs rather than a
+    /// screen: payment-service mirrors it, because Stripe will not open a connected
+    /// account without a country and fixes it permanently at creation.
+    pub country: Option<String>,
 }
 
 /// Its own event rather than a field on [`UserUpdated`]: that one is consumed by

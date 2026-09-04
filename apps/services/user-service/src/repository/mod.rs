@@ -82,6 +82,7 @@ mod live_tests {
             profile_picture: None,
             license_plates: vec!["1-ABC-123".to_string()],
             email_verified: false,
+            country: None,
         }
     }
 

@@ -8,9 +8,9 @@ use shared::{
     error::myerror::MyResult,
     extract::Valid,
     extractors::authed_jwt::AuthedJwt,
-    requests::payment::CreateSessionRequest,
+    requests::payment::{CreateSessionRequest, PayoutRequest},
     responses::common::backfilled,
-    responses::payment::{EarningsResponse, PayoutResponse, SessionResponse, SessionStateResponse},
+    responses::payment::{PayoutResponse, SessionResponse, SessionStateResponse},
 };
 
 use crate::{AppState, client::stripe::SessionStatus};
@@ -65,33 +65,35 @@ pub async fn session_state(
     }))
 }
 
-/// What this host has earned and what is withdrawable.
-///
-/// Scoped to the token's own user, with no id in the path — a host asking about someone
-/// else's income is not a request this endpoint can express.
-pub async fn earnings(
-    AuthedJwt { user_id, .. }: AuthedJwt,
-    State(state): State<AppState>,
-) -> MyResult<impl IntoResponse> {
-    let earnings = state.payment_service.earnings(&user_id).await?;
+// `GET /api/payment/earnings` was here. It is `GET /api/view/me/balance` now — reads
+// are view-service's, and that one also answers what is still pending, which this
+// service had no table to compute.
+//
+// The arithmetic did not move: `PaymentService::earnings_with` still runs inside
+// `request_payout`'s transaction, below the advisory lock, and it is what decides how
+// much a withdrawal actually pays out. What a host is *shown* may lag; what they are
+// *paid* is computed here, from these tables, at the moment they ask for it.
 
-    Ok(Json(EarningsResponse {
-        available_cents: earnings.available_cents(),
-        earned_cents: earnings.earned_cents,
-        paid_out_cents: earnings.paid_out_cents,
-    }))
-}
-
-/// Withdraws the whole available balance. Nothing real moves.
+/// Withdraws part or all of the caller's available balance, as a real Stripe Transfer.
 ///
-/// No amount in the request: the server computes it, so there is no figure a client
-/// could inflate. 202 with a `seq`, like every other write — the payout row appears
-/// once the projector has applied the event.
+/// The amount **is** in the request now, unlike `create_session` above, and the
+/// difference is whose money it is: a renter choosing what to be charged would be
+/// picking a price, a host choosing what to withdraw is picking how much of their own
+/// balance to take. It is still not trusted — `request_payout` re-reads the balance
+/// under an advisory lock and refuses anything larger, rather than clamping.
+///
+/// 202 with a `seq`, like every other write. The transfer itself has not happened when
+/// this answers: the payout row lands as `requested`, and a worker turns it into
+/// `paid` or `failed` a moment later.
 pub async fn request_payout(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
+    Valid(request): Valid<PayoutRequest>,
 ) -> MyResult<impl IntoResponse> {
-    let (token, amount_cents) = state.payment_service.request_payout(&user_id).await?;
+    let (token, amount_cents) = state
+        .payment_service
+        .request_payout(&user_id, request.amount_cents)
+        .await?;
 
     Ok((
         StatusCode::ACCEPTED,

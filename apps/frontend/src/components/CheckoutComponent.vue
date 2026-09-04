@@ -25,6 +25,7 @@ import Button from "@/components/ui/button/Button.vue";
 import Separator from "@/components/ui/separator/Separator.vue";
 import Spinner from "@/components/ui/spinner/Spinner.vue";
 import { stripe } from "@/lib/stripe";
+import { cssColorToHex, token } from "@/lib/theme";
 import { fetchBooking, fetchMe, viewKeys } from "@/api/viewApi";
 import * as paymentApi from "@/api/paymentApi";
 import * as bookingApi from "@/api/bookingApi";
@@ -120,9 +121,8 @@ async function mount(clientSecret: string) {
 
   // Themed off the app's own tokens so the Element doesn't read as a third-party panel.
   // Converted because Tailwind 4 emits `oklch(...)` and Stripe accepts only HEX, rgb()
-  // or hsl() — see `cssColorToHex`.
-  const css = getComputedStyle(document.documentElement);
-  const token = (name: string) => css.getPropertyValue(name).trim();
+  // or hsl() — see `cssColorToHex`, shared with the Connect components in
+  // `lib/connect.ts`, which need the identical treatment.
   sdk.changeAppearance({
     theme: "flat",
     variables: {
@@ -257,32 +257,8 @@ async function giveUp() {
   }
 }
 
-/**
- * Resolves any CSS colour the browser understands to `#rrggbb`.
- *
- * Tailwind 4 defines its palette in `oklch(...)` and Stripe's Appearance API parses only
- * HEX, `rgb()` or `hsl()`. Rather than keep a second hardcoded copy of the palette, the
- * conversion is delegated to the browser: assigning to a canvas `fillStyle` parses with
- * the engine's own colour code, and reading it back serialises to hex.
- *
- * Returns `undefined` when the value can't be parsed, so the caller omits the variable
- * rather than handing Stripe something else it rejects. The sentinel detects that:
- * `fillStyle` keeps its previous value when assigned something invalid.
- */
-function cssColorToHex(value: string): string | undefined {
-  if (!value) return undefined;
-
-  const ctx = document.createElement("canvas").getContext("2d");
-  if (!ctx) return undefined;
-
-  const sentinel = "#010203";
-  ctx.fillStyle = sentinel;
-  ctx.fillStyle = value;
-
-  const resolved = ctx.fillStyle;
-  if (typeof resolved !== "string" || resolved === sentinel) return undefined;
-  return resolved.startsWith("#") ? resolved : undefined;
-}
+// `cssColorToHex` and `token` moved to `lib/theme.ts` when Connect's embedded
+// components needed the identical conversion — see the note in `lib/connect.ts`.
 </script>
 
 <template>

@@ -4,8 +4,12 @@ use shared::db;
 use shared::{
     domain_models::{
         booking::status as booking_status,
+        // The write side's statuses, mirrored rather than re-spelled — this projection
+        // is not allowed to invent a fourth one.
+        payment::payout::status as payout_status,
         view::{
             booking::{ViewBooking, ViewBookingPatch},
+            payment::{ViewPayment, ViewPaymentPatch},
             payout::ViewPayout,
             spot::ViewSpotPatch,
             user::{ViewUser, ViewUserPatch},
@@ -20,8 +24,9 @@ use shared::{
 use sqlx::PgConnection;
 
 use crate::repository::{
-    booking_repository::ViewBookingRepository, payout_repository::ViewPayoutRepository,
-    spot_repository::ViewSpotRepository, user_repository::ViewUserRepository,
+    booking_repository::ViewBookingRepository, payment_repository::ViewPaymentRepository,
+    payout_repository::ViewPayoutRepository, spot_repository::ViewSpotRepository,
+    user_repository::ViewUserRepository,
 };
 
 /// One projector per stream, each with its own consumer. They advance independently,
@@ -118,8 +123,7 @@ impl Projector for SpotProjector {
             // Soft delete. The row stays selectable so a renter's past booking still
             // resolves a title and an address — the lists filter `deleted`.
             SpotEvent::Deleted { spot_id } => {
-                ViewSpotRepository::patch(&mut *conn, spot_id, ViewSpotPatch::deleted(at))
-                    .await?;
+                ViewSpotRepository::patch(&mut *conn, spot_id, ViewSpotPatch::deleted(at)).await?;
                 db::set_version(conn, "spot", &spot_id, version).await
             }
         }
@@ -148,11 +152,8 @@ impl Projector for BookingProjector {
                 let booking_id = e.booking_id;
                 // One statement. `spot_id` and `renter_id` ride in the row; there are
                 // no links for a second statement to restore.
-                ViewBookingRepository::upsert(
-                    &mut *conn,
-                    ViewBooking::created(e, at, version),
-                )
-                .await?;
+                ViewBookingRepository::upsert(&mut *conn, ViewBooking::created(e, at, version))
+                    .await?;
                 db::set_version(conn, "booking", &booking_id, version).await
             }
 
@@ -192,13 +193,18 @@ impl Projector for BookingProjector {
     }
 }
 
-/// PAYMENTS, for **payout history only**.
+/// PAYMENTS, into two tables: `payment` and `payout`.
 ///
-/// Deliberately not the payments themselves. A renter's charges and a host's income
-/// figures are served by payment-service, which owns them — projecting them here too
-/// would give the payout button one answer and the balance next to it another. What
-/// belongs in the read model is the *list* of withdrawals, so it can be queried
-/// alongside the rest of a profile like everything else.
+/// **This used to project payouts and nothing else**, on the argument that a second
+/// copy of a renter's charges would disagree with the balance beside the withdraw
+/// button. The split is the ordinary one now — payment-service writes, view-service
+/// reads — and the wallet needs the charges, so they are here.
+///
+/// What keeps the old argument from coming true is that no money is ever *spent*
+/// against this table. `PaymentService::request_payout` computes what it pays out from
+/// payment-service's own rows, inside its own transaction, under an advisory lock; this
+/// projection is only ever displayed, and it is allowed to lag by however far the
+/// projector is behind. See `migrations/view/0003_payment.sql`.
 pub struct PaymentProjector;
 
 impl Projector for PaymentProjector {
@@ -213,35 +219,116 @@ impl Projector for PaymentProjector {
         _at: DateTime<Utc>,
         version: u64,
     ) -> MyResult<()> {
-        let PaymentEvent::PayoutRequested {
-            payout_id,
-            owner_id,
-            amount_cents,
-            requested_at,
-        } = event
-        else {
-            // Every other variant stores nothing. Not a gap: what a renter was
-            // charged is payment-service's to answer, and duplicating it here would
-            // create a second version of the same money. The cursor still advances,
-            // which `Tx` does after this returns.
-            return Ok(());
-        };
-
-        ViewPayoutRepository::upsert(
-            &mut *conn,
-            ViewPayout {
-                id: payout_id,
-                version,
+        match event {
+            // A payout is its own aggregate on this stream — `payout:<uuid>`, a
+            // different table and a different version counter from every other variant
+            // here, which is why `PaymentEvent::payment_id` answers `None` for it.
+            PaymentEvent::PayoutRequested {
+                payout_id,
                 owner_id,
-                amount: amount_cents,
-                // The requester's timestamp off the event, not this replica's clock.
-                created_at: requested_at,
-            },
-        )
-        .await?;
-        // `payout`, not `payment`: this database has no payment table, which is why
-        // the version write lives in each projector rather than in `bus::Tx` — a
-        // statement naming a table that does not exist is an error, not a no-op.
-        db::set_version(conn, "payout", &payout_id, version).await
+                amount_cents,
+                requested_at,
+            } => {
+                ViewPayoutRepository::upsert(
+                    &mut *conn,
+                    ViewPayout {
+                        id: payout_id,
+                        version,
+                        owner_id,
+                        amount: amount_cents,
+                        // The transfer has not been attempted yet. This is what the
+                        // wallet renders with its PENDING chip.
+                        status: payout_status::REQUESTED.to_string(),
+                        // The requester's timestamp off the event, not this replica's
+                        // clock.
+                        created_at: requested_at,
+                    },
+                )
+                .await?;
+                db::set_version(conn, "payout", &payout_id, version).await
+            }
+
+            // The worker's outcome. One column, and the row is certainly here: these
+            // share a subject with the request above, so they share a lane and arrive
+            // after it.
+            //
+            // `transfer_id` and `reason` are dropped on the floor on purpose, exactly
+            // as the payment handles are below — a Stripe id and a log message, neither
+            // of which a browser has any use for.
+            PaymentEvent::PayoutPaid { payout_id, .. } => {
+                ViewPayoutRepository::set_status(&mut *conn, payout_id, payout_status::PAID)
+                    .await?;
+                db::set_version(conn, "payout", &payout_id, version).await
+            }
+
+            // A failed withdrawal leaves the row here, marked — the wallet's queries
+            // filter it out of both the list and the balance, which is how the money
+            // comes back. Deleting it instead would lose the audit and make a
+            // redelivered event recreate it as `requested`.
+            PaymentEvent::PayoutFailed { payout_id, .. } => {
+                ViewPayoutRepository::set_status(&mut *conn, payout_id, payout_status::FAILED)
+                    .await?;
+                db::set_version(conn, "payout", &payout_id, version).await
+            }
+
+            PaymentEvent::Created(e) => {
+                let payment_id = e.payment_id;
+                ViewPaymentRepository::upsert(&mut *conn, ViewPayment::created(e, version)).await?;
+                db::set_version(conn, "payment", &payment_id, version).await
+            }
+
+            // The four transitions. Each is one patch and the version write, and the
+            // row they patch always exists by the time they arrive: a payment's events
+            // share one subject, so they share one projector lane and stay ordered.
+            //
+            // `intent_id`, `refund_id` and `reason` are dropped on the floor here on
+            // purpose — the Stripe handles are the write side's business, and Stripe's
+            // failure message is for our log rather than for a screen.
+            PaymentEvent::Succeeded { payment_id, .. } => {
+                ViewPaymentRepository::transition(
+                    &mut *conn,
+                    payment_id,
+                    ViewPaymentPatch::succeeded(),
+                )
+                .await?;
+                db::set_version(conn, "payment", &payment_id, version).await
+            }
+
+            PaymentEvent::Failed { payment_id, .. } => {
+                ViewPaymentRepository::transition(
+                    &mut *conn,
+                    payment_id,
+                    ViewPaymentPatch::failed(),
+                )
+                .await?;
+                db::set_version(conn, "payment", &payment_id, version).await
+            }
+
+            PaymentEvent::Refunded {
+                payment_id,
+                refunded_at,
+                ..
+            } => {
+                ViewPaymentRepository::transition(
+                    &mut *conn,
+                    payment_id,
+                    // Off the event, so this replica dates the refund exactly where
+                    // payment-service's own row does.
+                    ViewPaymentPatch::refunded(refunded_at),
+                )
+                .await?;
+                db::set_version(conn, "payment", &payment_id, version).await
+            }
+
+            PaymentEvent::SessionExpired { payment_id, .. } => {
+                ViewPaymentRepository::transition(
+                    &mut *conn,
+                    payment_id,
+                    ViewPaymentPatch::expired(),
+                )
+                .await?;
+                db::set_version(conn, "payment", &payment_id, version).await
+            }
+        }
     }
 }

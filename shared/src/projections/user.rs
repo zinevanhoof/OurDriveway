@@ -46,6 +46,14 @@ pub struct OwnerViewUser {
     pub email: String,
     #[sqlx(rename = "user_license_plates")]
     pub license_plates: Vec<String>,
+    /// ISO 3166-1 alpha-2, `None` until the profile screen sets it.
+    ///
+    /// On this side rather than [`PublicViewUser`], and unlike `license_plates`: where
+    /// somebody banks is nobody else's business. It is here at all because the profile
+    /// form has to render its current value, and because the withdraw screen needs to
+    /// know whether it has one before Stripe refuses to open an account without it.
+    #[sqlx(rename = "user_country")]
+    pub country: Option<String>,
 }
 
 /// `GET /api/view/me`.

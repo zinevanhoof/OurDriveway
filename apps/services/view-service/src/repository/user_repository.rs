@@ -29,7 +29,8 @@ impl ViewUserRepository {
                     last_name       AS user_last_name,
                     profile_picture AS user_profile_picture,
                     email           AS user_email,
-                    license_plates  AS user_license_plates
+                    license_plates  AS user_license_plates,
+                    country         AS user_country
                FROM app_user
               WHERE id = $1",
         )
@@ -46,15 +47,17 @@ impl ViewUserRepository {
     pub async fn upsert(ex: impl PgExecutor<'_>, user: ViewUser) -> MyResult<()> {
         sqlx::query(
             "INSERT INTO app_user
-                 (id, version, first_name, last_name, profile_picture, email, license_plates)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 (id, version, first_name, last_name, profile_picture, email,
+                  license_plates, country)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO UPDATE SET
                  version         = EXCLUDED.version,
                  first_name      = EXCLUDED.first_name,
                  last_name       = EXCLUDED.last_name,
                  profile_picture = EXCLUDED.profile_picture,
                  email           = EXCLUDED.email,
-                 license_plates  = EXCLUDED.license_plates",
+                 license_plates  = EXCLUDED.license_plates,
+                 country         = EXCLUDED.country",
         )
         .bind(user.id)
         .bind(user.version as i64)
@@ -63,6 +66,7 @@ impl ViewUserRepository {
         .bind(user.profile_picture)
         .bind(user.email)
         .bind(user.license_plates)
+        .bind(user.country)
         .execute(ex)
         .await?;
         Ok(())
@@ -70,7 +74,7 @@ impl ViewUserRepository {
 
     /// Update only the columns the patch carries. Does not create the row.
     ///
-    /// The five columns here are every column [`ViewUserPatch`] carries.
+    /// The six columns here are every column [`ViewUserPatch`] carries.
     /// **The binds are positional**, so their order must match the `$n`.
     pub async fn patch(
         ex: impl PgExecutor<'_>,
@@ -83,7 +87,8 @@ impl ViewUserRepository {
                  last_name       = COALESCE($3, last_name),
                  profile_picture = COALESCE($4, profile_picture),
                  email           = COALESCE($5, email),
-                 license_plates  = COALESCE($6, license_plates)
+                 license_plates  = COALESCE($6, license_plates),
+                 country         = COALESCE($7, country)
              WHERE id = $1",
         )
         .bind(user_id)
@@ -92,6 +97,7 @@ impl ViewUserRepository {
         .bind(patch.profile_picture)
         .bind(patch.email)
         .bind(patch.license_plates)
+        .bind(patch.country)
         .execute(ex)
         .await?;
         Ok(())

@@ -89,6 +89,30 @@ async fn run_inner<W: Worker>(js: Context, worker: Arc<W>) -> MyResult<()> {
             .map_err(|e| bus_err(format!("message info: {e}")))?;
         let (seq, delivered) = (info.stream_sequence, info.delivered);
 
+        // A backfill is for rebuilding a *projection*. Nothing on this side of the bus
+        // should react to one: a re-emitted `Registered` would send every user another
+        // verification email, and a re-emitted `Succeeded` would re-confirm bookings and
+        // ask Stripe about payments that settled months ago.
+        //
+        // Here rather than in each `handle`, because the rule is a property of what a
+        // worker *is* — the consumer whose reaction leaves this system — and one worker
+        // forgetting the guard is a mistake nothing else would catch. `Envelope` has
+        // carried this flag and documented exactly this purpose since backfill existed;
+        // it simply had no reader until the read model started projecting payments.
+        if is_backfill(&message.payload) {
+            tracing::debug!(
+                stream = W::STREAM,
+                durable = W::DURABLE,
+                seq,
+                "skipping backfill"
+            );
+            message
+                .ack()
+                .await
+                .map_err(|e| bus_err(format!("ack {seq}: {e}")))?;
+            continue;
+        }
+
         match worker.handle(&message.payload, seq).await {
             Ok(()) => {
                 message
@@ -128,6 +152,25 @@ async fn run_inner<W: Worker>(js: Context, worker: Arc<W>) -> MyResult<()> {
     }
 
     Err(bus_err("message stream ended".to_string()))
+}
+
+/// Whether an envelope is a re-emission rather than something that just happened.
+///
+/// Reads the one field it needs and ignores the payload entirely, so it stays free of
+/// the event type and cannot fail on a variant this worker does not know. **An envelope
+/// that will not decode at all is treated as live**, which is the safe direction: the
+/// handler is about to fail on it properly and say why, rather than having it silently
+/// acked here as if it were a backfill.
+fn is_backfill(payload: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Flag {
+        /// `#[serde(default)]` for the same reason `Envelope` has it: an event encoded
+        /// before the field existed still decodes, as `false`.
+        #[serde(default)]
+        backfill: bool,
+    }
+
+    serde_json::from_slice::<Flag>(payload).is_ok_and(|f| f.backfill)
 }
 
 /// Split out from `run_inner` so the four settings that define this primitive can
@@ -187,5 +230,20 @@ mod tests {
             config.max_deliver > 1,
             "max_deliver is the retry policy; 1 means a single blip drops the mail"
         );
+    }
+
+    /// The other way to mail every user at once: rebuild a projection and have the
+    /// workers treat the re-emission as news.
+    #[test]
+    fn only_an_envelope_that_says_so_is_a_backfill() {
+        assert!(is_backfill(
+            br#"{"backfill":true,"payload":{"type":"Registered"}}"#
+        ));
+        assert!(!is_backfill(br#"{"backfill":false,"payload":{}}"#));
+        // Encoded before the field existed.
+        assert!(!is_backfill(br#"{"payload":{}}"#));
+        // Not decodable at all: live, so the handler gets it and fails with a real
+        // message instead of it being acked here as if it had been re-emitted.
+        assert!(!is_backfill(b"not json"));
     }
 }

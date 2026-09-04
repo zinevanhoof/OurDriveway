@@ -67,6 +67,13 @@ pub struct Payment {
     /// Set together with `status = 'refunded'`. Its presence is what makes the
     /// refund path idempotent — `settle_up` refuses a payment that already has one.
     pub refund_id: Option<String>,
+    /// When the money went back, which is *not* `created_at` — that is when the
+    /// checkout session was made. Written in the same patch as `refund_id`, and
+    /// carried on `PaymentEvent::Refunded` so view-service dates the refund at the
+    /// same instant this row does.
+    ///
+    /// `None` for every payment refunded before the column existed.
+    pub refunded_at: Option<DateTime<Utc>>,
     /// Stripe's message from the last failed attempt. Kept for the log, never
     /// rendered to a renter — the Payment Element already told them, in their
     /// language.
@@ -88,6 +95,7 @@ impl Payment {
             intent_id: None,
             status: status::CREATED.to_string(),
             refund_id: None,
+            refunded_at: None,
             failure_reason: None,
             // The event's own timestamp, not this process's: every replica must
             // store the same one.
@@ -110,6 +118,7 @@ pub struct PaymentPatch {
     pub status: Option<String>,
     pub intent_id: Option<String>,
     pub refund_id: Option<String>,
+    pub refunded_at: Option<DateTime<Utc>>,
     pub failure_reason: Option<String>,
 }
 
@@ -142,11 +151,19 @@ impl PaymentPatch {
         }
     }
 
-    /// Refunded, carrying the id that stops it happening twice.
-    pub fn refunded(refund_id: String) -> Self {
+    /// Refunded, carrying the id that stops it happening twice and the instant it
+    /// happened at.
+    ///
+    /// The two are set together for the same reason `succeeded` pairs its status with
+    /// `intent_id`: a refunded row that cannot say *when* is one a history has to
+    /// invent a date for. `refunded_at` comes from the caller rather than a clock in
+    /// here so the identical instant reaches the event and every replica of the
+    /// projection.
+    pub fn refunded(refund_id: String, refunded_at: DateTime<Utc>) -> Self {
         Self {
             status: Some(status::REFUNDED.to_string()),
             refund_id: Some(refund_id),
+            refunded_at: Some(refunded_at),
             ..Self::default()
         }
     }
@@ -194,6 +211,7 @@ mod tests {
             status: None,
             intent_id: None,
             refund_id: None,
+            refunded_at: None,
             failure_reason: None,
         };
     }
@@ -209,12 +227,14 @@ mod tests {
 
     /// Refunding records the id that makes a second refund impossible, and nothing
     /// else clears it — absent means unchanged.
+    ///
+    /// It also records *when*, in the same patch. A refund with no instant is one the
+    /// wallet cannot place in a month.
     #[test]
     fn only_refunding_sets_a_refund_id() {
-        assert_eq!(
-            PaymentPatch::refunded("re_1".into()).refund_id.as_deref(),
-            Some("re_1")
-        );
+        let patch = PaymentPatch::refunded("re_1".into(), Utc::now());
+        assert_eq!(patch.refund_id.as_deref(), Some("re_1"));
+        assert!(patch.refunded_at.is_some());
         for patch in [
             PaymentPatch::succeeded("pi_1".into()),
             PaymentPatch::failed("declined".into()),

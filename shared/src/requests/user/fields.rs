@@ -110,6 +110,40 @@ fn has_special(value: &str, _: &()) -> garde::Result {
     )
 }
 
+/// Where the caller banks — ISO 3166-1 alpha-2, as Stripe wants it.
+///
+/// A newtype rather than a rule function because it has an invariant beyond its
+/// length: it is stored and sent **uppercase**, so two spellings of Belgium cannot
+/// end up in two rows. `parse` is the only way in, which is what makes that true.
+///
+/// The country is only ever asked for on the profile screen, and only because
+/// Stripe demands it before a connected account can receive money — it is fixed at
+/// account creation and cannot be changed afterwards, so a wrong one costs a host
+/// their payouts. Hence a value type, and not a free-text field.
+///
+/// Deliberately not checked against a list of the countries Stripe supports. That
+/// list changes on Stripe's schedule, and a stale copy here would refuse a country
+/// that had just become valid; Stripe answers `country_unsupported` itself, and
+/// that answer is always current.
+#[derive(Clone, Debug, Deserialize, Validate)]
+#[serde(transparent)]
+#[garde(transparent)]
+pub struct Country(#[garde(custom(is_alpha2))] String);
+
+impl Country {
+    /// Uppercased, so the stored value has one spelling.
+    pub fn into_inner(self) -> String {
+        self.0.to_ascii_uppercase()
+    }
+}
+
+fn is_alpha2(value: &String, _: &()) -> garde::Result {
+    require(
+        value.len() == 2 && value.chars().all(|c| c.is_ascii_alphabetic()),
+        "Must be a two-letter country code.",
+    )
+}
+
 /// A person's name, and a plate. Not newtypes: each is used once per form and a
 /// wrapper would buy nothing but a `.0`.
 pub(super) fn name_length(value: &String, _: &()) -> garde::Result {

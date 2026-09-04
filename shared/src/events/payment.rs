@@ -52,6 +52,14 @@ pub enum PaymentEvent {
         booking_id: Uuid,
         refund_id: String,
         amount_cents: i64,
+        /// When the money went back. Carried rather than left to the projector's
+        /// clock for the same reason as `PayoutRequested::requested_at`: every
+        /// replica applies this independently and must date it identically.
+        ///
+        /// It is a separate instant from the payment's `created_at` — that is when
+        /// the checkout session was made — and a wallet groups the two into
+        /// different months whenever a booking is cancelled after the turn of one.
+        refunded_at: DateTime<Utc>,
     },
 
     /// An unpaid Checkout Session was expired because its booking ended before anyone
@@ -66,11 +74,12 @@ pub enum PaymentEvent {
     /// the only Stripe handle there is.
     SessionExpired { payment_id: Uuid, booking_id: Uuid },
 
-    /// A host withdrew their balance. Nothing leaves any real account — see the note
-    /// on `payout` in schemas/payment-schema.surql.
+    /// A host asked to withdraw. **Nothing has moved yet** — this is the request, and
+    /// the transfer it causes is made by a worker off this very event.
     ///
-    /// `amount_cents` is computed server-side from earnings minus prior payouts. A
-    /// client-supplied figure never reaches this.
+    /// `amount_cents` is computed server-side: a client may ask for a figure, but it is
+    /// only ever narrowed by earnings minus prior payouts, read under the advisory lock
+    /// inside the transaction that publishes this. What a client sent never reaches here.
     PayoutRequested {
         payout_id: Uuid,
         /// The host.
@@ -78,14 +87,44 @@ pub enum PaymentEvent {
         amount_cents: i64,
         requested_at: DateTime<Utc>,
     },
+
+    /// The Stripe Transfer succeeded: the money is in the host's connected account.
+    ///
+    /// `transfer_id` is carried for the same reason `Refunded` carries `refund_id` —
+    /// it is the handle a reversal would need, and its presence in the row is the
+    /// second reading of "already paid".
+    PayoutPaid {
+        payout_id: Uuid,
+        /// Carried so this lands on the same `payments.payout.<owner>` subject as the
+        /// request, which is what keeps one payout's three events in order.
+        owner_id: Uuid,
+        transfer_id: String,
+        /// Off the event, never a projector's clock — every replica must date it the
+        /// same. Same rule as `Refunded::refunded_at`.
+        paid_at: DateTime<Utc>,
+    },
+
+    /// Stripe refused the transfer, permanently. The commonest cause in test mode is
+    /// `balance_insufficient` — charges land in the platform's *pending* balance and a
+    /// transfer can only draw on the available one.
+    ///
+    /// The money is not lost: `total_for` sums only requested and paid payouts, so a
+    /// failed row drops straight back out of the balance.
+    PayoutFailed {
+        payout_id: Uuid,
+        owner_id: Uuid,
+        /// Stripe's message, for the log. Never rendered to a host — a failed payout is
+        /// filtered out of the wallet entirely.
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 impl PaymentEvent {
     /// The payment a variant is about — the aggregate half of `payment:<uuid>`.
     ///
-    /// `None` for `PayoutRequested`, which is the one variant on this stream that
-    /// concerns no payment at all: it is its own `payout:<uuid>` aggregate, written
-    /// to a different table.
+    /// `None` for the three payout variants, which concern no payment at all: they are
+    /// their own `payout:<uuid>` aggregate, written to a different table.
     pub fn payment_id(&self) -> Option<Uuid> {
         match self {
             Self::Created(e) => Some(e.payment_id),
@@ -93,7 +132,23 @@ impl PaymentEvent {
             | Self::Failed { payment_id, .. }
             | Self::Refunded { payment_id, .. }
             | Self::SessionExpired { payment_id, .. } => Some(*payment_id),
-            Self::PayoutRequested { .. } => None,
+            Self::PayoutRequested { .. } | Self::PayoutPaid { .. } | Self::PayoutFailed { .. } => {
+                None
+            }
+        }
+    }
+
+    /// The payout a variant is about — the aggregate half of `payout:<uuid>`.
+    ///
+    /// The mirror of [`Self::payment_id`], and the reason it exists is the projector:
+    /// applying one of these has to find the row, and matching the three variants in
+    /// every consumer that only needs the id is three arms each time.
+    pub fn payout_id(&self) -> Option<Uuid> {
+        match self {
+            Self::PayoutRequested { payout_id, .. }
+            | Self::PayoutPaid { payout_id, .. }
+            | Self::PayoutFailed { payout_id, .. } => Some(*payout_id),
+            _ => None,
         }
     }
 }

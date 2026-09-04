@@ -5,6 +5,9 @@ import { Bell } from '@lucide/vue';
 import Avatar from '../ui/avatar/Avatar.vue';
 import AvatarImage from '../ui/avatar/AvatarImage.vue';
 import AvatarFallback from '../ui/avatar/AvatarFallback.vue';
+import { useRouter } from 'vue-router';
+
+const router = useRouter()
 
 // Already fetched once at boot by fetchMe(); no reason for a second round trip.
 const user = computed(() => useAuthStore().user);
@@ -28,7 +31,7 @@ const greeting = computed(() => {
                 class="flex items-center justify-center border border-border w-10 h-10 rounded-full bg-card text-muted-foreground">
                 <bell :size="20" />
             </div>
-            <Avatar size="lg">
+            <Avatar @click="router.push({ name: 'profile' })" size="lg">
                 <AvatarImage v-if="user?.profilePicture" :src="user.profilePicture" />
                 <AvatarFallback :name="{ firstName: user?.firstName ?? '', lastName: user?.lastName ?? '' }" />
             </Avatar>

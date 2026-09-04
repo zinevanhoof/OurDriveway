@@ -2,8 +2,8 @@
 //! actually issues. There is no shared `Repository` trait behind them and nothing is
 //! generated: what a method does is the string in front of you.
 //!
-//! Three tables: this service's own `payment` and `payout`, plus a mirror of the
-//! bookings they pay for.
+//! Five tables: this service's own `payment`, `payout` and `connect_account`, plus
+//! mirrors of the bookings they pay for and of the hosts they pay.
 //!
 //! Every statement is a literal — no `format!`, no consts spliced in from the domain
 //! models, nothing to follow to a second file. Reads are plain `SELECT *`; writes name
@@ -14,6 +14,8 @@
 //! `&mut PgConnection` alike, so each method just takes one.
 
 pub mod booking_mirror_repository;
+pub mod connect_account_repository;
+pub mod host_mirror_repository;
 pub mod payment_repository;
 pub mod payout_repository;
 
@@ -36,14 +38,16 @@ pub mod payout_repository;
 mod live_tests {
     use chrono::{TimeDelta, Utc};
     use shared::domain_models::booking::status as booking_status;
+    use shared::domain_models::payment::payout::status as payout_status;
     use shared::domain_models::payment::{
-        BookingMirror, BookingMirrorPatch, Payment, PaymentPatch, Payout, status,
+        BookingMirror, BookingMirrorPatch, Payment, PaymentPatch, Payout, PayoutPatch, status,
     };
     use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::booking_mirror_repository::BookingMirrorRepository;
     use super::payment_repository::PaymentRepository;
+    use super::host_mirror_repository::HostMirrorRepository;
     use super::payout_repository::PayoutRepository;
 
     /// Connects and migrates, so a running container is the only prerequisite.
@@ -73,6 +77,21 @@ mod live_tests {
         }
     }
 
+    /// A freshly requested payout — the state `request_payout` commits, before the
+    /// worker has been anywhere near Stripe.
+    fn a_payout(id: Uuid, owner_id: Uuid, amount_cents: i64) -> Payout {
+        Payout {
+            id,
+            version: 1,
+            owner_id,
+            amount_cents,
+            status: payout_status::REQUESTED.to_string(),
+            transfer_id: None,
+            failure_reason: None,
+            created_at: Utc::now(),
+        }
+    }
+
     fn a_payment(id: Uuid, booking_id: Uuid, owner_id: Uuid, amount_cents: i64) -> Payment {
         Payment {
             id,
@@ -85,6 +104,7 @@ mod live_tests {
             intent_id: None,
             status: status::CREATED.to_string(),
             refund_id: None,
+            refunded_at: None,
             failure_reason: None,
             created_at: Utc::now(),
         }
@@ -194,7 +214,10 @@ mod live_tests {
         .await
         .unwrap();
 
-        let got = BookingMirrorRepository::find_by_id(&db, id).await.unwrap().unwrap();
+        let got = BookingMirrorRepository::find_by_id(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.status, booking_status::CONFIRMED);
         // The unconditional assignment, not the patch: `COALESCE` can leave a value
         // alone but never clear it, and every transition out of `reserved` ends the
@@ -209,6 +232,96 @@ mod live_tests {
             .unwrap();
     }
 
+    /// **The regression test for a silent rollback.**
+    ///
+    /// `UserProjector` writes the `host` mirror and then calls `db::set_version` for
+    /// the `user` aggregate — whose table, `app_user`, this service does not have. That
+    /// used to be handled by letting the statement fail and swallowing 42P01, which
+    /// aborts the transaction the projector opened: the swallow answered `Ok`, the
+    /// commit became a silent rollback, the message was acked, and the mirror stayed
+    /// empty through eighteen events with nothing in any log.
+    ///
+    /// So this applies a real event through the real projector, **commits**, and reads
+    /// the row back on a fresh connection. The commit is the whole point — asserting
+    /// inside the transaction would have passed the entire time the bug existed.
+    #[tokio::test]
+    #[ignore]
+    async fn a_projected_user_survives_the_commit_though_this_service_has_no_user_table() {
+        use bus::Projector;
+        use shared::events::user::{UserRegistered, UserUpdated};
+
+        let db = db().await;
+        let user_id = Uuid::now_v7();
+        let email = format!("host-{user_id}@example.test");
+
+        assert!(
+            sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass('app_user')::text")
+                .fetch_one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "the premise: payment-service has no app_user table, which is what made \
+             set_version poison the projector's transaction"
+        );
+
+        let apply = async |event, version| {
+            let mut tx = db.begin().await.unwrap();
+            crate::projector::UserProjector
+                .apply(&mut tx, event, Utc::now(), version)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        };
+
+        apply(
+            shared::events::user::UserEvent::Registered(UserRegistered {
+                user_id,
+                first_name: "Ada".to_string(),
+                last_name: "Lovelace".to_string(),
+                email: email.clone(),
+                password_hash: "$argon2id$vTEST".to_string(),
+            }),
+            1,
+        )
+        .await;
+
+        let host = HostMirrorRepository::find(&db, &user_id)
+            .await
+            .unwrap()
+            .expect("Registered creates the mirror row");
+        assert_eq!(host.email, email);
+        assert_eq!(host.country, None, "signup never carries a country");
+
+        // The country arrives on a later profile edit and nothing else changes. This is
+        // the path a host actually takes before onboarding.
+        apply(
+            shared::events::user::UserEvent::Updated(UserUpdated {
+                user_id,
+                first_name: None,
+                last_name: None,
+                email: None,
+                profile_picture: None,
+                license_plates: None,
+                country: Some("BE".to_string()),
+            }),
+            2,
+        )
+        .await;
+
+        let host = HostMirrorRepository::find(&db, &user_id)
+            .await
+            .unwrap()
+            .expect("the row is still there");
+        assert_eq!(host.country.as_deref(), Some("BE"));
+        assert_eq!(host.email, email, "an absent field is unchanged, not cleared");
+
+        sqlx::query("DELETE FROM host WHERE id = $1")
+            .bind(user_id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore]
     async fn payouts_sum_per_owner() {
@@ -217,25 +330,80 @@ mod live_tests {
         let owner_id = Uuid::now_v7();
         let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
         for (id, amount_cents) in [(a, 700), (b, 300)] {
-            PayoutRepository::upsert(
-                &db,
-                Payout {
-                    id,
-                    version: 1,
-                    owner_id,
-                    amount_cents,
-                    created_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+            PayoutRepository::upsert(&db, a_payout(id, owner_id, amount_cents))
+                .await
+                .unwrap();
         }
 
-        assert_eq!(PayoutRepository::total_for(&db, &owner_id).await.unwrap(), 1000);
+        assert_eq!(
+            PayoutRepository::total_for(&db, &owner_id).await.unwrap(),
+            1000,
+            "a requested payout counts — the money is already spoken for"
+        );
+
+        // The refund mechanism, and there is no other one: a failed transfer stops
+        // counting, and the balance goes back up because it is derived on every read.
+        PayoutRepository::transition(
+            &db,
+            b,
+            &[payout_status::REQUESTED],
+            PayoutPatch::failed("balance_insufficient".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            PayoutRepository::total_for(&db, &owner_id).await.unwrap(),
+            700,
+            "a failed payout must hand the money back"
+        );
+
+        // Paid still counts, and the transfer id is what a reconciliation would need.
+        PayoutRepository::transition(
+            &db,
+            a,
+            &[payout_status::REQUESTED],
+            PayoutPatch::paid("tr_test".to_string()),
+        )
+        .await
+        .unwrap();
+        let paid = PayoutRepository::find_by_id(&db, a)
+            .await
+            .unwrap()
+            .expect("upserted row");
+        assert_eq!(paid.status, payout_status::PAID);
+        assert_eq!(paid.transfer_id.as_deref(), Some("tr_test"));
+        assert_eq!(paid.amount_cents, 700, "absent columns survive a patch");
+        assert_eq!(
+            PayoutRepository::total_for(&db, &owner_id).await.unwrap(),
+            700
+        );
+
+        // Redelivery: no longer `requested`, so the guard refuses and a second transfer
+        // cannot overwrite the first's id.
+        PayoutRepository::transition(
+            &db,
+            a,
+            &[payout_status::REQUESTED],
+            PayoutPatch::paid("tr_second".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            PayoutRepository::find_by_id(&db, a)
+                .await
+                .unwrap()
+                .unwrap()
+                .transfer_id
+                .as_deref(),
+            Some("tr_test"),
+            "the guard must have held"
+        );
         // A host with nothing withdrawn is 0, not an error and not NULL — SUM over no
         // rows is NULL, which is what the COALESCE in that statement is for.
         assert_eq!(
-            PayoutRepository::total_for(&db, &Uuid::now_v7()).await.unwrap(),
+            PayoutRepository::total_for(&db, &Uuid::now_v7())
+                .await
+                .unwrap(),
             0
         );
 
@@ -292,7 +460,9 @@ mod live_tests {
         };
 
         if lock {
-            PayoutRepository::lock_owner(&mut *tx, &owner_id).await.unwrap();
+            PayoutRepository::lock_owner(&mut *tx, &owner_id)
+                .await
+                .unwrap();
         }
 
         // Both racers are certainly past the lock decision before either commits.
@@ -310,13 +480,7 @@ mod live_tests {
 
         PayoutRepository::upsert(
             &mut *tx,
-            Payout {
-                id: Uuid::now_v7(),
-                version: 1,
-                owner_id,
-                amount_cents: amount,
-                created_at: Utc::now(),
-            },
+            a_payout(Uuid::now_v7(), owner_id, amount),
         )
         .await
         .unwrap();
@@ -346,13 +510,7 @@ mod live_tests {
                 }
                 PayoutRepository::upsert(
                     &mut *tx,
-                    Payout {
-                        id: Uuid::now_v7(),
-                        version: 1,
-                        owner_id,
-                        amount_cents: amount,
-                        created_at: Utc::now(),
-                    },
+                    a_payout(Uuid::now_v7(), owner_id, amount),
                 )
                 .await
                 .unwrap();
@@ -372,7 +530,9 @@ mod live_tests {
         let earned = PaymentRepository::earned(&mut *conn, owner_id, Utc::now())
             .await
             .unwrap();
-        let paid = PayoutRepository::total_for(&mut *conn, owner_id).await.unwrap();
+        let paid = PayoutRepository::total_for(&mut *conn, owner_id)
+            .await
+            .unwrap();
         earned - paid
     }
 
@@ -396,7 +556,11 @@ mod live_tests {
         );
 
         let paid: Vec<i64> = [a, b].into_iter().flatten().collect();
-        assert_eq!(paid, vec![5000], "exactly one withdrawal may take the money");
+        assert_eq!(
+            paid,
+            vec![5000],
+            "exactly one withdrawal may take the money"
+        );
         assert_eq!(
             PayoutRepository::total_for(&db, &owner_id).await.unwrap(),
             5000,

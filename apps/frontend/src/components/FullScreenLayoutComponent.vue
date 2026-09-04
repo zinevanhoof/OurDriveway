@@ -20,7 +20,7 @@ const emit = defineEmits(['close'])
             <div v-if="description" class="text-xs text-muted-foreground font-semibold">{{ description }}</div>
         </div>
     </header>
-    <main class="space-y-4 flex-1 px-4 pb-2 pt-4 bg-background overflow-y-auto no-scrollbar">
+    <main class="space-y-4 flex-1 px-4 pb-4 pt-4 bg-background overflow-y-auto no-scrollbar">
         <slot name="main"></slot>
     </main>
     <footer class="px-4 pb-4 pt-3 bg-card border-t border-border">

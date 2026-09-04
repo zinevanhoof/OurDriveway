@@ -141,7 +141,7 @@ async fn create_database(url: &str) -> MyResult<()> {
 ///
 /// `None` means the caller passed a name no service owns, which is a typo and is
 /// reported. It does **not** mean "this database has no such table" — that is a
-/// legitimate case and is handled by [`missing_table`].
+/// legitimate case and is handled by [`table_present`].
 pub fn table_for(aggregate: &str) -> Option<&'static str> {
     Some(match aggregate {
         "user" => "app_user",
@@ -155,16 +155,40 @@ pub fn table_for(aggregate: &str) -> Option<&'static str> {
 }
 
 fn resolve(aggregate: &str) -> MyResult<&'static str> {
-    table_for(aggregate)
-        .ok_or_else(|| MyError::Bus(format!("unknown aggregate {aggregate:?}; see db::table_for")))
+    table_for(aggregate).ok_or_else(|| {
+        MyError::Bus(format!(
+            "unknown aggregate {aggregate:?}; see db::table_for"
+        ))
+    })
 }
 
 /// Whether this error is "that table does not exist in this database".
 ///
-/// Not a fault: view-service holds `payout` but no `payment`, and a client that has
-/// written a payment still echoes `payment:<id>@1` at it. SQLSTATE 42P01.
-fn missing_table(e: &sqlx::Error) -> bool {
-    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01"))
+/// Not a fault: each service's schema holds only the aggregates it projects, and a
+/// version can be asked about anywhere. SQLSTATE 42P01.
+///
+/// `payment` in view-service used to be the example of this. It is a real table there
+/// now — the wallet reads it — so that particular lookup resolves rather than escaping
+/// through here.
+/// Whether this database has that table, asked of the catalogue.
+///
+/// # Why not "try it and swallow 42P01"
+///
+/// Because a failed statement **aborts the surrounding transaction**, and both callers
+/// run inside one. Swallowing the error returns `Ok` to a caller that then commits —
+/// and Postgres answers a COMMIT on an aborted transaction with a silent ROLLBACK. The
+/// writes made before it disappear, the projector acks its message, and nothing
+/// reports a problem. `payment-service`'s host mirror consumed eighteen events that way
+/// and stayed empty; that is what this function exists to prevent.
+///
+/// `to_regclass` answers NULL for a table that is not there rather than raising, which
+/// is what makes it safe to ask mid-transaction.
+async fn table_present(conn: &mut PgConnection, table: &str) -> MyResult<bool> {
+    let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(table)
+        .fetch_one(conn)
+        .await?;
+    Ok(found.is_some())
 }
 
 /// The version this aggregate will have **after** the caller's write, having first
@@ -196,13 +220,18 @@ fn missing_table(e: &sqlx::Error) -> bool {
 ///   - `request_payout`, which takes `pg_advisory_xact_lock` on the owner id.
 pub async fn next_version(conn: &mut PgConnection, aggregate: &str, id: &Uuid) -> MyResult<u64> {
     let table = resolve(aggregate)?;
-    let sql = format!("SELECT version FROM {table} WHERE id = $1 FOR UPDATE");
 
-    let current: Option<i64> = match sqlx::query_scalar(&sql).bind(id).fetch_optional(conn).await {
-        Ok(v) => v,
-        Err(e) if missing_table(&e) => None,
-        Err(e) => return Err(e.into()),
-    };
+    // Same catalogue check as `set_version`, and the same reason — this also runs
+    // inside the caller's write transaction. In practice only the service that owns an
+    // aggregate calls this, so the branch is not expected to be taken; it is here so
+    // that the failure mode, if it ever is, is "version 1" rather than a transaction
+    // that silently commits nothing.
+    if !table_present(&mut *conn, table).await? {
+        return Ok(1);
+    }
+
+    let sql = format!("SELECT version FROM {table} WHERE id = $1 FOR UPDATE");
+    let current: Option<i64> = sqlx::query_scalar(&sql).bind(id).fetch_optional(conn).await?;
 
     Ok(current.unwrap_or(0).max(0) as u64 + 1)
 }
@@ -211,9 +240,10 @@ pub async fn next_version(conn: &mut PgConnection, aggregate: &str, id: &Uuid) -
 ///
 /// Called by the projector rather than by `bus::Tx`, because only the projector knows
 /// which table the aggregate lives in *here*: view-service holds `payout` but no
-/// `payment`, and a statement naming a table this database does not have is an error
-/// rather than a no-op. That error is absorbed — see [`missing_table`]. A missing
-/// *row* in a table that does exist is a clean no-op.
+/// `payment`, and payment-service projects users into a `host` mirror while having no
+/// `app_user` at all. Such a table is checked for first — see [`table_present`], which
+/// is where the interesting failure is written up — and a missing one makes this a
+/// no-op. A missing *row* in a table that does exist is a clean no-op too.
 ///
 /// `WHERE version < $v` so a redelivered or out-of-order event cannot wind the
 /// version backwards. A client waiting on `user:<id>@7` must never see 7 and then 6.
@@ -241,15 +271,22 @@ pub async fn set_version(
 ) -> MyResult<()> {
     let table = resolve(aggregate)?;
 
+    // Is this table even in this database? A service may project part of a stream
+    // without storing the aggregate itself — payment-service mirrors two columns of a
+    // user into `host` and has no `app_user` at all. Asked first, and asked of the
+    // catalogue: see [`table_present`] for what happens otherwise.
+    if !table_present(&mut *conn, table).await? {
+        return Ok(());
+    }
+
     // A read before the write rather than `RETURNING`: the update is conditional, so
     // it returns nothing at all in exactly the duplicate case this most wants to
     // distinguish from a gap.
     let read = format!("SELECT version FROM {table} WHERE id = $1");
-    let stored: Option<i64> = match sqlx::query_scalar(&read).bind(id).fetch_optional(&mut *conn).await {
-        Ok(v) => v,
-        Err(e) if missing_table(&e) => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
+    let stored: Option<i64> = sqlx::query_scalar(&read)
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
 
     if let Some(missing) = version_gap(stored.map(|v| v.max(0) as u64), version) {
         tracing::error!(
@@ -261,12 +298,16 @@ pub async fn set_version(
         );
     }
 
+    // No missing-table arm here either, and for the same reason: past the check above
+    // the table is there, and a genuine failure must reach the caller rather than be
+    // absorbed into a transaction that then commits nothing.
     let write = format!("UPDATE {table} SET version = $2 WHERE id = $1 AND version < $2");
-    match sqlx::query(&write).bind(id).bind(version as i64).execute(conn).await {
-        Ok(_) => Ok(()),
-        Err(e) if missing_table(&e) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    sqlx::query(&write)
+        .bind(id)
+        .bind(version as i64)
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// How many events are missing between `stored` and `incoming`, if any.
@@ -282,7 +323,9 @@ pub async fn set_version(
 /// - anything higher: `Some(n)` events were never applied here.
 pub fn version_gap(stored: Option<u64>, incoming: u64) -> Option<u64> {
     let stored = stored?;
-    incoming.checked_sub(stored + 1).filter(|missing| *missing > 0)
+    incoming
+        .checked_sub(stored + 1)
+        .filter(|missing| *missing > 0)
 }
 
 /// A per-owner lock key for `pg_advisory_xact_lock`, from the low 64 bits of a uuid.
@@ -397,7 +440,14 @@ mod tests {
     /// it must answer for exactly the names the services use and nothing else.
     #[test]
     fn every_aggregate_resolves_and_nothing_else_does() {
-        for aggregate in ["user", "spot", "booking", "payment", "payout", "refresh_token"] {
+        for aggregate in [
+            "user",
+            "spot",
+            "booking",
+            "payment",
+            "payout",
+            "refresh_token",
+        ] {
             assert!(table_for(aggregate).is_some(), "{aggregate}");
         }
 
@@ -406,8 +456,16 @@ mod tests {
         assert_eq!(table_for("user"), Some("app_user"));
 
         // Anything else is a typo, and must be reported rather than spliced.
-        assert_eq!(table_for("app_user"), None, "the aggregate is `user`, not the table name");
-        assert_eq!(table_for("host"), None, "the host table is gone; see advisory_key");
+        assert_eq!(
+            table_for("app_user"),
+            None,
+            "the aggregate is `user`, not the table name"
+        );
+        assert_eq!(
+            table_for("host"),
+            None,
+            "the host table is gone; see advisory_key"
+        );
         assert_eq!(table_for(""), None);
         assert_eq!(table_for("spot; DROP TABLE spot--"), None);
     }
@@ -417,6 +475,10 @@ mod tests {
     fn advisory_keys_differ_per_owner() {
         let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
         assert_ne!(advisory_key(&a), advisory_key(&b));
-        assert_eq!(advisory_key(&a), advisory_key(&a), "must be stable per owner");
+        assert_eq!(
+            advisory_key(&a),
+            advisory_key(&a),
+            "must be stable per owner"
+        );
     }
 }

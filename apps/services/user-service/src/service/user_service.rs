@@ -8,7 +8,7 @@ use bus::outbox;
 use shared::db;
 use shared::events::{Envelope, aggregate_id, format_version, user_subject};
 use shared::requests::user::{
-    Email, LoginRequest, ResendVerificationRequest, SignupRequest, UpdateUserRequest,
+    Country, Email, LoginRequest, ResendVerificationRequest, SignupRequest, UpdateUserRequest,
     VerifyEmailRequest,
 };
 use uuid::Uuid;
@@ -314,6 +314,7 @@ impl UserService {
             last_name,
             email,
             license_plates,
+            country,
             current_password,
             new_password,
             profile_picture,
@@ -327,6 +328,7 @@ impl UserService {
                     || last_name.is_some()
                     || email.is_some()
                     || license_plates.is_some()
+                    || country.is_some()
                     || profile_picture.is_some();
                 (!profile_too).context_unprocessable_entity((
                     "One change at a time",
@@ -395,6 +397,10 @@ impl UserService {
                     email: email.map(Into::into),
                     license_plates,
                     profile_picture,
+                    // Uppercased on the way out — `Country::into_inner` is the only
+                    // way to read one, so the database and every consumer of this
+                    // event see a single spelling.
+                    country: country.map(Country::into_inner),
                 })
             }
         };
@@ -491,6 +497,7 @@ impl UserService {
                 email: None,
                 profile_picture: user.profile_picture,
                 license_plates: Some(user.license_plates),
+                country: user.country,
             };
 
             // This table keeps no timestamp of its own and nothing downstream stores

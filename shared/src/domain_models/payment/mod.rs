@@ -14,4 +14,4 @@ pub mod payout;
 
 pub use booking::{BookingMirror, BookingMirrorPatch};
 pub use payment::{Earnings, Payment, PaymentPatch, status};
-pub use payout::Payout;
+pub use payout::{Payout, PayoutPatch};

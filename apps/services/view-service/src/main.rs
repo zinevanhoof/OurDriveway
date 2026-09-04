@@ -39,6 +39,16 @@ pub struct Config {
     pub port: u16,
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
+    /// How long after a booking ends its payment counts as settled — and therefore as
+    /// withdrawable rather than pending.
+    ///
+    /// **payment-service reads the same variable and the two must agree.** This one
+    /// decides what a host is *shown*; payment-service's decides what
+    /// `POST /api/payment/payout` will actually hand over. Set them apart and a wallet
+    /// offers a balance the withdraw endpoint refuses, or hides one it would have paid.
+    /// `k8s/chart/values.yaml` sets both from one entry; the two `.env` files are on
+    /// their honour.
+    pub settlement_secs: i64,
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
@@ -46,6 +56,7 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     nats_url: env::require("NATS_URL"),
     port: env::require_parsed("PORT"),
     jwt_secret: env::require("JWT_SECRET"),
+    settlement_secs: env::require_parsed("SETTLEMENT_SECS"),
 });
 
 #[tokio::main]
@@ -83,8 +94,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         js.client().clone(),
         &[STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
     );
-
-
 
     // For the outbox relay only. The projectors need no election: each partition is
     // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
@@ -138,13 +147,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the rules and the two problems that came with the old arrangement (a denied field
     // nulling a whole GraphQL array, and VULN-001's indexed-equality oracle).
     //
-    // Eight endpoints, replacing eleven GraphQL documents. One audience, one projection
-    // and one repository call each — see `route/mod.rs` for the rules that shape them.
+    // Nine endpoints. One audience, one projection and one repository call each — see
+    // `route/mod.rs` for the rules that shape them.
+    //
+    // Two of them are money, and they are here rather than on payment-service because
+    // reads are this service's job: `/me/wallet` is the history, `/me/balance` is what
+    // `GET /api/payment/earnings` used to answer.
     let app = Router::new()
         .route("/api/view/me", get(route::me::me))
         .route("/api/view/me/spots", get(route::me::spots))
         .route("/api/view/me/bookings", get(route::me::bookings))
-        .route("/api/view/me/payouts", get(route::me::payouts))
+        .route("/api/view/me/wallet", get(route::me::wallet))
+        .route("/api/view/me/balance", get(route::me::balance))
         .route("/api/view/spots/nearby", get(route::spot::nearby))
         .route("/api/view/spots/{id}", get(route::spot::public))
         .route("/api/view/spots/{id}/manage", get(route::spot::manage))

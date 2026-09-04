@@ -1,5 +1,6 @@
 import { apiFetch } from "./king";
 import { native } from "./http";
+import { recordSeq } from "@/lib/awaitSeq";
 import { readErrorDetail } from "@/lib/serverErrors";
 
 /**
@@ -98,36 +99,86 @@ export async function sessionState(sessionId: string): Promise<SessionState> {
   return await res.json();
 }
 
-export type Earnings = {
-  /** Withdrawable now: settled income minus what has already been taken out. */
-  availableCents: number;
-  /** Everything earned and settled, ever. */
-  earnedCents: number;
-  paidOutCents: number;
+// `earnings()` was here, behind `GET /api/payment/earnings`. It is
+// `viewApi.fetchBalance()` now: payment-service writes and view-service reads, and the
+// balance is a read. The same move gives it `pendingCents`, which this endpoint had no
+// booking table to compute.
+
+/**
+ * Withdraws `amountCents` to the host's connected Stripe account.
+ *
+ * The amount is sent, unlike `createSession` above, because it is the host's own money
+ * and they choose how much of it to take. It is not *trusted*: the server re-reads the
+ * balance under an advisory lock and refuses anything larger rather than clamping, so
+ * the figure returned is the only one that is true — print that one, never the one sent.
+ *
+ * Two of these racing is resolved by the same lock: the loser re-reads, finds nothing
+ * left, and gets **422**. It is not a 409 and there is no retry to write — by the time
+ * it answers, there genuinely is nothing to take out.
+ *
+ * `recordSeq` is what makes the wallet show the withdrawal on arrival. The response is
+ * a 202: the payout row exists in payment-service, but the projection the wallet reads
+ * is still catching up, and without recording the version here the very next balance
+ * read can legitimately answer from before this write.
+ *
+ * The transfer itself has *not* happened yet when this resolves. The row lands as
+ * pending and a worker turns it into paid or failed a moment later, which is why there
+ * is nothing to await beyond the projection.
+ */
+export async function requestPayout(amountCents: number): Promise<number> {
+  const res = await apiFetch("/api/payment/payout", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ amountCents }),
+  });
+  if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
+
+  const body = await res.json();
+  recordSeq(body.seq);
+  return body.amountCents;
+}
+
+export type ConnectStatus = {
+  /**
+   * `needs_country` — no account, and no country on the profile to open one with.
+   * Stripe fixes the country permanently when the account is created, so it is asked
+   * for first rather than guessed.
+   * `none` — ready to onboard; nothing exists at Stripe yet.
+   * `onboarding` — an account exists but Stripe will not pay it: abandoned halfway, or
+   * submitted and under review.
+   * `enabled` — payouts are on, and the withdraw form is safe to show.
+   */
+  state: "needs_country" | "none" | "onboarding" | "enabled";
+  /** Last four of the bank account Stripe pays into. Null when it hands back none. */
+  bankLast4: string | null;
 };
 
 /**
- * What this host has earned and what they can withdraw.
+ * Whether the caller can be paid, and where.
  *
- * The single source for every money figure shown to a host. It deliberately does not
- * come from the booking read model: a total derived one way next to a withdraw button
- * that spends a total derived another way is how the two end up disagreeing.
+ * Answered from Stripe live rather than from a projection — which is why it is on
+ * payment-service and not view-service, like `sessionState` above and for the same
+ * reason. A cached copy would go stale in exactly the moment that matters: a host
+ * finishing onboarding in Stripe's own iframe and expecting the form to appear.
  */
-export async function earnings(): Promise<Earnings> {
-  const res = await apiFetch("/api/payment/earnings");
+export async function fetchConnectStatus(): Promise<ConnectStatus> {
+  const res = await apiFetch("/api/payment/connect/account");
   if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
   return await res.json();
 }
 
 /**
- * Withdraws the whole available balance. Nothing real moves — no bank, no transfer.
+ * A client secret for Connect's embedded components, creating the caller's connected
+ * account on the first call.
  *
- * No amount is sent: the server computes it, so there is nothing here a caller could
- * inflate. Two of these racing is resolved server-side by a compare-and-swap, which
- * surfaces as a 409 rather than a double payout.
+ * POST, because it is not a read: the first one creates an account at Stripe. Called on
+ * mount and again whenever a component asks for a fresh secret — see `lib/connect.ts`.
+ *
+ * Deliberately does **not** `recordSeq`: nothing here writes to a stream, and there is
+ * no projection to wait for.
  */
-export async function requestPayout(): Promise<number> {
-  const res = await apiFetch("/api/payment/payout", { method: "POST" });
+export async function createAccountSession(): Promise<string> {
+  const res = await apiFetch("/api/payment/connect/session", { method: "POST" });
   if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
-  return (await res.json()).amountCents;
+  return (await res.json()).clientSecret;
 }

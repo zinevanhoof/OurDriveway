@@ -218,6 +218,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stripe-connect"
+version = "1.0.0-rc.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c00f3890e66de35835f92c25d2c458c5b29ff9332c49493f4fccb02bc810a69c"
+dependencies = [
+ "async-stripe-client-core",
+ "async-stripe-shared",
+ "async-stripe-types",
+ "miniserde",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "tracing",
+]
+
+[[package]]
 name = "async-stripe-core"
 version = "1.0.0-rc.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3006,6 +3022,7 @@ dependencies = [
  "async-nats",
  "async-stripe",
  "async-stripe-checkout",
+ "async-stripe-connect",
  "async-stripe-core",
  "async-stripe-types",
  "async-stripe-webhook",
@@ -3014,6 +3031,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "garde",
+ "reqwest",
  "serde",
  "serde_json",
  "shared",

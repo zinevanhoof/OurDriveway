@@ -20,7 +20,9 @@ use shared::{
 };
 use sqlx::PgPool;
 
-use crate::service::settlement_worker_service::SettlementWorkerService;
+use crate::service::{
+    payout_worker_service::PayoutWorkerService, settlement_worker_service::SettlementWorkerService,
+};
 
 /// How long to wait for this service's booking mirror to catch up to the event being
 /// handled. Past this, fail and let the NAK bring the message back — a projector that
@@ -82,13 +84,20 @@ impl Worker for BookingWorker {
     }
 }
 
-/// The other edge: a payment resolving for a booking that has already ended.
+/// This service's own stream, and the two side effects it triggers: a payment
+/// resolving for a booking that has already ended, and a host's withdrawal.
 ///
-/// Needed because the orderings are genuinely independent. A Bancontact payment can
-/// land after the hold lapsed, in which case the BOOKINGS worker already ran and found
-/// nothing but an unpaid intent.
+/// The first is needed because the orderings are genuinely independent — a Bancontact
+/// payment can land after the hold lapsed, in which case the BOOKINGS worker already
+/// ran and found nothing but an unpaid intent.
+///
+/// **One consumer for both**, rather than a second `PayoutWorker` beside this one. A
+/// durable consumer is a cursor and an ack floor, not a dispatch mechanism; two of them
+/// on the same stream would each receive every message and each ignore most of it. The
+/// arms below are disjoint, so a NAK from either only ever redelivers its own event.
 pub struct PaymentWorker {
     pub service: Arc<SettlementWorkerService>,
+    pub payouts: Arc<PayoutWorkerService>,
 }
 
 impl Worker for PaymentWorker {
@@ -101,8 +110,15 @@ impl Worker for PaymentWorker {
 
         // Only a successful payment can require settling from this side. Refunded and
         // IntentCancelled are the *outcomes* of settling — reacting to them would loop.
+        //
+        // `PayoutRequested` is the other half, and the same rule applies to it:
+        // `PayoutPaid` and `PayoutFailed` are what this arm *produces*, so reacting to
+        // either would be the same loop one table over.
         let booking_id = match envelope.payload {
             PaymentEvent::Succeeded { booking_id, .. } => booking_id,
+            PaymentEvent::PayoutRequested { payout_id, .. } => {
+                return self.payouts.pay_out(&payout_id).await;
+            }
             _ => return Ok(()),
         };
 

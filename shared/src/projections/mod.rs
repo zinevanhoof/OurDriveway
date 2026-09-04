@@ -43,9 +43,9 @@
 //! per site. Nothing needs that today — the spot page reads its bookings separately.
 
 pub mod booking;
-pub mod payout;
 pub mod spot;
 pub mod user;
+pub mod wallet;
 
 use serde::Serialize;
 use sqlx::{FromRow, postgres::PgRow};

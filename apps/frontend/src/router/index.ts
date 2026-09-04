@@ -1,5 +1,6 @@
 import HomeView from "@/views/HomeView.vue";
 import { createWebHistory, createRouter } from "vue-router";
+import type { RouteLocationNormalized } from "vue-router";
 import type { Component } from "vue";
 import ProfileView from "@/views/ProfileView.vue";
 import SearchView from "@/views/SearchView.vue";
@@ -15,6 +16,8 @@ import EditProfileView from "@/views/EditProfileView.vue";
 import ChangePasswordView from "@/views/ChangePasswordView.vue";
 import VerifyEmailView from "@/views/VerifyEmailView.vue";
 import CheckoutView from "@/views/CheckoutView.vue";
+import WalletView from "@/views/wallet/WalletView.vue";
+import WalletWithdrawView from "@/views/wallet/WalletWithdrawView.vue";
 
 export type RouteMeta = {
   header: Component | null;
@@ -73,6 +76,28 @@ const routes = [
     name: "spot-edit",
     component: EditSpotView,
     props: true,
+    meta: {
+      header: null,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    path: "/wallet",
+    name: "wallet",
+    component: WalletView,
+    meta: {
+      header: null,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    path: "/wallet/withdraw/:maxWithdraw",
+    name: "wallet-withdraw",
+    component: WalletWithdrawView,
+    // Params are strings; the cap is money in cents.
+    props: (route: RouteLocationNormalized) => ({
+      maxWithdraw: Number(route.params.maxWithdraw),
+    }),
     meta: {
       header: null,
       requiresAuth: true,

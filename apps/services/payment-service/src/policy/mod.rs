@@ -10,4 +10,5 @@
 //! a type with fields here would be state, and state is exactly what this folder
 //! does not have. The enums that do live here are return values, not holders.
 
+pub mod payout;
 pub mod settlement;

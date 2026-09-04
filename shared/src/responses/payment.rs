@@ -30,24 +30,52 @@ pub struct SessionStateResponse {
     pub booking_id: Uuid,
 }
 
-/// A host's money.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EarningsResponse {
-    /// Withdrawable now: settled income minus what has already been taken out.
-    pub available_cents: i64,
-    /// Everything earned and settled, ever.
-    pub earned_cents: i64,
-    pub paid_out_cents: i64,
-}
+// `EarningsResponse` was here. A host's money is `projections::wallet::Balance` now,
+// served by view-service — same three figures plus what is still pending, which needs
+// the read model's booking rows to compute.
 
 /// A withdrawal, which like every other write answers with where it landed.
 ///
-/// Carries the amount as well, because the server computed it — the client sent no
-/// figure and has no other way to learn what was actually taken out.
+/// Carries the amount as well, and that is not a convenience: the client asks for a
+/// figure but the server recomputes under the lock and may pay **less** — a booking
+/// that had not settled when the page was drawn is gone from the balance by the time
+/// the request arrives. This is the only figure that is true, which is why the screen
+/// prints this one back rather than the one it sent.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PayoutResponse {
     pub seq: String,
     pub amount_cents: i64,
+}
+
+/// Whether this host can be paid, for the withdraw screen's one gate.
+///
+/// Answered from Stripe live rather than from a column — see the note over
+/// `connect_account` in `migrations/payment/0003`. A cached `enabled` that has gone
+/// stale is exactly the failure worth avoiding: it shows a host a withdraw form Stripe
+/// then refuses.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectStatusResponse {
+    /// `needs_country` — no account, and no country on the profile to open one with.
+    /// Accounts v2 fixes `identity.country` permanently at creation, so it is asked for
+    /// before anything is created rather than defaulted.
+    /// `none` — ready to onboard, nothing created at Stripe yet.
+    /// `onboarding` — an account exists but Stripe will not pay it yet.
+    /// `enabled` — payouts are on; the withdraw form is safe to show.
+    pub state: &'static str,
+    /// The last four of the bank account Stripe will pay into, for the summary line.
+    /// `None` whenever Stripe does not hand one back, which the screen renders by
+    /// omitting the line rather than by inventing a placeholder.
+    pub bank_last4: Option<String>,
+}
+
+/// The short-lived secret that lets the browser mount Connect's embedded components.
+///
+/// Not a bearer token for our API: it authorises rendering one account's onboarding and
+/// account-management UI, from Stripe's own iframes, and expires on its own.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSessionResponse {
+    pub client_secret: String,
 }

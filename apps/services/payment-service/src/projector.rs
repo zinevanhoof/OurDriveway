@@ -6,11 +6,14 @@ use shared::{
         payment::{BookingMirror, BookingMirrorPatch},
     },
     error::myerror::MyResult,
-    events::{STREAM_BOOKINGS, booking::BookingEvent},
+    events::{STREAM_BOOKINGS, STREAM_USERS, booking::BookingEvent, user::UserEvent},
 };
 use sqlx::PgConnection;
 
-use crate::repository::booking_mirror_repository::BookingMirrorRepository;
+use crate::repository::{
+    booking_mirror_repository::BookingMirrorRepository,
+    host_mirror_repository::HostMirrorRepository,
+};
 
 /// payment-service consumes BOOKINGS as well as its own stream, for two things it
 /// cannot answer otherwise: what a booking costs and who it belongs to (before a
@@ -83,6 +86,53 @@ impl Projector for BookingProjector {
         }?;
 
         shared::db::set_version(conn, "booking", &booking_id, version).await
+    }
+}
+
+/// USERS, into the `host` mirror: the email and country Stripe demands before it will
+/// open a connected account.
+///
+/// A second foreign stream, and it is here for the reason `shared::rpc` gives for not
+/// being here — a value onboarding cannot proceed without must not depend on another
+/// service answering a request. See `migrations/payment/0004_host_mirror.sql`.
+///
+/// Only two of the five USERS variants matter. A password change, an email
+/// verification and a resend request change nothing Stripe is ever told.
+pub struct UserProjector;
+
+impl Projector for UserProjector {
+    const STREAM: &'static str = STREAM_USERS;
+    const DURABLE: &'static str = "payment-host-mirror";
+    type Event = UserEvent;
+
+    async fn apply(
+        &self,
+        conn: &mut PgConnection,
+        event: UserEvent,
+        _at: DateTime<Utc>,
+        version: u64,
+    ) -> MyResult<()> {
+        let user_id = event.user_id();
+
+        match event {
+            UserEvent::Registered(e) => {
+                HostMirrorRepository::upsert(&mut *conn, &user_id, version, &e.email).await
+            }
+
+            // `None` is unchanged in the event and unchanged in the write — the same
+            // rule the profile form sends. A country arrives only this way: it is not
+            // asked for at signup.
+            UserEvent::Updated(e) => {
+                HostMirrorRepository::patch(&mut *conn, &user_id, version, e.email, e.country).await
+            }
+
+            // Deliberately ignored, and each for its own reason: a password hash must
+            // never reach this database, `EmailVerified` gates login rather than
+            // payouts, and `VerificationRequested` is notification-service's alone.
+            _ => Ok(()),
+        }?;
+
+        shared::db::set_version(conn, "user", &user_id, version).await
     }
 }
 

@@ -50,6 +50,10 @@ pub struct User {
     /// Gates login. On the same row as the password hash deliberately — one
     /// lookup, and no way to check the credential without also holding the flag.
     pub email_verified: bool,
+    /// ISO 3166-1 alpha-2, uppercase. `None` until the profile is filled in, which
+    /// is most accounts: it is only needed to open a Stripe connected account, and
+    /// only hosts ever do that.
+    pub country: Option<String>,
 }
 
 impl User {
@@ -73,6 +77,7 @@ impl User {
             profile_picture: None,
             license_plates: Vec::new(),
             email_verified: false,
+            country: None,
         }
     }
 }
@@ -93,6 +98,7 @@ pub struct UserPatch {
     pub profile_picture: Option<String>,
     pub license_plates: Option<Vec<String>>,
     pub email_verified: Option<bool>,
+    pub country: Option<String>,
 }
 
 // There is no `bind` here any more. It existed because SurrealDB binds by NAME, so a
@@ -113,6 +119,7 @@ impl From<UserUpdated> for UserPatch {
             email: e.email,
             profile_picture: e.profile_picture,
             license_plates: e.license_plates,
+            country: e.country,
             ..Self::default()
         }
     }
@@ -141,6 +148,7 @@ mod tests {
             profile_picture: None,
             license_plates: None,
             email_verified: None,
+            country: None,
         };
     }
 }

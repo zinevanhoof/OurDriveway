@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use async_nats::jetstream::Context;
-use chrono::Utc;
 use bus::outbox;
+use chrono::{DateTime, Utc};
 use shared::db;
 use shared::{
     domain_models::{
@@ -30,6 +30,7 @@ use axum::http::StatusCode;
 
 use crate::{
     client::stripe::{NewSession, Outcome, SessionState, Stripe},
+    policy::{self, payout::Rejection},
     repository::{
         booking_mirror_repository::BookingMirrorRepository, payment_repository::PaymentRepository,
         payout_repository::PayoutRepository,
@@ -53,12 +54,7 @@ pub struct PaymentService {
 }
 
 impl PaymentService {
-    pub fn new(
-        js: Context,
-        db: sqlx::PgPool,
-        stripe: Arc<Stripe>,
-        settlement_secs: i64,
-    ) -> Self {
+    pub fn new(js: Context, db: sqlx::PgPool, stripe: Arc<Stripe>, settlement_secs: i64) -> Self {
         Self {
             nc: js.client().clone(),
             db,
@@ -312,12 +308,8 @@ impl PaymentService {
         db::set_version(&mut tx, "payment", &payment_id, version).await?;
 
         // Same as above: the id is what makes a redelivered webhook a no-op.
-        let mut envelope = Envelope::new(
-            event,
-            None,
-            aggregate_id("payment", &payment_id),
-            version,
-        );
+        let mut envelope =
+            Envelope::new(event, None, aggregate_id("payment", &payment_id), version);
         envelope.event_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, dedupe.as_bytes());
 
         outbox::enqueue(&mut *tx, &payment_subject(&booking_id), &envelope).await?;
@@ -349,14 +341,15 @@ impl PaymentService {
         })
     }
 
-    /// The read-only version, for the endpoint that just reports a balance.
-    ///
-    /// Borrows a connection for the pair, so both halves see one snapshot each rather
-    /// than being answered from two different pooled connections.
-    pub async fn earnings(&self, owner_id: &Uuid) -> MyResult<Earnings> {
-        let mut conn = self.db.acquire().await?;
-        self.earnings_with(&mut conn, owner_id).await
-    }
+    // There was a read-only sibling here, `earnings`, behind `GET /api/payment/earnings`.
+    // Both are gone: reading is view-service's job, and `GET /api/view/me/balance`
+    // answers the same question over the projection.
+    //
+    // `earnings_with` stays because it is not the same thing. It has exactly one caller,
+    // `request_payout` below, and it runs *inside* that transaction under the advisory
+    // lock — which is the only reason two double-clicked withdrawals cannot both be
+    // paid. A balance computed anywhere else can lag; this one cannot, and that is the
+    // whole distinction.
 
     /// "Take the money out." Nothing leaves any real account.
     ///
@@ -384,22 +377,29 @@ impl PaymentService {
     /// The loser therefore gets "You have no settled earnings yet" rather than a
     /// conflict to retry — which is the honest answer, because by then there genuinely
     /// is nothing left to withdraw.
-    pub async fn request_payout(&self, owner_id: &Uuid) -> MyResult<(String, i64)> {
+    pub async fn request_payout(
+        &self,
+        owner_id: &Uuid,
+        requested_cents: i64,
+    ) -> MyResult<(String, i64)> {
         let mut tx = self.db.begin().await?;
 
         // First statement in the transaction. Everything below depends on it.
         PayoutRepository::lock_owner(&mut *tx, owner_id).await?;
 
         // AFTER the lock, never before.
-        let amount_cents = self
+        let available_cents = self
             .earnings_with(&mut *tx, owner_id)
             .await?
             .available_cents();
 
-        (amount_cents > 0).context_unprocessable_entity((
-            "Nothing to Withdraw",
-            "You have no settled earnings yet.",
-        ))?;
+        // The client's figure meets the server's here, and only here. `check` never
+        // clamps — a request for more than there is fails and names what there is,
+        // rather than quietly paying out a different number than the screen showed.
+        let amount_cents = match policy::payout::check(requested_cents, available_cents) {
+            Ok(amount) => amount,
+            Err(rejection) => return Err(refused(rejection)),
+        };
 
         let payout_id = Uuid::now_v7();
         let requested = PaymentEvent::PayoutRequested {
@@ -433,19 +433,56 @@ impl PaymentService {
         Ok((await_token, amount_cents))
     }
 
-    /// Re-emits every payout as the event that reproduces its row, for a consumer
-    /// that needs rebuilding. See [`outbox::backfill`] for what this is and is not.
+    /// Re-emits everything on this stream as the events that reproduce it, for a
+    /// consumer that needs rebuilding. See [`outbox::backfill`] for what this is and is
+    /// not.
     ///
-    /// Payouts and nothing else, because payouts are all PAYMENTS has downstream:
-    /// view-service projects `PayoutRequested` and deliberately ignores every other
-    /// variant — what a renter was charged is this service's to answer, and a second
-    /// copy of it elsewhere would be a second version of the same money. So there is
-    /// no payment projection to rebuild, and re-emitting `Succeeded` or `Refunded`
-    /// would only wake this service's own settlement worker for no reason.
+    /// **Payments as well as payouts now.** This used to be payouts alone, on the
+    /// argument that a payout was all PAYMENTS had downstream and that re-emitting
+    /// `Succeeded` would only wake this service's own settlement worker for nothing.
+    /// Half of that is obsolete — view-service projects the payments too, and a read
+    /// model that cannot be rebuilt is not a read model — and the other half is now
+    /// handled where it belongs: `bus::worker` acks a backfilled envelope without
+    /// running any handler, so no worker in any service reacts to one.
     ///
-    /// One event each: a payout is written once and never changes.
+    /// A payment takes two events: the `Created` that brings the row into existence and
+    /// the one transition that gives it its status. Both carry the same aggregate
+    /// version, which is the row's — a rebuild lands on the version the live path would
+    /// have left.
+    ///
+    /// A payout takes one; it is written once and never changes.
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
+
+        for payment in PaymentRepository::all(&self.db).await? {
+            let created_at = payment.created_at;
+            let created = PaymentEvent::Created(PaymentCreated {
+                payment_id: payment.id,
+                booking_id: payment.booking_id,
+                owner_id: payment.owner_id,
+                renter_id: payment.renter_id,
+                session_id: payment.session_id.clone(),
+                amount_cents: payment.amount_cents,
+                created_at,
+            });
+
+            let mut events = vec![(created_at, created)];
+            if let Some(terminal) = Self::terminal_event(&payment) {
+                events.push(terminal);
+            }
+
+            sent += outbox::backfill(
+                &self.db,
+                // The booking-keyed subject the original went out on. A backfill has no
+                // business landing on a different one: that subject is what orders one
+                // payment's events, and the projector's lanes are partitioned by it.
+                &payment_subject(&payment.booking_id),
+                &aggregate_id("payment", &payment.id),
+                payment.version,
+                events,
+            )
+            .await?;
+        }
 
         for payout in PayoutRepository::all(&self.db).await? {
             let requested_at = payout.created_at.into();
@@ -471,7 +508,106 @@ impl PaymentService {
             .await?;
         }
 
-        tracing::info!(events = sent, "payouts backfilled");
+        tracing::info!(events = sent, "payments and payouts backfilled");
         Ok(sent)
     }
+
+    /// The one event that moves a payment from `created` to where it ended up, rebuilt
+    /// from the row, or `None` for a payment that is still `created`.
+    ///
+    /// Two rows deliberately produce no terminal event:
+    ///
+    /// - A `succeeded` row with no `intent_id`, or a `failed` one with no reason. Both
+    ///   are written in the same statement as their status, so neither combination
+    ///   should exist; skipping is the honest answer for a row that does, rather than
+    ///   inventing a Stripe handle.
+    /// - A `refunded` row from before `refunded_at` existed. It is re-emitted as
+    ///   `Succeeded` instead — which it certainly was, before it was refunded. That
+    ///   matches what the live read does with such a row: `WalletRepository::find_month`
+    ///   filters on `refunded_at IS NOT NULL`, so the refund is absent from the history
+    ///   either way, and the balance stays right because the booking behind it is
+    ///   cancelled and stops matching there.
+    fn terminal_event(payment: &Payment) -> Option<(DateTime<Utc>, PaymentEvent)> {
+        let payment_id = payment.id;
+        let booking_id = payment.booking_id;
+        let succeeded = |intent_id: String| PaymentEvent::Succeeded {
+            payment_id,
+            booking_id,
+            intent_id,
+        };
+
+        match payment.status.as_str() {
+            status::SUCCEEDED => Some((payment.created_at, succeeded(payment.intent_id.clone()?))),
+
+            status::FAILED => Some((
+                payment.created_at,
+                PaymentEvent::Failed {
+                    payment_id,
+                    booking_id,
+                    reason: payment.failure_reason.clone()?,
+                },
+            )),
+
+            status::REFUNDED => match (payment.refund_id.clone(), payment.refunded_at) {
+                (Some(refund_id), Some(refunded_at)) => Some((
+                    refunded_at,
+                    PaymentEvent::Refunded {
+                        payment_id,
+                        booking_id,
+                        refund_id,
+                        amount_cents: payment.amount_cents,
+                        refunded_at,
+                    },
+                )),
+                // Refunded before the column existed: as far as anything downstream can
+                // honestly be told, this payment succeeded.
+                _ => Some((payment.created_at, succeeded(payment.intent_id.clone()?))),
+            },
+
+            status::EXPIRED => Some((
+                payment.created_at,
+                PaymentEvent::SessionExpired {
+                    payment_id,
+                    booking_id,
+                },
+            )),
+
+            // `created`: the `Created` event is the whole of its history.
+            _ => None,
+        }
+    }
+}
+
+/// A refused withdrawal, as the screen should read it.
+///
+/// All three are **422**, not 409: nothing here is a conflict to retry. The balance was
+/// read under the lock, so by the time this answers the figure it names is the true
+/// one, and repeating the same request would get the same refusal.
+///
+/// The detail is written for a host, in euros, and reaches the form verbatim — which is
+/// also why `AboveAvailable` carries the number rather than saying "too much".
+fn refused(rejection: Rejection) -> MyError {
+    let (title, detail) = match rejection {
+        Rejection::NothingAvailable => (
+            "Nothing to Withdraw",
+            "You have no settled earnings yet.".to_string(),
+        ),
+        Rejection::BelowMinimum => (
+            "Below the Minimum",
+            format!(
+                "The smallest withdrawal is €{}.",
+                shared::domain_models::payment::payout::MIN_CENTS / 100
+            ),
+        ),
+        Rejection::AboveAvailable { available_cents } => (
+            "More Than Available",
+            format!(
+                "You have €{}.{:02} available to withdraw.",
+                available_cents / 100,
+                available_cents % 100
+            ),
+        ),
+    };
+
+    MyError::api(StatusCode::UNPROCESSABLE_ENTITY, title, detail)
 }

@@ -13,12 +13,19 @@ use shared::error::myerror::{ContextExt, MyError, MyResult};
 // `StripeRequest` is imported for its `customize()` method, which is what carries an
 // idempotency key onto a request — it is a trait method, not an inherent one.
 use shared::{general_models::booking::Booked, rpc::spot::SpotCard};
-use stripe::{Client, IdempotencyKey, RequestStrategy, StripeRequest};
+use stripe::{Client, IdempotencyKey, RequestStrategy, StripeError, StripeRequest};
 use stripe_checkout::checkout_session::{
     CreateCheckoutSession, CreateCheckoutSessionLineItems, CreateCheckoutSessionLineItemsPriceData,
     CreateCheckoutSessionPaymentIntentData, ExpireCheckoutSession, ProductData,
     RetrieveCheckoutSession,
 };
+// No `account` imports: creating and retrieving a connected account is Accounts **v2**,
+// which this crate does not cover — see `Stripe::create_account`. What is left on v1 is
+// only what has no v2 endpoint at all.
+use stripe_connect::account_session::{
+    AccountConfigParam, CreateAccountSession, CreateAccountSessionComponents,
+};
+use stripe_connect::transfer::CreateTransfer;
 // These enums come from `stripe_shared` but are re-exported here, so that crate stays
 // transitive rather than becoming another direct dependency for a handful of type names.
 use stripe_checkout::{
@@ -37,6 +44,14 @@ use uuid::Uuid;
 /// with no booking id, `verify` returns `Ignored`, and paid bookings never confirm.
 const BOOKING_ID_KEY: &str = "booking_id";
 
+/// Our host id, set on the connected account. Never read back — the mapping this
+/// service trusts is the `connect_account` row, and this exists so a human looking at a
+/// Stripe dashboard can tell whose account they are looking at.
+const OWNER_ID_KEY: &str = "owner_id";
+
+/// Our payout id, set on the transfer. Same job, one row further down.
+const PAYOUT_ID_KEY: &str = "payout_id";
+
 /// How long past the hold's own expiry the Checkout Session stays alive.
 ///
 /// Stripe requires `expires_at` to be 30 minutes to 24 hours from creation, which is
@@ -54,8 +69,26 @@ const BOOKING_ID_KEY: &str = "booking_id";
 /// resume, which is exactly what it did.
 const SESSION_GRACE_MINUTES: i64 = 30;
 
+/// The Accounts v2 API version this service is written against.
+///
+/// Sent on every `/v2/…` request. v2 pins its shape to a dated version rather than to
+/// the account's default, so this string is part of the contract the parsing below
+/// assumes — change it and re-read `AccountState`.
+const V2_VERSION: &str = "2026-08-26.dahlia";
+
+const V2_ACCOUNTS: &str = "https://api.stripe.com/v2/core/accounts";
+
 pub struct Stripe {
     client: Client,
+    /// For the v2 calls, which `async-stripe` does not cover: the crate is generated
+    /// from the v1 OpenAPI spec and has no `/v2/core/accounts` in it at all.
+    ///
+    /// Two clients in one struct is not duplication so much as the seam holding: both
+    /// stay behind this file, and nothing outside it knows which API version answered.
+    http: reqwest::Client,
+    /// Held because the raw v2 requests have to authenticate themselves — `Client`
+    /// owns its copy privately and exposes no way to borrow it.
+    secret_key: String,
 }
 
 /// A freshly created Checkout Session. `client_secret` is the only part the browser sees.
@@ -86,6 +119,116 @@ pub struct SessionState {
     pub client_secret: Option<String>,
 }
 
+// ─── the Accounts v2 wire shapes ────────────────────────────────────────────
+//
+// Hand-written because `async-stripe` has no v2 surface, and deliberately partial:
+// every field this service does not read is left out rather than modelled, so a v2
+// account gaining one is a field ignored and not a decode that fails. `Option`
+// everywhere for the same reason — v2 answers `null` for anything `include` did not
+// ask for, which is most of the object.
+
+#[derive(serde::Deserialize)]
+struct V2Account {
+    id: String,
+    configuration: Option<V2Configuration>,
+}
+
+#[derive(serde::Deserialize)]
+struct V2Configuration {
+    recipient: Option<V2Recipient>,
+}
+
+#[derive(serde::Deserialize)]
+struct V2Recipient {
+    capabilities: Option<V2Capabilities>,
+    /// Where Stripe pays this account, once onboarding has added one. Kept as a raw
+    /// value: it is only ever read for four digits to print, its shape varies by payout
+    /// rail, and nothing here should fail to decode over a summary line.
+    default_outbound_destination: Option<serde_json::Value>,
+}
+
+impl V2Recipient {
+    /// The last four digits of the destination bank account, if Stripe named one.
+    ///
+    /// Searches the destination for a `last4` at either level, because a bank account
+    /// may be the object itself or nested under its type. `None` whenever it is absent,
+    /// which is every account that has not finished onboarding — the withdraw screen
+    /// drops the line rather than inventing a placeholder.
+    fn bank_last4(self) -> Option<String> {
+        let destination = self.default_outbound_destination?;
+        let last4 = destination
+            .get("last4")
+            .or_else(|| destination.get("bank_account")?.get("last4"))?;
+        last4.as_str().map(str::to_string)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct V2Capabilities {
+    stripe_balance: Option<V2StripeBalance>,
+}
+
+#[derive(serde::Deserialize)]
+struct V2StripeBalance {
+    /// Stripe can move this account's balance to their bank.
+    payouts: Option<V2Capability>,
+}
+
+#[derive(serde::Deserialize)]
+struct V2Capability {
+    /// `active`, `restricted`, `pending`, `unsupported`, `disabled` — compared as a
+    /// string rather than an enum so a status Stripe adds is "not active" instead of a
+    /// decode failure in the middle of the payout gate.
+    status: String,
+}
+
+#[derive(serde::Deserialize)]
+struct V2Error {
+    error: V2ErrorBody,
+}
+
+#[derive(serde::Deserialize)]
+struct V2ErrorBody {
+    message: String,
+}
+
+/// What Stripe says about a host's connected account, reduced to the two things the
+/// withdraw screen actually asks.
+///
+/// Read live on every status call rather than cached in a column — see the note over
+/// `connect_account` in `migrations/payment/0003`. The whole `Account` object is a
+/// hundred fields of requirements and settings; none of the rest is our business.
+pub struct AccountState {
+    /// Stripe will pay this account: `configuration.recipient.capabilities
+    /// .stripe_balance.payouts` is `active`. The **only** gate on showing the withdraw
+    /// form.
+    ///
+    /// `details_submitted` used to sit beside this and is gone with the v1 object — v2
+    /// has no such flag, and nothing read it: "an account that cannot be paid yet" is
+    /// one screen whether the host abandoned onboarding or is still under review, and
+    /// Stripe's own component explains which inside its iframe.
+    pub payouts_enabled: bool,
+    /// Last four of the bank account Stripe pays into, for the summary line. `None`
+    /// whenever Stripe hands back no external account, which the screen renders by
+    /// dropping the line rather than by inventing a placeholder.
+    pub bank_last4: Option<String>,
+}
+
+/// What became of a Transfer.
+///
+/// The distinction is the worker's whole retry policy, so it is a return value rather
+/// than an error: `Refused` is Stripe's own answer and will be the same answer forever
+/// (`balance_insufficient`, an account that cannot receive transfers), so the payout is
+/// marked failed and the money returns to the balance. A transport failure or a 5xx is
+/// an `Err` instead, which NAKs and comes back — and the idempotency key means the
+/// retry cannot pay twice.
+pub enum Transferred {
+    /// `tr_…`
+    Ok(String),
+    /// Stripe's own message, for the log.
+    Refused(String),
+}
+
 /// What a verified webhook turned out to be about.
 ///
 /// `Ignored` is not an error: a sandbox is shared, `--events` filtering is
@@ -101,6 +244,8 @@ impl Stripe {
     pub fn new(secret_key: &str) -> Self {
         Self {
             client: Client::new(secret_key),
+            http: reqwest::Client::new(),
+            secret_key: secret_key.to_string(),
         }
     }
 
@@ -251,6 +396,273 @@ impl Stripe {
             .await
             .map_err(|e| stripe_err("expire checkout session", e))?;
         Ok(())
+    }
+
+    // ─── Connect: the host's side of the money ──────────────────────────────
+    //
+    // Charges are unchanged by everything below. A renter still pays the platform, and
+    // the split happens only when a host withdraws — Stripe calls this "separate
+    // charges and transfers". The alternative, a destination charge that splits at
+    // checkout, would move the settlement window and the balance into Stripe and leave
+    // our own wallet projection describing money it no longer owns.
+
+    /// Creates the connected account a host will be paid into.
+    ///
+    /// # Accounts v2, and why this one call is hand-rolled
+    ///
+    /// `POST /v2/core/accounts`, not `/v1/accounts`. Stripe refuses the v1 endpoint for
+    /// new integrations outright:
+    ///
+    ///     Stripe no longer recommends Accounts v1 for new Connect integrations.
+    ///     Create connected accounts with POST /v2/core/accounts instead.
+    ///
+    /// `async-stripe` is generated from the v1 OpenAPI spec and has no v2 surface at
+    /// all, so this is `reqwest` and a JSON body rather than a builder. Everything
+    /// Stripe-shaped still stops at this file, which is the rule that matters.
+    ///
+    /// # The shape
+    ///
+    /// A **recipient** configuration: it is what lets an account receive funds from the
+    /// platform, and requesting `stripe_balance.stripe_transfers` grants
+    /// `stripe_balance.payouts` alongside it — receiving our transfer and being paid out
+    /// to a bank, which is the whole of what a host needs. No `merchant` configuration:
+    /// nothing is ever charged on this account.
+    ///
+    /// `dashboard: express` fixes the two responsibilities, and it is not a choice:
+    ///
+    ///     If `dashboard` is `express`, `fees_collector` must be `application` and
+    ///     `losses_collector` must be `application`.
+    ///
+    /// The Express dashboard means the platform owns the relationship with the host, so
+    /// the platform carries the fees and the negative balances.
+    ///
+    /// `contact_email` and `identity.country` are both **required** before a recipient
+    /// configuration is accepted, which is why this takes them as arguments — see the
+    /// `host` mirror in `migrations/payment/0004`. The country is immutable after
+    /// creation, so it is asked of the host rather than guessed.
+    ///
+    /// # The `v4` in the idempotency key, and why it must be bumped
+    ///
+    /// **Stripe stores a failed request against its idempotency key**, parameters and
+    /// all. A request rejected for a bad parameter poisons that key: fixing the
+    /// parameter and retrying answers
+    ///
+    ///     Keys for idempotent requests can only be used with the same parameters they
+    ///     were first used with.
+    ///
+    /// for the next 24 hours — a host locked out of onboarding by a bug that is already
+    /// fixed. The key therefore carries a version of the *request shape*, not just the
+    /// owner. Change any field in the body below and bump it, or every host who already
+    /// tried waits a day. It has been bumped for a wrong `losses` value, for a platform
+    /// that had not enabled Connect yet, and now for the move to v2.
+    pub async fn create_account(
+        &self,
+        owner_id: &Uuid,
+        email: &str,
+        country: &str,
+    ) -> MyResult<String> {
+        let body = serde_json::json!({
+            "contact_email": email,
+            "identity": { "country": country },
+            "dashboard": "express",
+            "configuration": {
+                "recipient": {
+                    "capabilities": {
+                        "stripe_balance": { "stripe_transfers": { "requested": true } }
+                    }
+                }
+            },
+            "defaults": {
+                "responsibilities": {
+                    "fees_collector": "application",
+                    "losses_collector": "application"
+                }
+            },
+            // Our id on their object, so a Stripe dashboard row can be traced back to a
+            // host without a lookup here. The reverse direction is `connect_account`.
+            "metadata": { OWNER_ID_KEY: owner_id.to_string() },
+        });
+
+        let account: V2Account = self
+            .v2(
+                self.http
+                    .post(V2_ACCOUNTS)
+                    .header("Idempotency-Key", format!("connect:v4:{owner_id}"))
+                    .json(&body),
+                "create connected account",
+            )
+            .await?;
+
+        Ok(account.id)
+    }
+
+    /// The short-lived secret the browser mounts Connect's embedded components against.
+    ///
+    /// Still `/v1/account_sessions`, and that is not a leftover: **there is no v2
+    /// account-sessions endpoint**. Stripe's own guidance is that a v2 account id may be
+    /// passed to a v1 endpoint, and this is the case it was written for — verified
+    /// against a v2 account, which answers with a client secret exactly as a v1 one did.
+    ///
+    /// Two components, and they are the two halves of one job: `account_onboarding`
+    /// collects identity and a bank account the first time, `account_management` lets a
+    /// host change that bank account later. Without the second, changing a bank means
+    /// re-running onboarding.
+    ///
+    /// Deliberately **not** idempotent. A session expires, and the frontend's
+    /// `fetchClientSecret` is called again precisely to get a fresh one — replaying the
+    /// first would hand back an expired secret forever.
+    pub async fn account_session(&self, account_id: &str) -> MyResult<String> {
+        let session = CreateAccountSession::new(
+            account_id.to_string(),
+            CreateAccountSessionComponents {
+                account_onboarding: Some(AccountConfigParam::new(true)),
+                account_management: Some(AccountConfigParam::new(true)),
+                ..CreateAccountSessionComponents::new()
+            },
+        )
+        .send(&self.client)
+        .await
+        .map_err(|e| stripe_err("create account session", e))?;
+
+        Ok(session.client_secret)
+    }
+
+    /// Whether this host can be paid, and where.
+    ///
+    /// `include` is not optional politeness: **a v2 account answers `null` for
+    /// everything not asked for**, so without it the configuration comes back empty and
+    /// every host reads as un-onboarded.
+    ///
+    /// The gate is the *payouts* capability rather than the transfers one, and the
+    /// difference is real. `stripe_transfers` says our Transfer into their balance will
+    /// land; `payouts` says Stripe can then move it to their bank. A host with the
+    /// first and not the second would take money out of our balance and watch it sit in
+    /// theirs — so both must be active, and requiring `payouts` implies both, because
+    /// Stripe grants the pair together.
+    pub async fn retrieve_account(&self, account_id: &str) -> MyResult<AccountState> {
+        // `include[0]`, not `include[]`. The v2 API rejects the bracket-array syntax
+        // that v1 accepts, by name:
+        //
+        //     Query parameters with the [] array syntax are unsupported. Please
+        //     provide exact indexes, i.e. value[0], value[1], etc.
+        let url = format!("{V2_ACCOUNTS}/{account_id}?include[0]=configuration.recipient");
+        let account: V2Account = self
+            .v2(self.http.get(url), "retrieve connected account")
+            .await?;
+
+        let recipient = account.configuration.and_then(|c| c.recipient);
+        let capabilities = recipient
+            .as_ref()
+            .and_then(|r| r.capabilities.as_ref())
+            .and_then(|c| c.stripe_balance.as_ref());
+
+        Ok(AccountState {
+            // Absent reads as false throughout: a missing capability is not permission.
+            payouts_enabled: capabilities
+                .and_then(|b| b.payouts.as_ref())
+                .is_some_and(|c| c.status == "active"),
+            bank_last4: recipient.and_then(|r| r.bank_last4()),
+        })
+    }
+
+    /// Sends one v2 request and decodes it, with the same error handling as every v1
+    /// call in this file.
+    ///
+    /// The authentication, the pinned API version and the refusal-to-`MyError` mapping
+    /// are identical for every v2 endpoint, and there is no builder generating them —
+    /// so they live here once rather than at each call site.
+    async fn v2<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        what: &str,
+    ) -> MyResult<T> {
+        let response = request
+            .bearer_auth(&self.secret_key)
+            .header("Stripe-Version", V2_VERSION)
+            .send()
+            .await
+            .map_err(|e| transport_err(what, e))?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|e| transport_err(what, e))?;
+
+        if !status.is_success() {
+            // Stripe's own words, the way `stripe_err` logs them for v1 — the message
+            // names the parameter it refused and is the only useful thing in the body.
+            let message = serde_json::from_str::<V2Error>(&body)
+                .ok()
+                .map(|e| e.error.message)
+                .unwrap_or_else(|| body.clone());
+            tracing::error!(%status, %message, "stripe: {what} was refused");
+
+            return Err(MyError::api(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "Payment Provider Unavailable",
+                "Could not reach the payment provider. Please try again.",
+            ));
+        }
+
+        serde_json::from_str(&body).map_err(|e| {
+            tracing::error!(error = %e, "stripe: could not decode the {what} response");
+            MyError::Bus(format!("decode stripe v2 response for {what}"))
+        })
+    }
+
+    /// Moves money from the platform balance into a host's connected account.
+    ///
+    /// `/v1/transfers`, and like the account session above that is the only endpoint
+    /// there is: the recipient configuration's `stripe_transfers` capability exists
+    /// precisely to make this call work for a v2 account. (`/v2/money_management` is
+    /// Global Payouts, a different product.)
+    ///
+    /// **The idempotency key is the whole safety of this path.** It is derived from the
+    /// payout id, so a redelivered `PayoutRequested` — or a retry after we crashed
+    /// between Stripe answering and our own commit — returns Stripe's first transfer
+    /// rather than making a second one. The row's `status` guard is the cheaper check;
+    /// this is the one that holds when the row has not been written yet.
+    ///
+    /// A refusal comes back as `Refused` rather than `Err`; see [`Transferred`].
+    pub async fn transfer(
+        &self,
+        account_id: &str,
+        amount_cents: i64,
+        payout_id: &Uuid,
+    ) -> MyResult<Transferred> {
+        let result = CreateTransfer::new(Currency::EUR, account_id.to_string())
+            .amount(amount_cents)
+            .description(format!("OurDriveway payout {payout_id}"))
+            .metadata(HashMap::from([(
+                PAYOUT_ID_KEY.to_string(),
+                payout_id.to_string(),
+            )]))
+            .customize()
+            .request_strategy(RequestStrategy::Idempotent(idempotency_key(
+                "payout", payout_id,
+            )?))
+            .send(&self.client)
+            .await;
+
+        match result {
+            Ok(transfer) => Ok(Transferred::Ok(transfer.id.as_str().to_string())),
+
+            // Stripe answered, and answered with a client error: not enough in the
+            // platform balance, an account that cannot receive transfers, a currency it
+            // will not convert. Retrying sends the identical request and gets the
+            // identical refusal, so this is terminal.
+            Err(StripeError::Stripe(api, status)) if status < 500 => {
+                let reason = api
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| format!("stripe refused the transfer ({status})"));
+                tracing::warn!(%payout_id, %status, %reason, "stripe refused a transfer");
+                Ok(Transferred::Refused(reason))
+            }
+
+            // A 5xx, a timeout, a dropped connection, an unparseable body. Nothing is
+            // known about whether the transfer happened, which is exactly the case the
+            // idempotency key exists for — so this retries.
+            Err(e) => Err(stripe_err("create transfer", e)),
+        }
     }
 }
 
@@ -429,11 +841,45 @@ fn idempotency_key(prefix: &str, id: &Uuid) -> MyResult<IdempotencyKey> {
         .map_err(|e| MyError::Bus(format!("idempotency key: {e}")))
 }
 
-fn stripe_err(what: &str, e: impl std::fmt::Display) -> MyError {
-    // 502, not 500: the failure is upstream. Detail stays in the log — a Stripe error
-    // can name an intent id and a decline reason, neither of which belongs in a
-    // response body.
+/// A v2 call that never reached Stripe, or whose answer could not be read off the
+/// socket. The v1 half of this is `StripeError::ClientError`, handled by the fallback
+/// arm of [`stripe_err`].
+fn transport_err(what: &str, e: reqwest::Error) -> MyError {
     tracing::error!(error = %e, "stripe: {what} failed");
+    MyError::api(
+        axum::http::StatusCode::BAD_GATEWAY,
+        "Payment Provider Unavailable",
+        "Could not reach the payment provider. Please try again.",
+    )
+}
+
+fn stripe_err(what: &str, e: StripeError) -> MyError {
+    // Stripe's own words, pulled out field by field rather than left to the error's
+    // `Display`.
+    //
+    // That `Display` formats the payload with `{:#?}`, and `redact-generated-debug` —
+    // on for every Stripe crate here, so a stray `debug!` cannot print card or customer
+    // detail — reduces that to a literal `ApiErrors { .. }`. The status code survives
+    // and nothing else does, which is how a 400 saying "with a dashboard type of
+    // `express`, the Connect application must control losses" reached the log as no
+    // information at all.
+    //
+    // `message`, `code` and `param` are safe to keep: they describe *our* request, not
+    // anyone's card. The redaction is still doing its job on every other field.
+    match &e {
+        StripeError::Stripe(api, status) => tracing::error!(
+            %status,
+            message = api.message.as_deref().unwrap_or("none"),
+            code = ?api.code,
+            param = api.param.as_deref().unwrap_or("none"),
+            "stripe: {what} was refused"
+        ),
+        _ => tracing::error!(error = %e, "stripe: {what} failed"),
+    }
+
+    // 502, not 500: the failure is upstream. The detail stays in the log — a Stripe
+    // error can name an intent id and a decline reason, neither of which belongs in a
+    // response body.
     MyError::api(
         axum::http::StatusCode::BAD_GATEWAY,
         "Payment Provider Unavailable",

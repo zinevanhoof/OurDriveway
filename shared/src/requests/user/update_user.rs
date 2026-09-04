@@ -1,7 +1,7 @@
 use garde::Validate;
 use serde::Deserialize;
 
-use super::fields::{Email, Password, name_length, plate_length};
+use super::fields::{Country, Email, Password, name_length, plate_length};
 use crate::validation::require;
 
 /// The caller's own record — both forms that write it: the profile screen and the
@@ -32,6 +32,13 @@ pub struct UpdateUserRequest {
     pub email: Option<Email>,
     #[garde(inner(inner(custom(plate_length))))]
     pub license_plates: Option<Vec<String>>,
+    /// Where this person banks, ISO 3166-1 alpha-2.
+    ///
+    /// On the profile rather than at signup because most people never need it: it
+    /// exists for hosts, and it is asked for once, before Stripe will open a
+    /// connected account for them. See [`Country`].
+    #[garde(dive)]
+    pub country: Option<Country>,
     #[garde(skip)]
     pub current_password: Option<String>,
     /// Held to exactly the signup rules — see `new_password_rules_match_signup`.
@@ -76,9 +83,33 @@ mod tests {
             last_name: None,
             email: None,
             license_plates: None,
+            country: None,
             current_password: None,
             new_password: None,
             profile_picture: None,
+        }
+    }
+
+    /// Two letters, and stored in one spelling — a host whose country is `be` on one
+    /// save and `BE` on the next must not read as two different countries, because
+    /// Stripe fixes this value permanently at account creation.
+    #[test]
+    fn the_country_is_two_letters_and_uppercase() {
+        let country = |code: &str| UpdateUserRequest {
+            country: Some(serde_json::from_value(code.into()).unwrap()),
+            ..empty()
+        };
+
+        assert!(country("BE").validate().is_ok());
+        assert!(country("be").validate().is_ok(), "case is normalised, not refused");
+        assert_eq!(
+            country("be").country.unwrap().into_inner(),
+            "BE",
+            "one spelling reaches the database"
+        );
+
+        for bad in ["", "B", "BEL", "b3", "🇧🇪"] {
+            assert!(country(bad).validate().is_err(), "{bad:?} is not a country");
         }
     }
 

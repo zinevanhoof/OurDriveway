@@ -111,6 +111,13 @@ export type UpdateProfileRequest = {
   lastName: string;
   email: string;
   licensePlates: string[];
+  /**
+   * ISO 3166-1 alpha-2, or omitted for "unchanged".
+   *
+   * Where the user banks, not where they live — it is what Stripe opens their payout
+   * account with, and it cannot be changed once that account exists.
+   */
+  country?: string;
   /** Only required when `email` differs from the stored one; the server decides. */
   currentPassword?: string;
   /**

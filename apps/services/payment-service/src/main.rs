@@ -6,14 +6,16 @@ use axum::{
 };
 use shared::{
     env,
-    events::STREAM_BOOKINGS,
+    events::{STREAM_BOOKINGS, STREAM_USERS},
 };
 
 use crate::{
     client::stripe::Stripe,
-    projector::BookingProjector,
+    projector::{BookingProjector, UserProjector},
     service::{
-        payment_service::PaymentService, settlement_worker_service::SettlementWorkerService,
+        connect_service::ConnectService, payment_service::PaymentService,
+        payout_worker_service::PayoutWorkerService,
+        settlement_worker_service::SettlementWorkerService,
     },
     worker::{BookingWorker, PaymentWorker},
 };
@@ -29,6 +31,10 @@ mod worker;
 #[derive(Clone)]
 pub struct AppState {
     pub payment_service: Arc<PaymentService>,
+    /// Separate from `payment_service` because it shares none of its rules: no
+    /// aggregate, no event, no version to wait on — just a Stripe account and whether
+    /// it can be paid.
+    pub connect_service: Arc<ConnectService>,
 }
 
 /// Every variable this service reads, in one place.
@@ -100,13 +106,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // BOOKINGS as well as its own stream: this service needs a booking's price, renter
     // and lifecycle to authorize a payment and to decide a refund, and the booking
     // table lives in another service's database.
-    // BOOKINGS only now. PAYMENTS is this service's own stream and it no longer
+    // BOOKINGS and USERS. PAYMENTS is this service's own stream and it no longer
     // projects it — those rows are written directly by the request that causes them.
-    let readiness = bus::Readiness::new(js.client().clone(), &[STREAM_BOOKINGS]);
-
+    //
+    // USERS is here for two fields and no more: Stripe will not open a connected
+    // account without a contact email and a country, and a value onboarding cannot
+    // proceed without must not depend on another service answering a request. See
+    // `shared::rpc`, which says so itself.
+    let readiness = bus::Readiness::new(js.client().clone(), &[STREAM_BOOKINGS, STREAM_USERS]);
 
     let stripe = Arc::new(Stripe::new(&CONFIG.stripe_secret_key));
     let settlement = Arc::new(SettlementWorkerService {
+        db: db.clone(),
+        stripe: stripe.clone(),
+    });
+    // The other side effect on this stream: the Transfer a withdrawal turns into. Its
+    // own service rather than an arm of `settlement` — that one is about a booking
+    // ending, this one about a host asking, and they share no state but the pool.
+    let payouts = Arc::new(PayoutWorkerService {
         db: db.clone(),
         stripe: stripe.clone(),
     });
@@ -123,6 +140,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::spawn(bus::projector::run(
         js.clone(),
         Arc::new(BookingProjector),
+        db.clone(),
+        readiness.clone(),
+    ));
+    tokio::spawn(bus::projector::run(
+        js.clone(),
+        Arc::new(UserProjector),
         db.clone(),
         readiness.clone(),
     ));
@@ -154,29 +177,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         js.clone(),
         Arc::new(PaymentWorker {
             service: settlement,
+            payouts,
         }),
     ));
 
     let state = AppState {
-        payment_service: Arc::new(PaymentService::new(js, db, stripe, CONFIG.settlement_secs)),
+        payment_service: Arc::new(PaymentService::new(
+            js,
+            db.clone(),
+            stripe.clone(),
+            CONFIG.settlement_secs,
+        )),
+        connect_service: Arc::new(ConnectService::new(db, stripe)),
     };
 
-    // No GraphQL here, and no reads of anything but this user's own money. Payout
-    // *history* is served by view-service from the combined projection; this database is
-    // private to this service and no browser identity can reach it at all.
+    // **Writes, and one read that is not of this database.** Every figure a client is
+    // shown — the history, the balance, what is still pending — comes from view-service,
+    // which projects this service's events like it projects every other service's. This
+    // database is private and no browser identity reaches it at all.
+    //
+    // `GET /api/payment/session/{id}` is the exception and stays an exception: it reads
+    // a Checkout Session's live state from *Stripe*, not from the read model, and moving
+    // it would give view-service the Stripe SDK, its secret key, and a reason to be
+    // redeployed whenever Stripe changes.
     let api_router: Router<AppState> = Router::new()
         .route("/api/payment/session", post(route::payment::create_session))
         .route(
             "/api/payment/session/{session_id}",
             get(route::payment::session_state),
         )
-        .route("/api/payment/earnings", get(route::payment::earnings))
         .route("/api/payment/payout", post(route::payment::request_payout))
+        // The host's side of the money. Both scoped to the verified claim — there is
+        // no account id in either path, so there is nobody else's account to ask about.
+        //
+        // `GET connect/account` is the second exception to "reads live in
+        // view-service", and it is the same exception as `session/{id}` above: the
+        // answer comes from *Stripe*, live, not from a projection. Moving it would
+        // give view-service the Stripe SDK and the secret key.
+        .route("/api/payment/connect/account", get(route::connect::status))
+        .route(
+            "/api/payment/connect/session",
+            post(route::connect::account_session),
+        )
         // Unauthenticated by design — authentication is the Stripe signature. Auth in
         // this codebase is a per-handler extractor rather than a router layer, so this
         // route simply omits it and there is no middleware exception to get wrong.
         .route("/api/payment/webhook", post(route::webhook::stripe_webhook));
-
 
     let app = Router::new()
         .merge(api_router)

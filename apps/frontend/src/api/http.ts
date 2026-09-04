@@ -57,26 +57,7 @@ export function installNativeFetch() {
       return browserFetch(input, init);
     }
 
-    const url = parsed.toString();
-
-    // Drain the body once into a plain Response and drop the signal.
-    //
-    // This was written for urql, which broke plugin-http two ways ("resource id is
-    // invalid"): it probed `response.body`, freeing the read-once native body, and
-    // aborted on teardown, so `fetch_cancel` on an already-consumed rid rejected
-    // uncaught. urql is gone — but **do not remove this**. vue-query also aborts
-    // in-flight queries on unmount and passes a signal, so the second half applies
-    // unchanged; and a native `Response` whose body can only be read once is a sharp
-    // edge for any caller, not just that one.
-    if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    const { signal: _signal, ...rest } = init ?? {};
-
-    const res = await tauriFetch(url, rest);
-    const body = await res.arrayBuffer();
-    return new Response(body, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: res.headers,
-    });
+    // The resolved absolute URL, not `input` — reqwest cannot resolve a relative one.
+    return tauriFetch(parsed, init);
   };
 }
