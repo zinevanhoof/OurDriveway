@@ -17,6 +17,7 @@ import type { SpotFilter } from '@/types/SpotFilter';
 import MapSearchFilterComponent from './MapSearchFilterComponent.vue';
 import Input from '../ui/input/Input.vue';
 import Button from '../ui/button/Button.vue';
+import { IconBox } from '@/components/base/icon-box';
 
 const emit = defineEmits<{ select: [coords: [number, number]]; filter: [filter: SpotFilter] }>();
 
@@ -84,10 +85,9 @@ const onSelect = (value: AcceptableValue) => {
         </Combobox>
         <MapSearchFilterComponent v-model:open="filterOpen" @update="filterSummary = $event"
             @apply="emit('filter', $event)">
-            <div
-                class="flex items-center justify-center w-10 h-10 bg-accent text-accent-foreground rounded-md cursor-pointer">
+            <IconBox size="lg" class="cursor-pointer">
                 <SlidersHorizontal />
-            </div>
+            </IconBox>
         </MapSearchFilterComponent>
         <Button v-if="filterSummary" size="xs" @click="filterOpen = true"
             class="absolute -bottom-4 left-2 rounded-full font-bold shadow-md">

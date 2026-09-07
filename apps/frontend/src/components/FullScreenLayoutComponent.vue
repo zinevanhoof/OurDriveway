@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { X } from '@lucide/vue';
 import Button from './ui/button/Button.vue';
+import { Text, Title } from '@/components/base/text';
 
 const { title, description } = defineProps<{
     title: string
@@ -16,8 +17,8 @@ const emit = defineEmits(['close'])
             <X />
         </Button>
         <div>
-            <div class="text-[16px] font-extrabold">{{ title }}</div>
-            <div v-if="description" class="text-xs text-muted-foreground font-semibold">{{ description }}</div>
+            <Title weight="extrabold">{{ title }}</Title>
+            <Text v-if="description" weight="semibold">{{ description }}</Text>
         </div>
     </header>
     <main class="space-y-4 flex-1 px-4 pb-4 pt-4 bg-background overflow-y-auto no-scrollbar">

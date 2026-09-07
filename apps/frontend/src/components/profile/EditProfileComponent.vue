@@ -16,6 +16,7 @@ import { Spinner } from '@/components/ui/spinner'
 import Avatar from '@/components/ui/avatar/Avatar.vue'
 import AvatarImage from '@/components/ui/avatar/AvatarImage.vue'
 import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue'
+import { Text, Title } from '@/components/base/text'
 
 import { fetchMe as fetchMeView, viewKeys } from '@/api/viewApi'
 import { updateProfile } from '@/api/userApi'
@@ -204,7 +205,7 @@ const submit = handleSubmit(async (form) => {
                 </div>
 
                 <FieldGroup class="gap-4">
-                    <div class="font-bold">Your details</div>
+                    <Title>Your details</Title>
 
                     <div class="grid grid-cols-2 gap-3">
                         <VeeField v-slot="{ componentField, errors }" name="firstName">
@@ -254,10 +255,10 @@ const submit = handleSubmit(async (form) => {
 
                 <FieldGroup class="gap-4">
                     <div>
-                        <div class="font-bold">Payouts</div>
-                        <div class="text-xs text-muted-foreground font-medium">
+                        <Title>Payouts</Title>
+                        <Text>
                             Only needed if you rent out a driveway.
-                        </div>
+                        </Text>
                     </div>
 
                     <VeeField v-slot="{ value, handleChange, errors }" name="country">
@@ -288,10 +289,10 @@ const submit = handleSubmit(async (form) => {
 
                 <FieldGroup class="gap-4">
                     <div>
-                        <div class="font-bold">License plates</div>
-                        <div class="text-xs text-muted-foreground font-medium">
+                        <Title>License plates</Title>
+                        <Text>
                             So a host can recognise the car on their driveway.
-                        </div>
+                        </Text>
                     </div>
 
                     <div v-auto-animate class="space-y-2">

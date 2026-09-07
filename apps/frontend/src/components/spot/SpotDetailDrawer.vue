@@ -8,8 +8,10 @@ import { computed } from "vue";
 import { fetchSpot, viewKeys } from "@/api/viewApi";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import { formatDay, formatSlots, sortedDays } from "@/lib/bookingDates";
-import { formatCents } from "@/lib/money";
 import { CalendarDays, Star } from "@lucide/vue";
+import { Text, Title } from "@/components/base/text";
+import { Money } from "@/components/base/money";
+import { SectionHeader } from "@/components/base/section-header";
 import Avatar from "../ui/avatar/Avatar.vue";
 import AvatarImage from "../ui/avatar/AvatarImage.vue";
 import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
@@ -62,40 +64,37 @@ const days = computed(() => sortedDays(props.booking));
             class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md border-border" />
         </div>
         <div>
-          <div class="flex items-end justify-between">
-            <div class="text-lg font-bold">{{ spot?.title }}</div>
-            <div class="flex items-baseline text-xl font-extrabold text-primary">{{
-              formatCents(spot?.pricePerHour ?? 0)
-            }}
-              <div class="text-xs text-muted-foreground font-medium">/hr</div>
-            </div>
-          </div>
-          <div class="flex max-w-3/4 gap-1 items-center text-xs text-muted-foreground font-medium">
+          <SectionHeader>
+            <Title size="lg">{{ spot?.title }}</Title>
+            <template #action>
+              <Money :cents="spot?.pricePerHour ?? 0" suffix="/hr" size="xl" weight="extrabold" tone="primary" />
+            </template>
+          </SectionHeader>
+          <Text class="flex max-w-3/4 gap-1 items-center">
             {{ spot?.address?.formatted }}
-          </div>
+          </Text>
         </div>
         <!-- The whole schedule, which is what the card's "+N more" points at.
              Rows are the unit here rather than a paragraph of dates: a booking can
              span several days with different hours on each, and a renter reads this
              to answer "when am I due there", one line at a time. -->
         <div v-if="days.length" class="rounded-lg border border-border overflow-hidden">
-          <div
-            class="flex items-center gap-1.5 bg-muted/50 px-3 py-2 text-xs font-semibold text-muted-foreground">
+          <Text weight="semibold" class="flex items-center gap-1.5 bg-muted/50 px-3 py-2">
             <CalendarDays :size="14" />
             {{ days.length }} {{ days.length === 1 ? "day" : "days" }} booked
-          </div>
+          </Text>
           <div v-for="([date, slots], i) in days" :key="date"
             class="flex items-baseline justify-between gap-4 px-3 py-2 text-sm"
             :class="i > 0 && 'border-t border-border'">
-            <span class="font-semibold">{{ formatDay(date, timezone) }}</span>
-            <span class="text-muted-foreground font-medium tabular-nums">
+            <Title as="span" size="sm" weight="semibold">{{ formatDay(date, timezone) }}</Title>
+            <Text as="span" size="sm" class="tabular-nums">
               {{ formatSlots(slots) }}
-            </span>
+            </Text>
           </div>
           <div v-if="booking?.amount != null"
             class="flex items-baseline justify-between border-t border-border bg-muted/50 px-3 py-2">
-            <span class="text-xs font-semibold text-muted-foreground">Total</span>
-            <span class="font-extrabold">{{ formatCents(booking.amount) }}</span>
+            <Text as="span" weight="semibold">Total</Text>
+            <Money :cents="booking.amount" size="md" weight="extrabold" />
           </div>
         </div>
 
@@ -106,11 +105,11 @@ const days = computed(() => sortedDays(props.booking));
               :name="{ firstName: spot?.owner?.firstName ?? '', lastName: spot?.owner?.lastName ?? '' }" />
           </Avatar>
           <div>
-            <div class="font-semibold">{{ spot?.owner?.firstName }} {{ spot?.owner?.lastName }}</div>
-            <div class="flex items-center gap-1 text-xs text-muted-foreground font-medium">
+            <Title weight="semibold">{{ spot?.owner?.firstName }} {{ spot?.owner?.lastName }}</Title>
+            <Text class="flex items-center gap-1">
               <Star :size="16" class="fill-star text-star" />
               4.9 · 128 trips
-            </div>
+            </Text>
           </div>
         </div>
         <div class="space-y-2">
@@ -119,9 +118,9 @@ const days = computed(() => sortedDays(props.booking));
           </Button>
           <!-- Kept even when there's nothing to book: this is the line a renter
                looking at a booking they already hold most needs to read. -->
-          <div class="text-xs text-muted-foreground font-medium text-center">
+          <Text class="text-center">
             Free cancellation up to 1 hour before
-          </div>
+          </Text>
         </div>
       </div>
     </DrawerContent>

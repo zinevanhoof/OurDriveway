@@ -6,7 +6,6 @@ import type { OwnerViewBooking } from '@/types/view';
 import { computed, ref } from 'vue';
 import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
-import { formatCents } from '@/lib/money.ts';
 import { formatDay, formatSlots, sortedDays, todayIn } from '@/lib/bookingDates.ts';
 import { deleteSpot, updateSpot } from '@/api/spotApi.ts';
 import { readErrorDetail } from '@/lib/serverErrors.ts';
@@ -18,6 +17,10 @@ import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
 import Switch from '../ui/switch/Switch.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer'
 import { FieldError } from '@/components/ui/field'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
+import { Money } from '@/components/base/money'
+import { SectionHeader } from '@/components/base/section-header'
 
 const { id } = defineProps<{ id: string }>()
 
@@ -166,7 +169,7 @@ const bookingWhen = (booking: any) => {
             class="justify-self-start bg-card text-card-foreground border border-border shadow-xs rounded-full">
             <ArrowLeft />
         </Button>
-        <div class="font-bold">Manage spot</div>
+        <Title>Manage spot</Title>
         <div class="flex gap-2 justify-self-end">
             <Button size="icon-lg" @click="confirmOpen = true"
                 class="bg-card text-card-foreground border border-border shadow-xs rounded-full">
@@ -185,103 +188,100 @@ const bookingWhen = (booking: any) => {
         </div>
         <div class="flex">
             <div class="flex-1">
-                <div class="font-bold text-lg">{{ data?.title }}</div>
-                <div class="text-xs text-muted-foreground font-medium">
+                <Title size="lg">{{ data?.title }}</Title>
+                <Text>
                     {{ data?.address?.formatted }}
-                </div>
+                </Text>
             </div>
-            <div class="flex items-baseline text-lg font-bold text-primary">
-                {{ formatCents(data?.pricePerHour ?? 0) }}
-                <div class="text-xs text-muted-foreground font-medium">/hr</div>
-            </div>
+            <Money :cents="data?.pricePerHour ?? 0" suffix="/hr" size="lg" tone="primary" />
         </div>
-        <div class="flex justify-between items-center px-4 py-3 border border-border rounded-md bg-card">
+        <Surface orientation="horizontal" class="justify-between">
             <div>
-                <div class="text-sm font-medium">Listing is live</div>
-                <div class="text-xs text-muted-foreground font-medium">
+                <Text size="sm" tone="default">Listing is live</Text>
+                <Text>
                     {{ live ? 'Drivers can book this now' : 'Hidden — bookings already made still stand' }}
-                </div>
+                </Text>
             </div>
             <Switch :model-value="live" @update:model-value="toggleLive" />
-        </div>
+        </Surface>
         <FieldError v-if="errors.length" :errors="errors" />
-        <div class="flex gap-2">
-            <div class="bg-card text-center flex-1 py-3 border border-border shadow-xs rounded-md">
-                <div class="font-bold">{{ formatCents(12800) }}</div>
-                <div class="text-xs text-muted-foreground font-medium">Earned</div>
-            </div>
-            <div class="bg-card text-center flex-1 py-3 border border-border shadow-xs rounded-md">
-                <div class="font-bold">14</div>
-                <div class="text-xs text-muted-foreground font-medium">Trips</div>
-            </div>
-            <div class="bg-card text-center flex-1 py-3 border border-border shadow-xs rounded-md">
-                <div class="flex justify-center items-center gap-1 font-bold">
+        <div class="grid grid-cols-3 gap-2">
+            <Surface variant="elevated" class="text-center">
+                <Money :cents="12800" size="md" />
+                <Text>Earned</Text>
+            </Surface>
+            <Surface variant="elevated" class="text-center">
+                <Title>14</Title>
+                <Text>Trips</Text>
+            </Surface>
+            <Surface variant="elevated" class="text-center">
+                <Title class="flex justify-center items-center gap-1">
                     <Star :size="14" />
                     4.9
-                </div>
-                <div class="text-xs text-muted-foreground font-medium">Rating</div>
-            </div>
+                </Title>
+                <Text>Rating</Text>
+            </Surface>
         </div>
         <div v-for="section in sections" :key="section.title" class="space-y-2">
-            <div class="flex justify-between items-end">
-                <div class="font-bold">{{ section.title }}</div>
-                <div @click="routeToSpotEdit" class="flex gap-1 items-center text-primary font-semibold text-xs">
-                    <Pencil :size="16" />
-                    Edit
-                </div>
-            </div>
+            <SectionHeader>
+                <Title>{{ section.title }}</Title>
+                <template #action>
+                    <Text tone="primary" weight="semibold" class="flex gap-1 items-center" @click="routeToSpotEdit">
+                        <Pencil :size="16" />
+                        Edit
+                    </Text>
+                </template>
+            </SectionHeader>
             <div class="space-y-2">
-                <div v-for="row in section.rows" :key="row.key" @click="toggle(row.key)"
-                    class="px-4 py-3 border border-border rounded-md bg-card">
-                    <div class="text-sm font-medium">{{ row.label }}</div>
+                <Surface v-for="row in section.rows" :key="row.key" @click="toggle(row.key)">
+                    <Text size="sm" tone="default">{{ row.label }}</Text>
                     <!-- Collapsed shows the first slot and how many are hidden; tapping
                          reveals the rest in place, because a day's hours are one thought. -->
-                    <div v-auto-animate class="text-xs text-muted-foreground font-medium">
+                    <Text v-auto-animate>
                         <div v-for="slot in slotsShown(row)" :key="slot.start">
                             {{ formatSlots([slot]) }}
                         </div>
                         <div v-if="expanded !== row.key && row.slots.length > 1">
                             +{{ row.slots.length - 1 }} more
                         </div>
-                    </div>
-                </div>
-                <div v-if="!section.rows.length" class="text-xs text-muted-foreground font-medium">
+                    </Text>
+                </Surface>
+                <Text v-if="!section.rows.length">
                     {{ section.empty }}
-                </div>
+                </Text>
             </div>
         </div>
         <div class="space-y-2">
-            <div class="flex justify-between items-end">
-                <div class="font-bold">Upcoming bookings</div>
-                <div v-if="upcoming.length > PREVIEW" @click="showAllBookings = !showAllBookings"
-                    class="text-primary font-semibold text-xs">
-                    {{ showAllBookings ? 'Show less' : 'View all' }}
-                </div>
-            </div>
+            <SectionHeader>
+                <Title>Upcoming bookings</Title>
+                <template #action>
+                    <Text v-if="upcoming.length > PREVIEW" @click="showAllBookings = !showAllBookings" tone="primary"
+                        weight="semibold">
+                        {{ showAllBookings ? 'Show less' : 'View all' }}
+                    </Text>
+                </template>
+            </SectionHeader>
             <div v-auto-animate class="space-y-2 max-h-96 overflow-y-auto no-scrollbar">
-                <div v-for="booking in visibleBookings" :key="booking.id"
-                    class="flex items-center gap-2 px-4 py-3 border border-border rounded-md bg-card">
+                <Surface v-for="booking in visibleBookings" :key="booking.id" orientation="horizontal" class="gap-2">
                     <Avatar size="lg">
                         <AvatarImage v-if="booking?.renter?.profilePicture" :src="booking?.renter?.profilePicture" />
                         <AvatarFallback
                             :name="{ firstName: booking?.renter?.firstName ?? '', lastName: booking?.renter?.lastName ?? '' }" />
                     </Avatar>
                     <div class="flex-1">
-                        <div class="text-sm font-medium">{{ booking?.renter?.firstName }} {{ booking?.renter?.lastName
+                        <Text size="sm" tone="default">{{ booking?.renter?.firstName }} {{ booking?.renter?.lastName
                             }}
-                        </div>
-                        <div class="text-xs text-muted-foreground font-medium">{{ bookingWhen(booking) }}</div>
+                        </Text>
+                        <Text>{{ bookingWhen(booking) }}</Text>
                     </div>
-                    <div class="text-success font-bold">
-                        <!-- Non-null for the host, who is a party to every booking on
-                             their own listing. `?? 0` only covers the tick before the
-                             query resolves. -->
-                        +{{ formatCents(booking?.amount ?? 0) }}
-                    </div>
-                </div>
-                <div v-if="!upcoming.length" class="text-xs text-muted-foreground font-medium">
+                    <!-- Non-null for the host, who is a party to every booking on
+                         their own listing. `?? 0` only covers the tick before the
+                         query resolves. -->
+                    <Money :cents="booking?.amount ?? 0" signed size="md" />
+                </Surface>
+                <Text v-if="!upcoming.length">
                     Nothing booked yet.
-                </div>
+                </Text>
             </div>
         </div>
     </div>
@@ -291,12 +291,12 @@ const bookingWhen = (booking: any) => {
             class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
             <div class="m-4 space-y-4">
                 <div>
-                    <div class="text-lg font-bold">Delete this listing?</div>
-                    <div class="text-sm text-muted-foreground font-medium">
+                    <Title size="lg">Delete this listing?</Title>
+                    <Text size="sm">
                         {{ data?.title }} comes off the market for good. Any booking it still
                         owes is cancelled and refunded. This can't be undone — to pause it instead,
                         turn off "Listing is live".
-                    </div>
+                    </Text>
                 </div>
                 <div class="space-y-2">
                     <Button variant="destructive" class="w-full h-11 font-bold" :disabled="deleting" @click="remove">

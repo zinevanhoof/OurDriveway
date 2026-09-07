@@ -25,6 +25,12 @@ import { formatDay, formatSlots, sortedDays } from '@/lib/bookingDates'
 import { fetchBalance, fetchWallet, viewKeys } from '@/api/viewApi'
 import type { WalletTransaction } from '@/types/view'
 import Button from '../ui/button/Button.vue'
+import { Badge } from '@/components/ui/badge'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
+import { IconBox } from '@/components/base/icon-box'
+import { Money } from '@/components/base/money'
+import { SectionHeader } from '@/components/base/section-header'
 import { useRouter } from 'vue-router'
 
 const router = useRouter()
@@ -61,13 +67,11 @@ const currentMonthShort = computed(() =>
 )
 
 const kindStyle = {
-    in: { icon: Banknote, chip: 'bg-accent text-primary' },
-    refund: { icon: RotateCcw, chip: 'bg-accent text-primary' },
-    out: { icon: CarFront, chip: 'bg-muted' },
-    payout: { icon: Landmark, chip: 'bg-muted' }
-}
-
-const signed = (cents: number) => `${cents >= 0 ? '+' : '−'}${formatCents(Math.abs(cents))}`
+    in: { icon: Banknote, tone: 'brand' },
+    refund: { icon: RotateCcw, tone: 'brand' },
+    out: { icon: CarFront, tone: 'muted' },
+    payout: { icon: Landmark, tone: 'muted' }
+} as const
 
 const dayFormat = new Intl.DateTimeFormat(navigator.language, {
     day: 'numeric',
@@ -86,7 +90,8 @@ function monthLabel(month: string): string {
 
 /** What the month came to, ignoring withdrawals — the same rule as the tiles. */
 function net(page: { inCents: number; outCents: number }): string {
-    return signed(page.inCents - page.outCents)
+    const cents = page.inCents - page.outCents
+    return `${cents >= 0 ? '+' : '−'}${formatCents(Math.abs(cents))}`
 }
 
 /** The spot, or the least-wrong stand-in for one. */
@@ -137,90 +142,88 @@ watchEffect(() => {
 
 <template>
     <div class="space-y-4 px-4 py-2">
-        <h1 class="text-xl font-extrabold">Wallet</h1>
+        <Title as="h1" size="xl" weight="extrabold">Wallet</Title>
 
         <!-- Balance -->
-        <div class="flex flex-col gap-4 rounded-md bg-primary p-4 text-primary-foreground">
+        <Surface variant="primary" size="lg" class="gap-4">
             <div>
-                <div class="text-[11.5px] font-semibold opacity-80">AVAILABLE TO WITHDRAW</div>
-                <div class="text-[34px] leading-none font-extrabold">{{ formatCents(available) }}</div>
+                <Text size="eyebrow" weight="semibold" tone="inverse" class="opacity-80">Available to withdraw</Text>
+                <Money :cents="available" tone="inverse" weight="extrabold" class="text-[34px] leading-none" />
             </div>
 
-            <div v-if="pending > 0" class="flex items-center gap-2 rounded-md bg-white/[0.14] px-3 py-2">
+            <Surface v-if="pending > 0" variant="none" size="sm" orientation="horizontal" class="gap-2 bg-white/[0.14]">
                 <Clock class="size-4 shrink-0 opacity-90" />
-                <span class="text-[12px] font-semibold leading-[1.35] opacity-95">
+                <Text as="span" size="xs" weight="semibold" tone="inverse" class="leading-[1.35] opacity-95">
                     {{ formatCents(pending) }} pending — clears 24h after each booking ends
-                </span>
-            </div>
+                </Text>
+            </Surface>
 
             <Button class="h-11 bg-primary-foreground text-primary font-bold"
                 @click="router.push({ name: 'wallet-withdraw', params: { maxWithdraw: available } })">
                 <ArrowUpRight class="size-4.5" />
                 Withdraw
             </Button>
-        </div>
+        </Surface>
 
         <!-- Month totals -->
         <div class="grid grid-cols-2 gap-2">
-            <div class="rounded-md border border-border bg-card px-3 py-2">
-                <div class="text-xs font-bold">MONEY IN · {{ currentMonthShort }}</div>
-                <div class="text-xl font-extrabold text-success">{{ formatCents(monthIn) }}</div>
-            </div>
-            <div class="rounded-md border border-border bg-card px-3 py-2">
-                <div class="text-xs font-bold">MONEY OUT · {{ currentMonthShort }}</div>
-                <div class="text-xl font-extrabold">{{ formatCents(monthOut) }}</div>
-            </div>
+            <Surface size="sm">
+                <Text size="xs" weight="bold" tone="default">MONEY IN · {{ currentMonthShort }}</Text>
+                <Money :cents="monthIn" size="xl" weight="extrabold" tone="success" />
+            </Surface>
+            <Surface size="sm">
+                <Text size="xs" weight="bold" tone="default">MONEY OUT · {{ currentMonthShort }}</Text>
+                <Money :cents="monthOut" size="xl" weight="extrabold" />
+            </Surface>
         </div>
 
         <!-- Combined history, one section per month that has rows. Every month past the
              first is one the server named because it holds something, so the only empty
              page is normally the current month, and a header over nothing is noise. -->
-        <section v-for="page in months" :key="page.month" class="flex flex-col gap-2.5">
-            <header class="flex items-baseline justify-between">
-                <h2 class="text-sm font-extrabold">{{ monthLabel(page.month) }}</h2>
-                <span class="text-xs font-semibold text-muted-foreground">{{ net(page) }} net</span>
-            </header>
+        <section v-for="page in months" :key="page.month" class="space-y-2.5">
+            <SectionHeader as="header" class="items-baseline">
+                <Title as="h2" size="sm" weight="extrabold">{{ monthLabel(page.month) }}</Title>
+                <template #action>
+                    <Text as="span" size="xs" weight="semibold">{{ net(page) }} net</Text>
+                </template>
+            </SectionHeader>
 
-            <ul class="overflow-hidden rounded-md border border-border bg-card">
-                <li v-for="tx in page.transactions" :key="tx.id"
-                    class="flex items-center gap-3 border-b border-border px-3 py-2 last:border-b-0">
-                    <div class="flex size-9 items-center justify-center rounded-md" :class="kindStyle[tx.kind].chip">
-                        <component :is="kindStyle[tx.kind].icon" class="size-5" />
-                    </div>
+            <Surface as="ul" size="none" class="overflow-hidden">
+                <Surface v-for="tx in page.transactions" :key="tx.id" as="li" variant="none" size="sm"
+                    orientation="horizontal" class="gap-3 border-b border-border rounded-none last:border-b-0">
+                    <IconBox :tone="kindStyle[tx.kind].tone">
+                        <component :is="kindStyle[tx.kind].icon" />
+                    </IconBox>
 
                     <div class="flex-1">
-                        <div class="text-sm font-semibold">{{ title(tx) }}</div>
-                        <div class="flex items-center gap-1.5 text-xs text-muted-foreground font-medium">
+                        <Title size="sm" weight="semibold">{{ title(tx) }}</Title>
+                        <Text class="flex items-center gap-1.5">
                             {{ sub(tx) }}
-                            <div v-if="tx.pending"
-                                class="rounded-md bg-accent px-1.5 py-0.5 text-xs font-bold text-primary">
+                            <Badge v-if="tx.pending" class="bg-accent px-1.5 text-primary">
                                 PENDING
-                            </div>
-                        </div>
+                            </Badge>
+                        </Text>
                     </div>
 
-                    <span class="text-sm font-bold" :class="tx.amountCents >= 0 ? 'text-success' : ''">
-                        {{ signed(tx.amountCents) }}
-                    </span>
-                </li>
-            </ul>
+                    <Money :cents="tx.amountCents" signed size="sm" weight="bold" />
+                </Surface>
+            </Surface>
         </section>
 
-        <div v-if="isPending" class="py-6 text-center text-sm text-muted-foreground font-medium">
+        <Text v-if="isPending" size="sm" class="py-6 text-center">
             Loading…
-        </div>
+        </Text>
         <!-- `hasNextPage` because a quiet current month is not an empty history: there
              are older months to come, and saying "nothing" over them is a lie. -->
-        <div v-else-if="!hasNextPage && !months.length"
-            class="py-6 text-center text-sm text-muted-foreground font-medium">
+        <Text v-else-if="!hasNextPage && !months.length" size="sm" class="py-6 text-center">
             Nothing has moved yet. Bookings you make and money you earn show up here.
-        </div>
+        </Text>
 
         <!-- Crossing this asks for the next month. It sits inside the scrolling page
              rather than at a fixed offset, so it fires exactly once per month. -->
         <div ref="sentinel" class="h-px"></div>
-        <div v-if="isFetchingNextPage" class="pb-4 text-center text-sm text-muted-foreground font-medium">
+        <Text v-if="isFetchingNextPage" size="sm" class="pb-4 text-center">
             Loading…
-        </div>
+        </Text>
     </div>
 </template>

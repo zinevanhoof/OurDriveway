@@ -1,8 +1,9 @@
 <script setup lang="ts">
+import { Title } from '@/components/base/text';
 </script>
 
 <template>
-    <header class="px-4 py-2 text-2xl font-extrabold">
+    <Title as="header" size="2xl" weight="extrabold" class="px-4 py-2">
         Profile
-    </header>
+    </Title>
 </template>

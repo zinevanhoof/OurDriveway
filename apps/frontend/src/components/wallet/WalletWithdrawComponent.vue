@@ -26,6 +26,9 @@ import FullScreenLayoutComponent from '../FullScreenLayoutComponent.vue'
 import Button from '../ui/button/Button.vue'
 import Spinner from '../ui/spinner/Spinner.vue'
 import Separator from '../ui/separator/Separator.vue'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
+import { IconBox } from '@/components/base/icon-box'
 import { centsToEuros, eurosToCents, formatCents } from '@/lib/money.ts'
 import { mountConnect } from '@/lib/connect'
 import { viewKeys } from '@/api/viewApi'
@@ -165,26 +168,26 @@ watch(managementEl, (el) => {
         <template #main>
             <!-- Asking Stripe, which is a round trip on every visit — see
                  `ConnectService::status` for why it is not a cached column. -->
-            <div v-if="statusPending" class="flex flex-col items-center gap-3 py-16 text-center">
+            <Surface v-if="statusPending" variant="none" size="none" class="items-center gap-3 py-16 text-center">
                 <Spinner class="size-6" />
-                <div class="text-sm text-muted-foreground font-medium">Loading…</div>
-            </div>
+                <Text size="sm">Loading…</Text>
+            </Surface>
 
-            <div v-else-if="statusFailed" class="flex flex-col items-center gap-3 py-16 text-center">
-                <div class="text-sm font-semibold">We couldn't check your payout details.</div>
+            <Surface v-else-if="statusFailed" variant="none" size="none" class="items-center gap-3 py-16 text-center">
+                <Title size="sm" weight="semibold">We couldn't check your payout details.</Title>
                 <Button variant="outline" @click="refetchStatus()">Try again</Button>
-            </div>
+            </Surface>
 
             <!-- No country on the profile, so there is nothing to create an account
                  with. Its own screen rather than a failed button press: Stripe fixes
                  the country permanently at creation, so it has to be right first. -->
             <div v-else-if="connectStatus?.state === 'needs_country'" class="py-8 text-center">
-                <div class="text-sm font-extrabold">One thing first</div>
-                <div class="mx-auto mt-1 max-w-xs text-xs text-muted-foreground font-medium leading-[1.45]">
+                <Title size="sm" weight="extrabold">One thing first</Title>
+                <Text class="mx-auto mt-1 max-w-xs leading-[1.45]">
                     Stripe needs to know which country you bank in before it can open your
                     payout account. It can't be changed afterwards, so we ask you rather
                     than guess.
-                </div>
+                </Text>
                 <Button class="mt-4 font-bold" @click="router.push({ name: 'profile-edit' })">
                     Add it to your profile
                 </Button>
@@ -195,18 +198,18 @@ watch(managementEl, (el) => {
                  Stripe's to explain inside the component, which resumes where the host
                  left off. -->
             <template v-else-if="connectStatus?.state !== 'enabled'">
-                <div class="flex items-start gap-3 rounded-md border border-border bg-card p-3">
-                    <div class="flex size-9 shrink-0 items-center justify-center rounded-md bg-accent text-primary">
-                        <Landmark class="size-5" />
-                    </div>
+                <Surface orientation="horizontal" class="items-start gap-3">
+                    <IconBox tone="brand">
+                        <Landmark />
+                    </IconBox>
                     <div>
-                        <div class="text-sm font-extrabold">Set up payouts</div>
-                        <div class="text-xs text-muted-foreground font-medium leading-[1.4]">
+                        <Title size="sm" weight="extrabold">Set up payouts</Title>
+                        <Text class="leading-[1.4]">
                             Stripe needs a few details and a bank account before it can pay you.
                             Everything below is theirs — we never see your bank details.
-                        </div>
+                        </Text>
                     </div>
-                </div>
+                </Surface>
 
                 <!-- The card is ours, the contents are Stripe's. Their component fills
                      whatever box it is given and carries no padding of its own, so the
@@ -220,25 +223,25 @@ watch(managementEl, (el) => {
             <!-- Onboarded, but there is nothing to take out yet. Distinct from a
                  validation failure: no amount would work, so no form is offered. -->
             <div v-else-if="belowMinimumBalance" class="py-10 text-center">
-                <div class="text-sm font-semibold">Not enough to withdraw yet</div>
-                <div class="mt-1 text-xs text-muted-foreground font-medium">
+                <Title size="sm" weight="semibold">Not enough to withdraw yet</Title>
+                <Text class="mt-1">
                     Withdrawals start at {{ formatCents(MIN_CENTS) }}. You have {{ formatCents(maxWithdraw) }}.
-                </div>
+                </Text>
             </div>
 
             <template v-else>
                 <!-- The amount. One big field, because it is the only thing on this
                      screen the host is actually deciding. -->
                 <div class="flex items-center justify-center gap-1 pt-4 pb-1">
-                    <span class="text-[34px] leading-none font-extrabold text-muted-foreground">€</span>
+                    <Title as="span" weight="extrabold" tone="muted" class="text-[34px] leading-none">€</Title>
                     <input v-model="amount" inputmode="decimal" @focus="selectAll"
                         class="w-[6ch] bg-transparent text-[44px] leading-none font-extrabold tracking-tight outline-none"
                         aria-label="Amount to withdraw" />
                 </div>
 
-                <div class="min-h-5 text-center text-xs font-semibold text-destructive">
+                <Text weight="semibold" tone="destructive" class="min-h-5 text-center">
                     {{ problem }}
-                </div>
+                </Text>
 
                 <div class="flex justify-center gap-2">
                     <Button v-for="option in quickPicks" :key="option" variant="outline" size="sm"
@@ -254,26 +257,26 @@ watch(managementEl, (el) => {
 
                 <!-- The overview. Live, so the figure being confirmed is the figure in
                      the field — there is no second screen where they could diverge. -->
-                <dl class="space-y-2 rounded-md border border-border bg-card px-3 py-2.5 text-sm">
+                <Surface as="dl" size="sm" class="gap-2 py-2.5">
                     <div class="flex items-center justify-between">
-                        <dt class="text-muted-foreground font-medium">Amount</dt>
-                        <dd class="font-bold">{{ formatCents(Math.max(cents, 0)) }}</dd>
+                        <Text as="dt" size="sm">Amount</Text>
+                        <Title as="dd" size="sm">{{ formatCents(Math.max(cents, 0)) }}</Title>
                     </div>
                     <div class="flex items-center justify-between">
-                        <dt class="text-muted-foreground font-medium">Fee</dt>
-                        <dd class="font-bold text-success">Free</dd>
+                        <Text as="dt" size="sm">Fee</Text>
+                        <Title as="dd" size="sm" tone="success">Free</Title>
                     </div>
                     <!-- Omitted rather than faked when Stripe hands back no external
                          account, which happens while one is still being verified. -->
                     <div v-if="connectStatus.bankLast4" class="flex items-center justify-between">
-                        <dt class="text-muted-foreground font-medium">To</dt>
-                        <dd class="font-bold">•••• {{ connectStatus.bankLast4 }}</dd>
+                        <Text as="dt" size="sm">To</Text>
+                        <Title as="dd" size="sm">•••• {{ connectStatus.bankLast4 }}</Title>
                     </div>
                     <div class="flex items-center justify-between">
-                        <dt class="text-muted-foreground font-medium">Arrives</dt>
-                        <dd class="font-bold">In a couple of days</dd>
+                        <Text as="dt" size="sm">Arrives</Text>
+                        <Title as="dd" size="sm">In a couple of days</Title>
                     </div>
-                </dl>
+                </Surface>
 
                 <!-- Changing where the money goes. Mounted on demand: it is a whole
                      Stripe iframe, and almost nobody opens it. -->

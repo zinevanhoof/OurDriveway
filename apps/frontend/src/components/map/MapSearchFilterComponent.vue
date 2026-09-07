@@ -22,6 +22,8 @@ import { CalendarIcon, Plus, X } from '@lucide/vue'
 import { toast } from 'vue-sonner'
 import Button from '../ui/button/Button.vue'
 import Input from '../ui/input/Input.vue'
+import { Text, Title } from '@/components/base/text'
+import { SectionHeader } from '@/components/base/section-header'
 
 // Controlled open so the parent's summary pill can open the same drawer as the icon trigger.
 const open = defineModel<boolean>('open')
@@ -141,15 +143,19 @@ function reset() {
         </DrawerTrigger>
         <DrawerContent class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
             <div class="m-4 space-y-4">
-                <div class="flex items-end justify-between">
-                    <div class="text-xl font-extrabold">Filters</div>
-                    <button type="button" @click="reset" class="text-primary font-semibold">Reset</button>
-                </div>
+                <SectionHeader>
+                    <Title size="xl" weight="extrabold">Filters</Title>
+                    <template #action>
+                        <button type="button" @click="reset" class="text-primary font-semibold">Reset</button>
+                    </template>
+                </SectionHeader>
                 <div class="space-y-1">
-                    <div class="flex justify-between">
-                        <div class="font-bold">Days</div>
-                        <div class="text-muted-foreground font-semibold">{{ daysLabel }}</div>
-                    </div>
+                    <SectionHeader>
+                        <Title>Days</Title>
+                        <template #action>
+                            <Text size="md" weight="semibold">{{ daysLabel }}</Text>
+                        </template>
+                    </SectionHeader>
                     <Popover>
                         <PopoverTrigger as-child>
                             <Button variant="outline"
@@ -168,17 +174,19 @@ function reset() {
                         @remove="removeDate" />
                 </div>
                 <div class="space-y-1">
-                    <div class="flex justify-between">
-                        <div class="font-bold">
+                    <SectionHeader>
+                        <Title>
                             Time slots<template v-if="activeDate"> · {{
                                 dfShort.format(activeDate.toDate(getLocalTimeZone())) }}</template>
-                        </div>
-                        <button type="button" @click="addSlot"
-                            :class="cn('flex gap-1 items-center font-bold cursor-pointer', addDisabled ? 'text-muted-foreground' : 'text-primary')">
-                            <Plus :size="16" />
-                            Add slot
-                        </button>
-                    </div>
+                        </Title>
+                        <template #action>
+                            <button type="button" @click="addSlot"
+                                :class="cn('flex gap-1 items-center font-bold cursor-pointer', addDisabled ? 'text-muted-foreground' : 'text-primary')">
+                                <Plus :size="16" />
+                                Add slot
+                            </button>
+                        </template>
+                    </SectionHeader>
                     <div v-auto-animate class="space-y-2 max-h-60 overflow-y-auto no-scrollbar">
                         <div v-for="(slot, i) in slots" :key="i" class="flex items-center gap-2">
                             <Input type="time" required :model-value="slot.start"

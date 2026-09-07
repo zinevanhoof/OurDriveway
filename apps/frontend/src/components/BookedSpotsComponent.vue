@@ -10,6 +10,7 @@ import {
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { computed } from 'vue';
 import BookedSpotRow from './BookedSpotRow.vue';
+import { Text } from '@/components/base/text';
 
 const queryClient = useQueryClient()
 
@@ -64,15 +65,15 @@ const refresh = () => queryClient.invalidateQueries({ queryKey: viewKeys.booking
         <TabsContent value="upcoming" class="space-y-2">
             <BookedSpotRow v-for="booking in upcoming" :key="booking?.id" :booking="booking"
                 @changed="refresh" />
-            <div v-if="!upcoming.length" class="py-8 text-center text-sm text-muted-foreground font-medium">
+            <Text v-if="!upcoming.length" size="sm" class="py-8 text-center">
                 Nothing booked yet.
-            </div>
+            </Text>
         </TabsContent>
         <TabsContent value="past" class="space-y-2">
             <BookedSpotRow v-for="booking in past" :key="booking?.id" :booking="booking" past />
-            <div v-if="!past.length" class="py-8 text-center text-sm text-muted-foreground font-medium">
+            <Text v-if="!past.length" size="sm" class="py-8 text-center">
                 No past bookings.
-            </div>
+            </Text>
         </TabsContent>
     </Tabs>
 </template>

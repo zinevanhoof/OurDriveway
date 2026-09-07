@@ -12,6 +12,8 @@ import Button from '@/components/ui/button/Button.vue';
 import { Spinner } from '@/components/ui/spinner'
 import { Drawer, DrawerContent } from '@/components/ui/drawer'
 import { TriangleAlert } from '@lucide/vue'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
 
 import CreateSpotBasicInfo from '@/components/forms/create-spot-form/CreateSpotBasicInfo.vue';
 import CreateSpotAvailability from '@/components/forms/create-spot-form/CreateSpotAvailability.vue';
@@ -216,25 +218,25 @@ const showServerErrors = (body: {
                 <CreateSpotImages v-model:images="images" :image-errors="imageErrors" />
 
                 <div v-auto-animate>
-                    <div v-if="casualties.length"
-                        class="flex gap-2 p-3 text-sm rounded-md border border-destructive/40 bg-destructive/5">
+                    <Surface v-if="casualties.length" variant="destructive" orientation="horizontal"
+                        class="items-start gap-2 text-sm">
                         <TriangleAlert class="size-4 shrink-0 text-destructive mt-0.5" />
                         <div class="space-y-1">
-                            <div class="font-bold">
+                            <Title size="sm">
                                 {{ casualties.length }} booked
                                 {{ casualties.length === 1 ? 'slot falls' : 'slots fall' }} outside your new
                                 hours
-                            </div>
-                            <div class="text-xs text-muted-foreground font-medium">
+                            </Title>
+                            <Text>
                                 Saving cancels
                                 {{ casualties.length === 1 ? 'it' : 'them' }} and refunds the renter.
-                            </div>
-                            <div v-for="({ date, slot }) in casualties" :key="`${date}-${slot.start}`"
-                                class="text-xs font-semibold">
+                            </Text>
+                            <Text v-for="({ date, slot }) in casualties" :key="`${date}-${slot.start}`"
+                                weight="semibold" tone="default">
                                 {{ formatDay(date, timezone) }} · {{ formatSlots([slot]) }}
-                            </div>
+                            </Text>
                         </div>
-                    </div>
+                    </Surface>
                 </div>
 
                 <FieldError v-if="formErrors.length" :errors="formErrors" />
@@ -261,11 +263,11 @@ const showServerErrors = (body: {
             class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
             <div class="m-4 space-y-4">
                 <div>
-                    <div class="text-lg font-bold">Delete this listing?</div>
-                    <div class="text-sm text-muted-foreground font-medium">
+                    <Title size="lg">Delete this listing?</Title>
+                    <Text size="sm">
                         {{ data?.title }} comes off the market for good. Any booking it still
                         owes is cancelled and refunded. This can't be undone.
-                    </div>
+                    </Text>
                 </div>
                 <div class="space-y-2">
                     <Button variant="destructive" class="w-full h-11 font-bold" :disabled="deleting" @click="remove">

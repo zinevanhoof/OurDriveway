@@ -4,14 +4,8 @@ import { useForm, Field as VeeField } from 'vee-validate'
 import { z } from 'zod'
 import { ref } from 'vue'
 
-import {
-    Card,
-    CardContent,
-    CardDescription,
-    CardHeader,
-    CardFooter,
-    CardTitle,
-} from '@/components/ui/card'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
 import {
     Field,
     FieldError,
@@ -69,14 +63,14 @@ const onSubmit = handleSubmit(async ({ confirmPassword, ...form }) => {
 </script>
 
 <template>
-    <Card>
-        <CardHeader>
-            <CardTitle>Signup</CardTitle>
-            <CardDescription>
+    <Surface size="lg" class="gap-6">
+        <div class="grid gap-1">
+            <Title class="font-medium">Signup</Title>
+            <Text size="sm" weight="normal">
                 Create an account here
-            </CardDescription>
-        </CardHeader>
-        <CardContent>
+            </Text>
+        </div>
+        <div>
             <form id="form-register" @submit="onSubmit">
                 <FieldGroup>
                     <div class="flex justify-center gap-2 items-center">
@@ -137,11 +131,9 @@ const onSubmit = handleSubmit(async ({ confirmPassword, ...form }) => {
                     <FieldError v-if="serverErrors.length" :errors="serverErrors" />
                 </FieldGroup>
             </form>
-        </CardContent>
-        <CardFooter>
-            <Button class="flex-1" type="submit" form="form-register" :disabled="isSubmitting">
-                Signup
-            </Button>
-        </CardFooter>
-    </Card>
+        </div>
+        <Button class="w-full" type="submit" form="form-register" :disabled="isSubmitting">
+            Signup
+        </Button>
+    </Surface>
 </template>

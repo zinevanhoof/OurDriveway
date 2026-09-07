@@ -18,6 +18,7 @@ import {
     ComboboxItem,
     ComboboxEmpty,
 } from '@/components/ui/combobox'
+import { Text, Title } from '@/components/base/text'
 import { suggestAddress } from '@/api/address'
 import type { Address } from '@/types/domain/spot'
 import { AcceptableValue } from 'reka-ui';
@@ -72,7 +73,7 @@ const onSelect = (value: AcceptableValue) => {
 
 <template>
     <FieldGroup class="gap-4">
-        <div class="font-bold">Address</div>
+        <Title>Address</Title>
         <Field class="gap-1">
             <Combobox v-model:open="open" :ignore-filter="true" :reset-search-term-on-blur="false"
                 @update:model-value="onSelect">
@@ -88,9 +89,9 @@ const onSelect = (value: AcceptableValue) => {
                     </ComboboxViewport>
                 </ComboboxList>
             </Combobox>
-            <p class="text-xs text-muted-foreground">
+            <Text as="p" weight="normal">
                 Search powered by LocationIQ
-            </p>
+            </Text>
         </Field>
 
         <VeeField v-slot="{ componentField, errors }" name="address.line1">

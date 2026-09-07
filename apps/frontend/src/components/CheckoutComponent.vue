@@ -24,6 +24,9 @@ import { CircleCheck, CircleX, ShieldCheck, Timer } from "@lucide/vue";
 import Button from "@/components/ui/button/Button.vue";
 import Separator from "@/components/ui/separator/Separator.vue";
 import Spinner from "@/components/ui/spinner/Spinner.vue";
+import { Surface } from "@/components/base/surface";
+import { Text, Title } from "@/components/base/text";
+import { IconBox } from "@/components/base/icon-box";
 import { stripe } from "@/lib/stripe";
 import { cssColorToHex, token } from "@/lib/theme";
 import { fetchBooking, fetchMe, viewKeys } from "@/api/viewApi";
@@ -264,58 +267,58 @@ async function giveUp() {
 <template>
   <div class="mx-auto w-full max-w-lg px-4 py-6 space-y-3">
     <template v-if="screen === 'loading'">
-      <div class="flex flex-col items-center gap-3 py-16 text-center">
+      <Surface variant="none" size="none" class="items-center gap-3 py-16 text-center">
         <Spinner class="size-6" />
-        <div class="text-sm text-muted-foreground font-medium">Loading your checkout…</div>
-      </div>
+        <Text size="sm">Loading your checkout…</Text>
+      </Surface>
     </template>
 
     <template v-else-if="screen === 'confirming'">
-      <div class="flex flex-col items-center gap-3 py-16 text-center">
-        <div class="bg-accent text-accent-foreground p-3 rounded-lg"><Spinner class="size-6" /></div>
-        <div class="text-lg font-extrabold">Confirming your payment…</div>
-        <div class="text-sm text-muted-foreground font-medium max-w-sm">
+      <Surface variant="none" size="none" class="items-center gap-3 py-16 text-center">
+        <IconBox size="xl"><Spinner class="size-6" /></IconBox>
+        <Title size="lg" weight="extrabold">Confirming your payment…</Title>
+        <Text size="sm" class="max-w-sm">
           Your bank has told Stripe. We're waiting for Stripe to tell us — this normally
           takes a second or two.
-        </div>
-      </div>
+        </Text>
+      </Surface>
     </template>
 
     <template v-else-if="screen === 'booked'">
-      <div class="flex flex-col items-center gap-3 py-16 text-center">
-        <div class="bg-accent text-accent-foreground p-3 rounded-lg"><CircleCheck class="size-6" /></div>
-        <div class="text-lg font-extrabold">You're booked</div>
-        <div class="text-sm text-muted-foreground font-medium max-w-sm">
+      <Surface variant="none" size="none" class="items-center gap-3 py-16 text-center">
+        <IconBox size="xl"><CircleCheck /></IconBox>
+        <Title size="lg" weight="extrabold">You're booked</Title>
+        <Text size="sm" class="max-w-sm">
           {{ message || "The spot is yours for the times you chose." }}
-        </div>
+        </Text>
         <Button class="h-11 font-bold" @click="router.push('/spots')">See my bookings</Button>
-      </div>
+      </Surface>
     </template>
 
     <template v-else-if="screen === 'expired'">
-      <div class="flex flex-col items-center gap-3 py-16 text-center">
-        <div class="bg-accent text-accent-foreground p-3 rounded-lg"><Timer class="size-6" /></div>
-        <div class="text-lg font-extrabold">This checkout expired</div>
-        <div class="text-sm text-muted-foreground font-medium max-w-sm">
+      <Surface variant="none" size="none" class="items-center gap-3 py-16 text-center">
+        <IconBox size="xl"><Timer /></IconBox>
+        <Title size="lg" weight="extrabold">This checkout expired</Title>
+        <Text size="sm" class="max-w-sm">
           Those times are back on the market. Nothing was charged.
-        </div>
+        </Text>
         <Button class="h-11 font-bold" @click="router.push('/search')">Find a spot</Button>
-      </div>
+      </Surface>
     </template>
 
     <template v-else-if="screen === 'error'">
-      <div class="flex flex-col items-center gap-3 py-16 text-center">
-        <div class="bg-accent text-accent-foreground p-3 rounded-lg"><CircleX class="size-6" /></div>
-        <div class="text-lg font-extrabold">Something went wrong</div>
-        <div class="text-sm text-muted-foreground font-medium max-w-sm">{{ message }}</div>
+      <Surface variant="none" size="none" class="items-center gap-3 py-16 text-center">
+        <IconBox size="xl"><CircleX /></IconBox>
+        <Title size="lg" weight="extrabold">Something went wrong</Title>
+        <Text size="sm" class="max-w-sm">{{ message }}</Text>
         <Button class="h-11 font-bold" @click="router.push('/search')">Find a spot</Button>
-      </div>
+      </Surface>
     </template>
 
     <!-- paying -->
     <template v-else>
-      <div class="bg-card border border-border rounded-lg px-3.5 py-3.25 space-y-2">
-        <div class="text-[15px] font-extrabold">Your booking</div>
+      <Surface class="gap-2">
+        <Title size="md" weight="extrabold" class="text-[15px]">Your booking</Title>
         <!--
           Straight from the Checkout Session — the spot's name, its address, the times and
           a photo, with no request of ours behind any of it. payment-service asked
@@ -339,37 +342,36 @@ async function giveUp() {
 
           <div class="flex items-start justify-between gap-3">
             <div class="min-w-0">
-              <div class="text-sm font-semibold">{{ item.name }}</div>
+              <Title size="sm" weight="semibold">{{ item.name }}</Title>
               <!-- Wraps. It carries the times *and* the address, which is longer than
                    one line on a phone and is the part worth reading. -->
-              <div v-if="item.description" class="text-xs text-muted-foreground font-medium">
+              <Text v-if="item.description">
                 {{ item.description }}
-              </div>
+              </Text>
             </div>
-            <span class="text-sm font-semibold shrink-0">{{ item.total.amount }}</span>
+            <Title as="span" size="sm" weight="semibold" class="shrink-0">{{ item.total.amount }}</Title>
           </div>
         </div>
         <Separator />
         <div class="flex items-center justify-between font-bold">
-          <span class="text-muted-foreground">Total</span>
-          <span>{{ total }}</span>
+          <Text as="span" size="md" weight="bold">Total</Text>
+          <Title as="span">{{ total }}</Title>
         </div>
-      </div>
+      </Surface>
 
-      <div class="bg-card border border-border rounded-lg px-3.5 py-3.25 space-y-3">
+      <Surface class="gap-3">
         <div ref="contactEl" />
         <div ref="paymentEl" />
-      </div>
+      </Surface>
 
-      <div v-if="message"
-        class="text-sm font-semibold text-destructive bg-card border border-border rounded-lg px-3.5 py-3">
+      <Surface v-if="message" class="text-sm font-semibold text-destructive">
         {{ message }}
-      </div>
+      </Surface>
 
-      <div class="flex items-center gap-2 text-xs text-muted-foreground font-medium px-1">
+      <Text class="flex items-center gap-2 px-1">
         <ShieldCheck class="size-4 shrink-0" />
         Test mode — no real money moves. Card 4242&nbsp;4242&nbsp;4242&nbsp;4242 works.
-      </div>
+      </Text>
 
       <div class="space-y-2 pt-1">
         <Button class="w-full h-11 font-bold" :disabled="busy || !canConfirm" @click="pay">

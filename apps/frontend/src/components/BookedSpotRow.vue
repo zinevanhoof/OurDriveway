@@ -11,10 +11,13 @@ import * as paymentApi from "@/api/paymentApi";
 import { native } from "@/api/http";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import Button from "@/components/ui/button/Button.vue";
+import { Badge } from "@/components/ui/badge";
 import Separator from "@/components/ui/separator/Separator.vue";
 import SpotDetailDrawer from "@/components/spot/SpotDetailDrawer.vue";
+import { Surface } from "@/components/base/surface";
+import { Text, Title } from "@/components/base/text";
+import { Money } from "@/components/base/money";
 import { canCancel, formatDay, formatSlots, isActiveNow, sortedDays } from "@/lib/bookingDates";
-import { formatCents } from "@/lib/money";
 
 const props = defineProps<{ booking: any; past?: boolean }>();
 const emit = defineEmits<{ changed: [] }>();
@@ -136,39 +139,36 @@ async function cancel() {
 </script>
 
 <template>
-  <div class="p-3 space-y-2 border border-border shadow-xs bg-card rounded-md">
-    <div class="flex items-start gap-3" :class="!past && 'cursor-pointer'" @click="!past && (detailOpen = true)">
+  <Surface variant="elevated" class="gap-2">
+    <Surface variant="none" size="none" orientation="horizontal"
+      :class="['items-start gap-3', !past && 'cursor-pointer']" @click="!past && (detailOpen = true)">
       <img v-if="booking?.spot?.images?.[0]" :src="booking.spot.images[0]"
         class="w-20 h-20 shrink-0 rounded-lg object-cover" />
       <div class="flex-1 space-y-1">
-        <div class="font-semibold">{{ booking?.spot?.title }}</div>
-        <div class="flex gap-1 items-center text-xs text-muted-foreground font-medium">
+        <Title weight="semibold">{{ booking?.spot?.title }}</Title>
+        <Text class="flex gap-1 items-center">
           <MapPin :size="16" class="shrink-0" />
           {{ booking?.spot?.address?.line1 }} · {{ booking?.spot?.address?.city }}
-        </div>
+        </Text>
         <!-- Dropped once it's history: which Tuesday it was is not what someone
              scanning past bookings is looking for. -->
-        <div v-if="!past && days.length" class="flex gap-1 items-center text-xs text-muted-foreground font-medium">
+        <Text v-if="!past && days.length" class="flex gap-1 items-center">
           <Clock :size="16" class="shrink-0" />
           <span>
             {{ formatDay(days[0][0], timezone) }} · {{ formatSlots(days[0][1]) }}
             <!-- Tapping the card shows the rest; the count is the invitation. -->
             <span v-if="days.length > 1" class="text-foreground">+{{ days.length - 1 }} more</span>
           </span>
-        </div>
-        <div class="flex items-baseline gap-0.5 font-extrabold">
-          {{ formatCents(booking?.amount ?? 0) }}
-          <div class="text-xs text-muted-foreground font-medium">total</div>
-        </div>
-        <div v-if="withdrawn" class="text-xs text-destructive font-semibold">
+        </Text>
+        <Money :cents="booking?.amount ?? 0" suffix="total" size="md" weight="extrabold" />
+        <Text v-if="withdrawn" weight="semibold" tone="destructive">
           The host withdrew this spot. Your refund is on the way.
-        </div>
+        </Text>
       </div>
-      <span class="shrink-0 rounded-full px-2 py-0.5 text-xs font-semibold capitalize"
-        :class="active ? 'bg-primary text-primary-foreground' : STATUS_CLASS[statusLabel] ?? 'bg-muted text-muted-foreground'">
+      <Badge :class="['capitalize', active ? 'bg-primary text-primary-foreground' : STATUS_CLASS[statusLabel] ?? 'bg-muted text-muted-foreground']">
         {{ active ? "Active now" : statusLabel }}
-      </span>
-    </div>
+      </Badge>
+    </Surface>
 
     <template v-if="showFooter">
       <Separator />
@@ -215,15 +215,15 @@ async function cancel() {
                says so: nothing has been charged for a hold, so "cancel" would overstate
                what is happening. -->
           <div>
-            <div class="text-lg font-bold">
+            <Title size="lg">
               {{ reserved ? "Give up these times?" : "Cancel this booking?" }}
-            </div>
-            <div class="text-sm text-muted-foreground font-medium">
+            </Title>
+            <Text size="sm">
               {{ booking?.spot?.title }} —
               <span v-if="days.length">{{ formatDay(days[0][0], timezone) }}</span>.
               The slots go straight back on the market.
               <template v-if="reserved">You haven't been charged.</template>
-            </div>
+            </Text>
           </div>
           <div class="space-y-2">
             <Button variant="destructive" class="w-full h-11 font-bold" :disabled="cancelling" @click="cancel">
@@ -236,5 +236,5 @@ async function cancel() {
         </div>
       </DrawerContent>
     </Drawer>
-  </div>
+  </Surface>
 </template>

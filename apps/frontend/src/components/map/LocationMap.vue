@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
-import { formatCents } from '@/lib/money';
 import { onMounted, onBeforeUnmount, ref, computed, watch, h, render } from "vue";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
@@ -18,6 +17,9 @@ import MapPinComponent from "./MapPinComponent.vue";
 import MapSearchComponent from "./MapSearchComponent.vue";
 import SpotDetailDrawer from "../spot/SpotDetailDrawer.vue";
 import BookingFormComponent from "../BookingFormComponent.vue";
+import { Surface } from "@/components/base/surface";
+import { Title } from "@/components/base/text";
+import { Money } from "@/components/base/money";
 
 // Dynamic OSM map via OpenFreeMap (Liberty vector style) + MapLibre GL. Keyless:
 // tiles + style are fetched straight from the browser, no API key to expose.
@@ -311,16 +313,13 @@ onBeforeUnmount(() => {
       <DrawerContent @close-auto-focus.prevent
         class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
         <div class="m-4 space-y-3">
-          <div class="text-lg font-bold">{{ openCluster?.spots.length }} spots here</div>
+          <Title size="lg">{{ openCluster?.spots.length }} spots here</Title>
           <div class="max-h-80 space-y-2 overflow-y-auto">
-            <button v-for="s in openCluster?.spots" :key="s.id" @click="openSpot(s.id)"
-              class="flex w-full items-center justify-between gap-4 rounded-md border border-border p-3 text-left">
-              <span class="truncate font-semibold">{{ s.title }}</span>
-              <span class="flex shrink-0 items-baseline font-extrabold text-primary">
-                {{ formatCents(s.price) }}
-                <span class="text-xs font-medium text-muted-foreground">/hr</span>
-              </span>
-            </button>
+            <Surface v-for="s in openCluster?.spots" :key="s.id" @click="openSpot(s.id)" as="button" variant="none"
+              orientation="horizontal" class="w-full justify-between gap-4 border border-border text-left">
+              <Title as="span" weight="semibold" class="truncate">{{ s.title }}</Title>
+              <Money :cents="s.price" suffix="/hr" size="md" weight="extrabold" tone="primary" class="shrink-0" />
+            </Surface>
           </div>
         </div>
       </DrawerContent>

@@ -1,23 +1,27 @@
-import type { VariantProps } from "class-variance-authority"
-import { cva } from "class-variance-authority"
+import type { VariantProps } from "class-variance-authority";
+import { cva } from "class-variance-authority";
 
-export { default as Surface } from "./Surface.vue"
+export { default as Surface } from "./Surface.vue";
 
 /**
  * The box. Roughly forty divs across the app are one of these, written ~24 different
  * ways, and the drift is entirely in what order the author happened to type the classes.
  *
- * Two things are baked into the base rather than exposed as variants, because the
- * evidence says there is no decision behind them:
+ * One thing is baked into the base rather than exposed as a variant, because the
+ * evidence says there is no decision behind it:
  *
  *   radius  `rounded-md` is used 48 times against `rounded-lg` 14, and the 14 follow no
  *           rule — the same kind of panel is `rounded-md` in ManageSpotComponent and
  *           `rounded-lg` in CheckoutComponent.
- *   gap     `gap-3` covers 8 of the 10 rows that have children side by side. It is a
- *           class, not a prop, so `class="gap-8"` overrides it through tailwind-merge
- *           without needing an API for every spacing anyone might want.
+ *
+ * **No default gap.** There was one — `gap-3`, on the grounds that it covered 8 of the
+ * 10 rows with children side by side. Migrating the app disproved that: the rows did
+ * want it, but the *stacks* did not, and eleven call sites ended up carrying `gap-0`
+ * purely to cancel a gap they never asked for. A default you spend a class undoing is
+ * worse than no default. Spell the gap out — `class="gap-3"` on the rows that want it —
+ * and a Surface with nothing said about spacing now stacks the way a plain div does.
  */
-export const surfaceVariants = cva("flex rounded-md gap-3", {
+export const surfaceVariants = cva("flex rounded-md", {
   variants: {
     variant: {
       // Layout only. For grouping things that should not read as a box of their own.
@@ -59,6 +63,6 @@ export const surfaceVariants = cva("flex rounded-md gap-3", {
     orientation: "vertical",
     interactive: false,
   },
-})
+});
 
-export type SurfaceVariants = VariantProps<typeof surfaceVariants>
+export type SurfaceVariants = VariantProps<typeof surfaceVariants>;

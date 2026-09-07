@@ -14,11 +14,12 @@ import {
     InputGroupText,
     InputGroupTextarea,
 } from '@/components/ui/input-group'
+import { Title } from '@/components/base/text'
 </script>
 
 <template>
     <FieldGroup class="gap-4">
-        <div class="font-bold">Basic details</div>
+        <Title>Basic details</Title>
         <VeeField v-slot="{ componentField, errors }" name="title">
             <Field :data-invalid="!!errors.length" class="gap-1">
                 <FieldLabel for="title">

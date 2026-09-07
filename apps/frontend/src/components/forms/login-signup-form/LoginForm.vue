@@ -5,14 +5,6 @@ import { z } from 'zod'
 import { ref } from 'vue'
 
 import {
-    Card,
-    CardContent,
-    CardDescription,
-    CardHeader,
-    CardFooter,
-    CardTitle,
-} from '@/components/ui/card'
-import {
     Field,
     FieldError,
     FieldGroup,
@@ -20,6 +12,8 @@ import {
 } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
 import { loginUser, resendVerification } from '@/api/userApi'
 import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
 import { AuthResponse } from '@/types/response/AuthResponse'
@@ -83,55 +77,51 @@ const resend = async () => {
 </script>
 
 <template>
-    <Card>
-        <CardHeader>
-            <CardTitle>Login</CardTitle>
-            <CardDescription>
+    <Surface size="lg" class="gap-6">
+        <div class="space-y-1">
+            <Title weight="medium">Login</Title>
+            <Text size="sm">
                 Login into your account here
-            </CardDescription>
-        </CardHeader>
-        <CardContent>
-            <form id="form-login" @submit="onSubmit">
-                <FieldGroup>
-                    <VeeField v-slot="{ field, errors }" name="email">
-                        <Field :data-invalid="!!errors.length">
-                            <FieldLabel for="form-login-email">
-                                Email
-                            </FieldLabel>
-                            <Input id="form-login-email" v-bind="field" placeholder="example@gmail.com"
-                                autocomplete="off" :aria-invalid="!!errors.length" />
-                            <FieldError v-if="errors.length" :errors="errors" />
-                        </Field>
-                    </VeeField>
+            </Text>
+        </div>
+        <form id="form-login" @submit="onSubmit">
+            <FieldGroup>
+                <VeeField v-slot="{ field, errors }" name="email">
+                    <Field :data-invalid="!!errors.length">
+                        <FieldLabel for="form-login-email">
+                            Email
+                        </FieldLabel>
+                        <Input id="form-login-email" v-bind="field" placeholder="example@gmail.com" autocomplete="off"
+                            :aria-invalid="!!errors.length" />
+                        <FieldError v-if="errors.length" :errors="errors" />
+                    </Field>
+                </VeeField>
 
-                    <VeeField v-slot="{ field, errors }" name="password">
-                        <Field :data-invalid="!!errors.length">
-                            <FieldLabel for="form-login-password">
-                                Password
-                            </FieldLabel>
-                            <Input type="password" id="form-login-password" v-bind="field" placeholder="Password"
-                                autocomplete="off" :aria-invalid="!!errors.length" />
-                            <FieldError v-if="errors.length" :errors="errors" />
-                        </Field>
-                    </VeeField>
+                <VeeField v-slot="{ field, errors }" name="password">
+                    <Field :data-invalid="!!errors.length">
+                        <FieldLabel for="form-login-password">
+                            Password
+                        </FieldLabel>
+                        <Input type="password" id="form-login-password" v-bind="field" placeholder="Password"
+                            autocomplete="off" :aria-invalid="!!errors.length" />
+                        <FieldError v-if="errors.length" :errors="errors" />
+                    </Field>
+                </VeeField>
 
-                    <FieldError v-if="serverErrors.length" :errors="serverErrors" />
-                </FieldGroup>
-            </form>
-        </CardContent>
-        <CardFooter class="flex-col gap-2">
-            <Button class="w-full" type="submit" form="form-login" :disabled="isSubmitting">
-                Login
-            </Button>
+                <FieldError v-if="serverErrors.length" :errors="serverErrors" />
 
-            <template v-if="unverified">
-                <p class="text-sm text-muted-foreground text-center">
-                    Verify your email address before logging in. Check your inbox.
-                </p>
-                <Button class="w-full" variant="outline" :disabled="resending" @click="resend">
-                    Send the link again
+                <Button class="w-full" type="submit" :disabled="isSubmitting">
+                    Login
                 </Button>
-            </template>
-        </CardFooter>
-    </Card>
+            </FieldGroup>
+        </form>
+        <template v-if="unverified">
+            <Text as="p" size="sm" weight="normal" class="text-center">
+                Verify your email address before logging in. Check your inbox.
+            </Text>
+            <Button class="w-full" variant="outline" :disabled="resending" @click="resend">
+                Send the link again
+            </Button>
+        </template>
+    </Surface>
 </template>

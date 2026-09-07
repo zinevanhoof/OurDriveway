@@ -1,19 +1,12 @@
 <script setup lang="ts">
-import { formatCents } from '@/lib/money';
+import { Surface } from '@/components/base/surface';
+import { Text, Title } from '@/components/base/text';
+import { Money } from '@/components/base/money';
+import { SectionHeader } from '@/components/base/section-header';
 
-import {
-    Item,
-    ItemContent,
-    ItemTitle,
-} from '@/components/ui/item'
-
-import ItemDescription from '@/components/ui/item/ItemDescription.vue';
 import { ChevronRight, MapPin, Plus, TrendingUp } from '@lucide/vue';
 import Button from '@/components/ui/button/Button.vue';
-import Card from '@/components/ui/card/Card.vue';
-import CardContent from '@/components/ui/card/CardContent.vue';
-import ItemMedia from '@/components/ui/item/ItemMedia.vue';
-import ItemGroup from '@/components/ui/item/ItemGroup.vue';
+import { Badge } from '@/components/ui/badge';
 import { useRouter } from 'vue-router';
 import { fetchMySpots, viewKeys } from '@/api/viewApi';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
@@ -45,64 +38,53 @@ onMounted(() => {
 
 <template>
     <div class="space-y-4">
-        <div class="flex justify-between items-center">
-            <div class="text-xl font-extrabold text-foreground">Your parking spots</div>
-            <Button @click="router.push({ name: 'spot-add' })" class="font-bold">
-                <Plus />
-                Add
-            </Button>
+        <SectionHeader class="items-center">
+            <Title size="xl" weight="extrabold">Your parking spots</Title>
+            <template #action>
+                <Button @click="router.push({ name: 'spot-add' })" class="font-bold">
+                    <Plus />
+                    Add
+                </Button>
+            </template>
+        </SectionHeader>
+        <div class="grid grid-cols-2 gap-2">
+            <Surface variant="elevated" size="lg">
+                <Text weight="normal">Earned this month</Text>
+                <Title size="2xl">$266</Title>
+                <Text weight="normal" tone="success" class="flex items-center gap-1">
+                    <TrendingUp :size="14" />
+                    +18% vs last
+                </Text>
+            </Surface>
+            <Surface variant="elevated" size="lg">
+                <Text weight="normal">Active parking spots</Text>
+                <Title size="2xl">2/3</Title>
+                <Text>1 booked right now</Text>
+            </Surface>
         </div>
-        <div class="flex gap-2">
-            <Card size="sm" class="flex-1">
-                <CardContent>
-                    <div class="text-xs text-muted-foreground">Earned this month</div>
-                    <div class="text-2xl font-bold">$266</div>
-                    <div class="flex items-center gap-1 text-success text-xs">
-                        <TrendingUp :size="14" />
-                        +18% vs last
-                    </div>
-                </CardContent>
-            </Card>
-            <Card size="sm" class="flex-1">
-                <CardContent>
-                    <div class="text-xs text-muted-foreground">Active parking spots</div>
-                    <div class="text-2xl font-bold">2/3</div>
-                    <div class="text-xs text-muted-foreground font-medium">1 booked right now</div>
-                </CardContent>
-            </Card>
-        </div>
-        <div class="text-xs text-muted-foreground font-semibold">All listings</div>
-        <ItemGroup class="cursor-pointer gap-2">
-            <Item @click="() => router.push({ name: 'spot', params: { id: spot.id } })" v-for="spot in spots"
-                :key="spot.id" variant="outline" class="bg-card">
-                <ItemMedia variant="image"
-                    class="group-has-data-[slot=item-description]/item:self-center group-has-data-[slot=item-description]/item:translate-y-0">
-                    <img :src="spot.images[0]">
-                </ItemMedia>
-                <ItemContent>
-                    <ItemTitle class="font-bold">
+        <Text weight="semibold">All listings</Text>
+        <ul class="space-y-2">
+            <Surface v-for="spot in spots" :key="spot.id" as="li" orientation="horizontal" class="gap-3"
+                @click="router.push({ name: 'spot', params: { id: spot.id } })">
+                <img :src="spot.images[0]" class="size-12 rounded-sm object-cover">
+                <div class="flex-1 space-y-1">
+                    <Title size="sm" weight="bold" class="flex items-center gap-2">
                         {{ spot.title }}
                         <!-- A paused listing looks identical to a live one otherwise,
                              and "why am I getting no bookings" is the question that
                              follows. -->
-                        <span v-if="!spot.active"
-                            class="rounded-full bg-muted px-2 py-0.5 text-xs font-semibold text-muted-foreground">
-                            Paused
-                        </span>
-                    </ItemTitle>
-                    <ItemDescription class="flex items-center gap-1 text-muted-foreground text-xs font-medium">
+                        <Badge v-if="!spot.active" variant="secondary">Paused</Badge>
+                    </Title>
+                    <Text as="p" class="flex items-center gap-1 leading-normal">
                         <MapPin :size="14" />
                         {{ spot.address.line1 }} - {{ spot.address.city }}
-                    </ItemDescription>
-                </ItemContent>
-                <ItemContent class="items-end">
-                    <div class="flex items-baseline text-lg font-semibold">{{
-                        formatCents(spot.pricePerHour) }}
-                        <div class="text-xs text-muted-foreground font-medium">/hr</div>
-                    </div>
+                    </Text>
+                </div>
+                <div class="flex flex-col items-end">
+                    <Money :cents="spot.pricePerHour" suffix="/hr" size="lg" weight="semibold" />
                     <ChevronRight class="text-muted-foreground" />
-                </ItemContent>
-            </Item>
-        </ItemGroup>
+                </div>
+            </Surface>
+        </ul>
     </div>
 </template>

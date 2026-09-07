@@ -13,17 +13,21 @@ import { cn } from "@/lib/utils"
  * Slots rather than `title`/`action` string props, so the label can be a Title at
  * whatever size the screen wants and the action can be a link, a button or a count.
  */
-const props = defineProps<{
+const props = withDefaults(defineProps<{
+  as?: string | object
   class?: HTMLAttributes["class"]
-}>()
+}>(), {
+  as: "div",
+})
 </script>
 
 <template>
-  <div
+  <component
+    :is="as"
     data-slot="section-header"
     :class="cn('flex items-end justify-between gap-2', props.class)"
   >
     <slot />
     <slot name="action" />
-  </div>
+  </component>
 </template>

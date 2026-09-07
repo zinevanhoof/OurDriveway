@@ -11,6 +11,9 @@ import AvatarImage from '@/components/ui/avatar/AvatarImage.vue';
 import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue';
 import { Camera, ChevronRight, Lock, LogOut, UserRound } from '@lucide/vue';
 import { formatCents } from '@/lib/money';
+import { Surface } from '@/components/base/surface';
+import { Text, Title } from '@/components/base/text';
+import { IconBox } from '@/components/base/icon-box';
 import { useRouter } from 'vue-router';
 import { logoutUser } from '@/api/userApi';
 
@@ -43,8 +46,8 @@ const logout = async () => {
 
 <template>
     <div class="px-4 space-y-2">
-        <div v-if="me" class="p-4 border border-border rounded-md shadow-xs space-y-2 bg-card">
-            <div class="flex items-center gap-3">
+        <Surface v-if="me" variant="elevated" size="lg" class="gap-2">
+            <Surface variant="none" size="none" orientation="horizontal" class="gap-3">
                 <!-- Goes to the edit screen rather than opening a picker here. This
                      view is read-only — every other control on it is a row that
                      navigates — and a second upload path would need its own PATCH
@@ -62,67 +65,68 @@ const logout = async () => {
                     <span class="sr-only">Change profile picture</span>
                 </button>
                 <div>
-                    <div class="text-lg font-bold">{{ me.firstName }} {{ me.lastName }}</div>
-                    <div class="text-xs text-muted-foreground font-medium">{{ me.email }}</div>
+                    <Title size="lg">{{ me.firstName }} {{ me.lastName }}</Title>
+                    <Text>{{ me.email }}</Text>
                 </div>
-            </div>
+            </Surface>
             <Separator />
             <div class="flex text-center font-bold">
                 <div class="flex-1">
                     3
-                    <div class="text-xs text-muted-foreground">Spots</div>
+                    <Text weight="bold">Spots</Text>
                 </div>
                 <Separator orientation="vertical" />
                 <div class="flex-1">
                     148
-                    <div class="text-xs text-muted-foreground">Trips</div>
+                    <Text weight="bold">Trips</Text>
                 </div>
                 <Separator orientation="vertical" />
                 <div class="flex-1">
                     {{ formatCents(124000) }}
-                    <div class="text-xs text-muted-foreground">Earned</div>
+                    <Text weight="bold">Earned</Text>
                 </div>
             </div>
-        </div>
+        </Surface>
 
-        <div class="bg-card border border-border rounded-md">
-            <button type="button" class="flex gap-3 items-center p-3 w-full text-left"
+        <Surface size="none">
+            <Surface as="button" variant="none" orientation="horizontal" type="button" class="w-full gap-3 text-left"
                 @click="router.push({ name: 'profile-edit' })">
-                <div class="p-2 rounded-md bg-accent text-accent-foreground">
-                    <UserRound :size="18" />
-                </div>
-                <div class="flex-1 font-semibold">Edit profile</div>
+                <IconBox>
+                    <UserRound />
+                </IconBox>
+                <Title weight="semibold" class="flex-1">Edit profile</Title>
                 <ChevronRight class="text-muted-foreground" />
-            </button>
+            </Surface>
             <Separator />
-            <button type="button" class="flex gap-3 items-center p-3 w-full text-left"
+            <Surface as="button" variant="none" orientation="horizontal" type="button" class="w-full gap-3 text-left"
                 @click="router.push({ name: 'profile-password' })">
-                <div class="p-2 rounded-md bg-accent text-accent-foreground">
-                    <Lock :size="18" />
-                </div>
-                <div class="flex-1 font-semibold">Change password</div>
+                <IconBox>
+                    <Lock />
+                </IconBox>
+                <Title weight="semibold" class="flex-1">Change password</Title>
                 <ChevronRight class="text-muted-foreground" />
-            </button>
-        </div>
-        <div class="bg-card border border-border rounded-md">
-            <button type="button" class="flex gap-3 items-center p-3 w-full text-left" @click="confirmOpen = true">
-                <div class="p-2 rounded-md bg-accent text-accent-foreground">
-                    <LogOut :size="18" class="text-destructive" />
-                </div>
-                <div class="flex-1 font-semibold text-destructive">Log out</div>
+            </Surface>
+        </Surface>
+        <Surface size="none">
+            <Surface as="button" variant="none" orientation="horizontal" type="button" class="w-full gap-3 text-left"
+                @click="confirmOpen = true">
+                <IconBox>
+                    <LogOut class="text-destructive" />
+                </IconBox>
+                <Title weight="semibold" tone="destructive" class="flex-1">Log out</Title>
                 <ChevronRight class="text-muted-foreground" />
-            </button>
-        </div>
+            </Surface>
+        </Surface>
 
         <Drawer v-model:open="confirmOpen">
             <DrawerContent @close-auto-focus.prevent
                 class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
                 <div class="m-4 space-y-4">
                     <div>
-                        <div class="text-lg font-bold">Log out?</div>
-                        <div class="text-sm text-muted-foreground font-medium">
+                        <Title size="lg">Log out?</Title>
+                        <Text size="sm">
                             You'll need to sign in again to book or manage your spots.
-                        </div>
+                        </Text>
                     </div>
                     <div class="space-y-2">
                         <Button variant="destructive" class="w-full h-11 font-bold" @click="logout">

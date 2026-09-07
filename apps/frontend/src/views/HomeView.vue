@@ -13,6 +13,12 @@ import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import BookingFormComponent from '@/components/BookingFormComponent.vue';
 import { CarFront, ChevronRight, CirclePlus, MapPin, Search, Star, Wallet } from '@lucide/vue';
+import { Surface } from '@/components/base/surface';
+import { Text, Title } from '@/components/base/text';
+import { IconBox } from '@/components/base/icon-box';
+import { Money } from '@/components/base/money';
+import { SectionHeader } from '@/components/base/section-header';
+import { Badge } from '@/components/ui/badge';
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -177,99 +183,94 @@ const openBooking = () => {
          `<button class="flex … w-full text-left">` is the shape that fixes it
          without disturbing layout — worth doing to the whole screen at once. -->
     <div class="pt-2 px-4 pb-2 space-y-4">
-        <div class="flex gap-2">
-            <div class="flex-1 bg-primary text-primary-foreground rounded-md p-4 space-y-8"
-                @click="router.push({ name: 'search' })">
+        <div class="grid grid-cols-2 gap-2">
+            <Surface variant="primary" size="lg" class="gap-8" @click="router.push({ name: 'search' })">
                 <Search />
                 <div>
-                    <div class="font-bold">Find parking</div>
-                    <div class="text-xs font-medium">Spots near you</div>
+                    <Title tone="inverse">Find parking</Title>
+                    <Text tone="inverse">Spots near you</Text>
                 </div>
-            </div>
-            <div class="flex-1 bg-card text-card-foreground rounded-md p-4 space-y-8 border border-border shadow-xs"
-                @click="router.push({ name: 'spot-add' })">
+            </Surface>
+            <Surface variant="elevated" size="lg" class="gap-8" @click="router.push({ name: 'spot-add' })">
                 <CirclePlus class="text-primary" />
                 <div>
-                    <div class="font-bold">Add a spot</div>
-                    <div class="text-xs text-muted-foreground font-medium">Earn from your driveway</div>
+                    <Title>Add a spot</Title>
+                    <Text>Earn from your driveway</Text>
                 </div>
-            </div>
+            </Surface>
         </div>
-        <div v-if="next"
-            class="flex items-center gap-3 bg-card text-card-foreground rounded-md border border-border shadow-xs p-3"
-            @click="openBooking">
-            <div class="p-2 rounded-md"
-                :class="happeningNow ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground'">
-                <CarFront :size="22" />
-            </div>
+        <Surface v-if="next" variant="elevated" orientation="horizontal" class="gap-3" @click="openBooking">
+            <IconBox :tone="happeningNow ? 'primary' : 'accent'">
+                <CarFront />
+            </IconBox>
             <div class="flex-1">
-                <div class="text-[10px] text-muted-foreground font-bold">
-                    {{ happeningNow ? 'HAPPENING NOW' : 'UPCOMING BOOKING' }}
-                </div>
-                <div class="font-semibold">{{ next.booking.spot?.title }}</div>
-                <div class="text-xs text-muted-foreground font-medium">
+                <Text size="eyebrow" weight="bold">
+                    {{ happeningNow ? 'Happening now' : 'Upcoming booking' }}
+                </Text>
+                <Title weight="semibold">{{ next.booking.spot?.title }}</Title>
+                <Text>
                     {{ formatDay(next.slot[0], nextTimezone) }} · {{ formatSlots([next.slot[1]]) }}
-                </div>
+                </Text>
             </div>
             <ChevronRight class="text-muted-foreground" />
-        </div>
-        <div
-            class="flex items-center gap-3 bg-linear-135 from-accent to-card-2 rounded-md border border-border shadow-xs p-3">
-            <div class="p-2 rounded-md bg-primary text-primary-foreground">
-                <Wallet :size="22" />
+        </Surface>
+        <Surface variant="elevated" orientation="horizontal" class="gap-3 bg-linear-135 from-accent to-card-2">
+            <IconBox tone="primary">
+                <Wallet />
+            </IconBox>
+            <div class="flex-1">
+                <Text>Available to withdraw</Text>
+                <Money :cents="available" size="xl" />
             </div>
-            <div class=flex-1>
-                <div class="text-xs text-muted-foreground font-medium">Available to withdraw</div>
-                <div class="text-xl font-bold">{{ formatCents(available) }}</div>
-            </div>
-            <div class="flex items-center gap-1 text-primary text-sm font-semibold"
+            <Text size="sm" weight="semibold" tone="primary" class="flex items-center gap-1"
                 @click="router.push({ name: 'wallet' })">
                 Wallet
                 <ChevronRight />
-            </div>
-        </div>
+            </Text>
+        </Surface>
         <div class="space-y-2">
-            <div class="flex justify-between items-end">
-                <div class="font-bold">Nearby spots</div>
-                <div class="text-primary text-xs font-bold" @click="router.push({ name: 'search' })">See all</div>
-            </div>
+            <SectionHeader>
+                <Title>Nearby spots</Title>
+                <template #action>
+                    <Text weight="bold" tone="primary" @click="router.push({ name: 'search' })">See all</Text>
+                </template>
+            </SectionHeader>
             <!-- On native this really does re-prompt via Tauri's permission flow. On
                  web a hard-denied permission cannot be re-asked from script, and only
                  site settings can undo it — but the common case is a prompt that got
                  dismissed, and that one this fixes. The row is the message; no toast. -->
-            <button v-if="!here" type="button" @click="locate" :disabled="locating"
-                class="flex gap-3 items-center p-3 w-full text-left bg-card border border-border rounded-md shadow-xs">
-                <div class="p-2 rounded-md bg-accent text-accent-foreground">
-                    <MapPin :size="22" />
-                </div>
+            <Surface v-if="!here" as="button" variant="elevated" orientation="horizontal" type="button" @click="locate"
+                :disabled="locating" class="w-full gap-3 text-left">
+                <IconBox>
+                    <MapPin />
+                </IconBox>
                 <div class="flex-1">
-                    <div class="font-semibold">{{ locating ? 'Finding you…' : 'Turn on location' }}</div>
-                    <div class="text-xs text-muted-foreground font-medium">To see spots near you</div>
+                    <Title weight="semibold">{{ locating ? 'Finding you…' : 'Turn on location' }}</Title>
+                    <Text>To see spots near you</Text>
                 </div>
                 <ChevronRight class="text-muted-foreground" />
-            </button>
+            </Surface>
             <div v-else class="flex gap-2">
-                <div v-for="spot in nearest" :key="spot.id" @click="openSpot(spot.id)"
-                    class="relative flex-1 min-w-0 bg-card border border-border shadow-xs rounded-md overflow-hidden">
+                <Surface v-for="spot in nearest" :key="spot.id" @click="openSpot(spot.id)" variant="elevated"
+                    size="none" class="relative flex-1 min-w-0 overflow-hidden">
                     <img v-if="spot.images?.[0]" class="w-full h-28 object-cover" :src="spot.images[0]">
                     <div v-else class="w-full h-28 bg-accent"></div>
                     <div class="p-2">
-                        <div class="text-sm font-semibold truncate">{{ spot.title }}</div>
+                        <Title size="sm" weight="semibold" class="truncate">{{ spot.title }}</Title>
                         <!-- ponytail: hardcoded, because there is no rating in the
                              system to show. `rating` is declared on booking in both
                              schemas and nothing ever writes it: no BookingRated event,
                              no endpoint, no projector arm folding an average onto the
                              spot, no UI to submit one. That is the chain this needs. -->
-                        <div class="flex items-center gap-1 text-xs text-muted-foreground font-medium">
+                        <Text class="flex items-center gap-1">
                             <Star :size="16" />
                             4.9
-                        </div>
+                        </Text>
                     </div>
-                    <div
-                        class="absolute left-2 top-2 bg-primary text-primary-foreground text-xs font-bold rounded-sm px-2 py-0.5">
+                    <Badge class="absolute left-2 top-2 rounded-sm">
                         {{ formatCents(spot.pricePerHour) }}/hr
-                    </div>
-                </div>
+                    </Badge>
+                </Surface>
             </div>
         </div>
 

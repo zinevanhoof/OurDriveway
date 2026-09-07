@@ -3,14 +3,8 @@ import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { toast } from 'vue-sonner'
 
-import {
-    Card,
-    CardContent,
-    CardDescription,
-    CardFooter,
-    CardHeader,
-    CardTitle,
-} from '@/components/ui/card'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
@@ -70,41 +64,37 @@ const resend = async () => {
 
 <template>
     <div class="mx-4 mt-22">
-        <Card>
-            <CardHeader>
-                <CardTitle>
+        <Surface size="lg" class="gap-6">
+            <div class="grid gap-1">
+                <Title class="font-medium">
                     <template v-if="state === 'verifying'">Verifying your email</template>
                     <template v-else-if="state === 'verified'">Email verified</template>
                     <template v-else>Link didn't work</template>
-                </CardTitle>
-                <CardDescription>
+                </Title>
+                <Text size="sm" weight="normal">
                     <template v-if="state === 'verifying'">One moment.</template>
                     <template v-else-if="state === 'verified'">
                         Your address is confirmed. You can log in now.
                     </template>
                     <template v-else>{{ error }}</template>
-                </CardDescription>
-            </CardHeader>
+                </Text>
+            </div>
 
-            <CardContent v-if="state === 'verifying'" class="flex justify-center py-6">
+            <div v-if="state === 'verifying'" class="flex justify-center py-6">
                 <Spinner />
-            </CardContent>
+            </div>
 
-            <CardContent v-else-if="state === 'failed'" class="space-y-2">
+            <div v-else-if="state === 'failed'" class="space-y-2">
                 <Input v-model="email" type="email" placeholder="example@gmail.com" autocomplete="email" />
-            </CardContent>
+            </div>
 
-            <CardFooter v-if="state === 'verified'">
-                <Button class="flex-1" @click="router.push({ name: 'login' })">
-                    Go to login
-                </Button>
-            </CardFooter>
+            <Button v-if="state === 'verified'" class="w-full" @click="router.push({ name: 'login' })">
+                Go to login
+            </Button>
 
-            <CardFooter v-else-if="state === 'failed'">
-                <Button class="flex-1" :disabled="resending || !email" @click="resend">
-                    Send a new link
-                </Button>
-            </CardFooter>
-        </Card>
+            <Button v-else-if="state === 'failed'" class="w-full" :disabled="resending || !email" @click="resend">
+                Send a new link
+            </Button>
+        </Surface>
     </div>
 </template>

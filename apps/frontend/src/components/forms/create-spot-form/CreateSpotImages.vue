@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { ImagePlus, X } from '@lucide/vue'
 import Button from '@/components/ui/button/Button.vue';
+import { Title } from '@/components/base/text'
 
 defineProps<{ imageErrors: string[] }>()
 
@@ -47,7 +48,7 @@ const onSelectImages = (event: Event) => {
 
 <template>
     <div class="space-y-2">
-        <div class="font-bold">Photos</div>
+        <Title>Photos</Title>
         <div class="flex gap-2">
             <label
                 class="relative flex shrink-0 flex-col justify-center items-center w-24 h-24 text-xs text-accent-foreground font-semibold bg-card-2 rounded-lg border border-dashed border-border">

@@ -8,6 +8,11 @@ import Button from "./ui/button/Button.vue";
 import Input from "./ui/input/Input.vue";
 import Separator from "./ui/separator/Separator.vue";
 import FilterChips from "./map/FilterChips.vue";
+import { Surface } from "@/components/base/surface";
+import { Text, Title } from "@/components/base/text";
+import { IconBox } from "@/components/base/icon-box";
+import { Money } from "@/components/base/money";
+import { SectionHeader } from "@/components/base/section-header";
 import { toast } from "vue-sonner";
 
 import { DateFormatter, DateValue, getLocalTimeZone, today } from "@internationalized/date";
@@ -229,55 +234,57 @@ watch(open, (o) => {
                     <!-- Only the picker lives here now. Paying is `/checkout`, a route of
                          its own, because a redirect payment method destroys this page. -->
                         <div class="space-y-2">
-                            <div class="text-[15px] font-extrabold">Pick your dates</div>
+                            <Title weight="extrabold" class="text-[15px]">Pick your dates</Title>
                             <Calendar multiple :model-value="(selectedDates as any)" @update:model-value="onDatesChange"
                                 :min-value="minDate" :max-value="maxDate" :is-date-disabled="isDateDisabled"
                                 class="bg-card rounded-lg border border-border" initial-focus />
                         </div>
 
-                        <div v-if="!selectedDates?.length"
-                            class="flex flex-col justify-center items-center gap-3 px-5 py-4.5 text-center bg-card rounded-lg border border-dashed border-border">
-                            <div class="bg-accent text-accent-foreground p-2 rounded-md">
+                        <Surface v-if="!selectedDates?.length" variant="dashed" size="lg"
+                            class="justify-center items-center gap-3 text-center">
+                            <IconBox size="lg">
                                 <CalendarDays />
-                            </div>
+                            </IconBox>
                             <div class="w-3/4">Tap the highlighted dates the host has opened up, then choose your time
                                 slots.</div>
-                        </div>
+                        </Surface>
 
                         <div v-else class="space-y-2">
                             <FilterChips :items="dateChips" :active="activeKey" @select="activeKey = $event"
                                 @remove="(k) => selectedDates = selectedDates.filter(d => d.toString() !== k)" />
                             <div class="space-y-1">
-                                <div class="text-[15px] font-extrabold">Choose your time</div>
-                                <div class="text-xs text-muted-foreground font-medium">Add one or more 30-min time slots
-                                    within each of the host's open windows.</div>
+                                <Title weight="extrabold" class="text-[15px]">Choose your time</Title>
+                                <Text>Add one or more 30-min time slots
+                                    within each of the host's open windows.</Text>
                             </div>
 
-                            <div v-if="activeDate"
-                                class="bg-card border border-border rounded-lg px-3.5 py-3.25 space-y-3">
-                                <div class="flex justify-between items-end">
-                                    <div class="font-bold">{{ dfShort.format(activeDate.toDate(getLocalTimeZone())) }}
-                                    </div>
-                                    <div class="text-xs font-bold text-primary">
-                                        {{ activePicked.length ? `${activePicked.length} slot${activePicked.length > 1 ?
-                                            's'
-                                        : ''}` : 'No time yet' }}
-                                    </div>
-                                </div>
+                            <Surface v-if="activeDate" class="gap-3">
+                                <SectionHeader>
+                                    <Title>{{ dfShort.format(activeDate.toDate(getLocalTimeZone())) }}
+                                    </Title>
+                                    <template #action>
+                                        <Text weight="bold" tone="primary">
+                                            {{ activePicked.length ? `${activePicked.length} slot${activePicked.length >
+                                                1 ? 's'
+                                                : ''}` : 'No time yet' }}
+                                        </Text>
+                                    </template>
+                                </SectionHeader>
 
                                 <!-- Already-picked slots for this date -->
                                 <div v-if="activePicked.length" class="space-y-1.5">
-                                    <div v-for="(s, i) in activePicked" :key="`${s.start}-${s.end}-${i}`"
-                                        class="flex items-center justify-between gap-2 bg-accent text-accent-foreground rounded-md px-2.5 py-1.5 text-sm font-semibold">
+                                    <Surface v-for="(s, i) in activePicked" :key="`${s.start}-${s.end}-${i}`"
+                                        variant="accent" size="sm" orientation="horizontal"
+                                        class="justify-between gap-2 text-sm font-semibold">
                                         <span>{{ s.start }} – {{ s.end }}</span>
-                                        <span class="ml-auto text-xs text-muted-foreground">
+                                        <Text as="span" weight="semibold" class="ml-auto">
                                             {{ slotHours(s) }} hr · {{ formatCents(slotCents(s)) }}
-                                        </span>
+                                        </Text>
                                         <button type="button" @click="removeSlot(i)"
                                             class="cursor-pointer opacity-70 hover:opacity-100">
                                             <X :size="14" />
                                         </button>
-                                    </div>
+                                    </Surface>
                                 </div>
 
                                 <Separator v-if="activePicked.length && windowRows.length" />
@@ -285,10 +292,10 @@ watch(open, (o) => {
                                 <!-- Open windows still available: add a slot inside each -->
                                 <div v-if="windowRows.length" class="space-y-2">
                                     <div v-for="{ win, key, draft } in windowRows" :key="key" class="space-y-1.5">
-                                        <div class="flex items-center gap-1 text-xs text-muted-foreground font-bold">
+                                        <Text weight="bold" class="flex items-center gap-1">
                                             <Clock class="size-4" />
                                             Host open · {{ win.start }} - {{ win.end }}
-                                        </div>
+                                        </Text>
                                         <div class="flex items-center gap-1">
                                             <Input type="time" step="1800" :min="win.start" :max="win.end"
                                                 v-model="draft.start" class="flex-1" />
@@ -302,21 +309,21 @@ watch(open, (o) => {
                                         </div>
                                     </div>
                                 </div>
-                                <div v-else-if="!activePicked.length" class="text-xs text-muted-foreground font-medium">
+                                <Text v-else-if="!activePicked.length">
                                     No open time left on this date.
-                                </div>
-                            </div>
+                                </Text>
+                            </Surface>
                         </div>
                 </template>
 
                 <template #footer>
                     <div v-if="totals.slots" class="flex items-center justify-between pb-2.5 text-sm font-bold">
-                        <span class="text-muted-foreground">
+                        <Text as="span" size="sm" weight="bold">
                             {{ totals.dates }} date{{ totals.dates > 1 ? 's' : '' }} ·
                             {{ totals.slots }} slot{{ totals.slots > 1 ? 's' : '' }} ·
                             {{ totals.hours }} hr{{ totals.hours !== 1 ? 's' : '' }}
-                        </span>
-                        <span>{{ formatCents(totals.amountCents) }}</span>
+                        </Text>
+                        <Money :cents="totals.amountCents" size="sm" />
                     </div>
                     <!-- Holds the slots and hands off to /checkout. The figure here is the
                          picker's estimate; the server reprices from the minutes it actually
