@@ -8,20 +8,20 @@ import { ChevronRight, MapPin, Plus, TrendingUp } from '@lucide/vue';
 import Button from '@/components/ui/button/Button.vue';
 import { Badge } from '@/components/ui/badge';
 import { useRouter } from 'vue-router';
-import { fetchMySpots, viewKeys } from '@/api/viewApi';
+import { fetchHostSpots, viewKeys } from '@/api/viewApi';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { computed, onMounted } from 'vue';
 
 const router = useRouter()
 const queryClient = useQueryClient()
 
-// No owner variable: `GET /api/view/me/spots` takes the owner from the token.
+// No host variable: `GET /api/view/host/spots` takes the host from the token.
 // Deleted listings are already excluded server-side, which the `deleted: { eq: false }`
-// in the document this replaces had to say explicitly — an owner's own *inactive*
+// in the document this replaces had to say explicitly — a host's own *inactive*
 // spots are still returned, because that is what the live switch is for.
 const { data } = useQuery({
-    queryKey: viewKeys.mySpots,
-    queryFn: fetchMySpots,
+    queryKey: viewKeys.hostSpots,
+    queryFn: fetchHostSpots,
 })
 
 const spots = computed(() => data.value ?? [])

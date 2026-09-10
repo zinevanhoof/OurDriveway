@@ -25,13 +25,28 @@ pub enum MyError {
 
     // Everything below is an unexpected failure -> 500.
     ///
-    /// Carries the `sqlx` error whole rather than a string, which is what lets
-    /// `db::is_write_conflict` match on SQLSTATE instead of on message text. The
-    /// SurrealDB equivalent had no typed surface at all — a write conflict arrived as
-    /// an untyped `Internal` whose kind was not stable across access paths, so the
+    /// Carries the diesel error whole rather than a string, which is what lets
+    /// `db::is_write_conflict` match on `DatabaseErrorKind` instead of on message text.
+    /// The SurrealDB equivalent had no typed surface at all — a write conflict arrived
+    /// as an untyped `Internal` whose kind was not stable across access paths, so the
     /// only thing to match was the substring "WriteConflict".
+    ///
+    /// Narrower than the sqlx variant it replaces: `sqlx::Error` folded connection and
+    /// pool failures in with query failures, and diesel splits all three. Hence the two
+    /// variants below it.
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] diesel::result::Error),
+    /// Establishing a connection failed — a bad URL, a refused socket, a wrong
+    /// password. Separate from [`Self::Database`] because diesel keeps it separate.
+    #[error(transparent)]
+    Connection(#[from] diesel::ConnectionError),
+    /// The pool could not hand out a connection: exhausted, or timed out waiting.
+    ///
+    /// `sqlx::Error` had a `PoolTimedOut` arm, so this used to arrive as `Database`.
+    /// bb8 reports it out of band, so it needs a home of its own or every
+    /// `pool.get().await?` call site would have to map it by hand.
+    #[error("connection pool: {0}")]
+    Pool(String),
     #[error(transparent)]
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]

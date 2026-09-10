@@ -22,8 +22,5 @@ pub async fn refresh(jar: CookieJar, State(state): State<AppState>) -> MyResult<
 
     let jar = jar.add(crate::auth::cookie::set(new_refresh_token));
 
-    Ok((
-        jar,
-        Json(AuthResponse::new(jwt, token)),
-    ))
+    Ok((jar, Json(AuthResponse::new(jwt, token))))
 }

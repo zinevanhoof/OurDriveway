@@ -1,17 +1,17 @@
 use bus::Projector;
 use chrono::{DateTime, Utc};
+use diesel_async::AsyncPgConnection;
 use shared::{
     domain_models::booking::{Booking, SpotMirrorPatch, status},
     error::myerror::MyResult,
     events::{
-        Envelope, STREAM_SPOTS,
+        Envelope, STREAM_SPOTS, aggregate_id,
         booking::{BookingEvent, CancelReason},
-        aggregate_id, booking_subject,
+        booking_subject,
         spot::SpotEvent,
     },
     general_models::{booking::Booked, spot::Availability},
 };
-use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::policy::availability;
@@ -40,10 +40,10 @@ impl Projector for SpotProjector {
 
     async fn apply(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         event: SpotEvent,
         at: DateTime<Utc>,
-        version: u64,
+        version: i64,
     ) -> MyResult<()> {
         let spot_id = event.spot_id();
 
@@ -75,7 +75,7 @@ impl Projector for SpotProjector {
         // spot-service's version of this aggregate, as last applied here. The only
         // counter on this row now — `bookings_seq` used to sit beside it doing an
         // entirely different job.
-        shared::db::set_version(conn, "spot", &spot_id, version).await
+        shared::set_version!(conn, "spot", shared::schema::booking::spot, &spot_id, version)
     }
 }
 
@@ -92,7 +92,7 @@ impl SpotProjector {
     /// payment — and losing that race means cancelling a booking that was paid for a
     /// moment later. A hold that *is* paid after this runs is the gap named below.
     async fn react(
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         event: &SpotEvent,
         at: DateTime<Utc>,
     ) -> MyResult<()> {
@@ -143,11 +143,11 @@ impl SpotProjector {
     /// view-service and payment-service both showed it cancelled. Exactly the wrong
     /// way round.
     async fn cancel(
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         booking: &Booking,
         at: DateTime<Utc>,
     ) -> MyResult<()> {
-        let version = shared::db::next_version(&mut *conn, "booking", &booking.id).await?;
+        let version = shared::next_version!(conn, shared::schema::booking::booking, &booking.id)?;
 
         // Scoped to `confirmed`, so a redelivered SpotUpdated is a no-op — the same
         // guard the projector arm used to carry.
@@ -160,19 +160,15 @@ impl SpotProjector {
             Some(CancelReason::SpotUnavailable.as_str()),
         )
         .await?;
-        shared::db::set_version(&mut *conn, "booking", &booking.id, version).await?;
+        shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking.id, version)?;
 
         let event = BookingEvent::Cancelled {
             booking_id: booking.id,
             reason: CancelReason::SpotUnavailable,
         };
         // `actor_id: None` — the host acted on the spot, not on this booking.
-        let mut envelope = Envelope::new(
-            event,
-            None,
-            aggregate_id("booking", &booking.id),
-            version,
-        );
+        let mut envelope =
+            Envelope::new(event, None, aggregate_id("booking", &booking.id), version);
         // Deterministic, like the sweeper's: a redelivered SpotUpdated must
         // not publish a second cancel for the same booking. Keyed on the event's own
         // timestamp too, so a *later* edit that invalidates the same booking again
@@ -234,9 +230,9 @@ mod tests {
             id: Uuid::now_v7(),
             version: 1,
             spot_id: Uuid::now_v7(),
-            owner_id: Uuid::now_v7(),
+            host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
-            booked: HashMap::from([(date.to_string(), slots)]),
+            booked: HashMap::from([(date.to_string(), slots)]).into(),
             amount: 500,
             status: status::CONFIRMED.into(),
             hold_until: None,

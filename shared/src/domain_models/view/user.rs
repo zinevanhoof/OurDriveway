@@ -1,3 +1,4 @@
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::events::user::{UserRegistered, UserUpdated};
@@ -5,15 +6,17 @@ use crate::events::user::{UserRegistered, UserUpdated};
 /// The `app_user` table in the read model.
 ///
 /// Note what is **absent: no password hash, ever.** Every row here is readable by
-/// anyone — spot-owner profiles have to resolve for everyone — so the projection is
+/// anyone — spot-host profiles have to resolve for everyone — so the projection is
 /// the first thing deciding what can possibly leak. `email` is the one sensitive
 /// field, and it is cut per-caller in the response type rather than filtered per-row.
 ///
 /// `email_verified` is absent for the same reason and is not an oversight: it is an
 /// authentication concern that stays in user-service's private projection. Adding it
 /// here would publish which addresses are unconfirmed to every client that can read
-/// a spot owner's profile.
-#[derive(Clone, Debug, sqlx::FromRow)]
+/// a spot host's profile.
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::view::app_user)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct ViewUser {
     pub id: Uuid,
     /// user-service's version of this user, as last applied here. What
@@ -26,13 +29,12 @@ pub struct ViewUser {
     /// `Registered`, so it took a rebuild to surface. Writes name their columns
     /// explicitly now, so an omission would be a compile error rather than a silent
     /// clear. The field remains because the version is genuinely read.
-    #[sqlx(try_from = "i64")]
-    pub version: u64,
+    pub version: i64,
     pub first_name: String,
     pub last_name: String,
     pub profile_picture: Option<String>,
     /// Not an `Option`, and `app_user.email` is `NOT NULL` — see
-    /// `migrations/view/0002_user_email_not_null.sql`. Every row here is created by
+    /// `migrations/view/0002_user_email_not_null/up.sql`. Every row here is created by
     /// `UserRegistered`, which carries a `String`; `UserUpdated` only reaches
     /// `ViewUserRepository::patch`, which is an `UPDATE` and cannot create one.
     pub email: String,
@@ -42,7 +44,7 @@ pub struct ViewUser {
     /// ISO 3166-1 alpha-2, or `None` until the profile is filled in.
     ///
     /// Scoped like `email`, not like `license_plates`: it is cut per-caller in
-    /// [`crate::projections::user::OwnerViewUser`], so only the profile screen ever
+    /// [`crate::projections::user::HostViewUser`], so only the profile screen ever
     /// sees it. Where somebody banks is nobody else's business, and no screen but
     /// their own has a use for it.
     pub country: Option<String>,
@@ -57,7 +59,8 @@ pub struct ViewUser {
 /// Five columns, which is every column this table has apart from the key. Nothing
 /// a USERS event carries is withheld here — the withholding happened in [`ViewUser`]
 /// itself, which has no password and no `email_verified`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = crate::schema::view::app_user)]
 pub struct ViewUserPatch {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
@@ -67,13 +70,13 @@ pub struct ViewUserPatch {
     pub country: Option<String>,
 }
 
-// No `bind` — see the note in `domain_models::user::user`. sqlx binds positionally,
-// so the binds live beside the `$n` placeholders in `ViewUserRepository::patch`.
+// No `bind` — `AsChangeset` is the `SET` list. See the note in
+// `domain_models::user::user`.
 
 impl ViewUser {
     /// The row a `Registered` writes. Safe to `upsert`: this table has no column any
     /// other stream owns.
-    pub fn registered(e: UserRegistered, version: u64) -> Self {
+    pub fn registered(e: UserRegistered, version: i64) -> Self {
         Self {
             id: e.user_id,
             version,

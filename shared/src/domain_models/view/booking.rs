@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::{
@@ -14,17 +15,17 @@ use crate::{
 /// both, so `ViewBookingRepository::created` had to put them back in the same
 /// transaction — two halves that both had to run, with nothing in Rust connecting
 /// them. `spot_id` and `renter_id` are plain uuids and a read LEFT JOINs.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::view::booking)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct ViewBooking {
     pub id: Uuid,
     /// booking-service's version of this booking, as last applied here. What
     /// `bus::await_version` compares a client's `X-Await-Version` against.
-    #[sqlx(try_from = "i64")]
-    pub version: u64,
+    pub version: i64,
     pub spot_id: Uuid,
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     pub renter_id: Uuid,
-    #[sqlx(json)]
     pub booked: Booked,
     /// EUR cents.
     pub amount: i64,
@@ -40,12 +41,12 @@ pub struct ViewBooking {
 
 impl ViewBooking {
     /// The row a `Created` writes.
-    pub fn created(e: BookingCreated, at: DateTime<Utc>, version: u64) -> Self {
+    pub fn created(e: BookingCreated, at: DateTime<Utc>, version: i64) -> Self {
         Self {
             id: e.booking_id,
             version,
             spot_id: e.spot_id,
-            owner_id: e.owner_id,
+            host_id: e.host_id,
             renter_id: e.renter_id,
             booked: e.booked,
             amount: e.amount_cents,
@@ -67,7 +68,8 @@ impl ViewBooking {
 /// express that — `ViewBookingRepository::settle` clears it with its own trailing
 /// assignment. The `spot` and `renter` links are absent for the same structural
 /// reason they are absent from [`ViewBooking`]: they belong to `link_refs`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = crate::schema::view::booking)]
 pub struct ViewBookingPatch {
     pub status: Option<String>,
     pub release_reason: Option<String>,
@@ -75,9 +77,8 @@ pub struct ViewBookingPatch {
 }
 
 impl ViewBookingPatch {
-    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
-    // positionally, so the binds live beside the `$n` placeholders in
-    // `ViewBookingRepository::settle`.
+    // No `bind` — `AsChangeset` is the `SET` list. See the note in
+    // `domain_models::user::user`.
 
     /// Paid.
     pub fn confirmed() -> Self {

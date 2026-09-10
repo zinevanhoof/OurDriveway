@@ -15,19 +15,20 @@
 
 use std::time::Duration;
 
+use diesel_async::AsyncConnection;
+use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::{
     domain_models::booking::status,
-    error::myerror::MyResult,
+    error::myerror::{MyError, MyResult},
     events::{
-        Envelope,
+        Envelope, aggregate_id,
         booking::{BookingEvent, ReleaseReason},
-        aggregate_id, booking_subject,
+        booking_subject,
     },
 };
 use uuid::Uuid;
 
 use crate::repository::booking_repository::BookingRepository;
-use sqlx::PgPool;
 
 const TICK: Duration = Duration::from_secs(60);
 
@@ -37,7 +38,7 @@ const MAX_PER_SWEEP: usize = 200;
 
 /// Sweeps forever. `tokio::spawn` is the caller's, like the projectors' and the
 /// worker's — this loop is no more special than theirs.
-pub async fn run(db: PgPool) {
+pub async fn run(db: shared::db::Db) {
     let mut ticker = tokio::time::interval(TICK);
     loop {
         ticker.tick().await;
@@ -49,8 +50,10 @@ pub async fn run(db: PgPool) {
     }
 }
 
-async fn sweep(db: &PgPool) -> MyResult<()> {
-    let lapsed = BookingRepository::lapsed_holds(db, MAX_PER_SWEEP).await?;
+async fn sweep(db: &shared::db::Db) -> MyResult<()> {
+    let mut read = shared::db::conn(db).await?;
+    let lapsed = BookingRepository::lapsed_holds(&mut read, MAX_PER_SWEEP).await?;
+    drop(read);
     if lapsed.is_empty() {
         return Ok(());
     }
@@ -63,67 +66,84 @@ async fn sweep(db: &PgPool) -> MyResult<()> {
             booking_id,
             reason: ReleaseReason::Expired,
         };
-        let mut tx = match db.begin().await {
-            Ok(tx) => tx,
+        // One transaction per hold. `?` inside rolls back and the loop moves on — the
+        // hold stays `reserved` with a past `hold_until`, so the next tick a minute
+        // from now picks it up again. Nothing is lost by failing here.
+        //
+        // Each step keeps its own message: "could not release" and "could not set
+        // version" are different faults, and collapsing them into one would make the
+        // log say only that a sweep failed.
+        let mut conn = match shared::db::conn(db).await {
+            Ok(c) => c,
             Err(e) => {
-                tracing::error!(booking = %booking_id, error = %e, "could not open transaction");
+                tracing::error!(booking = %booking_id, error = %e, "no connection");
                 continue;
             }
         };
-        let version = match shared::db::next_version(&mut tx, "booking", &booking_id).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(booking = %booking_id, error = %e, "could not read version");
-                continue;
-            }
-        };
 
-        // Scoped to `reserved`, which is what stops this undoing a payment that
-        // landed in the same instant — the sweeper and `confirm_paid` genuinely
-        // race, and the guard is the whole answer to it.
-        let moved = BookingRepository::transition(
-            &mut *tx,
-            booking_id,
-            status::RELEASED,
-            &[status::RESERVED],
-            Some(ReleaseReason::Expired.as_str()),
-            None,
-        )
-        .await;
-        if let Err(e) = moved {
-            tracing::error!(booking = %booking_id, error = %e, "could not release");
-            continue;
-        }
-        if let Err(e) = shared::db::set_version(&mut tx, "booking", &booking_id, version).await {
-            tracing::error!(booking = %booking_id, error = %e, "could not set version");
-            continue;
-        }
+        let released = conn
+            .transaction::<_, MyError, _>(|conn| {
+                let event = event.clone();
+                async move {
+                    let version =
+                        shared::next_version!(conn, shared::schema::booking::booking, &booking_id)
+                            .inspect_err(|e| {
+                                tracing::error!(booking = %booking_id, error = %e, "could not read version")
+                            })?;
 
-        // `actor_id: None` — nobody requested this, the clock did.
-        let mut envelope =
-            Envelope::new(event, None, aggregate_id("booking", &booking_id), version);
-        // Deliberately NOT a v7 id, the only place in the system that isn't. It
-        // rides the `Nats-Msg-Id` header `publish` already sets, so two instances
-        // sweeping the same booking inside the stream's 120s duplicate_window
-        // collapse to one event — and the 60s tick sits comfortably inside that.
-        envelope.event_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_OID,
-            format!("expire:{booking_id}").as_bytes(),
-        );
+                    // Scoped to `reserved`, which is what stops this undoing a payment
+                    // that landed in the same instant — the sweeper and `confirm_paid`
+                    // genuinely race, and the guard is the whole answer to it.
+                    BookingRepository::transition(
+                        conn,
+                        booking_id,
+                        status::RELEASED,
+                        &[status::RESERVED],
+                        Some(ReleaseReason::Expired.as_str()),
+                        None,
+                    )
+                    .await
+                    .inspect_err(|e| {
+                        tracing::error!(booking = %booking_id, error = %e, "could not release")
+                    })?;
 
-        // No compare-and-swap: a release only ever frees slots, so it can't lose a
-        // race in a way that matters. Applying it is guarded on the booking still
-        // being 'reserved', which is what stops it undoing a payment that landed in
-        // the same instant.
-        if let Err(e) = bus::outbox::enqueue(&mut *tx, &booking_subject(&spot_id), &envelope).await
-        {
-            tracing::error!(booking = %booking_id, error = %e, "could not enqueue release");
-            continue;
-        }
-        if let Err(e) = tx.commit().await {
-            // Nothing is lost: the hold is still `reserved` with a past
-            // `hold_until`, so the next tick a minute from now picks it up again.
-            tracing::error!(booking = %booking_id, error = %e, "could not commit release");
+                    shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking_id, version)
+                        .inspect_err(|e| {
+                            tracing::error!(booking = %booking_id, error = %e, "could not set version")
+                        })?;
+
+                    // `actor_id: None` — nobody requested this, the clock did.
+                    let mut envelope =
+                        Envelope::new(event, None, aggregate_id("booking", &booking_id), version);
+                    // Deliberately NOT a v7 id, the only place in the system that isn't.
+                    // It rides the `Nats-Msg-Id` header `publish` already sets, so two
+                    // instances sweeping the same booking inside the stream's 120s
+                    // duplicate_window collapse to one event — and the 60s tick sits
+                    // comfortably inside that.
+                    envelope.event_id = Uuid::new_v5(
+                        &Uuid::NAMESPACE_OID,
+                        format!("expire:{booking_id}").as_bytes(),
+                    );
+
+                    // No compare-and-swap: a release only ever frees slots, so it can't
+                    // lose a race in a way that matters. Applying it is guarded on the
+                    // booking still being 'reserved'.
+                    bus::outbox::enqueue(conn, &booking_subject(&spot_id), &envelope)
+                        .await
+                        .inspect_err(|e| {
+                            tracing::error!(booking = %booking_id, error = %e, "could not enqueue release")
+                        })?;
+
+                    Ok(())
+                }
+                .scope_boxed()
+            })
+            .await;
+
+        if released.is_err() {
+            // Already logged with its specific cause above; this only records that the
+            // hold survives to the next tick.
+            tracing::warn!(booking = %booking_id, "hold not released; next tick retries");
         }
     }
     Ok(())

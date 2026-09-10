@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::events::session::{RefreshTokenIssued, RefreshTokenRotated};
@@ -7,7 +8,9 @@ use crate::events::session::{RefreshTokenIssued, RefreshTokenRotated};
 ///
 /// Only ever the **hash** of a token, never the token itself — the plaintext is a
 /// bearer credential and goes to the client's cookie and nowhere else.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::user::refresh_token)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct RefreshToken {
     pub id: Uuid,
     /// A plain uuid with a foreign key to `app_user(id)`.
@@ -44,15 +47,14 @@ pub struct RefreshToken {
 /// Two columns, because revoking is the only thing that ever happens to a token
 /// after it is issued. Everything else — the hash, the jti, the expiry, and the
 /// user it belongs to — is fixed at issue and not representable here.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = crate::schema::user::refresh_token)]
 pub struct RefreshTokenPatch {
     pub revoked: Option<bool>,
     pub revoked_reason: Option<String>,
 }
 
-// No `bind` here any more — see the note in the sibling `user.rs`. sqlx binds
-// positionally, so the binds live beside the `$n` placeholders in
-// `RefreshTokenRepository::patch_by_token_hash`.
+// No `bind` — `AsChangeset` is the `SET` list. See the note in the sibling `user.rs`.
 
 impl RefreshToken {
     /// The row an `Issued` writes. `at` is the envelope's clock, not this

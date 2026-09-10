@@ -1,9 +1,11 @@
-use chrono::Utc;
-use shared::domain_models::spot::{Spot, SpotPatch};
-use shared::error::myerror::{ContextExt, MyResult};
-use shared::events::spot::{SpotCreated, SpotEvent, SpotUpdated};
 use bus::outbox;
+use chrono::Utc;
+use diesel_async::AsyncConnection;
+use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
+use shared::domain_models::spot::{Spot, SpotPatch};
+use shared::error::myerror::{ContextExt, MyError, MyResult};
+use shared::events::spot::{SpotCreated, SpotEvent, SpotUpdated};
 use shared::events::{Envelope, aggregate_id, format_version, spot_subject};
 use shared::requests::spot::{CreateSpotRequest, UpdateSpotRequest};
 use uuid::Uuid;
@@ -35,12 +37,12 @@ const NOT_FOUND: (&str, &str) = ("Not Found", "That spot doesn't exist.");
 /// narrowing availability while a booking lands — but CAS is per-subject, and bookings
 /// live on the BOOKINGS stream, so no assertion made here can see them. That ordering is
 /// enforced where it exists: booking-service's per-spot total order. What's left is two
-/// concurrent edits by the one owner, where last-write-wins is the honest answer.
+/// concurrent edits by the one host, where last-write-wins is the honest answer.
 pub struct SpotService {
-    /// Read-only here. Edits need the spot's owner to authorize against, which
+    /// Read-only here. Edits need the spot's host to authorize against, which
     /// only the projection knows.
     /// The pool. See the note on `UserService::db` — the repositories are stateless.
-    pub db: sqlx::PgPool,
+    pub db: shared::db::Db,
 }
 
 impl SpotService {
@@ -56,7 +58,11 @@ impl SpotService {
     /// It is unrecoverable if wanted later, though: the id is minted below rather
     /// than by the client, so "open the spot I just made" would need this to hand
     /// it back again.
-    pub async fn create_spot(&self, owner_id: &Uuid, request: CreateSpotRequest) -> MyResult<String> {
+    pub async fn create_spot(
+        &self,
+        host_id: &Uuid,
+        request: CreateSpotRequest,
+    ) -> MyResult<String> {
         // Independently geocode the submitted address (never trust client coords).
         // No confident match -> reject; the frontend renders `detail` from 422s.
         let (lng, lat) = locationiq::geocode(&request.address.formatted)
@@ -72,7 +78,7 @@ impl SpotService {
 
         let created = SpotCreated {
             spot_id,
-            owner_id: *owner_id,
+            host_id: *host_id,
             title: request.title.into_inner(),
             description: request.description.map(Into::into),
             price_per_hour_cents: request.price_per_hour_cents,
@@ -87,24 +93,33 @@ impl SpotService {
         // Row and event in one transaction — the database is authoritative now, and
         // the event is a durable side effect of the same commit.
         let now = Utc::now();
-        let mut tx = self.db.begin().await?;
-        let version = db::next_version(&mut tx, "spot", &spot_id).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        // No `set_version` after this: the row carries its own version and this is
-        // a whole-row write. `update_spot` and `delete_spot` still need it — they
-        // patch, and a patch does not touch the column.
-        SpotRepository::upsert(&mut *tx, Spot::created(created.clone(), now, version)).await?;
+        let await_token = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    let version = shared::next_version!(conn, shared::schema::spot::spot, &spot_id)?;
 
-        let envelope = Envelope::new(
-            SpotEvent::Created(created),
-            Some(*owner_id),
-            aggregate_id("spot", &spot_id),
-            version,
-        );
-        let await_token = format_version(&envelope.aggregate, envelope.version);
+                    // No `set_version` after this: the row carries its own version and this is
+                    // a whole-row write. `update_spot` and `delete_spot` still need it — they
+                    // patch, and a patch does not touch the column.
+                    SpotRepository::upsert(conn, Spot::created(created.clone(), now, version))
+                        .await?;
 
-        outbox::enqueue(&mut *tx, &spot_subject(&spot_id), &envelope).await?;
-        tx.commit().await?;
+                    let envelope = Envelope::new(
+                        SpotEvent::Created(created),
+                        Some(*host_id),
+                        aggregate_id("spot", &spot_id),
+                        version,
+                    );
+                    let await_token = format_version(&envelope.aggregate, envelope.version);
+
+                    outbox::enqueue(conn, &spot_subject(&spot_id), &envelope).await?;
+                    Ok(await_token)
+                }
+                .scope_boxed()
+            })
+            .await?;
 
         Ok(await_token)
     }
@@ -116,11 +131,11 @@ impl SpotService {
     /// The edit form still submits its whole state, so nothing about a save changed.
     pub async fn update_spot(
         &self,
-        owner_id: &Uuid,
+        host_id: &Uuid,
         spot_id: &Uuid,
         request: UpdateSpotRequest,
     ) -> MyResult<String> {
-        let spot = self.owned(owner_id, spot_id).await?;
+        let spot = self.owned(host_id, spot_id).await?;
 
         let updated = SpotUpdated {
             spot_id: spot.id,
@@ -133,26 +148,35 @@ impl SpotService {
         };
 
         let now = Utc::now();
-        let mut tx = self.db.begin().await?;
-        // Locks the row, which is what serialises two concurrent edits of one spot
-        // now that a contended write no longer conflicts on its own — see
-        // `shared::db::next_version`. Without it both would read version 3, both
-        // write 4, and the projector would silently drop one of the two events.
-        let version = db::next_version(&mut tx, "spot", &spot.id).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        SpotRepository::patch(&mut *tx, spot.id, SpotPatch::updated(updated.clone(), now)).await?;
-        db::set_version(&mut tx, "spot", &spot.id, version).await?;
+        let await_token = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    // Locks the row, which is what serialises two concurrent edits of one spot
+                    // now that a contended write no longer conflicts on its own — see
+                    // `shared::db::next_version`. Without it both would read version 3, both
+                    // write 4, and the projector would silently drop one of the two events.
+                    let version = shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
 
-        let envelope = Envelope::new(
-            SpotEvent::Updated(updated),
-            Some(*owner_id),
-            aggregate_id("spot", &spot.id),
-            version,
-        );
-        let await_token = format_version(&envelope.aggregate, envelope.version);
+                    SpotRepository::patch(conn, spot.id, SpotPatch::updated(updated.clone(), now))
+                        .await?;
+                    shared::set_version!(conn, "spot", shared::schema::spot::spot, &spot.id, version)?;
 
-        outbox::enqueue(&mut *tx, &spot_subject(&spot.id), &envelope).await?;
-        tx.commit().await?;
+                    let envelope = Envelope::new(
+                        SpotEvent::Updated(updated),
+                        Some(*host_id),
+                        aggregate_id("spot", &spot.id),
+                        version,
+                    );
+                    let await_token = format_version(&envelope.aggregate, envelope.version);
+
+                    outbox::enqueue(conn, &spot_subject(&spot.id), &envelope).await?;
+                    Ok(await_token)
+                }
+                .scope_boxed()
+            })
+            .await?;
 
         Ok(await_token)
     }
@@ -160,27 +184,35 @@ impl SpotService {
     /// Withdraw the listing for good. booking-service reacts to this by cancelling
     /// every booking the spot still owes — nothing here needs to know that, or to
     /// know bookings exist at all.
-    pub async fn delete_spot(&self, owner_id: &Uuid, spot_id: &Uuid) -> MyResult<String> {
-        let spot = self.owned(owner_id, spot_id).await?;
+    pub async fn delete_spot(&self, host_id: &Uuid, spot_id: &Uuid) -> MyResult<String> {
+        let spot = self.owned(host_id, spot_id).await?;
         let now = Utc::now();
-        let mut tx = self.db.begin().await?;
-        let version = db::next_version(&mut tx, "spot", &spot.id).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        // A soft delete: the row survives so a renter's past bookings still resolve
-        // a title and an address. Every list filters `deleted`.
-        SpotRepository::patch(&mut *tx, spot.id, SpotPatch::deleted(now)).await?;
-        db::set_version(&mut tx, "spot", &spot.id, version).await?;
+        let await_token = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    let version = shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
 
-        let envelope = Envelope::new(
-            SpotEvent::Deleted { spot_id: spot.id },
-            Some(*owner_id),
-            aggregate_id("spot", &spot.id),
-            version,
-        );
-        let await_token = format_version(&envelope.aggregate, envelope.version);
+                    // A soft delete: the row survives so a renter's past bookings still resolve
+                    // a title and an address. Every list filters `deleted`.
+                    SpotRepository::patch(conn, spot.id, SpotPatch::deleted(now)).await?;
+                    shared::set_version!(conn, "spot", shared::schema::spot::spot, &spot.id, version)?;
 
-        outbox::enqueue(&mut *tx, &spot_subject(&spot.id), &envelope).await?;
-        tx.commit().await?;
+                    let envelope = Envelope::new(
+                        SpotEvent::Deleted { spot_id: spot.id },
+                        Some(*host_id),
+                        aggregate_id("spot", &spot.id),
+                        version,
+                    );
+                    let await_token = format_version(&envelope.aggregate, envelope.version);
+
+                    outbox::enqueue(conn, &spot_subject(&spot.id), &envelope).await?;
+                    Ok(await_token)
+                }
+                .scope_boxed()
+            })
+            .await?;
 
         Ok(await_token)
     }
@@ -194,14 +226,15 @@ impl SpotService {
     /// A `None` here means this instance has not projected the spot yet, which the
     /// caller must treat as "not found" rather than "not yours" — and does, since
     /// both answer [`NOT_FOUND`].
-    async fn owned(&self, owner_id: &Uuid, spot_id: &Uuid) -> MyResult<Spot> {
-        let spot = SpotRepository::find_by_id(&self.db, *spot_id)
+    async fn owned(&self, host_id: &Uuid, spot_id: &Uuid) -> MyResult<Spot> {
+        let mut read = db::conn(&self.db).await?;
+        let spot = SpotRepository::find_by_id(&mut read, *spot_id)
             .await?
             .context_not_found(NOT_FOUND)?;
 
         // A deleted spot is gone as far as the host is concerned, even though the
         // row survives for the bookings that reference it.
-        (spot.owner_id == *owner_id && !spot.deleted).context_not_found(NOT_FOUND)?;
+        (spot.host_id == *host_id && !spot.deleted).context_not_found(NOT_FOUND)?;
 
         Ok(spot)
     }
@@ -222,14 +255,15 @@ impl SpotService {
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
 
-        for spot in SpotRepository::all(&self.db).await? {
+        let mut read = db::conn(&self.db).await?;
+        for spot in SpotRepository::all(&mut read).await? {
             let spot_id = spot.id;
             let (created_at, updated_at) = (spot.created_at.into(), spot.updated_at.into());
             let (active, deleted) = (spot.active, spot.deleted);
 
             let created = SpotCreated {
                 spot_id,
-                owner_id: spot.owner_id,
+                host_id: spot.host_id,
                 title: spot.title,
                 description: spot.description,
                 price_per_hour_cents: spot.price_per_hour,

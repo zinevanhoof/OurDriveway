@@ -9,8 +9,8 @@
 //! The mirror carries no copy of what is booked. Which slots are taken is
 //! `BookingRepository::taken_for_spot`, a query over the rows themselves.
 //!
-//! Reads are plain `SELECT *`. Writes name their columns, because sqlx has no
-//! whole-struct write to match `CONTENT $row`.
+//! Reads are `Selectable`. Writes bind the struct whole through `Insertable` and
+//! `AsChangeset` — what `CONTENT $row` did, and what sqlx could not.
 //!
 //! The two tables differ in one way that still matters: `booking` is written whole,
 //! since every column is BOOKINGS-owned, while `spot` is a mirror whose SPOTS writes
@@ -43,26 +43,52 @@ mod live_tests {
     use std::collections::HashMap;
 
     use chrono::{DateTime, TimeDelta, Utc};
+    use diesel::prelude::*;
+    use diesel_async::scoped_futures::ScopedFutureExt;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
     use shared::domain_models::booking::{Booking, SpotMirrorPatch, status};
+    use shared::general_models::booking::Booked;
     use shared::general_models::spot::{Availability, TimeSlot, WeeklyAvailability};
-    use sqlx::PgPool;
+    use shared::schema::booking::{booking, spot};
     use uuid::Uuid;
 
     use super::booking_repository::BookingRepository;
     use super::spot_mirror_repository::SpotMirrorRepository;
 
     /// Connects and migrates, so a running container is the only prerequisite.
-    async fn db() -> PgPool {
-        let pool = shared::db::connect("postgres://yugabyte@127.0.0.1:5433/booking")
+    async fn db() -> shared::db::Db {
+        // SAFETY: tests in one binary share an environment and every caller sets the
+        // same value.
+        unsafe {
+            std::env::set_var(
+                "BOOKING_DATABASE_URL",
+                "postgres://yugabyte@127.0.0.1:5433/booking",
+            )
+        };
+        // Through the migrator rather than a second copy of the wiring: that crate is
+        // the only thing that migrates in dev and production, so a test cannot drift
+        // from what actually gets applied. It creates the database if missing.
+        //
+        // `ensure` and not `run_one`: test threads run in parallel and would otherwise
+        // all try to apply a new migration at once, which YugabyteDB refuses rather than
+        // serialises. See the note on that function.
+        migrator::ensure("booking").await.expect("migrations apply");
+
+        shared::db::connect("postgres://yugabyte@127.0.0.1:5433/booking")
             .await
-            .expect("dev yugabyte on :5433, database `booking` — see this module's docs");
-        shared::db::migrate(&pool, &sqlx::migrate!("../../../migrations/booking"))
-            .await
-            .expect("migrations apply");
-        pool
+            .expect("dev yugabyte on :5433 — see this module's docs")
     }
 
-    fn slots() -> HashMap<String, Vec<TimeSlot>> {
+    /// One connection for a test to pass around: repositories take a connection, not a
+    /// pool.
+    async fn conn(
+        db: &shared::db::Db,
+    ) -> diesel_async::pooled_connection::bb8::PooledConnection<'_, diesel_async::AsyncPgConnection>
+    {
+        shared::db::conn(db).await.expect("a connection")
+    }
+
+    fn slots() -> Booked {
         HashMap::from([(
             "2026-08-19".to_string(),
             vec![TimeSlot {
@@ -70,6 +96,7 @@ mod live_tests {
                 end: "11:00".to_string(),
             }],
         )])
+        .into()
     }
 
     fn availability() -> Availability {
@@ -95,7 +122,7 @@ mod live_tests {
             id,
             version: 1,
             spot_id,
-            owner_id: Uuid::now_v7(),
+            host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: slots(),
             amount: 500,
@@ -109,19 +136,20 @@ mod live_tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn a_booking_round_trips_and_transitions_are_guarded() {
-        let db = db().await;
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
 
         let (id, spot_id) = (Uuid::now_v7(), Uuid::now_v7());
         // Comfortably in the future: `taken_for_spot` floors on `ends_at > now`, so a
         // booking that already ended would correctly not come back.
         let row = a_booking(id, spot_id, Utc::now() + TimeDelta::hours(2));
 
-        BookingRepository::upsert(&db, row.clone()).await.unwrap();
+        BookingRepository::upsert(db, row.clone()).await.unwrap();
 
-        let got = BookingRepository::find_by_id(&db, id)
+        let got = BookingRepository::find_by_id(db, id)
             .await
             .unwrap()
             .expect("upserted row");
@@ -132,20 +160,27 @@ mod live_tests {
         assert_eq!(got.rating, None);
         assert!(got.hold_until.is_some());
 
-        BookingRepository::transition(&db, id, status::CONFIRMED, &[status::RESERVED], None, None)
+        BookingRepository::transition(db, id, status::CONFIRMED, &[status::RESERVED], None, None)
             .await
             .unwrap();
 
-        let got = BookingRepository::find_by_id(&db, id).await.unwrap().unwrap();
+        let got = BookingRepository::find_by_id(db, id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.status, status::CONFIRMED);
         assert_eq!(got.hold_until, None, "every transition ends the hold");
-        assert_eq!(got.booked, slots(), "a transition must not disturb the rest");
+        assert_eq!(
+            got.booked,
+            slots(),
+            "a transition must not disturb the rest"
+        );
 
         // Redelivery: already out of `reserved`, so the guard refuses and the row is
         // untouched — this is what stops a lapsed-hold event undoing a confirmation
         // that raced it. Matching nothing is a no-op, not an error.
         BookingRepository::transition(
-            &db,
+            db,
             id,
             status::RELEASED,
             &[status::RESERVED],
@@ -154,28 +189,30 @@ mod live_tests {
         )
         .await
         .unwrap();
-        let got = BookingRepository::find_by_id(&db, id).await.unwrap().unwrap();
+        let got = BookingRepository::find_by_id(db, id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.status, status::CONFIRMED, "the guard must have held");
         assert_eq!(got.release_reason, None);
 
         // What blocks the spot, which is what `spot.booked` used to cache.
-        let taken = BookingRepository::taken_for_spot(&db, &spot_id, Utc::now())
+        let taken = BookingRepository::taken_for_spot(db, &spot_id, Utc::now())
             .await
             .unwrap();
         assert_eq!(taken, slots(), "a confirmed booking blocks its slots");
 
         // Released and cancelled free the slots again.
-        BookingRepository::transition(&db, id, status::CANCELLED, &[status::CONFIRMED], None, None)
+        BookingRepository::transition(db, id, status::CANCELLED, &[status::CONFIRMED], None, None)
             .await
             .unwrap();
-        let taken = BookingRepository::taken_for_spot(&db, &spot_id, Utc::now())
+        let taken = BookingRepository::taken_for_spot(db, &spot_id, Utc::now())
             .await
             .unwrap();
         assert!(taken.is_empty(), "a cancelled booking blocks nothing");
 
-        sqlx::query("DELETE FROM booking WHERE id = $1")
-            .bind(id)
-            .execute(&db)
+        diesel::delete(booking::table.find(id))
+            .execute(&mut *conn(&pool).await)
             .await
             .unwrap();
     }
@@ -183,18 +220,19 @@ mod live_tests {
     /// A partial SPOTS event must leave every column it does not name alone, in either
     /// arrival order — which on this table is the normal case, because the streams
     /// expire and a `SpotUpdated` can arrive for a spot whose `SpotCreated` aged out.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn a_partial_spots_write_leaves_unnamed_columns_alone() {
-        let db = db().await;
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
         let id = Uuid::now_v7();
-        let owner_id = Uuid::now_v7();
+        let host_id = Uuid::now_v7();
 
         SpotMirrorRepository::merge(
-            &db,
+            db,
             id,
             SpotMirrorPatch {
-                owner_id: Some(owner_id),
+                host_id: Some(host_id),
                 price_per_hour: Some(700),
                 availability: Some(availability()),
                 timezone: Some("Europe/Brussels".to_string()),
@@ -205,17 +243,17 @@ mod live_tests {
         .await
         .unwrap();
 
-        let got = SpotMirrorRepository::find_by_id(&db, id)
+        let got = SpotMirrorRepository::find_by_id(db, id)
             .await
             .unwrap()
             .expect("merge created it");
-        assert_eq!(got.owner_id, Some(owner_id));
+        assert_eq!(got.host_id, Some(host_id));
         assert_eq!(got.price_per_hour, Some(700));
         assert!(got.bookable().is_some(), "the mirror knows enough now");
 
         // A later partial edit — the live switch — must leave everything else alone.
         SpotMirrorRepository::merge(
-            &db,
+            db,
             id,
             SpotMirrorPatch {
                 active: Some(false),
@@ -224,7 +262,10 @@ mod live_tests {
         )
         .await
         .unwrap();
-        let got = SpotMirrorRepository::find_by_id(&db, id).await.unwrap().unwrap();
+        let got = SpotMirrorRepository::find_by_id(db, id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!got.active);
         assert!(!got.deleted, "the live switch must not delete");
         assert_eq!(got.timezone.as_deref(), Some("Europe/Brussels"));
@@ -235,7 +276,7 @@ mod live_tests {
         // closed rather than being bookable against nothing.
         let orphan = Uuid::now_v7();
         SpotMirrorRepository::merge(
-            &db,
+            db,
             orphan,
             SpotMirrorPatch {
                 active: Some(true),
@@ -244,15 +285,17 @@ mod live_tests {
         )
         .await
         .unwrap();
-        let got = SpotMirrorRepository::find_by_id(&db, orphan).await.unwrap().unwrap();
+        let got = SpotMirrorRepository::find_by_id(db, orphan)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             got.bookable().is_none(),
             "a half-built mirror must fail closed"
         );
 
-        sqlx::query("DELETE FROM spot WHERE id = ANY($1)")
-            .bind(vec![id, orphan])
-            .execute(&db)
+        diesel::delete(spot::table.filter(spot::id.eq_any([id, orphan])))
+            .execute(&mut *conn(&pool).await)
             .await
             .unwrap();
     }
@@ -261,36 +304,50 @@ mod live_tests {
     /// writes it: lock the spot, *then* read availability, insert only if free.
     ///
     /// `lock` is the whole variable under test.
-    async fn try_reserve(db: &PgPool, spot_id: Uuid, lock: bool) -> bool {
-        let mut tx = db.begin().await.unwrap();
+    async fn try_reserve(pool: &shared::db::Db, spot_id: Uuid, lock: bool) -> bool {
+        // A connection of its own: the two racers must not share one, or they would
+        // serialise on the connection rather than on the row lock under test.
+        let mut conn = shared::db::conn(pool).await.unwrap();
 
-        if lock {
-            SpotMirrorRepository::find_for_update(&mut *tx, spot_id).await.unwrap();
-        } else {
-            SpotMirrorRepository::find_by_id(&mut *tx, spot_id).await.unwrap();
-        }
+        conn.transaction::<bool, shared::error::myerror::MyError, _>(|conn| {
+            async move {
+                if lock {
+                    SpotMirrorRepository::find_for_update(conn, spot_id)
+                        .await
+                        .unwrap();
+                } else {
+                    SpotMirrorRepository::find_by_id(conn, spot_id)
+                        .await
+                        .unwrap();
+                }
 
-        // Both racers pause here, so each has definitely reached this point before
-        // either commits. Without the lock that means both read an empty set; with it,
-        // the second is still blocked above and has not read anything yet.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // Both racers pause here, so each has definitely reached this point
+                // before either commits. Without the lock that means both read an empty
+                // set; with it, the second is still blocked above and has not read
+                // anything yet.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let taken = BookingRepository::taken_for_spot(&mut *tx, &spot_id, Utc::now())
-            .await
-            .unwrap();
-        if !taken.is_empty() {
-            tx.rollback().await.unwrap();
-            return false;
-        }
+                let taken = BookingRepository::taken_for_spot(conn, &spot_id, Utc::now())
+                    .await
+                    .unwrap();
+                if !taken.is_empty() {
+                    // Returning rather than rolling back: nothing has been written, so
+                    // the two are the same except that this also releases the lock.
+                    return Ok(false);
+                }
 
-        BookingRepository::upsert(
-            &mut *tx,
-            a_booking(Uuid::now_v7(), spot_id, Utc::now() + TimeDelta::hours(2)),
-        )
+                BookingRepository::upsert(
+                    conn,
+                    a_booking(Uuid::now_v7(), spot_id, Utc::now() + TimeDelta::hours(2)),
+                )
+                .await
+                .unwrap();
+                Ok(true)
+            }
+            .scope_boxed()
+        })
         .await
-        .unwrap();
-        tx.commit().await.unwrap();
-        true
+        .unwrap()
     }
 
     /// Creates the spot mirror row, then races two reserves against it.
@@ -306,12 +363,13 @@ mod live_tests {
     /// is a 404 rather than an unlocked write. Worth knowing the dependency is there,
     /// because it is the same phantom that made a `host` table necessary in
     /// payment-service and then made an advisory lock the answer instead.
-    async fn seed_mirror(db: &PgPool, spot_id: Uuid) {
+    async fn seed_mirror(pool: &shared::db::Db, spot_id: Uuid) {
+        let mut conn = shared::db::conn(pool).await.unwrap();
         SpotMirrorRepository::merge(
-            db,
+            &mut conn,
             spot_id,
             SpotMirrorPatch {
-                owner_id: Some(Uuid::now_v7()),
+                host_id: Some(Uuid::now_v7()),
                 price_per_hour: Some(700),
                 availability: Some(availability()),
                 timezone: Some("Europe/Brussels".to_string()),
@@ -323,9 +381,12 @@ mod live_tests {
         .unwrap();
     }
 
-    async fn race(db: &PgPool, spot_id: Uuid, lock: bool) -> usize {
-        seed_mirror(db, spot_id).await;
-        let (a, b) = tokio::join!(try_reserve(db, spot_id, lock), try_reserve(db, spot_id, lock));
+    async fn race(pool: &shared::db::Db, spot_id: Uuid, lock: bool) -> usize {
+        seed_mirror(pool, spot_id).await;
+        let (a, b) = tokio::join!(
+            try_reserve(pool, spot_id, lock),
+            try_reserve(pool, spot_id, lock)
+        );
         [a, b].iter().filter(|won| **won).count()
     }
 
@@ -338,21 +399,20 @@ mod live_tests {
     /// What replaces it is the row lock plus a property of Read Committed: after the
     /// second transaction unblocks, its **next statement takes a new snapshot** and so
     /// sees the winner's booking. Exactly one insert survives.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn two_racing_reserves_cannot_double_book() {
-        let db = db().await;
+        let pool = db().await;
         let spot_id = Uuid::now_v7();
 
         assert_eq!(
-            race(&db, spot_id, true).await,
+            race(&pool, spot_id, true).await,
             1,
             "exactly one of two racing reserves may take the slot"
         );
 
-        sqlx::query("DELETE FROM booking WHERE spot_id = $1")
-            .bind(spot_id)
-            .execute(&db)
+        diesel::delete(booking::table.filter(booking::spot_id.eq(spot_id)))
+            .execute(&mut *conn(&pool).await)
             .await
             .unwrap();
     }
@@ -366,23 +426,36 @@ mod live_tests {
     /// is a coin flip, so it double-books only *sometimes*. A control that passes
     /// intermittently is worse than none. Here the writer holds its transaction open
     /// for a known duration, so the answer is forced either way.
-    async fn second_reader_sees_the_first(db: &PgPool, spot_id: Uuid, lock: bool) -> bool {
+    async fn second_reader_sees_the_first(
+        pool: &shared::db::Db,
+        spot_id: Uuid,
+        lock: bool,
+    ) -> bool {
         let writer = {
-            let db = db.clone();
+            let pool = pool.clone();
             tokio::spawn(async move {
-                let mut tx = db.begin().await.unwrap();
-                // The writer always locks — it is `create_booking`. What varies is
-                // whether the *reader* does.
-                SpotMirrorRepository::find_for_update(&mut *tx, spot_id).await.unwrap();
-                BookingRepository::upsert(
-                    &mut *tx,
-                    a_booking(Uuid::now_v7(), spot_id, Utc::now() + TimeDelta::hours(2)),
-                )
+                let mut conn = shared::db::conn(&pool).await.unwrap();
+                conn.transaction::<(), shared::error::myerror::MyError, _>(|conn| {
+                    async move {
+                        // The writer always locks — it is `create_booking`. What varies
+                        // is whether the *reader* does.
+                        SpotMirrorRepository::find_for_update(conn, spot_id)
+                            .await
+                            .unwrap();
+                        BookingRepository::upsert(
+                            conn,
+                            a_booking(Uuid::now_v7(), spot_id, Utc::now() + TimeDelta::hours(2)),
+                        )
+                        .await
+                        .unwrap();
+                        // Held open, so the reader below is guaranteed to start inside it.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        Ok(())
+                    }
+                    .scope_boxed()
+                })
                 .await
                 .unwrap();
-                // Held open, so the reader below is guaranteed to start inside it.
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                tx.commit().await.unwrap();
             })
         };
 
@@ -390,18 +463,28 @@ mod live_tests {
         // enough that it certainly has not committed.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        let mut tx = db.begin().await.unwrap();
-        if lock {
-            // Blocks here until the writer commits. Read Committed then gives the
-            // NEXT statement a new snapshot — which is the entire mechanism.
-            SpotMirrorRepository::find_for_update(&mut *tx, spot_id).await.unwrap();
-        } else {
-            SpotMirrorRepository::find_by_id(&mut *tx, spot_id).await.unwrap();
-        }
-        let taken = BookingRepository::taken_for_spot(&mut *tx, &spot_id, Utc::now())
+        let mut conn = shared::db::conn(pool).await.unwrap();
+        let taken = conn
+            .transaction::<_, shared::error::myerror::MyError, _>(|conn| {
+                async move {
+                    if lock {
+                        // Blocks here until the writer commits. Read Committed then
+                        // gives the NEXT statement a new snapshot — which is the entire
+                        // mechanism.
+                        SpotMirrorRepository::find_for_update(conn, spot_id)
+                            .await
+                            .unwrap();
+                    } else {
+                        SpotMirrorRepository::find_by_id(conn, spot_id)
+                            .await
+                            .unwrap();
+                    }
+                    BookingRepository::taken_for_spot(conn, &spot_id, Utc::now()).await
+                }
+                .scope_boxed()
+            })
             .await
             .unwrap();
-        tx.rollback().await.unwrap();
         writer.await.unwrap();
 
         !taken.is_empty()
@@ -419,35 +502,33 @@ mod live_tests {
     /// Same stale read, no error either way — which is why the image tag in
     /// docker-compose-dev.yml is pinned as a correctness constraint rather than a
     /// preference.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn the_lock_is_what_makes_the_second_read_fresh() {
-        let db = db().await;
+        let pool = db().await;
 
         let locked = Uuid::now_v7();
-        seed_mirror(&db, locked).await;
+        seed_mirror(&pool, locked).await;
         assert!(
-            second_reader_sees_the_first(&db, locked, true).await,
+            second_reader_sees_the_first(&pool, locked, true).await,
             "with FOR UPDATE the second reader must block and then see the booking"
         );
 
         let unlocked = Uuid::now_v7();
-        seed_mirror(&db, unlocked).await;
+        seed_mirror(&pool, unlocked).await;
         assert!(
-            !second_reader_sees_the_first(&db, unlocked, false).await,
+            !second_reader_sees_the_first(&pool, unlocked, false).await,
             "without FOR UPDATE the second reader must see a stale, empty set — if it \
              does not, the lock is not what prevents double-booking and the real \
              mechanism is unknown"
         );
 
-        sqlx::query("DELETE FROM booking WHERE spot_id = ANY($1)")
-            .bind(vec![locked, unlocked])
-            .execute(&db)
+        diesel::delete(booking::table.filter(booking::spot_id.eq_any([locked, unlocked])))
+            .execute(&mut *conn(&pool).await)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM spot WHERE id = ANY($1)")
-            .bind(vec![locked, unlocked])
-            .execute(&db)
+        diesel::delete(spot::table.filter(spot::id.eq_any([locked, unlocked])))
+            .execute(&mut *conn(&pool).await)
             .await
             .unwrap();
     }

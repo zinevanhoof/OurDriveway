@@ -6,10 +6,7 @@ use axum::{
 };
 use shared::env;
 
-use crate::{
-    projector::SpotProjector,
-    service::booking_service::BookingService,
-};
+use crate::{projector::SpotProjector, service::booking_service::BookingService};
 
 mod policy;
 mod projector;
@@ -18,6 +15,15 @@ mod route;
 mod service;
 mod sweeper;
 mod worker;
+
+bus::version_reader! {
+    /// Its own bookings, plus the spot mirror it projects from SPOTS — a client that has
+    /// just edited a spot and then reserves against it is waiting for that mirror, not for
+    /// spot-service's copy.
+    fn version_of;
+    "booking" => shared::schema::booking::booking,
+    "spot" => shared::schema::booking::spot,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -63,7 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
     let db = shared::db::connect(&CONFIG.database_url).await?;
-    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/booking")).await?;
+    // Schema is NOT applied here. `apps/migrator` is the only thing that migrates —
+    // one Compose one-shot in dev, one Helm hook Job in production — because
+    // diesel_migrations takes no lock around a run and `replicas: N` would race.
+    // This process assumes its database exists and is current, and fails at connect
+    // above if it does not.
 
     // One pool for the whole process — projector lanes, election, relay, sweeper,
     // handlers and the await layer all share it. `PgPool` is `Arc` inside, so a clone
@@ -126,7 +136,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Its own service rather than the `BookingService` above: the worker path is
     // post-capture and shares none of the request path's rules. See
     // service/payment_worker_service.rs.
-    let service = Arc::new(service::payment_worker_service::PaymentWorkerService::new(db));
+    let service = Arc::new(service::payment_worker_service::PaymentWorkerService::new(
+        db,
+    ));
     tokio::spawn(bus::worker::run(
         js,
         Arc::new(worker::PaymentWorker { service }),
@@ -142,7 +154,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/booking/{id}", delete(route::booking::release))
         .route("/api/booking/{id}/cancel", post(route::booking::cancel));
 
-
     let app = Router::new()
         .merge(api_router)
         // On the API only, and before health is merged: `/readyz` reporting how far
@@ -150,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Waits on the aggregate versions a client echoes back, against this
         // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            bus::AwaitVersions(await_db),
+            bus::AwaitVersions(await_db, version_of),
             bus::await_version::await_version,
         ))
         // After the layer, deliberately — a backfill is not a client read and has

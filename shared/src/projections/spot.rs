@@ -1,129 +1,127 @@
-use serde::Serialize;
+use diesel::prelude::*;
 use uuid::Uuid;
 
-use super::MaybeJoined;
-use super::booking::{OwnerViewBooking, PublicViewBooking};
-use super::user::PublicViewUser;
+use super::user::UserPublicProjection;
 use crate::general_models::spot::{Address, Availability};
 
-/// The columns of one spot, shared by both audiences.
+/// `GET /api/view/public/spots/{id}` — the parent half. Statement 1 of 2.
 ///
-/// [`PublicViewSpot`] and [`OwnerViewSpot`] select the *same* spot columns — they differ
-/// in their `WHERE` and in which booking projection they nest. This holds the shared
-/// half so a new spot column is added once rather than twice, which is the failure mode
-/// two near-identical thirteen-field structs would have.
+/// `Identifiable` is what makes it the parent: [`super::booking::PublicBookingProjection`]
+/// `belongs_to` it, so statement 2 is `PublicBookingProjection::belonging_to(&spot)`
+/// rather than a hand-written `spot_id = $1`.
 ///
-/// It is `#[serde(flatten)]`ed by both, so the JSON stays one flat object.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct SpotFields {
+/// **Two statements, deliberately.** One join would repeat `images`, `address` and
+/// `availability` once per booking, and those are the expensive columns. A
+/// single-statement form exists and works — a correlated `array_agg` over a row
+/// constructor decoded through `Record<(…)>`, built and verified during the diesel
+/// migration — and is not used: two statements are cheaper for a large jsonb parent and
+/// give parent and children independent cache keys, so making a booking invalidates the
+/// availability without refetching the listing.
+///
+/// No `host_id`, `lng`, `lat`, `active` or `description`: nothing on the detail sheet
+/// or the booking form reads them. `active` in particular is not a field because the
+/// statement's own `WHERE` already required it — a column saying `true` on every row it
+/// can return is a column that answers nothing.
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = crate::schema::view::spot)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct PublicSpotProjection {
     pub id: Uuid,
-    pub owner_id: Uuid,
-    /// `None` while the owner's `UserRegistered` has not been projected here. An absent
-    /// join, not a permission decision — see [`MaybeJoined`].
-    #[sqlx(flatten)]
-    pub owner: MaybeJoined<PublicViewUser>,
+    pub title: String,
+    /// EUR cents.
+    pub price_per_hour: i64,
+    pub images: Vec<String>,
+    pub address: Address,
+    pub availability: Availability,
+    /// The zone the bookings' `booked` maps are expressed in. Without it a client cannot
+    /// tell which slots are in the past.
+    pub timezone: String,
+    /// `None` while the host's `UserRegistered` has not been projected here. An absent
+    /// join, not a permission decision.
+    #[diesel(embed)]
+    pub host: Option<UserPublicProjection>,
+}
+
+/// `GET /api/view/public/spots/nearby` — one map pin.
+///
+/// `lng`/`lat` and `availability`, which the detail read does not carry, and no
+/// `address`: a pin is placed by coordinates and labelled by title and price. The map's
+/// weekday-and-time filter is a fold over `availability` that no query expresses, which
+/// is why that one column survives onto a few hundred rows.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = crate::schema::view::spot)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct PublicSpotPinProjection {
+    pub id: Uuid,
+    pub title: String,
+    /// EUR cents.
+    pub price_per_hour: i64,
+    pub images: Vec<String>,
+    pub lng: f64,
+    pub lat: f64,
+    pub availability: Availability,
+}
+
+/// `GET /api/view/host/spots/{id}` — the parent half. Statement 1 of 2.
+///
+/// Duplicates most of [`PublicSpotProjection`]'s columns and that is the point: `spot`
+/// has no field-level scoping, so the difference between these two is which columns a
+/// *screen* reads, not which a caller may see. `description` and `active` are here
+/// because the edit form seeds from them and the manage screen draws the live switch off
+/// them; the host join is not, because a host does not need their own name told back.
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = crate::schema::view::spot)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HostSpotProjection {
+    pub id: Uuid,
     pub title: String,
     /// Genuinely optional: `CreateSpotRequest` does not require one.
     pub description: Option<String>,
     /// EUR cents.
     pub price_per_hour: i64,
     pub images: Vec<String>,
-    pub lng: f64,
-    pub lat: f64,
+    /// The host's live switch. Only ever read here and in the list — a public read
+    /// cannot reach an inactive spot at all.
     pub active: bool,
-    #[sqlx(json)]
     pub address: Address,
-    #[sqlx(json)]
     pub availability: Availability,
-    /// The zone `booked` is expressed in. Without it a client cannot tell which slots
-    /// are in the past.
     pub timezone: String,
 }
 
-/// `GET /api/view/spots/:id` — one spot as a prospective renter sees it.
+/// `GET /api/view/host/spots` — one row of the host's own list.
 ///
-/// Reached only for an `active` spot. The bookings are the public availability answer:
-/// which slots are taken and until when, with no renter, no amount and no hold expiry.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicViewSpot {
-    #[sqlx(flatten)]
-    #[serde(flatten)]
-    pub spot: SpotFields,
-    /// Filled by `ViewSpotRepository::find_public_by_id`'s second statement, never by
-    /// the SELECT — `#[sqlx(skip)]` defaults it so the statement need not mention it.
-    #[sqlx(skip)]
-    pub bookings: Vec<PublicViewBooking>,
-}
-
-/// `GET /api/view/spots/:id/manage` — one spot as its host sees it.
-///
-/// Same columns, reached only by the owner, and its bookings carry the renter, the
-/// amount and the hold expiry. An inactive spot resolves here and nowhere else, which
-/// is what the live switch is for.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct OwnerViewSpot {
-    #[sqlx(flatten)]
-    #[serde(flatten)]
-    pub spot: SpotFields,
-    /// Filled by `ViewSpotRepository::find_owner_by_id`'s second statement.
-    #[sqlx(skip)]
-    pub bookings: Vec<OwnerViewBooking>,
-}
-
-/// The list shape: map pins and the host's own list.
-///
-/// Drops `description`, `timezone` and the owner join, which have no business on a few
-/// hundred map pins. `availability` stays despite its size — the map filters on weekday
-/// and time slot client-side, and that fold is not something a query can express.
-///
-/// No row struct behind it: `#[sqlx(json)]` decodes `address` and `availability`
-/// straight into their stored types.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct SpotListItem {
+/// No `availability` and no coordinates: this list is not a map, and `availability` is
+/// the largest jsonb column on the table. `active` is here and nowhere in the public
+/// reads, because a host's paused listing is exactly what this list has to show.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = crate::schema::view::spot)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HostSpotListProjection {
     pub id: Uuid,
     pub title: String,
     /// EUR cents.
     pub price_per_hour: i64,
     pub images: Vec<String>,
-    /// The host's live switch. Only ever `false` in the owner's own list — the radius
-    /// query filters inactive spots out.
     pub active: bool,
-    pub lng: f64,
-    pub lat: f64,
-    #[sqlx(json)]
     pub address: Address,
-    #[sqlx(json)]
-    pub availability: Availability,
 }
 
-/// Just enough of a spot to render a booking card.
+/// Just enough of a spot to render a booking card, nested in a renter's booking.
 ///
-/// Only ever nested inside [`super::booking::BookingListItem`], so the `spot_*` renames
-/// pin it to that one join site at no cost — the reuse argument that keeps
-/// [`PublicViewUser`] on bare-ish aliases does not apply.
+/// Only ever `#[diesel(embed)]`ed inside [`super::booking::RenterBookingProjection`], off
+/// a LEFT JOIN — so it is `Option` there, and resolves for a *deleted* spot, whose row
+/// survives precisely so a past booking keeps a title.
 ///
-/// `id` reads the booking's own `spot_id` column rather than a joined one, so it
-/// resolves even when the spot has not been projected yet — but the join still has to
-/// find `spot_title` for [`MaybeJoined`] to hand back a card at all.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct SpotCard {
-    #[sqlx(rename = "spot_id")]
+/// `timezone` is not decoration: `booked` holds bare wall-clock strings in this zone, so
+/// without it "today", "upcoming" and "active now" would be answered in the *viewer's*
+/// zone instead — wrong for anyone booking abroad.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = crate::schema::view::spot)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct SpotCardProjection {
     pub id: Uuid,
-    #[sqlx(rename = "spot_title")]
     pub title: String,
-    #[sqlx(rename = "spot_images")]
     pub images: Vec<String>,
-    /// Not decoration: `booked` holds bare wall-clock strings in this zone, so without
-    /// it "today", "upcoming" and "active now" would be answered in the *viewer's* zone
-    /// instead — wrong for anyone booking abroad.
-    #[sqlx(rename = "spot_timezone")]
     pub timezone: String,
-    #[sqlx(rename = "spot_address")]
-    #[sqlx(json)]
     pub address: Address,
 }

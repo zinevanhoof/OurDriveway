@@ -1,0 +1,100 @@
+{{/*
+The one process that migrates. Every service Deployment assumes its schema already
+exists and none of them touch it.
+
+WHY THIS EXISTS, given that a `create-databases` post-install hook was deliberately
+deleted once already (see deploy.sh and k8s/README.md): that removal was correct while
+the services used sqlx, because `sqlx::migrate` takes an advisory lock around the whole
+run, so every replica migrating at boot was safe. `diesel_migrations` takes no lock at
+all — each migration is wrapped in a transaction, but the run is not exclusive, so at
+`replicas: N` two pods would read the same pending set and both apply it. Centralising
+is what puts that guarantee back. See diesel-migration.md.
+
+`post-install,pre-upgrade`, NOT `pre-install`:
+  * `pre-install` runs before ANY chart resource, so on a cold install the yugabyte
+    StatefulSet would not exist yet and this would wait out activeDeadlineSeconds.
+  * `post-install` runs once the cluster is up, which is the only ordering that can
+    work the first time.
+  * `pre-upgrade` runs before new pods roll, which is the ordering that matters for
+    every deploy after the first.
+
+Known cold-install window: on a FIRST install the service pods and this Job start
+together, so they crash-loop on 3D000 until this creates their databases. Bounded,
+self-healing, once per cluster. The fix if that ever matters is a two-pass deploy.sh
+(apply this Job, wait, then `helm upgrade`) — a deploy.sh change, not a chart one.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-migrator
+  labels:
+    app.kubernetes.io/name: migrator
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    # Ahead of anything else that might be hooked later.
+    "helm.sh/hook-weight": "-5"
+    # A Job's pod template is immutable, so the previous run must be removed before
+    # this one is created. `before-hook-creation` also means a FAILED job is left in
+    # place until the next deploy — which is what you want to `kubectl logs`.
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  # The retry policy is Kubernetes', not a loop in Rust. A rerun is a no-op for every
+  # migration already applied, which is what makes retrying safe.
+  backoffLimit: 3
+  # A migration that has not finished in ten minutes is stuck, not slow.
+  activeDeadlineSeconds: 600
+  # Exactly one pod. Never run two migrators at once — that is the race this whole
+  # Job exists to remove.
+  parallelism: 1
+  completions: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrator
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      # Never. A failed migration must surface as a failed Job, not as a pod that
+      # quietly restarts until it happens to work.
+      restartPolicy: Never
+      initContainers:
+        # Same /dev/tcp wait the services use. The yugabyte Service is headless, so
+        # this proves a listener, not readiness — the connect in the migrator is what
+        # actually blocks until YSQL answers.
+        - name: wait-for-yugabyte
+          image: {{ .Values.registry }}/ourdriveway-migrator:{{ .Values.tag }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          command:
+            - bash
+            - -c
+            # 5433, not 5432 — YSQL does not listen on the PostgreSQL default.
+            - 'until : </dev/tcp/yugabyte/5433; do echo "waiting for yugabyte"; sleep 2; done'
+      containers:
+        - name: migrator
+          image: {{ .Values.registry }}/ourdriveway-migrator:{{ .Values.tag }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          # One URL per database, interpolated from the same secret entry YugabyteDB
+          # itself reads, so the two cannot drift. `$(VAR)` is expanded by Kubernetes
+          # at container start, so `kubectl get pod -o yaml` shows the reference rather
+          # than the password — and the migrator never logs a URL, only a database name.
+          env:
+            - name: YSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: YSQL_PASSWORD
+            {{- range $db := list "user" "spot" "booking" "payment" "view" }}
+            - name: {{ $db | upper }}_DATABASE_URL
+              value: "postgres://yugabyte:$(YSQL_PASSWORD)@yugabyte:5433/{{ $db }}"
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secretName }}
+          # Set here though the app Deployments have none: a Job competing for an
+          # unbounded share while the cluster is mid-deploy is the wrong trade.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

@@ -41,8 +41,13 @@
 
 use std::time::Duration;
 
+use diesel::prelude::*;
+use diesel::sql_types::{Double, Timestamptz};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::db::Db;
 use shared::error::myerror::MyResult;
-use sqlx::{PgExecutor, PgPool};
+
+use crate::schema::_lease;
 
 /// How long a lease stays valid after the last successful renewal.
 ///
@@ -95,25 +100,45 @@ pub const LEADER: &str = "leader";
 /// `BEGIN`/`COMMIT`. It worked over HTTP and silently returned `false` forever
 /// through the Rust client, whose statement indexing did not line up the same way
 /// across a transaction block. One statement has no index to get wrong.
-pub async fn acquire(ex: impl PgExecutor<'_>, name: &str, holder: &str) -> MyResult<bool> {
+pub async fn acquire(conn: &mut AsyncPgConnection, name: &str, holder: &str) -> MyResult<bool> {
+    // Imported HERE and not at module scope. `QueryDsl::filter` covers SELECTs; the
+    // `WHERE` on a DO UPDATE branch comes from `FilterDsl` implemented directly on
+    // `InsertStatement<_, OnConflictValues<..>>`. Both are in scope at module level and
+    // every ordinary `.filter()` in this file then becomes ambiguous.
+    use diesel::query_dsl::methods::FilterDsl;
+
     // `make_interval(secs => …)` rather than formatting a string and casting it: the
     // TTL is a Duration, and turning it into "30s" for the database to parse back is
-    // a round trip through text that can only go wrong.
-    let held: Option<String> = sqlx::query_scalar(
-        "INSERT INTO _lease (name, holder, expires_at)
-              VALUES ($1, $2, now() + make_interval(secs => $3))
-         ON CONFLICT (name) DO UPDATE
-             SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
-           WHERE _lease.holder = $2 OR _lease.expires_at < now()
-         RETURNING holder",
-    )
-    .bind(name)
-    .bind(holder)
-    .bind(TTL.as_secs() as f64)
-    .fetch_optional(ex)
-    .await?;
+    // a round trip through text that can only go wrong. It has no DSL spelling, so it
+    // is a typed `sql::<Timestamptz>` fragment with the seconds bound.
+    let expires_at = diesel::dsl::sql::<Timestamptz>("now() + make_interval(secs => ")
+        .bind::<Double, _>(TTL.as_secs() as f64)
+        .sql(")");
 
-    Ok(held.is_some())
+    // The `WHERE` on the DO UPDATE branch is the whole mechanism: without it the
+    // conflicting insert would steal a live lease. `.filter()` on the insert statement
+    // is what emits it — diesel implements `FilterDsl` for an `InsertStatement` whose
+    // values carry an `OnConflictValues`, so this is the conflict clause and not an
+    // ordinary predicate.
+    let held: Vec<String> = diesel::insert_into(_lease::table)
+        .values((
+            _lease::name.eq(name),
+            _lease::holder.eq(holder),
+            _lease::expires_at.eq(expires_at.clone()),
+        ))
+        .on_conflict(_lease::name)
+        .do_update()
+        .set((_lease::holder.eq(holder), _lease::expires_at.eq(expires_at)))
+        .filter(
+            _lease::holder
+                .eq(holder)
+                .or(_lease::expires_at.lt(diesel::dsl::now)),
+        )
+        .returning(_lease::holder)
+        .load(conn)
+        .await?;
+
+    Ok(!held.is_empty())
 }
 
 /// Gives the lease up immediately rather than waiting out [`TTL`].
@@ -121,12 +146,14 @@ pub async fn acquire(ex: impl PgExecutor<'_>, name: &str, holder: &str) -> MyRes
 /// Best effort, and deliberately scoped to our own holding: a losing racer must
 /// not be able to delete the winner's lease. Called on clean shutdown so a rolling
 /// restart hands over in milliseconds instead of half a minute.
-pub async fn release(ex: impl PgExecutor<'_>, name: &str, holder: &str) -> MyResult<()> {
-    sqlx::query("DELETE FROM _lease WHERE name = $1 AND holder = $2")
-        .bind(name)
-        .bind(holder)
-        .execute(ex)
-        .await?;
+pub async fn release(conn: &mut AsyncPgConnection, name: &str, holder: &str) -> MyResult<()> {
+    diesel::delete(
+        _lease::table
+            .filter(_lease::name.eq(name))
+            .filter(_lease::holder.eq(holder)),
+    )
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
@@ -149,12 +176,19 @@ pub async fn release(ex: impl PgExecutor<'_>, name: &str, holder: &str) -> MyRes
 /// *separate connection* because a projector's open transaction might block every
 /// other session on the shared socket — is gone with the socket. That was a real
 /// hazard when one WebSocket carried every session; a pool has no such coupling.
-pub fn elect(db: PgPool, holder: String) -> tokio::sync::watch::Receiver<bool> {
+pub fn elect(db: Db, holder: String) -> tokio::sync::watch::Receiver<bool> {
     let (tx, rx) = tokio::sync::watch::channel(false);
 
     tokio::spawn(async move {
         loop {
-            let held = match acquire(&db, LEADER, &holder).await {
+            // A pool checkout per attempt, every ten seconds. Cheap, and it means a
+            // connection is not held idle across the sleep.
+            let attempt = match db.get().await {
+                Ok(mut conn) => acquire(&mut conn, LEADER, &holder).await,
+                Err(e) => Err(shared::error::myerror::MyError::Pool(e.to_string())),
+            };
+
+            let held = match attempt {
                 Ok(held) => {
                     tracing::debug!(holder, held, "lease attempt");
                     held

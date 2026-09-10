@@ -75,7 +75,7 @@ k3d cluster create ourdriveway -p "80:80@loadbalancer" -p "443:443@loadbalancer"
 #    working tree and hand the results straight to the cluster.
 docker buildx bake --load
 for i in user-service booking-service spot-service view-service media-service \
-         notification-service payment-service frontend; do
+         notification-service payment-service migrator frontend; do
   k3d image import ghcr.io/zinevanhoof/ourdriveway-$i:latest -c ourdriveway
 done
 
@@ -128,26 +128,28 @@ controller's IP in `/etc/hosts`.
 
 It used to carry five `--set-file` flags, one per schema, because Helm templates
 cannot read files outside the chart and the `.surql` schemas lived in `schemas/`.
-**Schemas are not files any more.** Each service embeds its own migrations with
-`sqlx::migrate!` and applies them at boot, so a new image carries its schema with
-it — that deleted the ConfigMap, the `--set-file` plumbing, and the import Job.
+**Schemas are not files any more.** They are embedded in the `migrator` image with
+`diesel_migrations::embed_migrations!` — that deleted the ConfigMap, the
+`--set-file` plumbing, and the import Job.
 
-Every replica running migrations at boot is safe: sqlx takes an advisory lock
-around the run, migrations are versioned and applied once, and each service owns
-its own database so the only contention is between replicas of one service.
+**Migrations are a central step again, and `CREATE DATABASE` with them.** Both live
+in `k8s/chart/templates/migrator-job.yaml`, a Helm hook Job; no service Deployment
+touches schema.
 
-**Nor is `CREATE DATABASE` a central step.** `shared::db::connect` creates the
-database named in `DATABASE_URL` if connecting finds none (SQLSTATE `3D000`) and
-retries once, so a service brings up its own. That deleted the `create-databases`
-post-install hook, the second copy of the service list inside it, and the window
-where every service crash-looped waiting for a hook that runs *after* they start.
-Two replicas racing is fine: the loser gets `42P04` and treats it as success.
+This reverses what was here before, and the reason is the move from sqlx to diesel
+rather than a change of mind. Boot-time migration in every replica was safe *because*
+`sqlx::migrate` takes an advisory lock around the run. `diesel_migrations` takes no
+lock at all — each migration is wrapped in a transaction, but the run is not
+exclusive, so at `replicas: N` two pods would read the same pending set and both
+apply it. One Job is what puts that guarantee back.
 
-It cannot be a migration instead. `sqlx::migrate!` runs its files on a connection
-to the database being migrated, so a missing one fails at `connect` and the files
-are never read — the transaction is not the obstacle, since sqlx honours a leading
-`-- no-transaction`. It does assume the role in `DATABASE_URL` may create
-databases, which `yugabyte` may.
+The hook is `post-install,pre-upgrade`, not `pre-install`: `pre-install` runs before
+any chart resource, so on a cold install the yugabyte StatefulSet would not exist yet
+and the Job would wait out its deadline. The cost is a window on a **first** install
+only, where service pods start alongside the Job and crash-loop on `3D000` until
+their databases exist — bounded, self-healing, once per cluster.
+
+The migrator assumes the role in the URLs may create databases, which `yugabyte` may.
 
 The Secret is created by kubectl rather than templated, because Helm stores every
 value it renders in the release secret and hands them back to anyone who runs

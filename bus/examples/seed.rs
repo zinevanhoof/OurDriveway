@@ -36,6 +36,8 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use chrono::Utc;
+use diesel_async::scoped_futures::ScopedFutureExt;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use shared::domain_models::spot::Spot;
 use shared::domain_models::user::User;
 use shared::events::{
@@ -64,7 +66,7 @@ fn envelope<T>(
     actor_id: Option<Uuid>,
     event_key: &str,
     aggregate: String,
-    version: u64,
+    version: i64,
 ) -> Envelope<T> {
     Envelope {
         event_id: stable(event_key),
@@ -162,158 +164,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             password_hash: hash(PASSWORD),
         };
 
-        let mut tx = user_db.begin().await?;
+        let mut conn = user_db.get().await?;
 
         // Verified on the way in. The real path needs a mailed token, and a seeded
         // account that cannot log in is not a seeded account.
         let mut row = User::registered(registered.clone(), 1);
         row.email_verified = true;
-        // Through the repository's own statement rather than a hand-written one. It
-        // used to be `CONTENT $row`, which bound the struct whole and so could be
-        // written here without repeating a column list; sqlx has no such write, and a
-        // second copy of `app_user`'s columns in a seed script is exactly the sort of
-        // thing that goes stale silently.
+        // The struct is the write. `User` derives `Insertable + AsChangeset`, so
+        // `.values(row)` names `app_user`'s columns once — in the model — and this seed
+        // holds no second copy of them to go stale. That is what `CONTENT $row` used to
+        // do and what sqlx could not, which is why this block was a spelled-out column
+        // list for as long as sqlx was here.
         //
-        // That means reaching into user-service's crate, which this cannot do — so the
-        // statement is spelled out once here and the round-trip test in user-service is
-        // what would catch a drift. See the note at the top of this file about why a
-        // seed touches service databases directly at all.
-        sqlx::query(
-            "INSERT INTO app_user
-                 (id, version, first_name, last_name, email,
-                  email_verified, profile_picture, password, license_plates)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (id) DO UPDATE SET
-                 version         = EXCLUDED.version,
-                 first_name      = EXCLUDED.first_name,
-                 last_name       = EXCLUDED.last_name,
-                 email           = EXCLUDED.email,
-                 email_verified  = EXCLUDED.email_verified,
-                 profile_picture = EXCLUDED.profile_picture,
-                 password        = EXCLUDED.password,
-                 license_plates  = EXCLUDED.license_plates",
-        )
-        .bind(row.id)
-        .bind(row.version as i64)
-        .bind(row.first_name)
-        .bind(row.last_name)
-        .bind(row.email)
-        .bind(row.email_verified)
-        .bind(row.profile_picture)
-        .bind(row.password)
-        .bind(row.license_plates)
-        .execute(&mut *tx)
+        // One transaction: the row and the event that announces it commit together, the
+        // same rule every real write path follows.
+        let email_for_row = row.email.clone();
+        conn.transaction::<(), Box<dyn std::error::Error + Send + Sync>, _>(|conn| {
+            let registered = registered.clone();
+            async move {
+                diesel::insert_into(shared::schema::user::app_user::table)
+                    .values(row.clone())
+                    .on_conflict(shared::schema::user::app_user::id)
+                    .do_update()
+                    .set(row)
+                    .execute(conn)
+                    .await?;
+
+                bus::outbox::enqueue(
+                    conn,
+                    &user_subject(&id),
+                    &envelope(
+                        UserEvent::Registered(registered),
+                        Some(id),
+                        &format!("seed:event:registered:{id}"),
+                        aggregate_id("user", &id),
+                        1,
+                    ),
+                )
+                .await?;
+                Ok(())
+            }
+            .scope_boxed()
+        })
         .await?;
 
-        bus::outbox::enqueue(
-            &mut *tx,
-            &user_subject(&id),
-            &envelope(
-                UserEvent::Registered(registered),
-                Some(id),
-                &format!("seed:event:registered:{id}"),
-                aggregate_id("user", &id),
-                1,
-            ),
-        )
-        .await?;
-        tx.commit().await?;
-
-        println!("user     {id}  {email}");
+        println!("user     {id}  {}", email_for_row);
     }
 
     // Owned by Alice, so Bob is the one who can book it — a renter may not book
     // their own spot.
-    let (owner_id, ..) = users[0];
+    let (host_id, ..) = users[0];
     let spot_id = stable("seed:spot:alice-driveway");
     let spot_created = SpotCreated {
-            spot_id,
-            owner_id,
-            title: "Driveway near Brussels Central".into(),
-            description: Some("Seeded test spot. Easy to reach, fits one car.".into()),
-            price_per_hour_cents: 250,
-            // Empty: real images are R2 object keys uploaded by the browser, and
-            // a made-up key would render as a broken image.
-            images: vec![],
-            lng: 4.3517,
-            lat: 50.8466,
-            address: Address {
-                line1: "Grote Markt 1".into(),
-                line2: None,
-                city: "Brussels".into(),
-                postal_code: "1000".into(),
-                region: None,
-                country: "Belgium".into(),
-                formatted: "Grote Markt 1, 1000 Brussels, Belgium".into(),
-            },
-            availability: weekdays_9_to_5(),
-            // Matches the coordinates above. The real create path derives this
-            // from the geocoded point; here it is stated so the seed needs no
-            // network call.
-            timezone: "Europe/Brussels".into(),
+        spot_id,
+        host_id,
+        title: "Driveway near Brussels Central".into(),
+        description: Some("Seeded test spot. Easy to reach, fits one car.".into()),
+        price_per_hour_cents: 250,
+        // Empty: real images are R2 object keys uploaded by the browser, and
+        // a made-up key would render as a broken image.
+        images: vec![],
+        lng: 4.3517,
+        lat: 50.8466,
+        address: Address {
+            line1: "Grote Markt 1".into(),
+            line2: None,
+            city: "Brussels".into(),
+            postal_code: "1000".into(),
+            region: None,
+            country: "Belgium".into(),
+            formatted: "Grote Markt 1, 1000 Brussels, Belgium".into(),
+        },
+        availability: weekdays_9_to_5(),
+        // Matches the coordinates above. The real create path derives this
+        // from the geocoded point; here it is stated so the seed needs no
+        // network call.
+        timezone: "Europe/Brussels".into(),
     };
 
     let spot_db = shared::db::connect(&db_url("spot")).await?;
-    let mut tx = spot_db.begin().await?;
+    let mut conn = spot_db.get().await?;
 
     let row = Spot::created(spot_created.clone(), Utc::now(), 1);
-    sqlx::query(
-        "INSERT INTO spot
-             (id, version, owner_id, title, description, price_per_hour, images,
-              lng, lat, active, deleted, address, availability, timezone,
-              created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-         ON CONFLICT (id) DO UPDATE SET
-             version        = EXCLUDED.version,
-             owner_id       = EXCLUDED.owner_id,
-             title          = EXCLUDED.title,
-             description    = EXCLUDED.description,
-             price_per_hour = EXCLUDED.price_per_hour,
-             images         = EXCLUDED.images,
-             lng            = EXCLUDED.lng,
-             lat            = EXCLUDED.lat,
-             active         = EXCLUDED.active,
-             deleted        = EXCLUDED.deleted,
-             address        = EXCLUDED.address,
-             availability   = EXCLUDED.availability,
-             timezone       = EXCLUDED.timezone,
-             created_at     = EXCLUDED.created_at,
-             updated_at     = EXCLUDED.updated_at",
-    )
-    .bind(row.id)
-    .bind(row.version as i64)
-    .bind(row.owner_id)
-    .bind(row.title)
-    .bind(row.description)
-    .bind(row.price_per_hour)
-    .bind(row.images)
-    .bind(row.lng)
-    .bind(row.lat)
-    .bind(row.active)
-    .bind(row.deleted)
-    .bind(sqlx::types::Json(row.address))
-    .bind(sqlx::types::Json(row.availability))
-    .bind(row.timezone)
-    .bind(row.created_at)
-    .bind(row.updated_at)
-    .execute(&mut *tx)
+
+    // Row and event in one transaction, as above.
+    conn.transaction::<(), Box<dyn std::error::Error + Send + Sync>, _>(|conn| {
+        let spot_created = spot_created.clone();
+        async move {
+            diesel::insert_into(shared::schema::spot::spot::table)
+                .values(row.clone())
+                .on_conflict(shared::schema::spot::spot::id)
+                .do_update()
+                .set(row)
+                .execute(conn)
+                .await?;
+
+            bus::outbox::enqueue(
+                conn,
+                &spot_subject(&spot_id),
+                &envelope(
+                    SpotEvent::Created(spot_created),
+                    Some(host_id),
+                    &format!("seed:event:spot-created:{spot_id}"),
+                    aggregate_id("spot", &spot_id),
+                    1,
+                ),
+            )
+            .await?;
+            Ok(())
+        }
+        .scope_boxed()
+    })
     .await?;
 
-    bus::outbox::enqueue(
-        &mut *tx,
-        &spot_subject(&spot_id),
-        &envelope(
-            SpotEvent::Created(spot_created),
-            Some(owner_id),
-            &format!("seed:event:spot-created:{spot_id}"),
-            aggregate_id("spot", &spot_id),
-            1,
-        ),
-    )
-    .await?;
-    tx.commit().await?;
-
-    println!("spot     {spot_id}  owned by {owner_id}");
+    println!("spot     {spot_id}  owned by {host_id}");
     println!("\nRelays publish the outbox rows; view-service catches up within a moment.");
     println!("password for both users: {PASSWORD}");
     Ok(())

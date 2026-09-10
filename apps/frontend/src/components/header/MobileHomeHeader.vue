@@ -12,7 +12,7 @@ import { useRouter } from 'vue-router';
 
 const router = useRouter()
 
-// Already fetched once at boot by fetchMe(); no reason for a second round trip.
+// Already fetched once at boot by fetchAccount(); no reason for a second round trip.
 const user = computed(() => useAuthStore().user);
 
 const greeting = computed(() => {

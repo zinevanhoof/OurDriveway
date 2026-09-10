@@ -3,15 +3,18 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use bus::outbox;
 use chrono::Utc;
+use diesel_async::AsyncConnection;
+use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::{
     domain_models::booking::{Booking, status},
     error::myerror::{ContextExt, MyError, MyResult},
     events::{
-        Envelope, aggregate_id, format_version,
+        Envelope, aggregate_id,
         booking::{BookingCreated, BookingEvent, CancelReason, ReleaseReason},
-        booking_subject,
+        booking_subject, format_version,
     },
+    general_models::booking::Booked,
     requests::booking::CreateBookingRequest,
     responses::booking::CreatedResponse,
 };
@@ -60,11 +63,11 @@ const NOT_READY: (&str, &str) = (
 pub struct BookingService {
     /// The pool. See the note on `UserService::db` — the repositories are stateless,
     /// so this service no longer holds one per table.
-    pub db: sqlx::PgPool,
+    pub db: shared::db::Db,
 }
 
 impl BookingService {
-    pub fn new(db: sqlx::PgPool) -> Self {
+    pub fn new(db: shared::db::Db) -> Self {
         Self { db }
     }
 
@@ -90,100 +93,121 @@ impl BookingService {
         request: CreateBookingRequest,
     ) -> MyResult<CreatedResponse> {
         let spot_key = request.spot_id;
-        let requested = request.booked;
+        // The request spells the bare map — its garde rules are written against that —
+        // so this is where it becomes the domain type.
+        let requested = Booked::from(request.booked);
 
         // The idempotency key. If an ack is lost after the transaction committed, a
         // client resubmitting the same form gets its booking back rather than a
         // second one.
         let booking_id = Uuid::now_v7();
 
-        let mut tx = self.db.begin().await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        // ── THE SERIALISATION POINT ──────────────────────────────────────────
-        // Everything below reads and writes inside ONE transaction, and this is the
-        // first statement in it on purpose.
-        //
-        // Two renters racing one slot insert two *different* booking rows — different
-        // keys, nothing collides — so without contending on something, both commit.
-        // The lock is that something. A second request blocks here until the first
-        // commits, and because Read Committed gives each statement a **new snapshot**,
-        // `taken_for_spot` below then sees the winner's booking and refuses the slot
-        // by name.
-        //
-        // The ORDER is the whole trick and is easy to undo by accident: any read of
-        // availability placed above this line is taken on a stale snapshot and the
-        // lock protects nothing. See `SpotMirrorRepository::find_for_update` for what
-        // was measured, and what happens on a cluster where Read Committed silently
-        // degrades to Snapshot.
-        let spot = SpotMirrorRepository::find_for_update(&mut *tx, spot_key)
-            .await?
-            .context_not_found(("Not Found", "That spot doesn't exist."))?;
+        // Returns the version to report: 1 for a booking this call creates, or the
+        // existing row's for the idempotent-retry path below.
+        let seq_version = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    // ── THE SERIALISATION POINT ──────────────────────────────────────────
+                    // Everything below reads and writes inside ONE transaction, and this is the
+                    // first statement in it on purpose.
+                    //
+                    // Two renters racing one slot insert two *different* booking rows — different
+                    // keys, nothing collides — so without contending on something, both commit.
+                    // The lock is that something. A second request blocks here until the first
+                    // commits, and because Read Committed gives each statement a **new snapshot**,
+                    // `taken_for_spot` below then sees the winner's booking and refuses the slot
+                    // by name.
+                    //
+                    // The ORDER is the whole trick and is easy to undo by accident: any read of
+                    // availability placed above this line is taken on a stale snapshot and the
+                    // lock protects nothing. See `SpotMirrorRepository::find_for_update` for what
+                    // was measured, and what happens on a cluster where Read Committed silently
+                    // degrades to Snapshot.
+                    let spot = SpotMirrorRepository::find_for_update(conn, spot_key)
+                        .await?
+                        .context_not_found(("Not Found", "That spot doesn't exist."))?;
 
-        // A previous request committed and the client never heard back. `booking_id`
-        // comes from the caller's retry of the same form, so this is recognisable.
-        if let Some(existing) = BookingRepository::find_by_id(&mut *tx, booking_id).await? {
-            tx.rollback().await?;
-            return Ok(CreatedResponse {
-                id: booking_id,
-                seq: format_version(&aggregate_id("booking", &booking_id), existing.version),
-            });
-        }
+                    // A previous request committed and the client never heard back. `booking_id`
+                    // comes from the caller's retry of the same form, so this is recognisable.
+                    if let Some(existing) = BookingRepository::find_by_id(conn, booking_id).await? {
+                        // Returning rather than rolling back. Nothing has been written yet,
+                        // so committing an empty transaction and rolling one back differ in
+                        // nothing that matters here — both release the `FOR UPDATE` taken
+                        // above, which is the only state this holds.
+                        return Ok(existing.version);
+                    }
 
-        // The SPOTS mirror may not have caught up with this spot yet. Fail closed
-        // rather than booking against an availability we cannot see.
-        let (availability, price, owner_id) = spot.bookable().context_conflict(NOT_READY)?;
+                    // The SPOTS mirror may not have caught up with this spot yet. Fail closed
+                    // rather than booking against an availability we cannot see.
+                    let (availability, price, host_id) =
+                        spot.bookable().context_conflict(NOT_READY)?;
 
-        spot.active
-            .context_conflict(("Unavailable", "This spot is no longer accepting bookings."))?;
-        (owner_id != *renter_id)
-            .context_unprocessable_entity(("Not allowed", "You can't book your own spot."))?;
+                    spot.active.context_conflict((
+                        "Unavailable",
+                        "This spot is no longer accepting bookings.",
+                    ))?;
+                    (host_id != *renter_id).context_unprocessable_entity((
+                        "Not allowed",
+                        "You can't book your own spot.",
+                    ))?;
 
-        // Reads on a snapshot taken AFTER the lock was granted — which is what makes
-        // the loser of a race see the winner's booking here rather than a stale empty
-        // set. `availability::check` then produces the 409 naming the taken slot,
-        // which is the answer the renter actually wants; the old code reached the
-        // same place only after losing a write conflict and re-running.
-        let taken = BookingRepository::taken_for_spot(&mut *tx, &spot_key, Utc::now()).await?;
-        let minutes = availability::check(availability, &taken, &requested).map_err(reject)?;
+                    // Reads on a snapshot taken AFTER the lock was granted — which is what makes
+                    // the loser of a race see the winner's booking here rather than a stale empty
+                    // set. `availability::check` then produces the 409 naming the taken slot,
+                    // which is the answer the renter actually wants; the old code reached the
+                    // same place only after losing a write conflict and re-running.
+                    let taken =
+                        BookingRepository::taken_for_spot(conn, &spot_key, Utc::now()).await?;
+                    let minutes =
+                        availability::check(availability, &taken, &requested).map_err(reject)?;
 
-        // Truncating division rounds in the renter's favour. Slots are on a
-        // 30-minute grid, so it only bites on a hand-crafted request.
-        let amount_cents = minutes * price / 60;
+                    // Truncating division rounds in the renter's favour. Slots are on a
+                    // 30-minute grid, so it only bites on a hand-crafted request.
+                    let amount_cents = minutes * price / 60;
 
-        // Folded here rather than by a reader: the zone is a spot field, and
-        // "is it over yet" cannot be asked of wall-clock strings without it.
-        let ends_at = spot
-            .timezone
-            .as_deref()
-            .and_then(|tz| schedule::ends_at(&requested, tz))
-            .context_unprocessable_entity(NOT_READY)?;
+                    // Folded here rather than by a reader: the zone is a spot field, and
+                    // "is it over yet" cannot be asked of wall-clock strings without it.
+                    let ends_at = spot
+                        .timezone
+                        .as_deref()
+                        .and_then(|tz| schedule::ends_at(&requested, tz))
+                        .context_unprocessable_entity(NOT_READY)?;
 
-        let created = BookingCreated {
-            booking_id,
-            spot_id: spot_key,
-            owner_id,
-            renter_id: *renter_id,
-            booked: requested.clone(),
-            amount_cents,
-            expires_at: Utc::now() + HOLD,
-            ends_at,
-        };
+                    let created = BookingCreated {
+                        booking_id,
+                        spot_id: spot_key,
+                        host_id,
+                        renter_id: *renter_id,
+                        booked: requested.clone(),
+                        amount_cents,
+                        expires_at: Utc::now() + HOLD,
+                        ends_at,
+                    };
 
-        BookingRepository::upsert(&mut *tx, Booking::created(created.clone(), Utc::now(), 1))
+                    BookingRepository::upsert(
+                        conn,
+                        Booking::created(created.clone(), Utc::now(), 1),
+                    )
+                    .await?;
+
+                    let envelope = Envelope::new(
+                        BookingEvent::Created(created),
+                        Some(*renter_id),
+                        aggregate_id("booking", &booking_id),
+                        1,
+                    );
+                    outbox::enqueue(conn, &booking_subject(&spot_key), &envelope).await?;
+                    Ok(1)
+                }
+                .scope_boxed()
+            })
             .await?;
-
-        let envelope = Envelope::new(
-            BookingEvent::Created(created),
-            Some(*renter_id),
-            aggregate_id("booking", &booking_id),
-            1,
-        );
-        outbox::enqueue(&mut *tx, &booking_subject(&spot_key), &envelope).await?;
-        tx.commit().await?;
 
         Ok(CreatedResponse {
             id: booking_id,
-            seq: format_version(&aggregate_id("booking", &booking_id), 1),
+            seq: format_version(&aggregate_id("booking", &booking_id), seq_version),
         })
     }
 
@@ -201,7 +225,8 @@ impl BookingService {
     /// booked over a lapsed hold are both reasons to let the hold go, not to refuse
     /// and leave it blocking the spot for the rest of [`HOLD`].
     pub async fn release(&self, renter_id: &Uuid, booking_id: &Uuid) -> MyResult<String> {
-        let booking = BookingRepository::find_by_id(&self.db, *booking_id)
+        let mut read = db::conn(&self.db).await?;
+        let booking = BookingRepository::find_by_id(&mut read, *booking_id)
             .await?
             .context_not_found(NOT_FOUND)?;
 
@@ -236,12 +261,13 @@ impl BookingService {
     /// The deadline below is the one thing this adds, and it is about the host's
     /// evening rather than about the slots.
     pub async fn cancel(&self, renter_id: &Uuid, booking_id: &Uuid) -> MyResult<String> {
-        let booking = BookingRepository::find_by_id(&self.db, *booking_id)
+        let mut read = db::conn(&self.db).await?;
+        let booking = BookingRepository::find_by_id(&mut read, *booking_id)
             .await?
             .context_not_found(NOT_FOUND)?;
         authorize(&booking, renter_id, status::CONFIRMED)?;
 
-        let timezone = SpotMirrorRepository::find_by_id(&self.db, booking.spot_id)
+        let timezone = SpotMirrorRepository::find_by_id(&mut read, booking.spot_id)
             .await?
             .and_then(|s| s.timezone);
 
@@ -295,22 +321,31 @@ impl BookingService {
         cancel: Option<&str>,
         event: BookingEvent,
     ) -> MyResult<String> {
-        let mut tx = self.db.begin().await?;
-        let version = db::next_version(&mut tx, "booking", &booking_id).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        BookingRepository::transition(&mut *tx, booking_id, to, from, release, cancel).await?;
-        db::set_version(&mut tx, "booking", &booking_id, version).await?;
+        let await_token = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    let version = shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
 
-        let envelope = Envelope::new(
-            event,
-            Some(*renter_id),
-            aggregate_id("booking", &booking_id),
-            version,
-        );
-        let await_token = format_version(&envelope.aggregate, envelope.version);
+                    BookingRepository::transition(conn, booking_id, to, from, release, cancel)
+                        .await?;
+                    shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking_id, version)?;
 
-        outbox::enqueue(&mut *tx, &booking_subject(&spot_id), &envelope).await?;
-        tx.commit().await?;
+                    let envelope = Envelope::new(
+                        event,
+                        Some(*renter_id),
+                        aggregate_id("booking", &booking_id),
+                        version,
+                    );
+                    let await_token = format_version(&envelope.aggregate, envelope.version);
+
+                    outbox::enqueue(conn, &booking_subject(&spot_id), &envelope).await?;
+                    Ok(await_token)
+                }
+                .scope_boxed()
+            })
+            .await?;
 
         Ok(await_token)
     }
@@ -332,7 +367,8 @@ impl BookingService {
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
 
-        for booking in BookingRepository::all(&self.db).await? {
+        let mut read = db::conn(&self.db).await?;
+        for booking in BookingRepository::all(&mut read).await? {
             // One timestamp for the whole chain. Unlike a spot's, a booking's row
             // keeps no record of when it settled — `created_at` is the only clock
             // there is, and nothing downstream stores a settlement time anyway.

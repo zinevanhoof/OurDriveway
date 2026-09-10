@@ -62,7 +62,7 @@ pub struct UpdateUserRequest {
 ///
 /// Same trust boundary as a spot's photos: it comes straight back from the client
 /// and is rendered as an `<img src>` anywhere this user appears — on their own
-/// profile, in a spot's owner card, on a booking row.
+/// profile, in a spot's host card, on a booking row.
 fn is_avatar(url: &String, _: &()) -> garde::Result {
     require(
         crate::media::is_media_url(url, crate::media::PREFIX_AVATARS),
@@ -101,7 +101,10 @@ mod tests {
         };
 
         assert!(country("BE").validate().is_ok());
-        assert!(country("be").validate().is_ok(), "case is normalised, not refused");
+        assert!(
+            country("be").validate().is_ok(),
+            "case is normalised, not refused"
+        );
         assert_eq!(
             country("be").country.unwrap().into_inner(),
             "BE",

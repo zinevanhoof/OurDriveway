@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 // No `ViewPayoutPatch`, even though a payout is no longer written once: the only column
@@ -14,16 +15,17 @@ use uuid::Uuid;
 /// read as one of the four sources of a wallet month rather than as a list of their
 /// own: withdrawals beside the charges they came from is the point.
 ///
-/// There is no `owner` link column any more, and nothing to relink: the read model
+/// There is no `host` link column any more, and nothing to relink: the read model
 /// holds plain uuids and resolves references with a LEFT JOIN at read time.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::view::payout)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct ViewPayout {
     pub id: Uuid,
     /// The owning service's version of this aggregate. What `bus::await_version`
     /// compares a client's `X-Await-Version` against.
-    #[sqlx(try_from = "i64")]
-    pub version: u64,
-    pub owner_id: Uuid,
+    pub version: i64,
+    pub host_id: Uuid,
     /// EUR cents.
     pub amount: i64,
     /// `requested`, `paid` or `failed`, mirrored from payment-service. No enum and no
@@ -38,7 +40,7 @@ pub struct ViewPayout {
 
 // No unit tests: no patch struct to keep in step and no SQL in this file.
 //
-// `a_payout_upsert_clears_then_relinks_owner` is gone with the thing it tested. It
-// existed because a `CONTENT $row` write CLEARED the `owner` record link and
-// `link_owner` had to put it back in the same transaction — a two-halves-must-both-run
+// `a_payout_upsert_clears_then_relinks_host` is gone with the thing it tested. It
+// existed because a `CONTENT $row` write CLEARED the `host` record link and
+// `link_host` had to put it back in the same transaction — a two-halves-must-both-run
 // sequence that only a database could check. There is no link and no second half now.

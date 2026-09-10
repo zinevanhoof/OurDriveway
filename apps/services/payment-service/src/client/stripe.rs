@@ -47,7 +47,7 @@ const BOOKING_ID_KEY: &str = "booking_id";
 /// Our host id, set on the connected account. Never read back — the mapping this
 /// service trusts is the `connect_account` row, and this exists so a human looking at a
 /// Stripe dashboard can tell whose account they are looking at.
-const OWNER_ID_KEY: &str = "owner_id";
+const HOST_ID_KEY: &str = "host_id";
 
 /// Our payout id, set on the transfer. Same job, one row further down.
 const PAYOUT_ID_KEY: &str = "payout_id";
@@ -452,12 +452,12 @@ impl Stripe {
     ///
     /// for the next 24 hours — a host locked out of onboarding by a bug that is already
     /// fixed. The key therefore carries a version of the *request shape*, not just the
-    /// owner. Change any field in the body below and bump it, or every host who already
+    /// host. Change any field in the body below and bump it, or every host who already
     /// tried waits a day. It has been bumped for a wrong `losses` value, for a platform
     /// that had not enabled Connect yet, and now for the move to v2.
     pub async fn create_account(
         &self,
-        owner_id: &Uuid,
+        host_id: &Uuid,
         email: &str,
         country: &str,
     ) -> MyResult<String> {
@@ -480,14 +480,14 @@ impl Stripe {
             },
             // Our id on their object, so a Stripe dashboard row can be traced back to a
             // host without a lookup here. The reverse direction is `connect_account`.
-            "metadata": { OWNER_ID_KEY: owner_id.to_string() },
+            "metadata": { HOST_ID_KEY: host_id.to_string() },
         });
 
         let account: V2Account = self
             .v2(
                 self.http
                     .post(V2_ACCOUNTS)
-                    .header("Idempotency-Key", format!("connect:v4:{owner_id}"))
+                    .header("Idempotency-Key", format!("connect:v4:{host_id}"))
                     .json(&body),
                 "create connected account",
             )
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn one_slot_reads_as_a_date_and_a_range() {
-        let booked = HashMap::from([("2026-08-14".to_string(), vec![slot("09:00", "11:00")])]);
+        let booked = one_slot();
         assert_eq!(describe(&booked), "Parking · 14 Aug, 09:00–11:00");
     }
 
@@ -1001,13 +1001,14 @@ mod tests {
     /// retried checkout would be refused for differing parameters.
     #[test]
     fn the_description_is_deterministic_and_starts_at_the_earliest_slot() {
-        let booked = HashMap::from([
+        let booked: Booked = HashMap::from([
             (
                 "2026-08-15".to_string(),
                 vec![slot("14:00", "15:00"), slot("08:00", "09:00")],
             ),
             ("2026-08-14".to_string(), vec![slot("09:00", "11:00")]),
-        ]);
+        ])
+        .into();
 
         let once = describe(&booked);
         for _ in 0..50 {
@@ -1027,7 +1028,7 @@ mod tests {
         assert_eq!(pretty_date("nonsense"), "nonsense");
         // Never empty: an intent with no slots would otherwise get a blank product name,
         // which Stripe rejects.
-        assert_eq!(describe(&HashMap::new()), "Parking");
+        assert_eq!(describe(&Booked::new()), "Parking");
     }
 
     fn card(images: usize) -> SpotCard {
@@ -1039,7 +1040,7 @@ mod tests {
     }
 
     fn one_slot() -> Booked {
-        HashMap::from([("2026-08-14".to_string(), vec![slot("09:00", "11:00")])])
+        HashMap::from([("2026-08-14".to_string(), vec![slot("09:00", "11:00")])]).into()
     }
 
     #[test]

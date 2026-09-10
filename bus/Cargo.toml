@@ -22,7 +22,10 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 
-sqlx = { workspace = true }
+# sqlx is gone from this crate: `bus` was ported first because `Projector::apply` and
+# `outbox::enqueue` are what every service's write path threads a connection through.
+diesel = { workspace = true }
+diesel-async = { workspace = true }
 
 shared = { path = "../shared" }
 

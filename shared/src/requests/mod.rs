@@ -1,4 +1,5 @@
 pub mod booking;
+pub mod media;
 pub mod payment;
 pub mod spot;
 pub mod user;

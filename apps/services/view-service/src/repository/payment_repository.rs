@@ -1,6 +1,8 @@
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::view::payment::{ViewPayment, ViewPaymentPatch};
 use shared::error::myerror::MyResult;
-use sqlx::PgExecutor;
+use shared::schema::view::payment;
 use uuid::Uuid;
 
 /// The `payment` table in the read model.
@@ -15,33 +17,14 @@ impl ViewPaymentRepository {
     /// Insert-or-replace the whole row, from `PaymentCreated`.
     ///
     /// Idempotent by construction, which is what lets the projector replay the event.
-    pub async fn upsert(ex: impl PgExecutor<'_>, payment: ViewPayment) -> MyResult<()> {
-        sqlx::query(
-            "INSERT INTO payment
-                 (id, version, booking_id, owner_id, renter_id, amount, status,
-                  created_at, refunded_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (id) DO UPDATE SET
-                 version     = EXCLUDED.version,
-                 booking_id  = EXCLUDED.booking_id,
-                 owner_id    = EXCLUDED.owner_id,
-                 renter_id   = EXCLUDED.renter_id,
-                 amount      = EXCLUDED.amount,
-                 status      = EXCLUDED.status,
-                 created_at  = EXCLUDED.created_at,
-                 refunded_at = EXCLUDED.refunded_at",
-        )
-        .bind(payment.id)
-        .bind(payment.version as i64)
-        .bind(payment.booking_id)
-        .bind(payment.owner_id)
-        .bind(payment.renter_id)
-        .bind(payment.amount)
-        .bind(payment.status)
-        .bind(payment.created_at)
-        .bind(payment.refunded_at)
-        .execute(ex)
-        .await?;
+    pub async fn upsert(conn: &mut AsyncPgConnection, row: ViewPayment) -> MyResult<()> {
+        diesel::insert_into(payment::table)
+            .values(row.clone())
+            .on_conflict(payment::id)
+            .do_update()
+            .set(row)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
@@ -60,21 +43,14 @@ impl ViewPaymentRepository {
     /// `COALESCE($n, column)` is absent-is-unchanged, and is also the ceiling: no patch
     /// can set a column back to NULL. Nothing un-refunds a payment.
     pub async fn transition(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         payment_id: Uuid,
         patch: ViewPaymentPatch,
     ) -> MyResult<()> {
-        sqlx::query(
-            "UPDATE payment SET
-                 status      = COALESCE($2, status),
-                 refunded_at = COALESCE($3, refunded_at)
-             WHERE id = $1",
-        )
-        .bind(payment_id)
-        .bind(patch.status)
-        .bind(patch.refunded_at)
-        .execute(ex)
-        .await?;
+        diesel::update(payment::table.find(payment_id))
+            .set(&patch)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 }

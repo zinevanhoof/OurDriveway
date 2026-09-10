@@ -83,7 +83,7 @@ pub enum PaymentEvent {
     PayoutRequested {
         payout_id: Uuid,
         /// The host.
-        owner_id: Uuid,
+        host_id: Uuid,
         amount_cents: i64,
         requested_at: DateTime<Utc>,
     },
@@ -95,9 +95,9 @@ pub enum PaymentEvent {
     /// second reading of "already paid".
     PayoutPaid {
         payout_id: Uuid,
-        /// Carried so this lands on the same `payments.payout.<owner>` subject as the
+        /// Carried so this lands on the same `payments.payout.<host>` subject as the
         /// request, which is what keeps one payout's three events in order.
-        owner_id: Uuid,
+        host_id: Uuid,
         transfer_id: String,
         /// Off the event, never a projector's clock — every replica must date it the
         /// same. Same rule as `Refunded::refunded_at`.
@@ -112,7 +112,7 @@ pub enum PaymentEvent {
     /// failed row drops straight back out of the balance.
     PayoutFailed {
         payout_id: Uuid,
-        owner_id: Uuid,
+        host_id: Uuid,
         /// Stripe's message, for the log. Never rendered to a host — a failed payout is
         /// filtered out of the wallet entirely.
         reason: String,
@@ -161,7 +161,7 @@ pub struct PaymentCreated {
     pub booking_id: Uuid,
     /// The host who earns this. Denormalized so the earnings query is one indexed
     /// scan of `payment` and never joins back through the booking projection.
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     /// From the verified JWT claim. Who is paying.
     pub renter_id: Uuid,
     /// Stripe's `cs_…`. Known as soon as the session exists, which is what makes it the

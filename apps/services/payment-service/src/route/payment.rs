@@ -65,7 +65,7 @@ pub async fn session_state(
     }))
 }
 
-// `GET /api/payment/earnings` was here. It is `GET /api/view/me/balance` now — reads
+// `GET /api/payment/earnings` was here. It is `GET /api/view/host/balance` now — reads
 // are view-service's, and that one also answers what is still pending, which this
 // service had no table to compute.
 //

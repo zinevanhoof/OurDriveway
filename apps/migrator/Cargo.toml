@@ -1,0 +1,24 @@
+[package]
+name = "migrator"
+version = "0.1.0"
+edition.workspace = true
+
+# lib + bin. The lib exists so the `#[ignore]`d live tests in every service can call
+# `migrator::run_all` instead of each carrying its own copy of the migration wiring —
+# which is what the five `sqlx::migrate!` call sites in the test `db()` helpers were.
+[lib]
+name = "migrator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "migrator"
+path = "src/main.rs"
+
+[dependencies]
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+diesel_migrations = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }

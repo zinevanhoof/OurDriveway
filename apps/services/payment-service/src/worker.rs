@@ -12,13 +12,13 @@
 use std::{sync::Arc, time::Duration};
 
 use bus::Worker;
+use shared::db::Db;
 use shared::{
     error::myerror::{MyError, MyResult},
     events::{
         Envelope, STREAM_BOOKINGS, STREAM_PAYMENTS, booking::BookingEvent, payment::PaymentEvent,
     },
 };
-use sqlx::PgPool;
 
 use crate::service::{
     payout_worker_service::PayoutWorkerService, settlement_worker_service::SettlementWorkerService,
@@ -35,7 +35,7 @@ pub struct BookingWorker {
     pub service: Arc<SettlementWorkerService>,
     /// Read to check the booking mirror's version before deciding. Not written —
     /// that is `BookingProjector`'s job, on the same rows.
-    pub db: PgPool,
+    pub db: Db,
 }
 
 impl Worker for BookingWorker {
@@ -71,8 +71,15 @@ impl Worker for BookingWorker {
         // money, and the whole point of waiting is that the decision reads state
         // including the event that prompted it. The NAK is the retry.
         let version = envelope.version;
-        if !bus::await_version::reached(&self.db, "booking", &booking_id, version, PROJECTION_WAIT)
-            .await
+        if !bus::await_version::reached(
+            &self.db,
+            crate::version_of,
+            "booking",
+            &booking_id,
+            version,
+            PROJECTION_WAIT,
+        )
+        .await
         {
             return Err(MyError::Bus(format!(
                 "{STREAM_BOOKINGS} mirror of booking:{booking_id} has not reached \

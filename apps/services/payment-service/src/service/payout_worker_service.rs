@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use bus::outbox;
 use chrono::Utc;
+use diesel_async::AsyncConnection;
+use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::{
     domain_models::payment::{PayoutPatch, payout::status},
@@ -29,14 +31,13 @@ use uuid::Uuid;
 use crate::{
     client::stripe::{Stripe, Transferred},
     repository::{
-        connect_account_repository::ConnectAccountRepository,
-        payout_repository::PayoutRepository,
+        connect_account_repository::ConnectAccountRepository, payout_repository::PayoutRepository,
     },
 };
 
 pub struct PayoutWorkerService {
     /// The pool. See the note on `PaymentService::db` — the repositories are stateless.
-    pub db: sqlx::PgPool,
+    pub db: shared::db::Db,
     pub stripe: Arc<Stripe>,
 }
 
@@ -68,7 +69,8 @@ impl PayoutWorkerService {
         // A payout we have never heard of means our own commit has not landed, which
         // cannot happen — the event is enqueued in the same transaction as the row.
         // Erroring rather than skipping, so if it ever does, the NAK finds it.
-        let payout = PayoutRepository::find_by_id(&self.db, *payout_id)
+        let mut read = db::conn(&self.db).await?;
+        let payout = PayoutRepository::find_by_id(&mut read, *payout_id)
             .await?
             .ok_or_else(|| MyError::Bus(format!("payout {payout_id} not written; retrying")))?;
 
@@ -82,16 +84,17 @@ impl PayoutWorkerService {
         // silently marking the payout failed — a NAK retries, and a host who genuinely
         // has no account is a bug worth seeing in the log rather than a withdrawal
         // that quietly evaporates.
-        let account_id = ConnectAccountRepository::find(&self.db, &payout.owner_id)
+        let mut read = db::conn(&self.db).await?;
+        let account_id = ConnectAccountRepository::find(&mut read, &payout.host_id)
             .await?
             .ok_or_else(|| {
                 MyError::Bus(format!(
                     "payout {payout_id} is for host {} with no connected account",
-                    payout.owner_id
+                    payout.host_id
                 ))
             })?;
 
-        let owner_id = payout.owner_id;
+        let host_id = payout.host_id;
         let (patch, event) = match self
             .stripe
             .transfer(&account_id, payout.amount_cents, payout_id)
@@ -103,7 +106,7 @@ impl PayoutWorkerService {
                     PayoutPatch::paid(transfer_id.clone()),
                     PaymentEvent::PayoutPaid {
                         payout_id: *payout_id,
-                        owner_id,
+                        host_id,
                         transfer_id,
                         // Read once, here, and used for the row and the event alike —
                         // same rule as `Refunded::refunded_at`.
@@ -121,7 +124,7 @@ impl PayoutWorkerService {
                     PayoutPatch::failed(reason.clone()),
                     PaymentEvent::PayoutFailed {
                         payout_id: *payout_id,
-                        owner_id,
+                        host_id,
                         reason,
                         failed_at: Utc::now(),
                     },
@@ -129,28 +132,38 @@ impl PayoutWorkerService {
             }
         };
 
-        let mut tx = self.db.begin().await?;
-        let version = db::next_version(&mut tx, "payout", payout_id).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        // The row moves in the same transaction as the event, guarded on the status the
-        // decision was made from.
-        PayoutRepository::transition(&mut *tx, *payout_id, &[status::REQUESTED], patch).await?;
-        db::set_version(&mut tx, "payout", payout_id, version).await?;
+        conn.transaction::<_, MyError, _>(|conn| {
+            async move {
+                let version = shared::next_version!(conn, shared::schema::payment::payout, payout_id)?;
 
-        // Deterministic event id: a redelivery that gets this far — because Stripe
-        // answered but the commit did not — is discarded by the stream's duplicate
-        // window rather than recorded twice.
-        let mut envelope = Envelope::new(
-            event,
-            Some(owner_id),
-            aggregate_id("payout", payout_id),
-            version,
-        );
-        envelope.event_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("payout:{payout_id}").as_bytes());
+                // The row moves in the same transaction as the event, guarded on the status the
+                // decision was made from.
+                PayoutRepository::transition(conn, *payout_id, &[status::REQUESTED], patch).await?;
+                shared::set_version!(conn, "payout", shared::schema::payment::payout, payout_id, version)?;
 
-        // The same subject as the request, so one payout's events stay in order.
-        outbox::enqueue(&mut *tx, &payout_subject(&owner_id), &envelope).await?;
-        tx.commit().await?;
+                // Deterministic event id: a redelivery that gets this far — because Stripe
+                // answered but the commit did not — is discarded by the stream's duplicate
+                // window rather than recorded twice.
+                let mut envelope = Envelope::new(
+                    event,
+                    Some(host_id),
+                    aggregate_id("payout", payout_id),
+                    version,
+                );
+                envelope.event_id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_OID,
+                    format!("payout:{payout_id}").as_bytes(),
+                );
+
+                // The same subject as the request, so one payout's events stay in order.
+                outbox::enqueue(conn, &payout_subject(&host_id), &envelope).await?;
+                Ok(())
+            }
+            .scope_boxed()
+        })
+        .await?;
 
         Ok(())
     }

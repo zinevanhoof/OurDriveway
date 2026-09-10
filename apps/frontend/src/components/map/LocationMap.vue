@@ -62,7 +62,7 @@ const { data: spotsInRadius } = useQuery({
 });
 
 // Full detail for the selected pin, fetched on click (disabled until then) so nothing
-// runs at render time and there is one query total, not one per pin. The owner's
+// runs at render time and there is one query total, not one per pin. The host's
 // profile comes back on the same response — a LEFT JOIN now rather than a record link.
 //
 // `staleTime: 0` because this is the one read someone books against, and cached

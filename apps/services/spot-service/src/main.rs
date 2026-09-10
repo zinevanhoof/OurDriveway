@@ -18,6 +18,15 @@ mod repository;
 mod route;
 mod service;
 
+bus::version_reader! {
+    /// What this service can answer an `X-Await-Version` header about: its own `spot`
+    /// rows, and nothing else. Anything else a client echoes here — a booking it just
+    /// made, say — is `Unavailable`, so the request proceeds instead of waiting two
+    /// seconds for a table this database does not have.
+    fn version_of;
+    "spot" => shared::schema::spot::spot,
+}
+
 /// `SpotService` is built once at boot, not per request. It used to be assembled
 /// inside the `DbAuthenticated` extractor on every call, purely so the connection
 /// could be re-authenticated with the caller's JWT — which is exactly the pattern
@@ -81,7 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
     let db = shared::db::connect(&CONFIG.database_url).await?;
-    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/spot")).await?;
+    // Schema is NOT applied here. `apps/migrator` is the only thing that migrates —
+    // one Compose one-shot in dev, one Helm hook Job in production — because
+    // diesel_migrations takes no lock around a run and `replicas: N` would race.
+    // This process assumes its database exists and is current, and fails at connect
+    // above if it does not.
 
     // One pool for the whole process — election, relay, handlers, the card RPC and
     // the await layer all share it. `PgPool` is `Arc` inside, so a clone is a
@@ -95,8 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // which the outbox relay still needs.
     let readiness = bus::Readiness::new(js.client().clone(), &[]);
 
-
-    // The projector is the only *writer* to `db`. The service reads a spot's owner
+    // The projector is the only *writer* to `db`. The service reads a spot's host
     // before it publishes an edit — it still writes nothing, so the dual-write the
     // split avoids stays avoided.
     //
@@ -104,7 +116,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // projector and no worker, so there is nothing else here an election would gate.
     // The relay has no backstop of its own, so exactly one instance may run it.
     let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
-
 
     // Carries every SPOTS event this service commits. This is now the only path by
     // which they reach NATS.
@@ -138,7 +149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // row is one point read either way, and a second projection shape
                 // was one more thing to keep in step with the table.
                 async move {
-                    SpotRepository::find_by_id(&db, spot_id)
+                    // A connection per RPC, released as soon as the read is done.
+                    let mut conn = shared::db::conn(&db).await.ok()?;
+                    SpotRepository::find_by_id(&mut conn, spot_id)
                         .await
                         .ok()
                         .flatten()
@@ -168,7 +181,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // view-service from the combined projection. This database is private to
     // this service — no browser identity can reach it at all.
 
-
     let app = Router::new()
         .merge(api_router)
         // On the API only, and before health is merged: `/readyz` reporting how far
@@ -176,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Waits on the aggregate versions a client echoes back, against this
         // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            bus::AwaitVersions(await_db),
+            bus::AwaitVersions(await_db, version_of),
             bus::await_version::await_version,
         ))
         // After the layer, deliberately — a backfill is not a client read and has

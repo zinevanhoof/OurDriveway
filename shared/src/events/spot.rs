@@ -38,7 +38,7 @@ impl SpotEvent {
 pub struct SpotCreated {
     pub spot_id: Uuid,
     /// From the verified JWT claim.
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     pub title: String,
     pub description: Option<String>,
     /// EUR cents. Never a float: this feeds the amount a renter is charged, and

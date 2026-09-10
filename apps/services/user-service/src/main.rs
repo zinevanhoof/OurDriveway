@@ -66,6 +66,15 @@ mod repository;
 mod route;
 mod service;
 
+bus::version_reader! {
+    /// The two aggregates this service stores. Anything else a client echoes back is
+    /// `Unavailable` — nothing here to wait for, so the request proceeds rather than
+    /// spending the timeout on a table this database does not have.
+    fn version_of;
+    "user" => shared::schema::user::app_user,
+    "refresh_token" => shared::schema::user::refresh_token,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
@@ -88,13 +97,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let db = shared::db::connect(&CONFIG.database_url).await?;
 
-    // Applied by every replica at boot, which is safe: sqlx takes an advisory lock
-    // around the run, and each service owns its own database so the only contention
-    // is between replicas of this one. This replaced a ConfigMap of schema files, a
-    // `--set-file` loop in deploy.sh, and a post-install Job that POSTed them — the
-    // SQL is embedded in this binary, so there is nothing to mount and nothing that
-    // can drift from the image.
-    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/user")).await?;
+    // Schema is NOT applied here. `apps/migrator` is the only thing that migrates —
+    // one Compose one-shot in dev, one Helm hook Job in production — because
+    // diesel_migrations takes no lock around a run and `replicas: N` would race.
+    // This process assumes its database exists and is current, and fails at connect
+    // above if it does not.
 
     // One pool for the whole process — election, relay, handlers and the await layer
     // all share it. `PgPool` is `Arc` inside, so a clone is a refcount bump; a
@@ -108,8 +115,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // "is NATS reachable" — which still matters, because the outbox relay needs it.
     let readiness = bus::Readiness::new(js.client().clone(), &[]);
 
-
-
     // For the outbox relay, which is now the only thing here that must run on
     // exactly one instance. There are no projectors left to elect for: this
     // service writes its own rows inside the request's transaction, and the event
@@ -119,7 +124,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Carries every USERS and SESSIONS event this service commits. No longer
     // scaffolding — this is the only path by which those events reach NATS.
     tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
-
 
     let state = AppState {
         user_service: Arc::new(UserService { db: db.clone() }),
@@ -155,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Waits on the aggregate versions a client echoes back, against this
         // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            bus::AwaitVersions(await_db),
+            bus::AwaitVersions(await_db, version_of),
             bus::await_version::await_version,
         ))
         // After the layer, deliberately — a backfill is not a client read and has

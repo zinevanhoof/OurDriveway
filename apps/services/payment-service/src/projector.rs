@@ -1,5 +1,6 @@
 use bus::Projector;
 use chrono::{DateTime, Utc};
+use diesel_async::AsyncPgConnection;
 use shared::{
     domain_models::{
         booking::status as booking_status,
@@ -8,7 +9,6 @@ use shared::{
     error::myerror::MyResult,
     events::{STREAM_BOOKINGS, STREAM_USERS, booking::BookingEvent, user::UserEvent},
 };
-use sqlx::PgConnection;
 
 use crate::repository::{
     booking_mirror_repository::BookingMirrorRepository,
@@ -38,10 +38,10 @@ impl Projector for BookingProjector {
 
     async fn apply(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         event: BookingEvent,
         _at: DateTime<Utc>,
-        version: u64,
+        version: i64,
     ) -> MyResult<()> {
         let booking_id = event.booking_id();
 
@@ -85,7 +85,7 @@ impl Projector for BookingProjector {
             }
         }?;
 
-        shared::db::set_version(conn, "booking", &booking_id, version).await
+        shared::set_version!(conn, "booking", shared::schema::payment::booking, &booking_id, version)
     }
 }
 
@@ -94,7 +94,7 @@ impl Projector for BookingProjector {
 ///
 /// A second foreign stream, and it is here for the reason `shared::rpc` gives for not
 /// being here — a value onboarding cannot proceed without must not depend on another
-/// service answering a request. See `migrations/payment/0004_host_mirror.sql`.
+/// service answering a request. See `migrations/payment/0004_host_mirror/up.sql`.
 ///
 /// Only two of the five USERS variants matter. A password change, an email
 /// verification and a resend request change nothing Stripe is ever told.
@@ -107,23 +107,23 @@ impl Projector for UserProjector {
 
     async fn apply(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         event: UserEvent,
         _at: DateTime<Utc>,
-        version: u64,
+        version: i64,
     ) -> MyResult<()> {
         let user_id = event.user_id();
 
         match event {
             UserEvent::Registered(e) => {
-                HostMirrorRepository::upsert(&mut *conn, &user_id, version, &e.email).await
+                HostMirrorRepository::upsert(&mut *conn, &user_id, &e.email).await
             }
 
             // `None` is unchanged in the event and unchanged in the write — the same
             // rule the profile form sends. A country arrives only this way: it is not
             // asked for at signup.
             UserEvent::Updated(e) => {
-                HostMirrorRepository::patch(&mut *conn, &user_id, version, e.email, e.country).await
+                HostMirrorRepository::patch(&mut *conn, &user_id, e.email, e.country).await
             }
 
             // Deliberately ignored, and each for its own reason: a password hash must
@@ -132,7 +132,17 @@ impl Projector for UserProjector {
             _ => Ok(()),
         }?;
 
-        shared::db::set_version(conn, "user", &user_id, version).await
+        // `host`, not `app_user`. This line used to say `set_version(conn, "user", …)`,
+        // which resolved through an allowlist to `app_user` — a table this database does
+        // not have — so a runtime catalogue check turned it into a silent no-op on every
+        // USERS event. The typed table is what surfaced that: `shared::schema::payment`
+        // declares no `app_user`, so the old spelling no longer compiles.
+        //
+        // The aggregate stays `"user"` because that is the protocol name — what the log
+        // line and a client's `user:<id>@N` token spell — while `host` is where this
+        // service happens to keep it. They differ here exactly as `user`/`app_user` do
+        // everywhere else.
+        shared::set_version!(conn, "user", shared::schema::payment::host, &user_id, version)
     }
 }
 

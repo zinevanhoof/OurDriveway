@@ -4,21 +4,24 @@ use chrono::NaiveDate;
 use garde::Validate;
 // Serialize is here because these types travel inside events on the wire, not
 // just into the database.
+use diesel::deserialize::FromSqlRow;
+use diesel::expression::AsExpression;
 use serde::{Deserialize, Serialize};
 
 use crate::validation::require;
 
 // These four are stored as `jsonb` columns rather than as flattened scalars and
 // nested arrays, so they need no database-specific derive at all — `Serialize` and
-// `Deserialize` are the whole contract, and the field carrying them is marked
-// `#[sqlx(json)]` on the owning model.
+// `Deserialize` are the whole contract, and the owning model's field goes through a
+// `jsonb_column!` wrapper (see `shared::diesel_ext`).
 //
 // That is a real simplification over what it replaced: the SurrealDB schema spelled
 // out every leaf, down to `availability.weekly.*.*.start`, because SCHEMAFULL demanded
 // it. Nothing in any query reaches into these — they are read and written whole — so
 // the leaves were declaration without leverage.
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, AsExpression, FromSqlRow)]
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
 #[serde(rename_all = "camelCase")]
 pub struct Address {
     pub line1: String,
@@ -45,7 +48,8 @@ pub struct Address {
 /// depends on *when* it is being asked stays on the request field, because a stored
 /// grid may legitimately violate it: see `no_past_dates` in
 /// `requests::spot::availability`, which a spot listed last March fails and should.
-#[derive(Clone, Debug, Serialize, Deserialize, Validate)]
+#[derive(Clone, Debug, Serialize, Deserialize, Validate, AsExpression, FromSqlRow)]
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
 pub struct Availability {
     #[garde(dive)]
     pub weekly: WeeklyAvailability,
@@ -141,3 +145,8 @@ fn check_time(value: &str) -> garde::Result {
         "Time must be in 30 minute increments.",
     )
 }
+
+// `address` and `availability` are `jsonb` columns. The impls go on the types rather
+// than through a wrapper — see `crate::jsonb_column` for why.
+crate::jsonb_column!(Address);
+crate::jsonb_column!(Availability);

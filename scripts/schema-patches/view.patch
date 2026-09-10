@@ -1,0 +1,20 @@
+--- a/view.rs
++++ b/view.rs
+@@ -8,7 +8,7 @@
+         last_name -> Text,
+         profile_picture -> Nullable<Text>,
+         email -> Text,
+-        license_plates -> Array<Nullable<Text>>,
++        license_plates -> Array<Text>,
+         country -> Nullable<Text>,
+     }
+ }
+@@ -65,7 +65,7 @@
+         title -> Text,
+         description -> Nullable<Text>,
+         price_per_hour -> Int8,
+-        images -> Array<Nullable<Text>>,
++        images -> Array<Text>,
+         lng -> Float8,
+         lat -> Float8,
+         active -> Bool,

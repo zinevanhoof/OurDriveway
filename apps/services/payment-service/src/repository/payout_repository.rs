@@ -1,48 +1,37 @@
+use diesel::dsl::sum;
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::diesel_ext::to_bigint;
 use shared::domain_models::payment::payout::status;
 use shared::domain_models::payment::{Payout, PayoutPatch};
 use shared::error::myerror::MyResult;
-use sqlx::PgExecutor;
+use shared::schema::payment::payout;
 use uuid::Uuid;
 
 /// The `payout` table.
 pub struct PayoutRepository;
 
 impl PayoutRepository {
-    pub async fn upsert(ex: impl PgExecutor<'_>, payout: Payout) -> MyResult<()> {
-        sqlx::query(
-            "INSERT INTO payout
-                 (id, version, owner_id, amount_cents, status, transfer_id,
-                  failure_reason, created_at)
-                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (id) DO UPDATE SET
-                 version        = EXCLUDED.version,
-                 owner_id       = EXCLUDED.owner_id,
-                 amount_cents   = EXCLUDED.amount_cents,
-                 status         = EXCLUDED.status,
-                 transfer_id    = EXCLUDED.transfer_id,
-                 failure_reason = EXCLUDED.failure_reason,
-                 created_at     = EXCLUDED.created_at",
-        )
-        .bind(payout.id)
-        .bind(payout.version as i64)
-        .bind(payout.owner_id)
-        .bind(payout.amount_cents)
-        .bind(payout.status)
-        .bind(payout.transfer_id)
-        .bind(payout.failure_reason)
-        .bind(payout.created_at)
-        .execute(ex)
-        .await?;
+    pub async fn upsert(conn: &mut AsyncPgConnection, row: Payout) -> MyResult<()> {
+        diesel::insert_into(payout::table)
+            .values(row.clone())
+            .on_conflict(payout::id)
+            .do_update()
+            .set(row)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
     /// One payout, by id. The worker's only read: it is handed an id on an event and
-    /// needs the amount, the owner and — above all — the status.
-    pub async fn find_by_id(ex: impl PgExecutor<'_>, id: Uuid) -> MyResult<Option<Payout>> {
-        Ok(sqlx::query_as("SELECT * FROM payout WHERE id = $1")
-            .bind(id)
-            .fetch_optional(ex)
-            .await?)
+    /// needs the amount, the host and — above all — the status.
+    pub async fn find_by_id(conn: &mut AsyncPgConnection, id: Uuid) -> MyResult<Option<Payout>> {
+        Ok(payout::table
+            .find(id)
+            .select(Payout::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// Patch a payout only if it is currently in one of `from` — the same shape, and
@@ -57,24 +46,18 @@ impl PayoutRepository {
     /// `Option<String>`, so a swapped pair compiles and writes a transfer id into
     /// `failure_reason`.
     pub async fn transition(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         payout_id: Uuid,
         from: &[&str],
         patch: PayoutPatch,
     ) -> MyResult<()> {
-        sqlx::query(
-            "UPDATE payout SET
-                 status         = COALESCE($3, status),
-                 transfer_id    = COALESCE($4, transfer_id),
-                 failure_reason = COALESCE($5, failure_reason)
-             WHERE id = $1 AND status = ANY($2)",
+        diesel::update(
+            payout::table.find(payout_id).filter(
+                payout::status.eq_any(from.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+            ),
         )
-        .bind(payout_id)
-        .bind(from.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        .bind(patch.status)
-        .bind(patch.transfer_id)
-        .bind(patch.failure_reason)
-        .execute(ex)
+        .set(&patch)
+        .execute(conn)
         .await?;
         Ok(())
     }
@@ -87,8 +70,8 @@ impl PayoutRepository {
     /// rebuild.
     ///
     /// ponytail: whole table in one pass, same ceiling and same fix as the others.
-    pub async fn all(ex: impl PgExecutor<'_>) -> MyResult<Vec<Payout>> {
-        Ok(sqlx::query_as("SELECT * FROM payout").fetch_all(ex).await?)
+    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<Payout>> {
+        Ok(payout::table.select(Payout::as_select()).load(conn).await?)
     }
 
     /// Everything this host has already withdrawn **or is withdrawing**.
@@ -97,7 +80,7 @@ impl PayoutRepository {
     ///
     /// `COALESCE` because SUM over no rows is NULL, and a host who has never withdrawn
     /// is the ordinary case. `::bigint` because `SUM(bigint)` returns **numeric** —
-    /// Postgres widens to avoid overflow, and sqlx will not decode that into an i64.
+    /// Postgres widens to avoid overflow, and nothing decodes numeric into an i64.
     ///
     /// # The status filter is the money rule
     ///
@@ -113,24 +96,28 @@ impl PayoutRepository {
     ///
     /// view-service's wallet queries filter on the same three values. They are the same
     /// arithmetic over two databases and must not drift.
-    pub async fn total_for(ex: impl PgExecutor<'_>, owner_id: &Uuid) -> MyResult<i64> {
-        Ok(sqlx::query_scalar(
-            "SELECT COALESCE(SUM(amount_cents), 0)::bigint
-               FROM payout
-              WHERE owner_id = $1 AND status = ANY($2)",
-        )
-        .bind(owner_id)
-        .bind(
-            status::COUNTED
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-        )
-        .fetch_one(ex)
-        .await?)
+    pub async fn total_for(conn: &mut AsyncPgConnection, host_id: &Uuid) -> MyResult<i64> {
+        // `sum()` over no rows is NULL — a host who has never withdrawn is the ordinary
+        // case — so it arrives as `None` and `unwrap_or(0)` is the default. Deliberately
+        // not `COALESCE(…, 0)` in SQL, which would flatten "never withdrew" and "withdrew
+        // nothing" into one value before Rust could tell them apart.
+        //
+        // `to_bigint` because `sum(bigint)` is numeric in Postgres, which does not decode
+        // into an `i64` — see the note on that function in `shared::diesel_ext`.
+        let total: Option<i64> = payout::table
+            .filter(
+                payout::host_id
+                    .eq(host_id)
+                    .and(payout::status.eq_any(status::COUNTED)),
+            )
+            .select(to_bigint(sum(payout::amount_cents)))
+            .first(conn)
+            .await?;
+
+        Ok(total.unwrap_or(0))
     }
 
-    /// Takes the per-owner lock that serialises two concurrent withdrawals.
+    /// Takes the per-host lock that serialises two concurrent withdrawals.
     ///
     /// # Why an advisory lock and not a row
     ///
@@ -145,7 +132,7 @@ impl PayoutRepository {
     /// be contended on. Under Read Committed that bump would not conflict either, so
     /// the table was deleted rather than ported.
     ///
-    /// `pg_advisory_xact_lock` locks the owner id itself. Xact-scoped, never the
+    /// `pg_advisory_xact_lock` locks the host id itself. Xact-scoped, never the
     /// session variant: it is released by COMMIT or ROLLBACK, so there is no unlock to
     /// forget on the `?` early-returns this path is full of, and no `Drop` that would
     /// have to await one.
@@ -153,10 +140,13 @@ impl PayoutRepository {
     /// **The balance query must come after this**, inside the same transaction. That
     /// is the half that is easy to miss: a snapshot taken before the lock is stale
     /// however long the lock is then held.
-    pub async fn lock_owner(ex: impl PgExecutor<'_>, owner_id: &Uuid) -> MyResult<()> {
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(shared::db::advisory_key(owner_id))
-            .execute(ex)
+    pub async fn lock_host(conn: &mut AsyncPgConnection, host_id: &Uuid) -> MyResult<()> {
+        // Stays `sql_query`: `pg_advisory_xact_lock` is a void-returning function call
+        // with no DSL spelling, and wrapping it would hide the one statement whose
+        // ORDER relative to the balance read is the entire mechanism.
+        diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+            .bind::<diesel::sql_types::BigInt, _>(shared::db::advisory_key(host_id))
+            .execute(conn)
             .await?;
         Ok(())
     }

@@ -1,0 +1,11 @@
+--- a/user.rs
++++ b/user.rs
+@@ -10,7 +10,7 @@
+         email_verified -> Bool,
+         profile_picture -> Nullable<Text>,
+         password -> Text,
+-        license_plates -> Array<Nullable<Text>>,
++        license_plates -> Array<Text>,
+         country -> Nullable<Text>,
+     }
+ }

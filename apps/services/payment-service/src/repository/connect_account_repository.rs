@@ -1,6 +1,8 @@
 use chrono::Utc;
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::error::myerror::MyResult;
-use sqlx::PgExecutor;
+use shared::schema::payment::connect_account;
 use uuid::Uuid;
 
 /// The `connect_account` table: which Stripe account a host is paid into.
@@ -13,13 +15,13 @@ pub struct ConnectAccountRepository;
 
 impl ConnectAccountRepository {
     /// The host's `acct_…`, or `None` if they have never started onboarding.
-    pub async fn find(ex: impl PgExecutor<'_>, owner_id: &Uuid) -> MyResult<Option<String>> {
-        Ok(
-            sqlx::query_scalar("SELECT stripe_account_id FROM connect_account WHERE owner_id = $1")
-                .bind(owner_id)
-                .fetch_optional(ex)
-                .await?,
-        )
+    pub async fn find(conn: &mut AsyncPgConnection, host_id: &Uuid) -> MyResult<Option<String>> {
+        Ok(connect_account::table
+            .find(host_id)
+            .select(connect_account::stripe_account_id)
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// Records the account, and answers with the one that ends up stored.
@@ -29,32 +31,53 @@ impl ConnectAccountRepository {
     /// PRIMARY KEY is what decides which of them wins. The loser's account is
     /// abandoned at Stripe rather than pointed at, which the idempotency key on
     /// `Stripe::create_account` already makes unlikely: both calls key on the same
-    /// owner, so Stripe usually hands back the same account to both.
+    /// host, so Stripe usually hands back the same account to both.
     ///
     /// Returning the stored value rather than the argument is the whole point. A caller
     /// that used its own id after losing this race would talk to an account no row
     /// knows about.
     pub async fn insert(
-        ex: impl PgExecutor<'_>,
-        owner_id: &Uuid,
+        conn: &mut AsyncPgConnection,
+        host_id: &Uuid,
         stripe_account_id: &str,
     ) -> MyResult<String> {
-        Ok(sqlx::query_scalar(
+        // Stays hand-written, and this is the statement least worth fighting the DSL
+        // over: a CTE whose INSERT … ON CONFLICT DO NOTHING RETURNING is UNIONed with a
+        // plain SELECT so that the loser of the race gets the winner's id back rather
+        // than nothing. diesel has no CTE builder, and expressing this as fragments
+        // would be the same string with more ceremony.
+        let rows: Vec<AccountId> = diesel::sql_query(
             "WITH inserted AS (
-                 INSERT INTO connect_account (owner_id, stripe_account_id, created_at)
+                 INSERT INTO connect_account (host_id, stripe_account_id, created_at)
                       VALUES ($1, $2, $3)
-                 ON CONFLICT (owner_id) DO NOTHING
+                 ON CONFLICT (host_id) DO NOTHING
                    RETURNING stripe_account_id
              )
              SELECT stripe_account_id FROM inserted
               UNION ALL
-             SELECT stripe_account_id FROM connect_account WHERE owner_id = $1
+             SELECT stripe_account_id FROM connect_account WHERE host_id = $1
               LIMIT 1",
         )
-        .bind(owner_id)
-        .bind(stripe_account_id)
-        .bind(Utc::now())
-        .fetch_one(ex)
-        .await?)
+        .bind::<diesel::sql_types::Uuid, _>(host_id)
+        .bind::<diesel::sql_types::Text, _>(stripe_account_id)
+        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+        .load(conn)
+        .await?;
+
+        rows.into_iter()
+            .next()
+            .map(|r| r.stripe_account_id)
+            .ok_or_else(|| {
+                shared::error::myerror::MyError::Bus(
+                    "connect_account insert returned no row".to_string(),
+                )
+            })
     }
+}
+
+/// The one column both statements above read back.
+#[derive(diesel::QueryableByName)]
+struct AccountId {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    stripe_account_id: String,
 }

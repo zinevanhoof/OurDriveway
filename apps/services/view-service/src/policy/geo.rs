@@ -53,6 +53,16 @@ pub fn bbox(lng: f64, lat: f64, meters: f64) -> (f64, f64, f64, f64) {
     )
 }
 
+/// Mean Earth radius in metres, shared by the two implementations of the haversine.
+///
+/// **Not `cfg(test)`, unlike [`haversine`] itself.** The reference implementation is a
+/// test-only check on the query; the *radius* is an input to the query, so
+/// `ViewSpotRepository::find_pins_for_public` reads it from here. One constant is what
+/// stops the release build and the thing that verifies it from disagreeing about how big
+/// the planet is — a disagreement no test could catch, because both sides would be
+/// consistent with themselves.
+pub const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
 /// Great-circle distance in metres between two lng/lat pairs.
 ///
 /// **Nothing in the request path calls this.** The distance filter runs in SQL, so the
@@ -74,16 +84,16 @@ pub fn bbox(lng: f64, lat: f64, meters: f64) -> (f64, f64, f64, f64) {
 /// it dead-code-allowed instead would leave a reader wondering which path uses it.
 #[cfg(test)]
 pub fn haversine(lng_a: f64, lat_a: f64, lng_b: f64, lat_b: f64) -> f64 {
-    const R: f64 = 6_371_000.0;
+    let r = EARTH_RADIUS_M;
 
     let (phi_a, phi_b) = (lat_a.to_radians(), lat_b.to_radians());
     let d_phi = (lat_b - lat_a).to_radians();
     let d_lambda = (lng_b - lng_a).to_radians();
 
-    let a = (d_phi / 2.0).sin().powi(2)
-        + phi_a.cos() * phi_b.cos() * (d_lambda / 2.0).sin().powi(2);
+    let a =
+        (d_phi / 2.0).sin().powi(2) + phi_a.cos() * phi_b.cos() * (d_lambda / 2.0).sin().powi(2);
 
-    2.0 * R * a.sqrt().asin()
+    2.0 * r * a.sqrt().asin()
 }
 
 #[cfg(test)]
@@ -102,8 +112,7 @@ mod tests {
         for bearing in (0..360).step_by(5) {
             let theta = (bearing as f64).to_radians();
             let d_lat = (meters * theta.cos()) / M_PER_DEG_LAT;
-            let d_lng =
-                (meters * theta.sin()) / (M_PER_DEG_LAT * lat.to_radians().cos());
+            let d_lng = (meters * theta.sin()) / (M_PER_DEG_LAT * lat.to_radians().cos());
             let (p_lat, p_lng) = (lat + d_lat, lng + d_lng);
 
             assert!(
@@ -130,7 +139,10 @@ mod tests {
     #[test]
     fn a_known_distance_is_about_right() {
         let d = haversine(4.3517, 50.8466, 4.4025, 51.2194);
-        assert!((40_000.0..=45_000.0).contains(&d), "Brussels–Antwerp was {d}m");
+        assert!(
+            (40_000.0..=45_000.0).contains(&d),
+            "Brussels–Antwerp was {d}m"
+        );
     }
 
     /// The pole is where the naive `1 / cos(lat)` blows up. The box must stay finite

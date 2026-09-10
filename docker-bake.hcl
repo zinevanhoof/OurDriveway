@@ -22,11 +22,20 @@ variable "REGISTRY" {
 // `builder` is deliberately absent: it carries no tags and is never pushed, it
 // only exists to be consumed by the service targets.
 group "default" {
-  targets = ["user-service", "booking-service", "spot-service", "view-service", "media-service", "notification-service", "payment-service", "frontend"]
+  targets = ["user-service", "booking-service", "spot-service", "view-service", "media-service", "notification-service", "payment-service", "migrator", "frontend"]
 }
 
 target "builder" {
   dockerfile = "Dockerfile.builder"
+}
+
+// Not a service, and deliberately not named like one: it runs to completion and exits.
+// It is the only thing that migrates — no service does, because diesel_migrations takes
+// no lock around a run and `replicas: N` would race. See diesel-migration.md.
+target "migrator" {
+  dockerfile = "apps/migrator/Dockerfile"
+  contexts   = { builder = "target:builder" }
+  tags       = ["${REGISTRY}/ourdriveway-migrator:${TAG}"]
 }
 
 target "user-service" {

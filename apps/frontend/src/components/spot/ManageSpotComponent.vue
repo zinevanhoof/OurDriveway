@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import Button from '../ui/button/Button.vue';
-import { fetchSpotManage, viewKeys } from '@/api/viewApi';
-import type { OwnerViewBooking } from '@/types/view';
+import { fetchHostSpot, viewKeys } from '@/api/viewApi';
+import type { HostBookingResponse } from '@/types/view';
 import { computed, ref } from 'vue';
 import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
@@ -36,8 +36,8 @@ const queryClient = useQueryClient()
 // The same key as every other reader of this spot, so the detail drawer and the booking
 // form share one cached copy.
 const { data } = useQuery({
-    queryKey: viewKeys.spotManage(id),
-    queryFn: () => fetchSpotManage(id),
+    queryKey: viewKeys.hostSpot(id),
+    queryFn: () => fetchHostSpot(id),
 })
 
 const routeToSpotEdit = () => router.push({ name: 'spot-edit', params: { id } })
@@ -144,7 +144,7 @@ const showAllBookings = ref(false)
 // until someone asks for all of it.
 // The host is a party to every booking on their own spot, so `renter` and `amount`
 // come back populated here — the same rows read by a stranger would have both null.
-const upcoming = computed<OwnerViewBooking[]>(() =>
+const upcoming = computed<HostBookingResponse[]>(() =>
     [...(data.value?.bookings ?? [])]
         .filter((b) => b.status === 'confirmed' || b.status === 'reserved')
         .sort((a, b) => a.endsAt.localeCompare(b.endsAt)))

@@ -18,8 +18,5 @@ pub async fn login(
 
     let jar = jar.add(crate::auth::cookie::set(refresh_token));
 
-    Ok((
-        jar,
-        Json(AuthResponse::new(jwt, token)),
-    ))
+    Ok((jar, Json(AuthResponse::new(jwt, token))))
 }
