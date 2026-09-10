@@ -1,8 +1,10 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::booking::Booking;
 use shared::error::myerror::MyResult;
 use shared::general_models::booking::Booked;
-use sqlx::PgExecutor;
+use shared::schema::booking::booking;
 use uuid::Uuid;
 
 /// The `booking` table.
@@ -16,13 +18,15 @@ impl BookingRepository {
     /// `SELECT *`. `spot_id` stays a plain uuid: the spot table is in another
     /// service's database and could never be dereferenced from here.
     pub async fn find_by_id(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         booking_id: Uuid,
     ) -> MyResult<Option<Booking>> {
-        Ok(sqlx::query_as("SELECT * FROM booking WHERE id = $1")
-            .bind(booking_id)
-            .fetch_optional(ex)
-            .await?)
+        Ok(booking::table
+            .find(booking_id)
+            .select(Booking::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// Every booking, for `BookingService::backfill`.
@@ -30,8 +34,11 @@ impl BookingRepository {
     /// ponytail: reads the whole table into memory in one pass, and this is the table
     /// most likely to be the one that outgrows it. Page on `id` — `WHERE id > $after
     /// ORDER BY id LIMIT $n` — when it does.
-    pub async fn all(ex: impl PgExecutor<'_>) -> MyResult<Vec<Booking>> {
-        Ok(sqlx::query_as("SELECT * FROM booking").fetch_all(ex).await?)
+    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<Booking>> {
+        Ok(booking::table
+            .select(Booking::as_select())
+            .load(conn)
+            .await?)
     }
 
     /// Insert-or-replace the whole row, keyed by its own id.
@@ -39,43 +46,14 @@ impl BookingRepository {
     /// Idempotent by construction, which is what lets a projector replay the same
     /// event. Every column of this table is owned by the BOOKINGS stream, so there is
     /// nothing for a whole-row write to erase.
-    pub async fn upsert(ex: impl PgExecutor<'_>, booking: Booking) -> MyResult<()> {
-        sqlx::query(
-            "INSERT INTO booking
-                 (id, version, spot_id, owner_id, renter_id, booked, amount, status,
-                  hold_until, release_reason, cancel_reason, ends_at, rating, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-             ON CONFLICT (id) DO UPDATE SET
-                 version        = EXCLUDED.version,
-                 spot_id        = EXCLUDED.spot_id,
-                 owner_id       = EXCLUDED.owner_id,
-                 renter_id      = EXCLUDED.renter_id,
-                 booked         = EXCLUDED.booked,
-                 amount         = EXCLUDED.amount,
-                 status         = EXCLUDED.status,
-                 hold_until     = EXCLUDED.hold_until,
-                 release_reason = EXCLUDED.release_reason,
-                 cancel_reason  = EXCLUDED.cancel_reason,
-                 ends_at        = EXCLUDED.ends_at,
-                 rating         = EXCLUDED.rating,
-                 created_at     = EXCLUDED.created_at",
-        )
-        .bind(booking.id)
-        .bind(booking.version as i64)
-        .bind(booking.spot_id)
-        .bind(booking.owner_id)
-        .bind(booking.renter_id)
-        .bind(sqlx::types::Json(booking.booked))
-        .bind(booking.amount)
-        .bind(booking.status)
-        .bind(booking.hold_until)
-        .bind(booking.release_reason)
-        .bind(booking.cancel_reason)
-        .bind(booking.ends_at)
-        .bind(booking.rating)
-        .bind(booking.created_at)
-        .execute(ex)
-        .await?;
+    pub async fn upsert(conn: &mut AsyncPgConnection, row: Booking) -> MyResult<()> {
+        diesel::insert_into(booking::table)
+            .values(row.clone())
+            .on_conflict(booking::id)
+            .do_update()
+            .set(row)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
@@ -98,29 +76,37 @@ impl BookingRepository {
     /// is `Some`, but collapsing them would leave a renter's history unable to tell
     /// "your hold ran out" from "the host pulled the listing".
     pub async fn transition(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         booking_id: Uuid,
         to: &str,
         from: &[&str],
         release: Option<&str>,
         cancel: Option<&str>,
     ) -> MyResult<()> {
-        // `= ANY($5)` rather than an `IN` list built by hand: the set is a parameter,
-        // so there is no string to assemble and no arity to get wrong.
-        sqlx::query(
-            "UPDATE booking SET
-                 status         = $2,
-                 hold_until     = NULL,
-                 release_reason = COALESCE($3, release_reason),
-                 cancel_reason  = COALESCE($4, cancel_reason)
-             WHERE id = $1 AND status = ANY($5)",
-        )
-        .bind(booking_id)
-        .bind(to)
-        .bind(release)
-        .bind(cancel)
-        .bind(from.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        .execute(ex)
+        // `.eq_any` rather than an `IN` list built by hand: the set is a parameter, so
+        // there is no string to assemble and no arity to get wrong.
+        //
+        // `hold_until` is assigned NULL unconditionally — a clear, which an
+        // absent-is-unchanged patch cannot express — so this is written as explicit
+        // column assignments rather than through an `AsChangeset` struct.
+        diesel::update(booking::table.find(booking_id).filter(
+            booking::status.eq_any(from.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+        ))
+        .set((
+            booking::status.eq(to),
+            booking::hold_until.eq(None::<DateTime<Utc>>),
+            // `None` here means "leave the existing reason alone" rather than "clear
+            // it" — only one of the two is ever set. Diesel skips a `None` element of a
+            // `set` tuple, so an absent reason is a column the statement never mentions.
+            //
+            // That is what `COALESCE($n, release_reason)` used to spell out, as a
+            // `sql::<Nullable<Text>>` fragment with the column name spliced in as
+            // unchecked text. The column reference is a real one now, and the shorter
+            // statement is the same rule.
+            release.map(|r| booking::release_reason.eq(r)),
+            cancel.map(|c| booking::cancel_reason.eq(c)),
+        ))
+        .execute(conn)
         .await?;
         Ok(())
     }
@@ -141,28 +127,30 @@ impl BookingRepository {
     /// is the same deliberate choice `spot.booked` made — a lapsed hold stops blocking
     /// when the sweeper publishes `Released`, not because this learned to skip it.
     pub async fn taken_for_spot(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         spot_id: &Uuid,
         now: DateTime<Utc>,
     ) -> MyResult<Booked> {
-        let maps: Vec<sqlx::types::Json<Booked>> = sqlx::query_scalar(
-            "SELECT booked FROM booking
-              WHERE spot_id = $1
-                AND ends_at > $2
-                AND status <> ALL($3)",
-        )
-        .bind(spot_id)
-        .bind(now)
-        .bind(vec!["released".to_string(), "cancelled".to_string()])
-        .fetch_all(ex)
-        .await?;
+        let maps: Vec<Booked> = booking::table
+            .filter(
+                booking::spot_id
+                    .eq(spot_id)
+                    .and(booking::ends_at.gt(now))
+                    .and(
+                        booking::status
+                            .ne_all(vec!["released".to_string(), "cancelled".to_string()]),
+                    ),
+            )
+            .select(booking::booked)
+            .load(conn)
+            .await?;
 
         // A union, not the old fold: the rows are already filtered to the ones that
         // block, and nothing downstream depends on the order — unlike `spot.booked`,
         // which had to be byte-identical across replicas because it was stored.
         let mut booked = Booked::new();
         for map in maps {
-            for (date, slots) in map.0 {
+            for (date, slots) in map {
                 booked.entry(date).or_default().extend(slots);
             }
         }
@@ -175,15 +163,20 @@ impl BookingRepository {
     /// The one clock read in this service that is allowed to be a clock read: the
     /// sweeper is a wall-clock job, not a projection, and its output is an event that
     /// everything downstream derives deterministically.
-    pub async fn lapsed_holds(ex: impl PgExecutor<'_>, limit: usize) -> MyResult<Vec<Booking>> {
-        Ok(sqlx::query_as(
-            "SELECT * FROM booking
-              WHERE status = 'reserved' AND hold_until < now()
-              LIMIT $1",
-        )
-        .bind(limit as i64)
-        .fetch_all(ex)
-        .await?)
+    pub async fn lapsed_holds(
+        conn: &mut AsyncPgConnection,
+        limit: usize,
+    ) -> MyResult<Vec<Booking>> {
+        Ok(booking::table
+            .filter(
+                booking::status
+                    .eq("reserved")
+                    .and(booking::hold_until.lt(diesel::dsl::now)),
+            )
+            .limit(limit as i64)
+            .select(Booking::as_select())
+            .load(conn)
+            .await?)
     }
 
     /// Paid bookings on one spot that are still to come, as of `at`.
@@ -192,17 +185,19 @@ impl BookingRepository {
     /// selects the same set it selected the first time, which is what keeps the cancel
     /// reactor's output a function of the log.
     pub async fn upcoming_confirmed(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         spot_id: &Uuid,
         at: DateTime<Utc>,
     ) -> MyResult<Vec<Booking>> {
-        Ok(sqlx::query_as(
-            "SELECT * FROM booking
-              WHERE spot_id = $1 AND status = 'confirmed' AND ends_at > $2",
-        )
-        .bind(spot_id)
-        .bind(at)
-        .fetch_all(ex)
-        .await?)
+        Ok(booking::table
+            .filter(
+                booking::spot_id
+                    .eq(spot_id)
+                    .and(booking::status.eq("confirmed"))
+                    .and(booking::ends_at.gt(at)),
+            )
+            .select(Booking::as_select())
+            .load(conn)
+            .await?)
     }
 }

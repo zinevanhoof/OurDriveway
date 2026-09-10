@@ -1,0 +1,63 @@
+# diesel CLI config — a DEV tool only.
+#
+# Production never installs the CLI: the migrator embeds its migrations with
+# `embed_migrations!` and the runtime images carry neither this file nor `migrations/`.
+# What the CLI is for here is `diesel print-schema` and `diesel migration generate`.
+#
+# ── Regenerating the schema modules ──────────────────────────────────────────
+#
+#   docker compose -f docker/docker-compose-dev.yml up -d yugabyte
+#   scripts/migrate.sh
+#   scripts/print-schema.sh
+#
+# This reads the schema back out of a RUNNING, MIGRATED cluster — the .sql files are not
+# parsed. Two consequences worth knowing:
+#
+#   * regeneration is a manual step after every migration;
+#   * CI has no database, so nothing verifies the committed modules are current. A stale
+#     one is a compile error at the USE site (a query naming a column that moved), not
+#     here.
+#
+# ── Why ONE section, not one per database ────────────────────────────────────
+#
+# There are five databases, and the obvious shape is five `[print_schema.<name>]`
+# sections selected with `--schema-key`. That is supported, but `print-schema` emits the
+# output of EVERY configured section on each invocation — five sections plus the implicit
+# `default` produced six concatenated copies of the same schema.
+#
+# All five databases want identical options anyway; only the URL and the destination file
+# differ, and `scripts/print-schema.sh` supplies both. So this is one section and the
+# script loops.
+#
+# `file` is deliberately unset: `print-schema` always writes to stdout regardless (the
+# key is what `diesel migration run` regenerates and what `--locked-schema` checks), so
+# having it here would imply a routing that does not happen. The script redirects.
+#
+# `__diesel_schema_migrations` needs no filter — diesel already skips `__%` tables (its
+# table listing filters `NOT LIKE '\_\_%'`). The projector live tests' scratch table is
+# named `__bus_livetest` for that reason: it is never dropped, because the eight tests run
+# concurrently and a teardown in one would pull it from under the others.
+#
+# ── Every table generated exactly once, in the crate that owns it ────────────
+#
+# `_lease` and `_outbox` are excluded HERE and generated instead into `bus/src/schema.rs`,
+# by a sixth invocation in `scripts/print-schema.sh` that passes `--only-tables` for just
+# those two. So nothing is hand-written and nothing is duplicated: each table has one
+# generated declaration, in the crate that owns it.
+#
+# They are bus's, not a service's — every database has an identical copy because every
+# service runs its own outbox relay and leader election. Generating them per service would
+# give five structurally identical `_outbox` types, and `bus::outbox::enqueue` is generic
+# over whichever database its caller holds, so it cannot name one of them. Keeping them out
+# of `shared::schema` is what makes `bus::schema::_outbox` the only one that exists — the
+# rule that services reach the outbox through `bus` is then enforced by the compiler rather
+# than by a comment.
+#
+# The bus pass reads all five databases and refuses to write if they disagree, which is the
+# one thing five copies of a migration can get wrong.
+#
+# The service modules are left holding exactly the tables that service owns.
+
+[print_schema]
+with_docs = false
+filter = { except_tables = ["_lease", "_outbox"] }

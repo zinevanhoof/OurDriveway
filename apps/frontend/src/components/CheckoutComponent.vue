@@ -29,7 +29,7 @@ import { Text, Title } from "@/components/base/text";
 import { IconBox } from "@/components/base/icon-box";
 import { stripe } from "@/lib/stripe";
 import { cssColorToHex, token } from "@/lib/theme";
-import { fetchBooking, fetchMe, viewKeys } from "@/api/viewApi";
+import { fetchAccount, fetchRenterBooking, viewKeys } from "@/api/viewApi";
 import * as paymentApi from "@/api/paymentApi";
 import * as bookingApi from "@/api/bookingApi";
 import type {
@@ -40,7 +40,7 @@ import type {
 const route = useRoute();
 const router = useRouter();
 // No `useAuthStore()` here any more: the only thing it supplied was the caller's id for
-// the `ME` document's `user(id:)` lookup, and `/me` takes that from the token.
+// the `ME` document's `user(id:)` lookup, and `/account` takes that from the token.
 
 /** Everything this screen knows on arrival. */
 const sessionId = computed(() => String(route.query.session_id ?? ""));
@@ -70,12 +70,12 @@ let actions: StripeCheckoutLoadActionsSuccess | null = null;
 // and `catch_deep_link` in src-tauri/src/lib.rs.
 
 // Prefill the email Stripe requires, so a logged-in renter doesn't retype an address we
-// already hold. `/me` is the only endpoint that returns it, and it picks the row from
+// already hold. `/account` is the only endpoint that returns it, and it picks the row from
 // the verified claim — where this used to ask for a user by id and rely on a
 // field-level permission to blank the address for anyone else.
 const { data: me } = useQuery({
-  queryKey: viewKeys.me,
-  queryFn: fetchMe,
+  queryKey: viewKeys.account,
+  queryFn: fetchAccount,
 });
 
 onMounted(load);
@@ -216,7 +216,7 @@ let poller: ReturnType<typeof setInterval> | undefined;
 
 const { data: booking, refetch: refetchBooking } = useQuery({
   queryKey: computed(() => viewKeys.booking(bookingId.value ?? "")),
-  queryFn: () => fetchBooking(bookingId.value!),
+  queryFn: () => fetchRenterBooking(bookingId.value!),
   enabled: computed(() => !!bookingId.value),
   staleTime: 0,
 });

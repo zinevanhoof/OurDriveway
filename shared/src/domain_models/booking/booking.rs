@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::{events::booking::BookingCreated, general_models::booking::Booked};
@@ -27,21 +28,22 @@ pub mod status {
 /// Read entire rather than per-use-case: this replaced a `BookingForUpdate` that
 /// selected seven columns for the write path and a `LiveBooking` that selected
 /// three for the cancel reactor, both over a row addressed by primary key.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::booking::booking)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Booking {
     pub id: Uuid,
     /// Bumped by booking-service inside the transaction that writes this row.
     /// The token a client waits on, and the gap detector for an out-of-order event —
     /// see `shared::events::Envelope`. No longer the key concurrent writers collide
     /// on; see `shared::db::next_version`.
-    #[sqlx(try_from = "i64")]
-    pub version: u64,
+    pub version: i64,
     /// A plain uuid, not a record link: the `spot` table lives in spot-service's
     /// database, so this one cannot hold a `record<spot>`.
     pub spot_id: Uuid,
     /// Denormalised at create time so a booking can be scoped to the host without
     /// a cross-database dereference.
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     pub renter_id: Uuid,
     /// `"YYYY-MM-DD"` -> slots, in the spot's timezone. Bare wall-clock strings,
     /// which is why `ends_at` exists as a separate folded instant.
@@ -49,7 +51,6 @@ pub struct Booking {
     /// A `jsonb` column. It was a SCHEMAFULL object spelled out to
     /// `booked.*.*.start`, which bought nothing: no query has ever reached into it,
     /// and the shape is enforced by garde on the request that creates it.
-    #[sqlx(json)]
     pub booked: Booked,
     /// EUR cents, recomputed server-side from the minutes actually authorised —
     /// never a figure the client sent.
@@ -86,12 +87,12 @@ impl Booking {
     ///
     /// `at` is the envelope's clock, never this process's — every replica has to
     /// store the same `created_at` for the same event.
-    pub fn created(e: BookingCreated, at: DateTime<Utc>, version: u64) -> Self {
+    pub fn created(e: BookingCreated, at: DateTime<Utc>, version: i64) -> Self {
         Self {
             id: e.booking_id,
             version,
             spot_id: e.spot_id,
-            owner_id: e.owner_id,
+            host_id: e.host_id,
             renter_id: e.renter_id,
             booked: e.booked,
             amount: e.amount_cents,
@@ -119,7 +120,7 @@ mod tests {
         let e = BookingCreated {
             booking_id: Uuid::now_v7(),
             spot_id: Uuid::now_v7(),
-            owner_id: Uuid::now_v7(),
+            host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: Default::default(),
             amount_cents: 500,

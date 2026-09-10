@@ -100,12 +100,12 @@ const days = computed(() => sortedDays(props.booking));
 
         <div class="flex items-center gap-2">
           <Avatar size="lg">
-            <AvatarImage v-if="spot?.owner?.profilePicture" :src="spot?.owner.profilePicture" />
+            <AvatarImage v-if="spot?.host?.profilePicture" :src="spot?.host.profilePicture" />
             <AvatarFallback
-              :name="{ firstName: spot?.owner?.firstName ?? '', lastName: spot?.owner?.lastName ?? '' }" />
+              :name="{ firstName: spot?.host?.firstName ?? '', lastName: spot?.host?.lastName ?? '' }" />
           </Avatar>
           <div>
-            <Title weight="semibold">{{ spot?.owner?.firstName }} {{ spot?.owner?.lastName }}</Title>
+            <Title weight="semibold">{{ spot?.host?.firstName }} {{ spot?.host?.lastName }}</Title>
             <Text class="flex items-center gap-1">
               <Star :size="16" class="fill-star text-star" />
               4.9 · 128 trips

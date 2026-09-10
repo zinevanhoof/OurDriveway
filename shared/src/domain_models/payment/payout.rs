@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::events::payment::PaymentEvent;
@@ -47,15 +48,16 @@ pub mod status {
 /// `earnings − Σ payouts that count`, computed on read. That is what makes both a
 /// refunded booking and a *failed* payout drop out of a host's figures for free, with
 /// no compensating write on either side.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::payment::payout)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Payout {
     pub id: Uuid,
     /// Bumped on every transition now, where it used to be written once — the worker's
     /// outcome is a second event for this aggregate, and the client waits on the
     /// version the request reached.
-    #[sqlx(try_from = "i64")]
-    pub version: u64,
-    pub owner_id: Uuid,
+    pub version: i64,
+    pub host_id: Uuid,
     pub amount_cents: i64,
     /// One of [`status`].
     pub status: String,
@@ -73,17 +75,17 @@ impl Payout {
     ///
     /// Takes the whole event rather than the four fields so the projector's arm
     /// stays a single line, and so the mapping lives next to the row it produces.
-    pub fn requested(event: &PaymentEvent, version: u64) -> Option<Self> {
+    pub fn requested(event: &PaymentEvent, version: i64) -> Option<Self> {
         match event {
             PaymentEvent::PayoutRequested {
                 payout_id,
-                owner_id,
+                host_id,
                 amount_cents,
                 requested_at,
             } => Some(Self {
                 id: *payout_id,
                 version,
-                owner_id: *owner_id,
+                host_id: *host_id,
                 amount_cents: *amount_cents,
                 status: status::REQUESTED.to_string(),
                 transfer_id: None,
@@ -102,7 +104,8 @@ impl Payout {
 /// Only the three columns the worker's outcome touches. Everything else is written once
 /// by [`Payout::requested`] and is not representable here: an amount that could be
 /// patched is an amount a bug could raise after the balance check that authorised it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = crate::schema::payment::payout)]
 pub struct PayoutPatch {
     pub status: Option<String>,
     pub transfer_id: Option<String>,

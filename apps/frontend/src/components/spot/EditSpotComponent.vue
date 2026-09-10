@@ -19,7 +19,7 @@ import CreateSpotBasicInfo from '@/components/forms/create-spot-form/CreateSpotB
 import CreateSpotAvailability from '@/components/forms/create-spot-form/CreateSpotAvailability.vue';
 import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImages.vue';
 
-import { fetchSpotManage, viewKeys } from '@/api/viewApi';
+import { fetchHostSpot, viewKeys } from '@/api/viewApi';
 import { deleteSpot, updateSpot } from '@/api/spotApi';
 import { uploadNewImages } from '@/api/mediaApi';
 import { bookedOutside, mergeBooked } from '@/lib/bookingAvailability';
@@ -34,8 +34,8 @@ const router = useRouter()
 const queryClient = useQueryClient()
 
 const { data } = useQuery({
-    queryKey: viewKeys.spotManage(id),
-    queryFn: () => fetchSpotManage(id),
+    queryKey: viewKeys.hostSpot(id),
+    queryFn: () => fetchHostSpot(id),
 })
 
 // Same rules as the create form, minus the address: a spot's location is fixed at
@@ -119,7 +119,7 @@ const hasSlots = () =>
 const casualties = computed(() =>
     bookedOutside(availability.value, mergeBooked(data.value?.bookings), today.value))
 
-// The spot's own key covers the edit; `spots` also clears the owner's list and any
+// The spot's own key covers the edit; `spots` also clears the host's list and any
 // radius result this listing appears in.
 const invalidateSpot = () =>
     queryClient.invalidateQueries({ queryKey: viewKeys.spots })

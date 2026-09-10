@@ -18,7 +18,7 @@ import AvatarImage from '@/components/ui/avatar/AvatarImage.vue'
 import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue'
 import { Text, Title } from '@/components/base/text'
 
-import { fetchMe as fetchMeView, viewKeys } from '@/api/viewApi'
+import { fetchAccount, viewKeys } from '@/api/viewApi'
 import { updateProfile } from '@/api/userApi'
 import { uploadImage } from '@/api/mediaApi'
 import { fetchMe } from '@/api/me'
@@ -31,8 +31,8 @@ const auth = useAuthStore()
 const queryClient = useQueryClient()
 
 const { data } = useQuery({
-    queryKey: viewKeys.me,
-    queryFn: fetchMeView,
+    queryKey: viewKeys.account,
+    queryFn: fetchAccount,
 })
 
 const me = computed(() => data.value?.profile)
@@ -94,7 +94,7 @@ const formErrors = ref<string[]>([])
 watch(me, (user) => {
     if (!user) return
 
-    // No `?? ''` on the email: `OwnerViewUser.email` is not nullable. The column is
+    // No `?? ''` on the email: `HostViewUser.email` is not nullable. The column is
     // NOT NULL and every projected row comes from a registration that carried one.
     loadedEmail.value = user.email
     setValues({
@@ -156,12 +156,12 @@ const submit = handleSubmit(async (form) => {
         // Invalidate rather than refetch-and-forget. graphcache used to normalize by
         // entity id, so writing a user updated every cached reference to that person
         // at once; vue-query caches per key, so the keys that could hold a stale copy
-        // have to be named. `me` is this screen; `spots` and `bookings` embed an owner
+        // have to be named. `me` is this screen; `spots` and `bookings` embed a host
         // and a renter profile respectively.
         //
         // `recordSeq` in the write above already made the next request wait for the
         // projection, so these refetches see the new row rather than racing it.
-        await queryClient.invalidateQueries({ queryKey: viewKeys.me })
+        await queryClient.invalidateQueries({ queryKey: viewKeys.account })
         await queryClient.invalidateQueries({ queryKey: viewKeys.spots })
         await queryClient.invalidateQueries({ queryKey: viewKeys.bookings })
         // The header reads the store, not the query.
@@ -269,7 +269,7 @@ const submit = handleSubmit(async (form) => {
                                     class="bg-card">
                                     <SelectValue placeholder="Not set" />
                                 </SelectTrigger>
-                                <SelectContent position="popper" :collision-padding="{ top: 60 }">
+                                <SelectContent position="popper" :collision-padding="{ top: 60, bottom: safeBottom }">
                                     <SelectGroup>
                                         <SelectItem v-for="country in countries" :key="country.code"
                                             :value="country.code">

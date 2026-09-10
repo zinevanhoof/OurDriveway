@@ -4,8 +4,9 @@ YugabyteDB: the authoritative store, and the only stateful thing in this chart.
 It replaced four templates — tikv.yaml, surrealdb.yaml, schemas.yaml and
 schema-import.yaml. SurrealDB needed a separate distributed store underneath it (TiKV,
 which needed a placement driver of its own) and a separate pass to apply the schemas.
-This is all of that in one process, and the schemas ship inside the service binaries as
-sqlx migrations.
+This is all of that in one process. The schema pass did not disappear — it moved to
+migrator-job.yaml, one Job with the diesel migrations embedded in it, which is the only
+thing in the cluster that touches schema.
 
 ⚠ SINGLE NODE. `yugabyted start` with one replica is right for this chart's scale and
 wrong for anything that must survive losing a node: there is one copy of every tablet.

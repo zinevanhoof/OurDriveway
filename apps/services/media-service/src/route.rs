@@ -2,51 +2,14 @@ use std::time::Duration;
 
 use aws_sdk_s3::presigning::PresigningConfig;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use serde::{Deserialize, Serialize};
 use shared::error::myerror::{MyError, MyResult};
 use shared::extractors::authed_jwt::AuthedJwt;
-use shared::media::{self, PREFIX_AVATARS, PREFIX_SPOTS};
+use shared::media;
+use shared::requests::media::UploadUrlRequest;
+use shared::responses::media::UploadUrlResponse;
 use uuid::Uuid;
 
 use crate::{AppState, CONFIG};
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadUrlRequest {
-    pub kind: Kind,
-    pub content_type: String,
-    /// The exact size of the body the client is about to PUT. Declared up front
-    /// because it is the only way a presigned PUT can be capped — see below.
-    pub content_length: u64,
-}
-
-/// Which part of the bucket the object belongs in. An enum rather than a free
-/// string: it becomes a key prefix, and the set of prefixes is ours.
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "camelCase")]
-pub enum Kind {
-    Spot,
-    Avatar,
-}
-
-impl Kind {
-    fn prefix(self) -> &'static str {
-        match self {
-            Kind::Spot => PREFIX_SPOTS,
-            Kind::Avatar => PREFIX_AVATARS,
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadUrlResponse {
-    /// What the client sends back in the create/edit request, and what ends up in
-    /// the event: the whole URL, already loadable. See `shared::media`.
-    pub url: String,
-    /// Where to PUT the bytes. Good for one object, one method and one size.
-    pub upload_url: String,
-}
 
 /// Mints a presigned PUT so the browser can upload straight to R2.
 ///
@@ -139,7 +102,8 @@ fn internal(what: &str, error: impl std::fmt::Display) -> MyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::media::{init_base, is_media_url};
+    use shared::media::{PREFIX_AVATARS, PREFIX_SPOTS, init_base, is_media_url};
+    use shared::requests::media::Kind;
 
     /// The allowlist and the extension table are the same decision, so they can't
     /// disagree — but the key built from one has to satisfy the validator that

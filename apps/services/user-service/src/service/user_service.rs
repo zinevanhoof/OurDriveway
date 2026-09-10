@@ -1,11 +1,13 @@
+use bus::outbox;
 use chrono::Utc;
+use diesel_async::AsyncConnection;
+use diesel_async::scoped_futures::ScopedFutureExt;
+use shared::db;
 use shared::domain_models::user::{User, UserPatch};
-use shared::error::myerror::{ContextExt, MyResult};
+use shared::error::myerror::{ContextExt, MyError, MyResult};
 use shared::events::user::{
     UserEvent, UserPasswordChanged, UserRegistered, UserUpdated, VerificationRequested,
 };
-use bus::outbox;
-use shared::db;
 use shared::events::{Envelope, aggregate_id, format_version, user_subject};
 use shared::requests::user::{
     Country, Email, LoginRequest, ResendVerificationRequest, SignupRequest, UpdateUserRequest,
@@ -32,7 +34,7 @@ pub struct UserService {
     /// The pool, not a repository. The repositories are stateless now — sqlx's
     /// `PgExecutor` covers both `&PgPool` and the `&mut PgConnection` inside an open
     /// transaction, so there is nothing for a repository to hold.
-    pub db: sqlx::PgPool,
+    pub db: shared::db::Db,
 }
 
 impl UserService {
@@ -49,7 +51,8 @@ impl UserService {
         // layer holds it until the row is there. Without the echo it falls through
         // to the dedupe window below, which is silent — the same account, answered
         // twice with success.
-        UserRepository::find_by_email(&self.db, req.email.to_string())
+        let mut read = db::conn(&self.db).await?;
+        UserRepository::find_by_email(&mut read, req.email.to_string())
             .await?
             .is_none()
             .context_conflict((
@@ -103,25 +106,34 @@ impl UserService {
         // The row and its event, in one transaction. This is the whole shape of
         // the rewrite: the database is authoritative, and the event is a durable
         // side effect of the same commit rather than the thing that caused it.
-        let mut tx = self.db.begin().await?;
-        let version = db::next_version(&mut tx, "user", &user_id).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        // No `set_version` after this: the row carries its own version and this is
-        // a whole-row write. The separate statement is still needed wherever a
-        // *patch* moves a row, since a patch does not touch the column.
-        UserRepository::upsert(&mut *tx, User::registered(registered.clone(), version)).await?;
+        let await_token = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    let version = shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
 
-        let mut envelope = Envelope::new(
-            UserEvent::Registered(registered),
-            Some(user_id),
-            aggregate_id("user", &user_id),
-            version,
-        );
-        envelope.event_id = event_id;
-        let await_token = format_version(&envelope.aggregate, envelope.version);
+                    // No `set_version` after this: the row carries its own version and this is
+                    // a whole-row write. The separate statement is still needed wherever a
+                    // *patch* moves a row, since a patch does not touch the column.
+                    UserRepository::upsert(conn, User::registered(registered.clone(), version))
+                        .await?;
 
-        outbox::enqueue(&mut *tx, &user_subject(&user_id), &envelope).await?;
-        tx.commit().await?;
+                    let mut envelope = Envelope::new(
+                        UserEvent::Registered(registered),
+                        Some(user_id),
+                        aggregate_id("user", &user_id),
+                        version,
+                    );
+                    envelope.event_id = event_id;
+                    let await_token = format_version(&envelope.aggregate, envelope.version);
+
+                    outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
+                    Ok(await_token)
+                }
+                .scope_boxed()
+            })
+            .await?;
 
         Ok(await_token)
     }
@@ -132,7 +144,8 @@ impl UserService {
     /// Keeping the two apart is what stops the session service from needing to
     /// know how a password is stored.
     pub async fn authenticate(&self, req: LoginRequest) -> MyResult<User> {
-        let found = UserRepository::find_by_email(&self.db, req.email.to_string()).await?;
+        let mut read = db::conn(&self.db).await?;
+        let found = UserRepository::find_by_email(&mut read, req.email.to_string()).await?;
 
         // Verify even when no user matched, against a throwaway hash, so a missing
         // account and a wrong password take the same time to answer.
@@ -193,43 +206,50 @@ impl UserService {
             shared::email_token::Purpose::VerifyEmail,
         )?;
 
-        let mut tx = self.db.begin().await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        // Read inside the transaction: the token proves which account, but this
-        // must refuse one naming a user who no longer exists rather than writing
-        // for them.
-        UserRepository::find_by_id(&mut *tx, user_id)
-            .await?
-            .context_not_found(("Not Found", "Could not find user"))?;
+        let await_token = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    // Read inside the transaction: the token proves which account, but this
+                    // must refuse one naming a user who no longer exists rather than writing
+                    // for them.
+                    UserRepository::find_by_id(conn, user_id)
+                        .await?
+                        .context_not_found(("Not Found", "Could not find user"))?;
 
-        // Takes `FOR UPDATE` on the row, which is what serialises two of these
-        // against each other now that a contended write no longer conflicts on its
-        // own. See `shared::db::next_version`.
-        let version = db::next_version(&mut tx, "user", &user_id).await?;
-        // Idempotent by construction — setting `true` twice is setting `true`.
-        // That matters because mail scanners prefetch links, so this endpoint is
-        // deliberately re-runnable.
-        UserRepository::patch(
-            &mut *tx,
-            user_id,
-            UserPatch {
-                email_verified: Some(true),
-                ..Default::default()
-            },
-        )
-        .await?;
-        db::set_version(&mut tx, "user", &user_id, version).await?;
+                    // Takes `FOR UPDATE` on the row, which is what serialises two of these
+                    // against each other now that a contended write no longer conflicts on its
+                    // own. See `shared::db::next_version`.
+                    let version = shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
+                    // Idempotent by construction — setting `true` twice is setting `true`.
+                    // That matters because mail scanners prefetch links, so this endpoint is
+                    // deliberately re-runnable.
+                    UserRepository::patch(
+                        conn,
+                        user_id,
+                        UserPatch {
+                            email_verified: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    shared::set_version!(conn, "user", shared::schema::user::app_user, &user_id, version)?;
 
-        let envelope = Envelope::new(
-            UserEvent::EmailVerified { user_id },
-            Some(user_id),
-            aggregate_id("user", &user_id),
-            version,
-        );
-        let await_token = format_version(&envelope.aggregate, envelope.version);
+                    let envelope = Envelope::new(
+                        UserEvent::EmailVerified { user_id },
+                        Some(user_id),
+                        aggregate_id("user", &user_id),
+                        version,
+                    );
+                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
-        outbox::enqueue(&mut *tx, &user_subject(&user_id), &envelope).await?;
-        tx.commit().await?;
+                    outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
+                    Ok(await_token)
+                }
+                .scope_boxed()
+            })
+            .await?;
 
         Ok(await_token)
     }
@@ -245,7 +265,8 @@ impl UserService {
     // money to deliver. Add a per-user cooldown (last-sent timestamp on the row,
     // checked here) if this ever gets pointed at.
     pub async fn resend_verification(&self, req: ResendVerificationRequest) -> MyResult<()> {
-        let Some(user) = UserRepository::find_by_email(&self.db, req.email.to_string()).await?
+        let mut read = db::conn(&self.db).await?;
+        let Some(user) = UserRepository::find_by_email(&mut read, req.email.to_string()).await?
         else {
             return Ok(());
         };
@@ -260,26 +281,33 @@ impl UserService {
         // A transaction for an event that writes no row, which looks odd until you
         // ask where else the outbox row would go: the enqueue *is* the write, and it
         // still has to be atomic with the version it claims.
-        let mut tx = self.db.begin().await?;
-        let version = db::next_version(&mut tx, "user", &user.id).await?;
-        db::set_version(&mut tx, "user", &user.id, version).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        let envelope = Envelope::new(
-            UserEvent::VerificationRequested(VerificationRequested {
-                user_id: user.id,
-                email: user.email,
-                // Off the projection rather than the token: the template greets the
-                // reader by name and the token carries only an id. No second query
-                // for it — the row above is the whole user.
-                first_name: user.first_name,
-            }),
-            Some(user.id),
-            aggregate_id("user", &user.id),
-            version,
-        );
+        conn.transaction::<_, MyError, _>(|conn| {
+            async move {
+                let version = shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
+                shared::set_version!(conn, "user", shared::schema::user::app_user, &user.id, version)?;
 
-        outbox::enqueue(&mut *tx, &user_subject(&user.id), &envelope).await?;
-        tx.commit().await?;
+                let envelope = Envelope::new(
+                    UserEvent::VerificationRequested(VerificationRequested {
+                        user_id: user.id,
+                        email: user.email,
+                        // Off the projection rather than the token: the template greets the
+                        // reader by name and the token carries only an id. No second query
+                        // for it — the row above is the whole user.
+                        first_name: user.first_name,
+                    }),
+                    Some(user.id),
+                    aggregate_id("user", &user.id),
+                    version,
+                );
+
+                outbox::enqueue(conn, &user_subject(&user.id), &envelope).await?;
+                Ok(())
+            }
+            .scope_boxed()
+        })
+        .await?;
 
         Ok(())
     }
@@ -301,7 +329,8 @@ impl UserService {
     ///
     /// No ownership lookup: the target is always the caller's own record.
     pub async fn update_user(&self, uid: &Uuid, req: UpdateUserRequest) -> MyResult<String> {
-        let existing = UserRepository::find_by_id(&self.db, *uid)
+        let mut read = db::conn(&self.db).await?;
+        let existing = UserRepository::find_by_id(&mut read, *uid)
             .await?
             .context_not_found(("Not Found", "Could not find user"))?;
         let user_uuid = existing.id;
@@ -378,7 +407,8 @@ impl UserService {
                     // Same as signup: the unique index is the real guard, this only
                     // turns the common case into a 409 rather than a projector
                     // failure on an event that is already in the log.
-                    UserRepository::find_by_email(&self.db, email.to_string())
+                    let mut check = db::conn(&self.db).await?;
+                    UserRepository::find_by_email(&mut check, email.to_string())
                         .await?
                         .is_none()
                         .context_conflict((
@@ -405,58 +435,66 @@ impl UserService {
             }
         };
 
-        let mut tx = self.db.begin().await?;
-        let version = db::next_version(&mut tx, "user", &user_uuid).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        match &event {
-            UserEvent::PasswordChanged(e) => {
-                UserRepository::patch(
-                    &mut *tx,
-                    user_uuid,
-                    UserPatch {
-                        password: Some(e.password_hash.clone()),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            }
+        let await_token = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    let version = shared::next_version!(conn, shared::schema::user::app_user, &user_uuid)?;
 
-            // Order is the point, and it used to be the projector's: the submitted
-            // address has to be compared against the stored one *before* it is
-            // overwritten. Without this, changing to an unverified address keeps the
-            // flag from the old one and login lets it straight through, which makes
-            // the whole feature decorative.
-            UserEvent::Updated(e) => {
-                if e.email.as_ref().is_some_and(|new| *new != existing.email) {
-                    UserRepository::patch(
-                        &mut *tx,
-                        user_uuid,
-                        UserPatch {
-                            email_verified: Some(false),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
+                    match &event {
+                        UserEvent::PasswordChanged(e) => {
+                            UserRepository::patch(
+                                conn,
+                                user_uuid,
+                                UserPatch {
+                                    password: Some(e.password_hash.clone()),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        }
+
+                        // Order is the point, and it used to be the projector's: the submitted
+                        // address has to be compared against the stored one *before* it is
+                        // overwritten. Without this, changing to an unverified address keeps the
+                        // flag from the old one and login lets it straight through, which makes
+                        // the whole feature decorative.
+                        UserEvent::Updated(e) => {
+                            if e.email.as_ref().is_some_and(|new| *new != existing.email) {
+                                UserRepository::patch(
+                                    conn,
+                                    user_uuid,
+                                    UserPatch {
+                                        email_verified: Some(false),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await?;
+                            }
+                            UserRepository::patch(conn, user_uuid, e.clone().into()).await?;
+                        }
+
+                        // `update_user` builds only the two variants above.
+                        _ => {}
+                    }
+
+                    shared::set_version!(conn, "user", shared::schema::user::app_user, &user_uuid, version)?;
+
+                    let envelope = Envelope::new(
+                        event,
+                        Some(user_uuid),
+                        aggregate_id("user", &user_uuid),
+                        version,
+                    );
+                    let await_token = format_version(&envelope.aggregate, envelope.version);
+
+                    outbox::enqueue(conn, &user_subject(&user_uuid), &envelope).await?;
+                    Ok(await_token)
                 }
-                UserRepository::patch(&mut *tx, user_uuid, e.clone().into()).await?;
-            }
-
-            // `update_user` builds only the two variants above.
-            _ => {}
-        }
-
-        db::set_version(&mut tx, "user", &user_uuid, version).await?;
-
-        let envelope = Envelope::new(
-            event,
-            Some(user_uuid),
-            aggregate_id("user", &user_uuid),
-            version,
-        );
-        let await_token = format_version(&envelope.aggregate, envelope.version);
-
-        outbox::enqueue(&mut *tx, &user_subject(&user_uuid), &envelope).await?;
-        tx.commit().await?;
+                .scope_boxed()
+            })
+            .await?;
 
         Ok(await_token)
     }
@@ -478,7 +516,8 @@ impl UserService {
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
 
-        for user in UserRepository::all(&self.db).await? {
+        let mut read = db::conn(&self.db).await?;
+        for user in UserRepository::all(&mut read).await? {
             let user_id = user.id;
 
             let registered = UserRegistered {

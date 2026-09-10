@@ -19,7 +19,7 @@ pub const SUBJECT_SPOT_CARD: &str = "rpc.spot.card";
 
 /// A spot as something else needs to *display* it. The request is the bare `Uuid`.
 ///
-/// Deliberately not the spot: no price, no availability, no owner, no location. Those are
+/// Deliberately not the spot: no price, no availability, no host, no location. Those are
 /// spot-service's to reason about, and a consumer that wants them wants to be a consumer.
 /// This is the label on someone else's screen and nothing more, which is what keeps it
 /// safe to answer with `None` when anything at all goes wrong.

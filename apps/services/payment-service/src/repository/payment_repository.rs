@@ -1,7 +1,13 @@
 use chrono::{DateTime, Utc};
+use diesel::dsl::sum;
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::diesel_ext::to_bigint;
+use shared::domain_models::booking::status as booking_status;
+use shared::domain_models::payment::status;
 use shared::domain_models::payment::{Payment, PaymentPatch};
 use shared::error::myerror::MyResult;
-use sqlx::PgExecutor;
+use shared::schema::payment::{booking, payment};
 use uuid::Uuid;
 
 /// The `payment` table.
@@ -14,28 +20,28 @@ impl PaymentRepository {
     /// `payment_booking … UNIQUE`, so at most one row can match — a fact about the
     /// schema rather than a hope about the data.
     pub async fn find_by_booking_id(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         booking_id: Uuid,
     ) -> MyResult<Option<Payment>> {
-        Ok(
-            sqlx::query_as("SELECT * FROM payment WHERE booking_id = $1")
-                .bind(booking_id)
-                .fetch_optional(ex)
-                .await?,
-        )
+        Ok(payment::table
+            .filter(payment::booking_id.eq(booking_id))
+            .select(Payment::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// `payment_session … UNIQUE`. The checkout screen knows only a session id.
     pub async fn find_by_session_id(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         session_id: String,
     ) -> MyResult<Option<Payment>> {
-        Ok(
-            sqlx::query_as("SELECT * FROM payment WHERE session_id = $1")
-                .bind(session_id)
-                .fetch_optional(ex)
-                .await?,
-        )
+        Ok(payment::table
+            .filter(payment::session_id.eq(session_id))
+            .select(Payment::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// Every payment, for `PaymentService::backfill`.
@@ -48,9 +54,11 @@ impl PaymentRepository {
     /// ponytail: whole table in one pass, same ceiling and same fix as the others —
     /// keyset on `created_at` if this ever has to run against a table that does not fit
     /// in memory.
-    pub async fn all(ex: impl PgExecutor<'_>) -> MyResult<Vec<Payment>> {
-        Ok(sqlx::query_as("SELECT * FROM payment ORDER BY created_at")
-            .fetch_all(ex)
+    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<Payment>> {
+        Ok(payment::table
+            .order(payment::created_at.asc())
+            .select(Payment::as_select())
+            .load(conn)
             .await?)
     }
 
@@ -58,42 +66,14 @@ impl PaymentRepository {
     ///
     /// Idempotent by construction, which is what lets a projector replay the same
     /// event.
-    pub async fn upsert(ex: impl PgExecutor<'_>, payment: Payment) -> MyResult<()> {
-        sqlx::query(
-            "INSERT INTO payment
-                 (id, version, booking_id, owner_id, renter_id, amount_cents,
-                  session_id, intent_id, status, refund_id, refunded_at,
-                  failure_reason, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-             ON CONFLICT (id) DO UPDATE SET
-                 version        = EXCLUDED.version,
-                 booking_id     = EXCLUDED.booking_id,
-                 owner_id       = EXCLUDED.owner_id,
-                 renter_id      = EXCLUDED.renter_id,
-                 amount_cents   = EXCLUDED.amount_cents,
-                 session_id     = EXCLUDED.session_id,
-                 intent_id      = EXCLUDED.intent_id,
-                 status         = EXCLUDED.status,
-                 refund_id      = EXCLUDED.refund_id,
-                 refunded_at    = EXCLUDED.refunded_at,
-                 failure_reason = EXCLUDED.failure_reason,
-                 created_at     = EXCLUDED.created_at",
-        )
-        .bind(payment.id)
-        .bind(payment.version as i64)
-        .bind(payment.booking_id)
-        .bind(payment.owner_id)
-        .bind(payment.renter_id)
-        .bind(payment.amount_cents)
-        .bind(payment.session_id)
-        .bind(payment.intent_id)
-        .bind(payment.status)
-        .bind(payment.refund_id)
-        .bind(payment.refunded_at)
-        .bind(payment.failure_reason)
-        .bind(payment.created_at)
-        .execute(ex)
-        .await?;
+    pub async fn upsert(conn: &mut AsyncPgConnection, row: Payment) -> MyResult<()> {
+        diesel::insert_into(payment::table)
+            .values(row.clone())
+            .on_conflict(payment::id)
+            .do_update()
+            .set(row)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
@@ -110,28 +90,16 @@ impl PaymentRepository {
     /// column — `set_covers_every_patchable_column` in the model is the reminder to
     /// come here, and the live round-trip is what would catch it.
     pub async fn transition(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         payment_id: Uuid,
         from: &[&str],
         patch: PaymentPatch,
     ) -> MyResult<()> {
-        sqlx::query(
-            "UPDATE payment SET
-                 status         = COALESCE($3, status),
-                 intent_id      = COALESCE($4, intent_id),
-                 refund_id      = COALESCE($5, refund_id),
-                 refunded_at    = COALESCE($6, refunded_at),
-                 failure_reason = COALESCE($7, failure_reason)
-             WHERE id = $1 AND status = ANY($2)",
-        )
-        .bind(payment_id)
-        .bind(from.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        .bind(patch.status)
-        .bind(patch.intent_id)
-        .bind(patch.refund_id)
-        .bind(patch.refunded_at)
-        .bind(patch.failure_reason)
-        .execute(ex)
+        diesel::update(payment::table.find(payment_id).filter(
+            payment::status.eq_any(from.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+        ))
+        .set(&patch)
+        .execute(conn)
         .await?;
         Ok(())
     }
@@ -145,36 +113,43 @@ impl PaymentRepository {
     /// yet — see `SETTLEMENT_SECS`.
     ///
     /// A join rather than the nested `booking_id IN (SELECT …)` this replaced. Same
-    /// two conditions, one pass, and `booking_owner (owner_id, status, ends_at)` serves
+    /// two conditions, one pass, and `booking_host (host_id, status, ends_at)` serves
     /// the inner half.
     ///
     /// `cutoff` is passed in rather than read from a clock here, so this stays a pure
     /// query and the caller owns the window.
     pub async fn earned(
-        ex: impl PgExecutor<'_>,
-        owner_id: &Uuid,
+        conn: &mut AsyncPgConnection,
+        host_id: &Uuid,
         cutoff: DateTime<Utc>,
     ) -> MyResult<i64> {
-        // Two things in that one expression, and both are needed:
+        // `sum()` over no rows is NULL — a host who has earned nothing is the ordinary
+        // case on a fresh account — so it arrives as `None` and `unwrap_or(0)` is the
+        // default. Deliberately not `COALESCE(…, 0)` in SQL, which would flatten "no
+        // bookings yet" and "earned nothing" into one value before Rust could tell them
+        // apart.
         //
-        //   COALESCE  SUM over no rows is NULL, not 0 — a host who has earned nothing
-        //             is the ordinary case on a fresh account.
-        //   ::bigint  `SUM(bigint)` returns **numeric**, which sqlx will not decode
-        //             into an i64. Postgres widens to avoid overflow; cents in an i64
-        //             cannot get near it, so casting back is safe.
-        Ok(sqlx::query_scalar(
-            "SELECT COALESCE(SUM(p.amount_cents), 0)::bigint
-               FROM payment p
-               JOIN booking b ON b.id = p.booking_id
-              WHERE p.owner_id = $1
-                AND p.status = 'succeeded'
-                AND b.owner_id = $1
-                AND b.status = 'confirmed'
-                AND b.ends_at < $2",
-        )
-        .bind(owner_id)
-        .bind(cutoff)
-        .fetch_one(ex)
-        .await?)
+        // `to_bigint` because `sum(bigint)` is numeric in Postgres, which does not decode
+        // into an `i64` — Postgres widens to avoid overflow, and cents in an `i64` cannot
+        // get near that bound, so casting back is safe. See `shared::diesel_ext`.
+        //
+        // **`host_id` is asserted on both sides of the join**, which is not redundant:
+        // it is what lets the planner start from `booking_host (host_id, status,
+        // ends_at)` instead of reaching every booking a payment points at.
+        let total: Option<i64> = payment::table
+            .inner_join(booking::table.on(booking::id.eq(payment::booking_id)))
+            .filter(
+                payment::host_id
+                    .eq(host_id)
+                    .and(payment::status.eq(status::SUCCEEDED))
+                    .and(booking::host_id.eq(host_id))
+                    .and(booking::status.eq(booking_status::CONFIRMED))
+                    .and(booking::ends_at.lt(cutoff)),
+            )
+            .select(to_bigint(sum(payment::amount_cents)))
+            .first(conn)
+            .await?;
+
+        Ok(total.unwrap_or(0))
     }
 }

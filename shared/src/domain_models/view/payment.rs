@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::{domain_models::payment::status, events::payment::PaymentCreated};
@@ -10,19 +11,20 @@ use crate::{domain_models::payment::status, events::payment::PaymentCreated};
 /// the session, intent and refund ids are how the write side talks to Stripe, and
 /// nothing a browser reaches has any use for them.
 ///
-/// The rule this reverses is recorded in `migrations/view/0003_payment.sql`. In short:
+/// The rule this reverses is recorded in `migrations/view/0003_payment/up.sql`. In short:
 /// this projection is displayed, never spent — `request_payout` computes what it pays
 /// out from payment-service's own tables, inside its own transaction.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::view::payment)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct ViewPayment {
     pub id: Uuid,
     /// payment-service's version of this payment, as last applied here. What
     /// `bus::await_version` compares a client's `X-Await-Version` against.
-    #[sqlx(try_from = "i64")]
-    pub version: u64,
+    pub version: i64,
     pub booking_id: Uuid,
     /// Who earns it.
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     /// Who paid.
     pub renter_id: Uuid,
     /// EUR cents.
@@ -40,12 +42,12 @@ impl ViewPayment {
     /// `created_at` comes off the event rather than from `at`, unlike `ViewBooking`:
     /// payment-service stores that exact instant on its own row, and a wallet showing a
     /// different date from the one the write side recorded is a bug nobody would spot.
-    pub fn created(e: PaymentCreated, version: u64) -> Self {
+    pub fn created(e: PaymentCreated, version: i64) -> Self {
         Self {
             id: e.payment_id,
             version,
             booking_id: e.booking_id,
-            owner_id: e.owner_id,
+            host_id: e.host_id,
             renter_id: e.renter_id,
             amount: e.amount_cents,
             status: status::CREATED.to_string(),
@@ -60,15 +62,16 @@ impl ViewPayment {
 /// Two columns, which is every column that changes after creation. The Stripe handles
 /// that make up the rest of payment-service's own patch have no counterpart here
 /// because there are no columns to put them in.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = crate::schema::view::payment)]
 pub struct ViewPaymentPatch {
     pub status: Option<String>,
     pub refunded_at: Option<DateTime<Utc>>,
 }
 
 impl ViewPaymentPatch {
-    // No `bind` — sqlx binds positionally, so the binds live beside the `$n`
-    // placeholders in `ViewPaymentRepository::transition`.
+    // No `bind` — `AsChangeset` is the `SET` list. See the note in
+    // `domain_models::user::user`.
 
     /// Paid. The intent id that arrives with this event stops at the write side.
     pub fn succeeded() -> Self {

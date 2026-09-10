@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::{
@@ -16,7 +17,9 @@ use crate::{
 ///
 /// Carries no methods beyond the event conversions below. Reading and writing it
 /// is `SpotRepository`'s job.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::spot::spot)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Spot {
     /// A plain uuid primary key — there is nothing left to unwrap, so `SELECT *`
     /// is enough where every read used to carry `record::id(id) AS id`.
@@ -28,12 +31,11 @@ pub struct Spot {
     /// On the model rather than only in the schema so a whole-row write carries it,
     /// and so a read can answer "which version is this" — which is what a backfill
     /// re-emitting current state has to stamp on the events it raises.
-    #[sqlx(try_from = "i64")]
-    pub version: u64,
-    /// A plain uuid column, not a record link — see `spot_owner` in
+    pub version: i64,
+    /// A plain uuid column, not a record link — see `spot_host` in
     /// `schemas/spot-schema.surql`, and the note there about why this is set by
     /// the service from the verified claim rather than by `VALUE $token.ID`.
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     pub title: String,
     pub description: Option<String>,
     /// EUR cents. Named for its column, which predates the `_cents` suffix the
@@ -55,9 +57,7 @@ pub struct Spot {
     /// still resolve a title and an address; every list filters on this.
     ///
     pub deleted: bool,
-    #[sqlx(json)]
     pub address: Address,
-    #[sqlx(json)]
     pub availability: Availability,
     /// IANA name, derived from the geocoded point at creation.
     pub timezone: String,
@@ -73,11 +73,11 @@ impl Spot {
     /// does not carry (`active`, `deleted`, and `created_at` equalling
     /// `updated_at`) are defaults of the model; they used to be literals in the
     /// projector's CONTENT block.
-    pub fn created(e: SpotCreated, at: DateTime<Utc>, version: u64) -> Self {
+    pub fn created(e: SpotCreated, at: DateTime<Utc>, version: i64) -> Self {
         Self {
             id: e.spot_id,
             version,
-            owner_id: e.owner_id,
+            host_id: e.host_id,
             title: e.title,
             description: e.description,
             price_per_hour: e.price_per_hour_cents,
@@ -101,10 +101,11 @@ impl Spot {
 /// SpotPatch { active: Some(false), ..Default::default() }
 /// ```
 ///
-/// Only the columns an edit can touch. `owner_id`, `lng`/`lat`, `address`,
+/// Only the columns an edit can touch. `host_id`, `lng`/`lat`, `address`,
 /// `timezone` and `created_at` are written once by [`Spot::created`] and are not
 /// representable here — a spot cannot change hands or move.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = crate::schema::spot::spot)]
 pub struct SpotPatch {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -117,9 +118,8 @@ pub struct SpotPatch {
 }
 
 impl SpotPatch {
-    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
-    // positionally, so the binds live beside the `$n` placeholders in
-    // `SpotRepository::patch`.
+    // No `bind` — `AsChangeset` is the `SET` list. See the note in
+    // `domain_models::user::user`.
 
     /// An edit. Absent fields stay absent — the `COALESCE($n, column)` in the patch
     /// is what makes "None means unchanged" hold in the projection as well as the

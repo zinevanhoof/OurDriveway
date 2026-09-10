@@ -7,8 +7,8 @@ import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDate
 import { locateUser, nearer, type Position } from '@/lib/geo';
 import { mergeBooked } from '@/lib/bookingAvailability';
 import { useAuthStore } from '@/stores/auth';
-import { fetchBalance, fetchMyBookings, fetchSpot, fetchSpotsNear, viewKeys } from '@/api/viewApi';
-import type { BookingListItem } from '@/types/view';
+import { fetchBalance, fetchNextBooking, fetchSpot, fetchSpotsNear, viewKeys } from '@/api/viewApi';
+import type { NextBookingResponse } from '@/types/view';
 import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import BookingFormComponent from '@/components/BookingFormComponent.vue';
@@ -30,45 +30,32 @@ const paused = computed(() => !auth.user?.id)
 
 // ─── the soonest booking ────────────────────────────────────────────────────
 //
-// `network-only` for the same reason the bookings tab is: statuses move through the
-// event log, never through a GraphQL mutation, so graphcache has nothing to invalidate
-// on and a cached read would show a hold that lapsed or miss a booking a webhook just
-// confirmed. This card saying something different from the tab is worse than the extra
-// request.
+// **One row, chosen by the server.** This used to fetch the renter's entire booking
+// history, filter it to `confirmed` here, and rank what was left by comparing
+// `"YYYY-MM-DDTHH:MM"` wall-clock strings — which orders wrong for two bookings in
+// different zones within a day of each other. `/renter/bookings/next` sorts on `endsAt`,
+// which is an instant, and `LIMIT 1` on `(renter_id, ends_at)` reads one row.
 //
-// ponytail: this pulls the renter's ENTIRE booking history to render one card. It shares
-// the document and variables with the bookings tab, so the two still share one cache
-// entry — they just no longer share one *request*. Give it its own
-// `where: { ends_at: { gt: $now } }, limit: 1` document (booking_ends is already
-// indexed) the day someone has hundreds of bookings.
-const { data: bookings } = useQuery({
-    queryKey: viewKeys.myBookings,
-    queryFn: fetchMyBookings,
+// `staleTime: 0` stays, and for the original reason: a booking's status moves through the
+// event log, never through anything this client did, so there is nothing to invalidate on
+// and a cached read would show a hold that lapsed or miss one a webhook just confirmed.
+const { data: nextBooking } = useQuery({
+    queryKey: viewKeys.nextBooking,
+    queryFn: fetchNextBooking,
     staleTime: 0,
 })
 
-// Confirmed only: a 'reserved' hold is an unfinished checkout, not somewhere you
-// are due. `nextSlot` — not the booking's first slot — because a booking with an
-// 09:00 and a 14:00 slot today has to read 14:00 once the morning is over.
-//
-// ponytail: candidates are ranked by wall-clock string, so two bookings in
-// different zones within a day of each other can order wrong. Compare instants if
-// this ever shows more than the single next one.
-// The `slot !== null` filter needs a type predicate to narrow, which it did not while
-// the query result was `any` — every row here was untyped, so the template read
-// `next.slot[0]` off something the compiler knew nothing about. `nextSlot` returns null
-// for a booking whose slots have all passed, and that was always reachable; it just was
-// not visible until the responses acquired types.
-type NextUp = { booking: BookingListItem; slot: [string, TimeSlot] }
+// `nextSlot` — not the booking's first slot — because a booking with an 09:00 and a 14:00
+// slot today has to read 14:00 once the morning is over. It returns null when every slot
+// has passed, which the server's `ends_at > now` makes rare but not impossible: the
+// booking's last slot can be over while its `ends_at` is not.
+type NextUp = { booking: NextBookingResponse; slot: [string, TimeSlot] }
 
 const next = computed<NextUp | null>(() => {
-    const upcoming = (bookings.value ?? [])
-        .filter((b) => b.status === 'confirmed')
-        .map((b) => ({ booking: b, slot: nextSlot(b, b.spot?.timezone) }))
-        .filter((row): row is NextUp => row.slot !== null)
-    return upcoming.sort((a, b) =>
-        `${a.slot[0]}T${a.slot[1].start}`.localeCompare(`${b.slot[0]}T${b.slot[1].start}`),
-    )[0] ?? null
+    const booking = nextBooking.value
+    if (!booking) return null
+    const slot = nextSlot(booking, booking.spot?.timezone)
+    return slot ? { booking, slot } : null
 })
 
 const nextTimezone = computed(() => next.value?.booking?.spot?.timezone)

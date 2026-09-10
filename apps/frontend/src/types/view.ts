@@ -1,21 +1,23 @@
 // What view-service answers with.
 //
-// One type per projection in `shared/src/projections/`, and they must stay in step with
-// it — there is no schema between them any more. That was true of the GraphQL documents
-// too: `graphql-codegen` was never wired up, so every result was `any` and a renamed
-// field was a runtime `undefined` rather than a type error. These are at least written
-// down.
+// **One type per `*Response` struct in `shared/src/responses/view.rs`**, named the same.
+// Projection names never cross the wire — a projection is a group of columns a statement
+// selects, and it changes when a statement needs another column, which is not a reason for
+// a client to change. These are the contract; the projections are not.
+//
+// They must stay in step by hand: there is no schema between them. That was true of the
+// GraphQL documents too — `graphql-codegen` was never wired up, so every result was `any`
+// and a renamed field was a runtime `undefined` rather than a type error. These are at
+// least written down.
 //
 // Every field is camelCase because the Rust types carry
-// `#[serde(rename_all = "camelCase")]`. The Rust side also carries `#[sqlx(rename)]`
-// aliases on the nested types — those are SQL-side only and change nothing here.
+// `#[serde(rename_all = "camelCase")]`.
 //
-// ## Public vs owner is a type, not a nullable field
+// ## `| null` never means "you may not see this"
 //
-// A `| null` below always means **"there is nothing"** — a join that found no row, a
-// booking nobody rated. It never means "you may not see this". The fields a stranger
-// used to receive as `null` are simply absent from the public types, because the
-// endpoint that serves them selects different columns.
+// It means **there is nothing** — a join that found no row, a booking nobody cancelled,
+// a renter with nothing coming up. The fields a caller may not see are simply absent from
+// the type, because the route that serves them selects different columns.
 
 import type { SpotAvailability } from "@/lib/bookingAvailability";
 import type { TimeSlot } from "@/types/domain/spot";
@@ -33,8 +35,10 @@ export type Address = {
   formatted: string;
 };
 
+// ─── account ────────────────────────────────────────────────────────────────
+
 /** A person as anyone may see them. Never carries an email. */
-export type PublicViewUser = {
+export type UserPublicResponse = {
   id: string;
   firstName: string;
   lastName: string;
@@ -42,98 +46,145 @@ export type PublicViewUser = {
 };
 
 /**
- * The caller's own profile — the one place `email` and `licensePlates` appear.
+ * The caller's own profile — the one place `email`, `licensePlates` and `country` appear.
  *
- * `email` is not nullable: every projected row is created by a registration, which
- * carries one, and the column is `NOT NULL`.
+ * `email` is not nullable: every projected row is created by a registration, which carries
+ * one, and the column is `NOT NULL`.
  */
-export type OwnerViewUser = PublicViewUser & {
+export type AccountProfileResponse = {
+  firstName: string;
+  lastName: string;
+  profilePicture: string | null;
   email: string;
   licensePlates: string[];
   /**
    * ISO 3166-1 alpha-2, or null until the profile sets it.
    *
-   * Scoped like `email` rather than like `licensePlates`: only its owner sees it.
-   * It exists because Stripe will not open a connected account without a country and
-   * fixes it permanently at creation, so a host sets it once, before onboarding.
+   * Scoped like `email` rather than like `licensePlates`: only its owner sees it. It
+   * exists because Stripe will not open a connected account without a country and fixes it
+   * permanently at creation, so a host sets it once, before onboarding.
    */
   country: string | null;
 };
 
-/** `GET /api/view/me`. `profile` is null only between signup and its projection. */
-export type Me = { id: string; profile: OwnerViewUser | null };
-
-/** The columns of one spot, shared by both spot shapes below. */
-type SpotFields = {
+/**
+ * `GET /api/view/account`.
+ *
+ * `profile` is null only between signup and its projection. `id` comes from the verified
+ * claim rather than a row, so it always resolves.
+ */
+export type AccountResponse = {
   id: string;
-  ownerId: string;
-  /** Null while the owner has not been projected here yet — an absent join. */
-  owner: PublicViewUser | null;
-  title: string;
-  description: string | null;
-  /** EUR cents. */
-  pricePerHour: number;
-  images: string[];
-  lng: number;
-  lat: number;
-  active: boolean;
-  address: Address;
-  availability: SpotAvailability;
-  timezone: string;
+  profile: AccountProfileResponse | null;
 };
+
+// ─── public ─────────────────────────────────────────────────────────────────
 
 /**
  * A booking on a spot's page, as anyone may see it: **the availability answer.**
  *
- * Which slots are taken, until when, and whether they still block. No renter, no
- * amount, no hold expiry — not nulled, not selected.
+ * Which slots are taken, until when, and whether they still block. No renter, no amount —
+ * not nulled, not selected.
  */
-export type PublicViewBooking = {
+export type PublicBookingResponse = {
   id: string;
   booked: Booked;
   status: string;
   endsAt: string;
 };
 
-/** A booking as a party to it sees it — the host on their spot, or the renter. */
-export type OwnerViewBooking = PublicViewBooking & {
-  spotId: string;
-  renterId: string;
-  ownerId: string;
-  /** Null while the renter has not been projected here yet. */
-  renter: PublicViewUser | null;
-  /** EUR cents. */
-  amount: number;
-  holdUntil: string | null;
-  releaseReason: string | null;
-  /** `'spot_unavailable'` means the host withdrew, not that you cancelled. */
-  cancelReason: string | null;
-  rating: number | null;
-  createdAt: string;
-};
-
-/** `GET /api/view/spots/:id` — one active spot as a prospective renter sees it. */
-export type PublicViewSpot = SpotFields & { bookings: PublicViewBooking[] };
-
-/** `GET /api/view/spots/:id/manage` — one spot as its host sees it. */
-export type OwnerViewSpot = SpotFields & { bookings: OwnerViewBooking[] };
-
-/** The list shape: map pins (`/spots/nearby`) and the host's own list (`/me/spots`). */
-export type SpotListItem = {
+/** `GET /api/view/public/spots/{id}` — one active spot as a prospective renter sees it. */
+export type PublicSpotResponse = {
   id: string;
   title: string;
   /** EUR cents. */
   pricePerHour: number;
   images: string[];
-  active: boolean;
+  address: Address;
+  availability: SpotAvailability;
+  timezone: string;
+  /** Null while the host has not been projected here yet — an absent join. */
+  host: UserPublicResponse | null;
+  bookings: PublicBookingResponse[];
+};
+
+/**
+ * `GET /api/view/public/spots/nearby` — one map pin.
+ *
+ * No `address` and no `active`: a pin is placed by coordinates, and the route only returns
+ * live listings in the first place.
+ */
+export type SpotPinResponse = {
+  id: string;
+  title: string;
+  /** EUR cents. */
+  pricePerHour: number;
+  images: string[];
   lng: number;
   lat: number;
-  address: Address;
+  /** The weekday-and-time filter is a client-side fold over this. */
   availability: SpotAvailability;
 };
 
+// ─── host ───────────────────────────────────────────────────────────────────
+
+/** A booking on the host's own spot. Carries the renter and the amount. */
+export type HostBookingResponse = {
+  id: string;
+  booked: Booked;
+  status: string;
+  endsAt: string;
+  /** EUR cents. */
+  amount: number;
+  /** Null while the renter has not been projected here yet. */
+  renter: UserPublicResponse | null;
+};
+
+/** `GET /api/view/host/spots/{id}` — one spot as its host sees it. */
+export type HostSpotResponse = {
+  id: string;
+  title: string;
+  description: string | null;
+  /** EUR cents. */
+  pricePerHour: number;
+  images: string[];
+  /** The live switch. An inactive spot resolves here and nowhere else. */
+  active: boolean;
+  address: Address;
+  availability: SpotAvailability;
+  timezone: string;
+  bookings: HostBookingResponse[];
+};
+
+/** `GET /api/view/host/spots` — one row of the host's own list. */
+export type HostSpotListItemResponse = {
+  id: string;
+  title: string;
+  /** EUR cents. */
+  pricePerHour: number;
+  images: string[];
+  /** False is a paused listing, which looks identical to a live one otherwise. */
+  active: boolean;
+  address: Address;
+};
+
+/**
+ * `GET /api/view/host/balance`.
+ *
+ * Two figures, not four: `earnedCents` and `paidOutCents` are the arithmetic behind
+ * `availableCents` and no screen renders them, so they stop at the server.
+ */
+export type BalanceResponse = {
+  /** Withdrawable now: settled income minus what has already been taken out. */
+  availableCents: number;
+  /** Earned but not settled yet — what `availableCents` will grow by. */
+  pendingCents: number;
+};
+
+// ─── renter ─────────────────────────────────────────────────────────────────
+
 /** Just enough of a spot to render a booking card. */
-export type SpotCard = {
+export type SpotCardResponse = {
   id: string;
   title: string;
   images: string[];
@@ -142,19 +193,38 @@ export type SpotCard = {
   address: Address;
 };
 
-/** `GET /api/view/me/bookings` — the caller's own bookings as a renter. */
-export type BookingListItem = {
+/** `GET /api/view/renter/bookings` and `/renter/bookings/{id}` — one of the caller's own. */
+export type RenterBookingResponse = {
   id: string;
   status: string;
   /** EUR cents. Unscoped: this endpoint only ever returns your own. */
   amount: number;
   booked: Booked;
   endsAt: string;
+  /** `'spot_unavailable'` means the host withdrew, not that you cancelled. */
   cancelReason: string | null;
-  spotId: string;
   /** Null while the spot has not been projected here yet. */
-  spot: SpotCard | null;
+  spot: SpotCardResponse | null;
 };
+
+/**
+ * `GET /api/view/renter/bookings/next` — the home screen's next-up card.
+ *
+ * The same rows as {@link RenterBookingResponse} behind a different response, and the
+ * clearest case for why every route has one: the card renders a title, a zone and the
+ * slots, so it is not sent a status, an end instant or a cancel reason.
+ *
+ * `null` when nothing is coming — an answer, not a 404.
+ */
+export type NextBookingResponse = {
+  id: string;
+  booked: Booked;
+  /** EUR cents. Read by the detail sheet the card opens, not by the card. */
+  amount: number;
+  spot: SpotCardResponse | null;
+};
+
+// ─── wallet ─────────────────────────────────────────────────────────────────
 
 /**
  * One line of the wallet: a single movement of money involving the caller.
@@ -162,7 +232,7 @@ export type BookingListItem = {
  * `GET /api/view/me/payouts` and its `PayoutListItem` are gone — withdrawals are one of
  * the four kinds below, in the same list as everything else that moved.
  */
-export type WalletTransaction = {
+export type WalletTransactionResponse = {
   /** `<uuid>:<kind>`. One payment yields two rows — the charge and its refund. */
   id: string;
   /**
@@ -185,12 +255,12 @@ export type WalletTransaction = {
 };
 
 /**
- * `GET /api/view/me/wallet?month=YYYY-MM` — one month, which is also one page.
+ * `GET /api/view/account/wallet?month=YYYY-MM` — one month, which is also one page.
  *
- * `nextMonth` is the cursor: the next older month that holds anything, or null at the
- * end of the history. Asking for the month after it would be asking for nothing.
+ * `nextMonth` is the cursor: the next older month that holds anything, or null at the end
+ * of the history. Asking for the month after it would be asking for nothing.
  */
-export type WalletMonth = {
+export type WalletMonthResponse = {
   /** `"YYYY-MM"`. */
   month: string;
   /** Everything that came in, positive. */
@@ -198,16 +268,5 @@ export type WalletMonth = {
   /** Everything that went out, **positive**, and not counting withdrawals. */
   outCents: number;
   nextMonth: string | null;
-  transactions: WalletTransaction[];
-};
-
-/** `GET /api/view/me/balance` — a host's money. */
-export type Balance = {
-  /** Withdrawable now: settled income minus what has already been taken out. */
-  availableCents: number;
-  /** Everything earned and settled, ever. */
-  earnedCents: number;
-  paidOutCents: number;
-  /** Earned but not settled yet — what `availableCents` will grow by. */
-  pendingCents: number;
+  transactions: WalletTransactionResponse[];
 };

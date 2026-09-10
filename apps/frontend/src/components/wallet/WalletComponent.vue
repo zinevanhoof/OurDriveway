@@ -23,7 +23,7 @@ import { ArrowUpRight, Banknote, CarFront, Clock, Landmark, RotateCcw } from '@l
 import { formatCents } from '@/lib/money'
 import { formatDay, formatSlots, sortedDays } from '@/lib/bookingDates'
 import { fetchBalance, fetchWallet, viewKeys } from '@/api/viewApi'
-import type { WalletTransaction } from '@/types/view'
+import type { WalletTransactionResponse } from '@/types/view'
 import Button from '../ui/button/Button.vue'
 import { Badge } from '@/components/ui/badge'
 import { Surface } from '@/components/base/surface'
@@ -95,7 +95,7 @@ function net(page: { inCents: number; outCents: number }): string {
 }
 
 /** The spot, or the least-wrong stand-in for one. */
-function title(tx: WalletTransaction): string {
+function title(tx: WalletTransactionResponse): string {
     if (tx.kind === 'payout') return 'Withdrawal'
     // Null while the spot has not been projected here yet, and for a spot deleted long
     // enough ago to be gone. The row is still a real movement of money, so it shows.
@@ -107,7 +107,7 @@ function title(tx: WalletTransaction): string {
  *
  * A payout has no booking, so it says when it was *made* instead.
  */
-function sub(tx: WalletTransaction): string {
+function sub(tx: WalletTransactionResponse): string {
     if (tx.kind === 'payout') return dayFormat.format(new Date(tx.occurredAt))
 
     const [day] = sortedDays({ booked: tx.booked })

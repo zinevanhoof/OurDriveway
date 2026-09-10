@@ -1,90 +1,50 @@
-//! What view-service reads and answers with — one type per (shape, audience).
+//! What view-service **reads**. One projection per route, named for the route.
 //!
-//! A projection is **both the row and the response**. It derives `FromRow` and
-//! `Serialize`, so a read is `query_as::<_, PublicViewSpot>(…)` and the result is
-//! handed to `Json` untouched. There is no row struct, no `From` impl and no mapping
-//! closure between the database and the wire.
+//! A projection is a group of columns and nothing else: `Queryable + Selectable`, no
+//! `Serialize`. What goes on the wire is a `*Response` in `crate::responses::view`,
+//! which every route has even where it would be field-for-field identical. The point of
+//! the split is that the wire contract stops moving when a projection does — adding a
+//! column to a read is then a change to one statement, not to a client.
 //!
-//! ## The audience is the type, not a field
+//! ## The audience is which projection you select, not a field you null out
 //!
 //! `responses::view` used to hold one shape per *aggregate* and cut fields per caller
 //! after the query: `SpotBooking::amount` was `Option<i64>` where `None` meant "you may
 //! not see this", decided by an `is_party` helper the repository ran over every row.
 //!
-//! That rule now lives in the type. `PublicViewBooking` has no `amount` column in its
-//! SELECT at all; `OwnerViewBooking` has an `amount: i64`. Reaching the owner type *is*
-//! the permission decision, made once by the route that chose which repository function
-//! to call. So:
+//! That rule is the type now. [`booking::PublicBookingProjection`] has no `amount` column
+//! in its SELECT at all; [`booking::HostBookingProjection`] has an `amount: i64`.
+//! Reaching the host projection *is* the permission decision, made once by the route
+//! namespace that chose which repository function to call. So:
 //!
 //! **Every `Option` here means "there is nothing", never "you may not see this."**
 //!
 //! An `Option` that can never be `None` is the same lie wearing a different hat — see
-//! `OwnerViewUser::email`, which is a `String` because every projected row has one.
+//! [`user::AccountProjection::email`], which is a `String` because every projected row
+//! has one.
 //!
-//! ## Column aliasing
+//! ## Duplication between projections is fine. One type is not.
 //!
-//! `#[sqlx(flatten)]` reads the nested type's own field names out of the *same* row and
-//! has no per-site prefix, so a nested projection sharing a name with its parent (`id`,
-//! `title`) would silently read the parent's column.
+//! [`spot::PublicSpotProjection`] and [`spot::HostSpotProjection`] overlap by seven
+//! columns and are deliberately two types. `spot` has **no** field-level scoping: every
+//! column is visible to anyone who may see the row at all, so what separates these two is
+//! which columns a screen reads, and a shared parent type would only make each of them
+//! carry the other's.
 //!
-//! Nothing is dropped to dodge that. Each nested type declares `#[sqlx(rename)]` and
-//! every statement writes the matching `AS`:
+//! [`user::UserPublicProjection`] is the exception and the reason the rule is worth
+//! stating: `app_user` *does* have a scoped subset, so that one type is shared, embedded
+//! everywhere a person appears, and must never quietly grow an `email`.
 //!
-//! - a person is always `user_*`, **including where there is no join** — the `/me` read
-//!   selects `id AS user_id, …` so [`user::PublicViewUser`] decodes identically as
-//!   owner-on-spot, renter-on-booking, and standalone;
-//! - a spot nested in a booking row is always `spot_*`.
+//! ## Columns match by position
 //!
-//! `#[sqlx(rename)]` is SQL-side only. `#[serde(rename_all = "camelCase")]` still uses
-//! the Rust field names, so the JSON is unaffected by any of it.
-//!
-//! **Ceiling:** one person per row. A statement needing an owner *and* a renter in the
-//! same row needs a second type with its own prefix, because `flatten` cannot take one
-//! per site. Nothing needs that today — the spot page reads its bookings separately.
+//! There is no aliasing anywhere and nothing to remember. The select clause is matched by
+//! POSITION, so a nested projection reads whichever columns its slot in the tuple was
+//! given — the same `UserPublicProjection` is the host in one slot and the renter in the
+//! next, and two aliases of `app_user` in one statement are ordinary. A LEFT JOIN that
+//! found nothing is `Option::<T>::as_select()`, which is `None` rather than a decode
+//! error, and the clause is checked against the FROM at compile time.
 
 pub mod booking;
 pub mod spot;
 pub mod user;
 pub mod wallet;
-
-use serde::Serialize;
-use sqlx::{FromRow, postgres::PgRow};
-
-/// A LEFT JOIN that may have found nothing.
-///
-/// `owner_id`, `spot_id` and `renter_id` carry no foreign key on purpose — the streams
-/// have no cross-stream ordering, so a spot is routinely projected before the user who
-/// owns it. The join then finds no row, and that is ordinary rather than an error.
-///
-/// `#[sqlx(flatten)]` cannot express it: there is no `impl FromRow for Option<T>`, and
-/// the derive calls `T::from_row` unconditionally, so a missed join arrives as a decode
-/// error rather than a `None`. The optionality lives here instead of being rebuilt by
-/// hand at every join site.
-///
-/// Only `ColumnDecode` becomes `None` — a NULL where the projection wants a value.
-/// **`ColumnNotFound` still propagates**, because that is a statement missing an `AS`,
-/// which is a bug in the query rather than a row that has not arrived.
-#[derive(Debug, Clone, Serialize)]
-#[serde(transparent)]
-pub struct MaybeJoined<T>(pub Option<T>);
-
-impl<T> MaybeJoined<T> {
-    /// The joined value, if the join found one.
-    pub fn as_ref(&self) -> Option<&T> {
-        self.0.as_ref()
-    }
-}
-
-impl<'r, T> FromRow<'r, PgRow> for MaybeJoined<T>
-where
-    T: FromRow<'r, PgRow>,
-{
-    fn from_row(row: &'r PgRow) -> sqlx::Result<Self> {
-        match T::from_row(row) {
-            Ok(v) => Ok(Self(Some(v))),
-            // The join found nothing: a NOT NULL field of `T` came back NULL.
-            Err(sqlx::Error::ColumnDecode { .. }) => Ok(Self(None)),
-            Err(e) => Err(e),
-        }
-    }
-}

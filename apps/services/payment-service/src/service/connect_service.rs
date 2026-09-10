@@ -8,6 +8,7 @@
 //! that other services project; it is a handle to a third party, and it stays where the
 //! Stripe SDK already is. There is nothing downstream to tell.
 
+use shared::db;
 use std::sync::Arc;
 
 use shared::error::myerror::{ContextExt, MyResult};
@@ -23,7 +24,7 @@ use crate::{
 
 pub struct ConnectService {
     /// The pool. See the note on `PaymentService::db` — the repositories are stateless.
-    db: sqlx::PgPool,
+    db: shared::db::Db,
     stripe: Arc<Stripe>,
 }
 
@@ -50,7 +51,7 @@ pub enum ConnectStatus {
 }
 
 impl ConnectService {
-    pub fn new(db: sqlx::PgPool, stripe: Arc<Stripe>) -> Self {
+    pub fn new(db: shared::db::Db, stripe: Arc<Stripe>) -> Self {
         Self { db, stripe }
     }
 
@@ -64,11 +65,13 @@ impl ConnectService {
     /// ponytail: an API call on every load. If it ever shows up in latency, the fix is
     /// `account.updated` in `stripe::verify` writing a cached flag onto
     /// `connect_account` — a webhook and a column, not a different design.
-    pub async fn status(&self, owner_id: &Uuid) -> MyResult<ConnectStatus> {
-        let Some(account_id) = ConnectAccountRepository::find(&self.db, owner_id).await? else {
+    pub async fn status(&self, host_id: &Uuid) -> MyResult<ConnectStatus> {
+        let mut read = db::conn(&self.db).await?;
+        let Some(account_id) = ConnectAccountRepository::find(&mut read, host_id).await? else {
             // Only asked when there is no account yet. Once one exists the country is
             // Stripe's and cannot be changed, so the profile's copy stops mattering.
-            let has_country = HostMirrorRepository::find(&self.db, owner_id)
+            let mut read = db::conn(&self.db).await?;
+            let has_country = HostMirrorRepository::find(&mut read, host_id)
                 .await?
                 .is_some_and(|host| host.country.is_some());
 
@@ -105,17 +108,19 @@ impl ConnectService {
     /// loads: `status` above deliberately does not do this.
     ///
     /// Two racing calls cannot leave two accounts pointed at: `Stripe::create_account`
-    /// is idempotent per owner, and `ConnectAccountRepository::insert` answers with
+    /// is idempotent per host, and `ConnectAccountRepository::insert` answers with
     /// whichever row won.
-    pub async fn account_session(&self, owner_id: &Uuid) -> MyResult<String> {
-        let account_id = match ConnectAccountRepository::find(&self.db, owner_id).await? {
+    pub async fn account_session(&self, host_id: &Uuid) -> MyResult<String> {
+        let mut read = db::conn(&self.db).await?;
+        let account_id = match ConnectAccountRepository::find(&mut read, host_id).await? {
             Some(existing) => existing,
             None => {
                 // Both required by Accounts v2 before a recipient configuration is
                 // accepted, and neither is guessable: the country is immutable once the
                 // account exists, so a default would cost a host their payouts rather
                 // than merely being wrong.
-                let host = HostMirrorRepository::find(&self.db, owner_id)
+                let mut read = db::conn(&self.db).await?;
+                let host = HostMirrorRepository::find(&mut read, host_id)
                     .await?
                     .context_not_found(("Not Found", "Could not find your account."))?;
 
@@ -126,10 +131,11 @@ impl ConnectService {
 
                 let created = self
                     .stripe
-                    .create_account(owner_id, &host.email, country)
+                    .create_account(host_id, &host.email, country)
                     .await?;
-                tracing::info!(%owner_id, account_id = %created, "created a connected account");
-                ConnectAccountRepository::insert(&self.db, owner_id, &created).await?
+                tracing::info!(%host_id, account_id = %created, "created a connected account");
+                let mut read = db::conn(&self.db).await?;
+                ConnectAccountRepository::insert(&mut read, host_id, &created).await?
             }
         };
 

@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::general_models::spot::TimeSlot;
+use crate::general_models::booking::Booked;
 
 /// Everything that can happen to a booking. Published by booking-service only.
 ///
@@ -135,14 +133,18 @@ pub struct BookingCreated {
     /// Selects the subject this booking lives on: every booking for one spot
     /// shares that spot's subject, which is what gives them a total order.
     pub spot_id: Uuid,
-    /// Denormalized from the spot so the booking row can be scoped to the owner
+    /// Denormalized from the spot so the booking row can be scoped to the host
     /// without a cross-database dereference.
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     /// From the verified JWT claim.
     pub renter_id: Uuid,
     /// `"YYYY-MM-DD"` -> slots, in the spot's timezone. Same shape as a spot's
     /// single-day availability, minus the weekly recurrence.
-    pub booked: HashMap<String, Vec<TimeSlot>>,
+    ///
+    /// The domain type rather than a bare map, so the three services that mirror this
+    /// event assign it straight across. `Booked` is `#[serde(transparent)]`, so the JSON
+    /// on the wire and in the log is unchanged by that.
+    pub booked: Booked,
     /// EUR cents, computed server-side from the spot's price and the *authorised*
     /// minutes. The client's figure is display-only and never reaches this.
     pub amount_cents: i64,

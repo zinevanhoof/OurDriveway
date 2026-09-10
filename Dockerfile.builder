@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/app/target,sharing=locked \
     && cp target/release/user-service target/release/booking-service \
           target/release/spot-service target/release/view-service \
           target/release/media-service target/release/notification-service \
-          target/release/payment-service /out/
+          target/release/payment-service target/release/migrator /out/
 # ^ the cp is required: /app/target is a cache mount, scratch space that never
 # lands in a layer. Only what reaches /out is visible to COPY --from=builder.
 

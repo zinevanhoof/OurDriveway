@@ -18,7 +18,7 @@
 //! the query is already parameterised on two instants.
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use shared::projections::wallet::{WalletTransaction, kind};
+use shared::projections::wallet::{WalletTransactionProjection, kind};
 
 /// `"2026-08"` — the month an instant falls in, which is also the page it belongs to.
 pub fn label(at: DateTime<Utc>) -> String {
@@ -67,7 +67,7 @@ pub fn bounds(month: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
 ///
 /// Folded here rather than as SQL aggregates so the totals are over exactly the rows on
 /// screen. Two statements could disagree; one cannot.
-pub fn totals(rows: &[WalletTransaction]) -> (i64, i64) {
+pub fn totals(rows: &[WalletTransactionProjection]) -> (i64, i64) {
     let mut money_in = 0;
     let mut money_out = 0;
 
@@ -82,18 +82,42 @@ pub fn totals(rows: &[WalletTransaction]) -> (i64, i64) {
     (money_in, money_out)
 }
 
+/// Whether a wallet row's money is still ripening.
+///
+/// **Two sources, and they are not the same question.** A host's charge is pending until
+/// the booking behind it has been over for `SETTLEMENT_SECS` — so the row carries
+/// `settles_at`, the booking's end, and this compares it. A withdrawal is pending while
+/// the transfer is in flight, which the row already knows as `pending_now` because it is
+/// a status rather than a deadline.
+///
+/// `settles_at` is `None` for every row that cannot ripen: a renter's charge, either side
+/// of a refund, and any payout. Money that already moved is not waiting for anything.
+///
+/// This used to be `(p.status = 'succeeded' AND b.status = 'confirmed' AND b.ends_at >= $4)`
+/// inside the wallet's `SELECT`, where nothing could test it and the settlement cutoff had
+/// to be bound into a query that otherwise has no use for it. The statement now returns
+/// the booking's end and this decides what it means.
+pub fn pending(
+    settles_at: Option<DateTime<Utc>>,
+    pending_now: bool,
+    settled_before: DateTime<Utc>,
+) -> bool {
+    pending_now || settles_at.is_some_and(|ends_at| ends_at >= settled_before)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn row(kind: &str, amount_cents: i64) -> WalletTransaction {
-        WalletTransaction {
+    fn row(kind: &str, amount_cents: i64) -> WalletTransactionProjection {
+        WalletTransactionProjection {
             id: format!("{kind}:{amount_cents}"),
             kind: kind.to_string(),
             amount_cents,
             occurred_at: Utc.with_ymd_and_hms(2026, 8, 14, 9, 0, 0).unwrap(),
-            pending: false,
+            settles_at: None,
+            pending_now: false,
             title: None,
             booked: None,
             timezone: None,
@@ -181,5 +205,43 @@ mod tests {
     #[test]
     fn an_empty_month_is_two_zeroes() {
         assert_eq!(totals(&[]), (0, 0));
+    }
+
+    /// The cutoff for every case below: a booking that ended before this has settled.
+    fn cutoff() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 14, 0, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn a_charge_on_a_booking_that_has_not_settled_is_pending() {
+        let ends_after = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
+        assert!(pending(Some(ends_after), false, cutoff()));
+    }
+
+    #[test]
+    fn a_charge_on_a_booking_that_settled_is_not() {
+        let ends_before = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        assert!(!pending(Some(ends_before), false, cutoff()));
+    }
+
+    /// The boundary is the cutoff itself, and it is inclusive on the pending side —
+    /// matching `b.ends_at >= $4`, which is what the SQL said.
+    #[test]
+    fn the_cutoff_instant_itself_is_still_pending() {
+        assert!(pending(Some(cutoff()), false, cutoff()));
+    }
+
+    /// A withdrawal in flight ripens on a status, not a deadline, so it carries no
+    /// `settles_at` at all and must still read as pending.
+    #[test]
+    fn a_withdrawal_in_flight_is_pending_with_no_settles_at() {
+        assert!(pending(None, true, cutoff()));
+    }
+
+    /// Everything that already moved: a renter's charge, either side of a refund, a
+    /// completed payout. Nothing is waiting, so nothing is pending.
+    #[test]
+    fn a_row_that_can_never_ripen_is_never_pending() {
+        assert!(!pending(None, false, cutoff()));
     }
 }

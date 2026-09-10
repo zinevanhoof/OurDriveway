@@ -37,8 +37,11 @@
 use std::time::Duration;
 
 use axum::{extract::Request, http::HeaderName, middleware::Next, response::Response};
+// Re-exported so `version_reader!` can name them without every service having to depend
+// on `futures` or import `shared::db::Db` for a signature the macro wrote.
+pub use futures::future::BoxFuture;
+pub use shared::db::Db;
 use shared::events::{parse_version, split_aggregate};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Header a client echoes back after a write: `X-Await-Version: spot:019f…@3`.
@@ -57,10 +60,101 @@ pub const TIMEOUT: Duration = Duration::from_secs(2);
 /// round trip the client is already making; long enough not to spin.
 const POLL: Duration = Duration::from_millis(25);
 
+/// What a service can answer about one aggregate, having looked in its own tables.
+///
+/// Three outcomes and not `Option<i64>`, because "no row yet" and "not stored here" want
+/// opposite reactions: the first is the ordinary case for a read that follows a create
+/// closely and must keep waiting, the second means there is nothing here to wait for and
+/// spinning until the timeout would be a two-second pause for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// The row is there, at this version.
+    At(i64),
+    /// The aggregate is stored here but this row has not been written yet. Keep waiting.
+    Pending,
+    /// Nothing to wait for: this database does not store this aggregate, or it declined
+    /// to answer. Stop rather than spin.
+    Unavailable,
+}
+
+/// How `bus` asks a service for a version without knowing the service's tables.
+///
+/// The aggregate name arrives from a client's `X-Await-Version` header, so it is a genuine
+/// runtime value — but `bus` is linked into all five services and each answers against its
+/// own schema module, where `spot` is a different Rust type in each. So the match lives in
+/// the service and `bus` holds a pointer to it.
+///
+/// This replaced a `format!`-spliced `SELECT version FROM {table}` guarded by
+/// `shared::db::table_for`'s allowlist. Write one with [`version_reader!`].
+pub type VersionReader = for<'a> fn(&'a Db, &'a str, &'a Uuid) -> BoxFuture<'a, Applied>;
+
 /// The database this service serves reads from — the same one its projectors
-/// write. Wrapped so it is a distinct extractor from any other `Surreal` state.
+/// write — and the service's own answer to "what version is this aggregate at?".
 #[derive(Clone)]
-pub struct AwaitVersions(pub PgPool);
+pub struct AwaitVersions(pub Db, pub VersionReader);
+
+/// Writes a service's [`VersionReader`]: one arm per aggregate it stores.
+///
+/// Each arm is a real diesel table from that service's own schema module, so the query is
+/// built by the DSL and the version comes back as a plain `i64` — no spliced table name,
+/// no allowlist, and no `QueryableByName` struct to carry a column called `version`.
+///
+/// An aggregate with no arm is [`Applied::Unavailable`], which is what a client echoing
+/// `booking:<id>@N` at every service gets from the ones that do not store bookings. That
+/// used to be a 42P01 from the database; it is an absent match arm now.
+///
+/// ```ignore
+/// bus::version_reader! {
+///     pub fn version_of;
+///     "spot" => shared::schema::spot::spot,
+/// }
+/// ```
+#[macro_export]
+macro_rules! version_reader {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident;
+        $($aggregate:literal => $($table:ident)::+),+ $(,)?
+    ) => {
+        $(#[$meta])*
+        $vis fn $name<'a>(
+            db: &'a $crate::await_version::Db,
+            aggregate: &'a str,
+            id: &'a ::uuid::Uuid,
+        ) -> $crate::await_version::BoxFuture<'a, $crate::await_version::Applied> {
+            use ::diesel::OptionalExtension as _;
+            use ::diesel::QueryDsl as _;
+            use ::diesel_async::RunQueryDsl as _;
+            use $crate::await_version::Applied;
+
+            ::std::boxed::Box::pin(async move {
+                let Ok(mut conn) = db.get().await else {
+                    // A pool error is not "behind", it is "no answer right now" — and the
+                    // caller's only two choices are wait or give up. Giving up matches
+                    // what a missing table does.
+                    return Applied::Unavailable;
+                };
+
+                match aggregate {
+                    $(
+                        $aggregate => match $($table)::+::table
+                            .find(id)
+                            .select($($table)::+::version)
+                            .first::<i64>(&mut *conn)
+                            .await
+                            .optional()
+                        {
+                            Ok(Some(version)) => Applied::At(version),
+                            Ok(None) => Applied::Pending,
+                            Err(_) => Applied::Unavailable,
+                        },
+                    )+
+                    _ => Applied::Unavailable,
+                }
+            })
+        }
+    };
+}
 
 pub async fn await_version(
     axum::extract::State(db): axum::extract::State<AwaitVersions>,
@@ -72,7 +166,7 @@ pub async fn await_version(
 
         let _ = tokio::time::timeout(TIMEOUT, async {
             for (table, id, want) in wanted {
-                wait_one(&db.0, &table, &id, want).await;
+                wait_one(&db.0, db.1, &table, &id, want).await;
             }
         })
         .await;
@@ -81,10 +175,10 @@ pub async fn await_version(
 }
 
 /// Blocks until `aggregate:id` has reached `want`, or the caller's timeout fires.
-async fn wait_one(db: &PgPool, table: &str, id: &Uuid, want: u64) {
+async fn wait_one(db: &Db, read: VersionReader, table: &str, id: &Uuid, want: i64) {
     // The outer [`TIMEOUT`] in the middleware caps the whole header, so this one is
     // only a backstop for a single entry.
-    let _ = reached(db, table, id, want, TIMEOUT).await;
+    let _ = reached(db, read, table, id, want, TIMEOUT).await;
 }
 
 /// Whether `table:id` reached `want` within `timeout`.
@@ -99,41 +193,37 @@ async fn wait_one(db: &PgPool, table: &str, id: &Uuid, want: u64) {
 /// and it was always the coarser question, since a worker holding one event cares
 /// about one aggregate rather than about everything published before it.
 pub async fn reached(
-    db: &PgPool,
+    db: &Db,
+    read: VersionReader,
     aggregate: &str,
     id: &Uuid,
-    want: u64,
+    want: i64,
     timeout: Duration,
 ) -> bool {
-    // Resolved once, outside the loop: an aggregate name no service owns is a caller
-    // bug, not something to retry until the timeout. Also the only thing standing
-    // between a client-supplied token and a table name spliced into SQL — Postgres
-    // cannot bind an identifier, so this must never be interpolated unchecked.
-    let Some(table) = shared::db::table_for(aggregate) else {
-        return false;
-    };
-    let sql = format!("SELECT version FROM {table} WHERE id = $1");
-
     tokio::time::timeout(timeout, async {
         loop {
-            match current(db, &sql, id).await {
-                Ok(Some(have)) if have >= want => return true,
-                // The row is not there yet — its creating event has not been applied
-                // — so keep waiting. This is the common case for a read that follows
+            match read(db, aggregate, id).await {
+                Applied::At(have) if have >= want => return true,
+                // Behind, or the row is not there yet — its creating event has not been
+                // applied. Keep waiting; this is the common case for a read that follows
                 // a create closely.
-                Ok(_) => {}
-                // The table does not exist in *this* database, which is not a fault:
+                Applied::At(_) | Applied::Pending => {}
+                // This database does not store this aggregate, which is not a fault:
                 // every service answers this header against its own schema, and a
                 // client that has written a booking echoes `booking:<id>@N` at all of
                 // them. There is nothing here to wait for, so stop rather than spin
                 // until the timeout.
+                //
+                // This used to be a 42P01 escaping from a spliced query. It is an absent
+                // match arm in the service's `version_reader!` now, which is the same
+                // answer decided at compile time.
                 //
                 // `payment` used to be the example — view-service held `payout` and no
                 // `payment`, so echoing a payment's version at it returned immediately.
                 // It holds both now, which means that wait is real: a client that has
                 // just paid, or just withdrawn, waits for the projector rather than
                 // reading a wallet without the thing it did in it.
-                Err(_) => return false,
+                Applied::Unavailable => return false,
             }
             tokio::time::sleep(POLL).await;
         }
@@ -142,17 +232,26 @@ pub async fn reached(
     .unwrap_or(false)
 }
 
-async fn current(db: &PgPool, sql: &str, id: &Uuid) -> Result<Option<u64>, sqlx::Error> {
-    let version: Option<i64> = sqlx::query_scalar(sql).bind(id).fetch_optional(db).await?;
-    Ok(version.map(|v| v.max(0) as u64))
-}
+// `current` was here: one poll, through `sql_query` on a `format!`-spliced table name,
+// reading back a `QueryableByName` struct whose only field was `version: i64`.
+//
+// Each service's [`version_reader!`] does that now, against real tables from its own
+// schema module — so the spliced name is gone, `shared::db::table_for`'s allowlist has no
+// caller left to guard, and `.select(version)` loads straight into `i64` with no struct.
+//
+// Its two error arms survive as [`Applied::Unavailable`]: a pool error and a query error
+// were folded together on purpose, because both mean "no answer right now" and the
+// caller's only two choices are wait or give up.
+//
+// No clamp on the value, then or now: the column and the answer are the same signed type,
+// and a stored version below the one being waited for is what "not there yet" means.
 
 /// `"user:019f…@7,spot:01a0…@3"` -> the entries that parse.
 ///
 /// Malformed entries are skipped rather than rejecting the header: this is an
 /// optimisation, not an authorization input, and one junk entry must not cost a
 /// client the positions it got right.
-fn parse(value: &str) -> impl Iterator<Item = (String, Uuid, u64)> + '_ {
+fn parse(value: &str) -> impl Iterator<Item = (String, Uuid, i64)> + '_ {
     value.split(',').filter_map(|entry| {
         let (aggregate, version) = parse_version(entry.trim())?;
         let (table, id) = split_aggregate(aggregate)?;
@@ -164,7 +263,7 @@ fn parse(value: &str) -> impl Iterator<Item = (String, Uuid, u64)> + '_ {
 mod tests {
     use super::*;
 
-    fn parsed(header: &str) -> Vec<(String, Uuid, u64)> {
+    fn parsed(header: &str) -> Vec<(String, Uuid, i64)> {
         parse(header).collect()
     }
 
@@ -185,6 +284,15 @@ mod tests {
         assert!(parsed(&format!("user:{id}@notanumber")).is_empty());
         assert!(parsed(&format!("user:{id}")).is_empty(), "no version");
         assert!(parsed("").is_empty());
+
+        // A version is an `i64` everywhere now, so this is the one place that still has
+        // to refuse a negative — `parse_version` parses as `u64` and widens for exactly
+        // this. A `-5` that got through would be a wait already satisfied, which is a
+        // read served before the write the client is echoing.
+        assert!(
+            parsed(&format!("user:{id}@-5")).is_empty(),
+            "a negative version must not parse"
+        );
     }
 
     /// One junk entry must not discard the entries around it.

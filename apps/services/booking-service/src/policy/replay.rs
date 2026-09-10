@@ -26,14 +26,16 @@ pub fn events(booking: &Booking) -> Vec<BookingEvent> {
     let created = BookingCreated {
         booking_id,
         spot_id: booking.spot_id,
-        owner_id: booking.owner_id,
+        host_id: booking.host_id,
         renter_id: booking.renter_id,
         booked: booking.booked.clone(),
         amount_cents: booking.amount,
         // Cleared when a booking settles, so a settled one has none to recover.
         // Harmless: the settlement that follows clears it again, and until then it
         // is a hold expiry in the past.
-        expires_at: booking.hold_until.unwrap_or_else(|| booking.created_at.into()),
+        expires_at: booking
+            .hold_until
+            .unwrap_or_else(|| booking.created_at.into()),
         ends_at: booking.ends_at.clone().into(),
     };
 
@@ -78,7 +80,7 @@ mod tests {
             id: Uuid::now_v7(),
             version: 3,
             spot_id: Uuid::now_v7(),
-            owner_id: Uuid::now_v7(),
+            host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: Default::default(),
             amount: 500,

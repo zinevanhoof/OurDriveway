@@ -1,3 +1,4 @@
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::{
@@ -31,7 +32,7 @@ use crate::{
 /// applies — so the counter would have silently stopped working. Reserve takes
 /// `SELECT … FOR UPDATE` on this row instead, and the fresh snapshot its next
 /// statement gets is what makes the loser see the winner's booking. See
-/// `migrations/booking/0001_init.sql` and `shared::db::next_version`.
+/// `migrations/booking/0001_init/up.sql` and `shared::db::next_version`.
 ///
 /// With it went the reason writes here had to be `merge` and never a whole-row
 /// write — there is no longer a column another stream owns. `merge` stays because
@@ -40,17 +41,18 @@ use crate::{
 /// There is deliberately no `booked` column. Which slots are taken is a query over
 /// the booking rows (`BookingRepository::taken_for_spot`), not a map kept in step
 /// with them.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::booking::spot)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct SpotMirror {
     pub id: Uuid,
-    pub owner_id: Option<Uuid>,
+    pub host_id: Option<Uuid>,
     /// EUR cents.
     pub price_per_hour: Option<i64>,
-    /// `json(nullable)`, not plain `json`. This column is genuinely NULL on a
-    /// half-built mirror — the case the whole `Option` here exists for — and plain
-    /// `#[sqlx(json)]` decodes straight into `Availability`, failing with
+    /// Genuinely NULL on a half-built mirror — the case this `Option` exists for — so
+    /// it decodes through the nullable half of its `jsonb_column!` wrapper. A wrapper
+    /// that decoded straight into `Availability` would fail the row with
     /// `UnexpectedNullError` rather than yielding `None`.
-    #[sqlx(json(nullable))]
     pub availability: Option<Availability>,
     /// IANA name. A booking's `booked` is bare wall-clock strings in this zone, so
     /// a cancel deadline cannot be placed on a timeline without it.
@@ -75,9 +77,10 @@ pub struct SpotMirror {
 ///
 /// `id` is absent for the same reason it is on every other patch: the primary key
 /// addresses the row, it is not a column you assign.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::booking::spot)]
 pub struct SpotMirrorPatch {
-    pub owner_id: Option<Uuid>,
+    pub host_id: Option<Uuid>,
     pub price_per_hour: Option<i64>,
     pub availability: Option<Availability>,
     pub timezone: Option<String>,
@@ -86,9 +89,10 @@ pub struct SpotMirrorPatch {
 }
 
 impl SpotMirrorPatch {
-    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
-    // positionally, so the binds live beside the `$n` placeholders in
-    // `SpotMirrorRepository::merge`.
+    // No `bind` — `Insertable` is the insert's column list and `AsChangeset` is the
+    // conflict path's `SET`. Both skip a `None`, which is the two things
+    // `SpotMirrorRepository::merge` used to spell out as COALESCEs. See the note in
+    // `domain_models::user::user`.
 
     /// What a `SpotCreated` mirrors. Only the columns reserve needs — the title,
     /// the photos and the location stay in spot-service.
@@ -97,7 +101,7 @@ impl SpotMirrorPatch {
     /// this may well be patching a row the BOOKINGS side already created.
     pub fn created(e: SpotCreated) -> Self {
         Self {
-            owner_id: Some(e.owner_id),
+            host_id: Some(e.host_id),
             price_per_hour: Some(e.price_per_hour_cents),
             availability: Some(e.availability),
             timezone: Some(e.timezone),
@@ -142,7 +146,7 @@ impl SpotMirror {
         Some((
             self.availability.as_ref()?,
             self.price_per_hour?,
-            self.owner_id?,
+            self.host_id?,
         ))
     }
 }
@@ -161,7 +165,7 @@ mod tests {
     #[test]
     fn set_covers_every_patchable_column() {
         let _: SpotMirrorPatch = SpotMirrorPatch {
-            owner_id: None,
+            host_id: None,
             price_per_hour: None,
             availability: None,
             timezone: None,

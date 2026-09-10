@@ -99,7 +99,8 @@ mod tests {
             // Out of order on purpose: `booked` is a HashMap, so "first" has to be a
             // minimum, not whatever happens to iterate first.
             vec![slot("11:00", "12:00"), slot("09:00", "10:00")],
-        )]);
+        )])
+        .into();
         let tz = "Europe/Brussels";
 
         assert_eq!(in_time(&booked, tz, at("2026-08-03T05:59:59Z")), Some(true));
@@ -119,7 +120,8 @@ mod tests {
         let spread: Booked = HashMap::from([
             ("2026-08-04".to_string(), vec![slot("08:00", "09:00")]),
             ("2026-08-03".to_string(), vec![slot("22:00", "23:00")]),
-        ]);
+        ])
+        .into();
         assert_eq!(in_time(&spread, tz, at("2026-08-03T19:00:00Z")), Some(true));
         assert_eq!(
             in_time(&spread, tz, at("2026-08-03T19:00:01Z")),
@@ -143,7 +145,8 @@ mod tests {
                 vec![slot("08:00", "09:00"), slot("10:00", "11:00")],
             ),
             ("2026-08-03".to_string(), vec![slot("22:00", "23:00")]),
-        ]);
+        ])
+        .into();
 
         // 11:00 Brussels on the 4th is 09:00Z in summer. Reading the strings as UTC
         // would answer 11:00Z and keep the booking "upcoming" two hours too long.
@@ -157,6 +160,6 @@ mod tests {
             Some(at("2026-08-03T20:00:00Z"))
         );
         assert_eq!(ends_at(&booked, "Not/AZone"), None);
-        assert_eq!(ends_at(&HashMap::new(), "Europe/Brussels"), None);
+        assert_eq!(ends_at(&Booked::new(), "Europe/Brussels"), None);
     }
 }

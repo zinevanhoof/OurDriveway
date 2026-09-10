@@ -1,6 +1,8 @@
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::booking::{SpotMirror, SpotMirrorPatch};
 use shared::error::myerror::MyResult;
-use sqlx::PgExecutor;
+use shared::schema::booking::spot;
 use uuid::Uuid;
 
 /// booking-service's local mirror of the `spot` table.
@@ -17,13 +19,15 @@ impl SpotMirrorRepository {
     /// an edge one. The columns that can legitimately be absent are `NULL`-able in the
     /// schema and `Option` on the model, so the read needs no defaults.
     pub async fn find_by_id(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         spot_id: Uuid,
     ) -> MyResult<Option<SpotMirror>> {
-        Ok(sqlx::query_as("SELECT * FROM spot WHERE id = $1")
-            .bind(spot_id)
-            .fetch_optional(ex)
-            .await?)
+        Ok(spot::table
+            .find(spot_id)
+            .select(SpotMirror::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// The same read, holding a row lock until the transaction ends.
@@ -58,15 +62,20 @@ impl SpotMirrorRepository {
     ///     taken ahead of the lock is stale no matter what is locked afterwards.
     ///
     /// See the notes in `docker/docker-compose-dev.yml` and
-    /// `migrations/booking/0001_init.sql`.
+    /// `migrations/booking/0001_init/up.sql`.
     pub async fn find_for_update(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         spot_id: Uuid,
     ) -> MyResult<Option<SpotMirror>> {
-        Ok(sqlx::query_as("SELECT * FROM spot WHERE id = $1 FOR UPDATE")
-            .bind(spot_id)
-            .fetch_optional(ex)
-            .await?)
+        // `.for_update()` is the whole point of this function existing separately from
+        // `find_by_id` — it is what serialises two renters racing one slot.
+        Ok(spot::table
+            .find(spot_id)
+            .for_update()
+            .select(SpotMirror::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// Apply a SPOTS event to the mirror, creating the row if it is not there yet.
@@ -75,40 +84,35 @@ impl SpotMirrorRepository {
     /// the streams expire and a consumer built later can see a `SpotUpdated` whose
     /// `SpotCreated` has already aged out.
     ///
-    /// `COALESCE($n, column)` means absent-is-unchanged. On a row being created that
-    /// resolves to `NULL`, so the table's own defaults decide the rest.
+    /// **Absent-is-unchanged, twice over, and both halves are derived.** `Insertable`
+    /// omits a `None` field from the insert's column list, and an omitted column is the
+    /// only way a table default ever applies — so `active` and `deleted` come back
+    /// `true`/`false` on a create that does not name them. `AsChangeset` skips the same
+    /// `None` on the conflict path, so a `SpotUpdated` carrying only a title leaves every
+    /// mirrored column alone.
+    ///
+    /// That last case is ordinary, not exotic: `SpotMirrorPatch::updated` mirrors three
+    /// columns out of a much wider event, so an **entirely empty patch** is what a
+    /// rename produces. Diesel handles it — `do_update()` with nothing to set is a no-op
+    /// rather than an error, unlike a bare `update().set()`, which is
+    /// `QueryBuilderError(EmptyChangeset)`. Checked against a real database, both paths.
     ///
     /// This no longer has a second job. It was `merge` and never a whole-row write
     /// specifically because `CONTENT` would have erased `bookings_seq`, a column this
     /// stream does not own — that column is gone, so the only reason left is the
     /// partial-row case above.
-    ///
-    /// **The binds are positional**, so their order must match the `$n`.
     pub async fn merge(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         spot_id: Uuid,
         patch: SpotMirrorPatch,
     ) -> MyResult<()> {
-        sqlx::query(
-            "INSERT INTO spot (id, owner_id, price_per_hour, availability, timezone, active, deleted)
-                  VALUES ($1, $2, $3, $4, $5, COALESCE($6, true), COALESCE($7, false))
-             ON CONFLICT (id) DO UPDATE SET
-                 owner_id       = COALESCE(EXCLUDED.owner_id,       spot.owner_id),
-                 price_per_hour = COALESCE(EXCLUDED.price_per_hour, spot.price_per_hour),
-                 availability   = COALESCE(EXCLUDED.availability,   spot.availability),
-                 timezone       = COALESCE(EXCLUDED.timezone,       spot.timezone),
-                 active         = COALESCE($6,                      spot.active),
-                 deleted        = COALESCE($7,                      spot.deleted)",
-        )
-        .bind(spot_id)
-        .bind(patch.owner_id)
-        .bind(patch.price_per_hour)
-        .bind(patch.availability.map(sqlx::types::Json))
-        .bind(patch.timezone)
-        .bind(patch.active)
-        .bind(patch.deleted)
-        .execute(ex)
-        .await?;
+        diesel::insert_into(spot::table)
+            .values((spot::id.eq(spot_id), &patch))
+            .on_conflict(spot::id)
+            .do_update()
+            .set(&patch)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 

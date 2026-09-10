@@ -8,9 +8,12 @@
 //!
 //! Nothing here takes a caller id, because there is no caller — Stripe acted.
 
+use diesel_async::AsyncConnection;
+use diesel_async::scoped_futures::ScopedFutureExt;
+use shared::db;
 use shared::{
     domain_models::booking::status,
-    error::myerror::{ContextExt, MyResult},
+    error::myerror::{ContextExt, MyError, MyResult},
     events::{Envelope, aggregate_id, booking::BookingEvent, booking_subject},
 };
 use uuid::Uuid;
@@ -21,11 +24,11 @@ use crate::repository::booking_repository::BookingRepository;
 /// Publishes `Confirmed` off a settled payment. Reads the booking only to address
 /// its subject — `PaymentEvent::Succeeded` does not carry the spot.
 pub struct PaymentWorkerService {
-    pub db: sqlx::PgPool,
+    pub db: shared::db::Db,
 }
 
 impl PaymentWorkerService {
-    pub fn new(db: sqlx::PgPool) -> Self {
+    pub fn new(db: shared::db::Db) -> Self {
         Self { db }
     }
 
@@ -50,42 +53,52 @@ impl PaymentWorkerService {
     ///
     /// `payment_id` only names the event, so a redelivered webhook is discarded by the
     /// stream's duplicate window instead of appending a second `Confirmed`.
-    pub async fn confirm_paid(&self, booking_id: Uuid, payment_id: Uuid) -> MyResult<u64> {
-        let booking = BookingRepository::find_by_id(&self.db, booking_id)
+    pub async fn confirm_paid(&self, booking_id: Uuid, payment_id: Uuid) -> MyResult<i64> {
+        let mut read = db::conn(&self.db).await?;
+        let booking = BookingRepository::find_by_id(&mut read, booking_id)
             .await?
             .context_not_found(NOT_FOUND)?;
 
-        let mut tx = self.db.begin().await?;
-        let version = shared::db::next_version(&mut tx, "booking", &booking_id).await?;
+        let mut conn = db::conn(&self.db).await?;
 
-        // `status = ANY(['reserved'])` is what keeps this idempotent: a redelivered
-        // webhook, or a payment landing after the hold already lapsed, applies to
-        // nothing.
-        BookingRepository::transition(
-            &mut *tx,
-            booking_id,
-            status::CONFIRMED,
-            &[status::RESERVED],
-            None,
-            None,
-        )
-        .await?;
-        shared::db::set_version(&mut tx, "booking", &booking_id, version).await?;
+        let version = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    let version = shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
 
-        // `actor_id: None` — Stripe acted, not a user holding a token.
-        let mut envelope = Envelope::new(
-            BookingEvent::Confirmed { booking_id },
-            None,
-            aggregate_id("booking", &booking_id),
-            version,
-        );
-        envelope.event_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_OID,
-            format!("payment-confirm:{payment_id}").as_bytes(),
-        );
+                    // `status = ANY(['reserved'])` is what keeps this idempotent: a redelivered
+                    // webhook, or a payment landing after the hold already lapsed, applies to
+                    // nothing.
+                    BookingRepository::transition(
+                        conn,
+                        booking_id,
+                        status::CONFIRMED,
+                        &[status::RESERVED],
+                        None,
+                        None,
+                    )
+                    .await?;
+                    shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking_id, version)?;
 
-        bus::outbox::enqueue(&mut *tx, &booking_subject(&booking.spot_id), &envelope).await?;
-        tx.commit().await?;
+                    // `actor_id: None` — Stripe acted, not a user holding a token.
+                    let mut envelope = Envelope::new(
+                        BookingEvent::Confirmed { booking_id },
+                        None,
+                        aggregate_id("booking", &booking_id),
+                        version,
+                    );
+                    envelope.event_id = Uuid::new_v5(
+                        &Uuid::NAMESPACE_OID,
+                        format!("payment-confirm:{payment_id}").as_bytes(),
+                    );
+
+                    bus::outbox::enqueue(conn, &booking_subject(&booking.spot_id), &envelope)
+                        .await?;
+                    Ok(version)
+                }
+                .scope_boxed()
+            })
+            .await?;
 
         Ok(version)
     }

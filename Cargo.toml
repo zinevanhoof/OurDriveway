@@ -7,6 +7,7 @@ members = [
     "apps/services/media-service",
     "apps/services/notification-service",
     "apps/services/payment-service",
+    "apps/migrator",
     "bus",
     "shared"
 ]
@@ -26,35 +27,42 @@ axum = { version = "0.8.9", features = ["macros"] }
 tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-# Replaced surrealdb, and the whole feature-unification argument at the top of
-# CLAUDE.md went with it — that file exists because `surrealdb-core` is a ~680 MB
-# rlib that got compiled eight times over. Nothing here is remotely that size.
+# sqlx is gone. It was replaced by diesel + diesel-async in one pass; the ledger it
+# owned (`_sqlx_migrations`) went with it, so the databases were wiped once at cutover
+# — see `diesel-migration.md`.
 #
-# `macros` is for the DERIVES only — `FromRow`, and the `#[sqlx(try_from)]` /
-# `#[sqlx(json)]` field attributes. One feature gates those together with the
-# `query!`/`query_as!` macros, so it has to be on; that does NOT drag in compile-time
-# SQL checking, which only happens where those macros are actually invoked.
+# `postgres_backend` and NOT `postgres`. The `postgres` feature pulls pq-sys, which links
+# libpq — and under `resolver = "2"` that feature unifies across every package built
+# together, so ONE crate asking for it would put libpq in all seven service binaries and
+# force `libpq5` into all seven images. diesel-async speaks the wire protocol through
+# tokio-postgres, so only the backend's SQL and type layer is needed here.
 #
-# They are not, anywhere. Every statement goes through runtime-checked
-# `sqlx::query_as::<_, T>(…)`, so `cargo check` never needs a live database and there
-# is no `.sqlx` cache to go stale in a way nobody notices. That also keeps the
-# repository layer's existing promise: what a method does is the string in front of
-# you, with no macro rewriting it.
-#
-# `tls-rustls-aws-lc-rs` and not plain `tls-rustls`: the provider must match
-# `shared::install_default_crypto_provider` and jsonwebtoken's `aws_lc_rs`, or two
-# providers end up in one process and rustls panics on first use — the exact failure
-# that function exists to prevent.
-sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio",
-    "tls-rustls-aws-lc-rs",
-    "postgres",
-    "macros",
+# TLS is deliberately absent: k8s/chart/templates/services.yaml connects with no
+# `sslmode`, so tokio-postgres uses NoTls. The aws-lc-rs rustls provider that
+# `shared::install_default_crypto_provider` installs stays for outbound HTTPS (Stripe,
+# Resend, R2) and jsonwebtoken only.
+diesel = { version = "2.3.13", default-features = false, features = [
+    "postgres_backend",
     "uuid",
     "chrono",
-    "json",
-    "migrate",
+    "serde_json",
+    "32-column-tables",
 ] }
+# `migrations` pulls diesel_migrations + async-connection-wrapper and, importantly, does
+# NOT enable `diesel/postgres` — which is what lets the migrator run migrations without
+# dragging libpq into the workspace per the note above.
+diesel-async = { version = "0.7", features = [
+    "postgres",
+    "bb8",
+    "async-connection-wrapper",
+    "migrations",
+] }
+diesel_migrations = "2.3"
+# The replacement for `#[sqlx(json)]`. `Json<T>` is `#[serde(transparent)]` with `Deref`,
+# so the wire format is unchanged, and its `from_sql` decodes through `serde_json::Value`
+# and propagates the real serde error — which is what tells a stalled projector WHICH
+# field failed to decode.
+diesel_json = "0.3"
 rustls = "0.23"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"

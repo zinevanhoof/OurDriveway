@@ -6,10 +6,11 @@ export type Address = {
   region?: string;
   country: string;
   formatted: string;
-  // Present on autocomplete suggestions; absent in the create form (backend
-  // re-geocodes on submit and never trusts client coords).
-  lat?: number;
-  lng?: number;
+  // On autocomplete suggestions only, and `null` there for a hit the provider gave no
+  // parseable point for — hence `| null` rather than just optional. Absent entirely in
+  // the create form: the backend re-geocodes on submit and never trusts client coords.
+  lat?: number | null;
+  lng?: number | null;
 };
 
 export type Availability = {

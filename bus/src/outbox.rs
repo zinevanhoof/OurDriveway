@@ -37,12 +37,16 @@ use std::time::Duration;
 
 use async_nats::jetstream::{Context, message::PublishMessage};
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Serialize;
+use shared::db::Db;
 use shared::{
     error::myerror::{MyError, MyResult},
     events::Envelope,
 };
-use sqlx::{PgExecutor, PgPool};
+
+use crate::schema::_outbox;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -57,7 +61,9 @@ const IDLE: Duration = Duration::from_millis(200);
 const BATCH: usize = 128;
 
 /// One pending event. The envelope is stored encoded, exactly as it will be sent.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = _outbox)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Pending {
     pub id: Uuid,
     pub subject: String,
@@ -107,24 +113,27 @@ pub struct Pending {
 /// `occurred_at` is when the thing happened and stays in the envelope for projectors
 /// to read, `created_at` is where the row sits in the relay queue.
 pub async fn enqueue<T: Serialize>(
-    ex: impl PgExecutor<'_>,
+    conn: &mut AsyncPgConnection,
     subject: &str,
     envelope: &Envelope<T>,
 ) -> MyResult<()> {
     let payload = serde_json::to_string(envelope)
         .map_err(|e| MyError::Bus(format!("serialize outbox event: {e}")))?;
 
-    sqlx::query(
-        "INSERT INTO _outbox (id, subject, payload, created_at)
-              VALUES ($1, $2, $3, now())
-         ON CONFLICT (id) DO UPDATE
-             SET subject = EXCLUDED.subject, payload = EXCLUDED.payload",
-    )
-    .bind(envelope.event_id)
-    .bind(subject)
-    .bind(payload)
-    .execute(ex)
-    .await?;
+    // `created_at` is left to the column's own `now()` default rather than set here, so
+    // it stays the DATABASE's transaction-start time. Replicas do not share a clock and
+    // this value is the relay's ordering key.
+    diesel::insert_into(_outbox::table)
+        .values((
+            _outbox::id.eq(envelope.event_id),
+            _outbox::subject.eq(subject),
+            _outbox::payload.eq(&payload),
+        ))
+        .on_conflict(_outbox::id)
+        .do_update()
+        .set((_outbox::subject.eq(subject), _outbox::payload.eq(&payload)))
+        .execute(conn)
+        .await?;
     Ok(())
 }
 
@@ -159,10 +168,10 @@ pub async fn enqueue<T: Serialize>(
 /// stale until its next real event. Compare versions inside each projector if this
 /// ever needs to be safe concurrently.
 pub async fn backfill<T: Serialize>(
-    pool: &PgPool,
+    pool: &Db,
     subject: &str,
     aggregate: &str,
-    version: u64,
+    version: i64,
     events: impl IntoIterator<Item = (DateTime<Utc>, T)>,
 ) -> MyResult<usize> {
     let mut sent = 0;
@@ -181,7 +190,12 @@ pub async fn backfill<T: Serialize>(
             backfill: true,
             payload,
         };
-        enqueue(pool, subject, &envelope).await?;
+        // `backfill` holds the pool rather than a transaction — each row is its own
+        // statement and a partial backfill is safe to resume — so it checks out a
+        // connection per event. `enqueue` itself takes a connection precisely so its
+        // OTHER callers can hand it an open transaction.
+        let mut conn = pool.get().await.map_err(|e| MyError::Pool(e.to_string()))?;
+        enqueue(&mut conn, subject, &envelope).await?;
         sent += 1;
     }
     Ok(sent)
@@ -204,11 +218,7 @@ pub async fn backfill<T: Serialize>(
 ///
 /// This does not close the window entirely — a stall *inside* a single publish still
 /// gets one message out — but one message is bounded and a whole backlog is not.
-pub async fn drain(
-    pool: &PgPool,
-    js: &Context,
-    leader: &watch::Receiver<bool>,
-) -> MyResult<usize> {
+pub async fn drain(pool: &Db, js: &Context, leader: &watch::Receiver<bool>) -> MyResult<usize> {
     let mut sent = 0;
     loop {
         if !*leader.borrow() {
@@ -224,13 +234,14 @@ pub async fn drain(
         // table and would be wrong here: skipping locked rows lets a second relay take
         // the *next* batch and publish it first, which is precisely the reordering the
         // lease exists to prevent. Order matters more than throughput on this table.
-        let batch: Vec<Pending> = sqlx::query_as(
-            "SELECT id, subject, payload, created_at
-               FROM _outbox ORDER BY created_at, id LIMIT $1",
-        )
-        .bind(BATCH as i64)
-        .fetch_all(pool)
-        .await?;
+        let mut conn = pool.get().await.map_err(|e| MyError::Pool(e.to_string()))?;
+
+        let batch: Vec<Pending> = _outbox::table
+            .order((_outbox::created_at.asc(), _outbox::id.asc()))
+            .limit(BATCH as i64)
+            .select(Pending::as_select())
+            .load(&mut *conn)
+            .await?;
 
         if batch.is_empty() {
             return Ok(sent);
@@ -242,9 +253,8 @@ pub async fn drain(
             // Only after the ack. A crash in this gap republishes on restart, which is
             // what makes this at-least-once rather than at-most-once — the safer side
             // to be wrong on, given the consumers are idempotent.
-            sqlx::query("DELETE FROM _outbox WHERE id = $1")
-                .bind(row.id)
-                .execute(pool)
+            diesel::delete(_outbox::table.filter(_outbox::id.eq(row.id)))
+                .execute(&mut *conn)
                 .await?;
 
             sent += 1;
@@ -260,7 +270,7 @@ pub async fn drain(
 ///
 /// A follower parks on `leader.changed()` and costs nothing at all; the election
 /// task is already paying the one query every ten seconds.
-pub async fn run(pool: PgPool, js: Context, mut leader: watch::Receiver<bool>) {
+pub async fn run(pool: Db, js: Context, mut leader: watch::Receiver<bool>) {
     loop {
         while !*leader.borrow() {
             if leader.changed().await.is_err() {

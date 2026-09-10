@@ -71,10 +71,11 @@ spec:
         that passed their own readiness probe. It is weaker for YugabyteDB, whose
         Service is HEADLESS — kube-proxy does no readiness filtering there, so this
         only proves something is listening on 5433. That is deliberate rather than
-        overlooked: the databases are created by the post-install hook, which may not
-        have run yet either, and a service that starts too early fails loudly at
-        `connect` and is fine on the CrashLoopBackOff retry. The init container turns
-        the common case into a wait instead of a restart; it is not a guarantee.
+        overlooked: the databases are created and migrated by the migrator Job, which
+        on a FIRST install runs alongside these pods rather than before them, so a
+        service that starts too early fails loudly at `connect` with 3D000 and is fine
+        on the CrashLoopBackOff retry. The init container turns the common case into a
+        wait instead of a restart; it is not a guarantee.
         */}}
         {{- if $needsNats }}
         - name: wait-for-nats

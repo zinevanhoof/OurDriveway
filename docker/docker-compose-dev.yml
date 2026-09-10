@@ -5,8 +5,10 @@
 #
 # Storage is ONE container now. It was four — pd, tikv, surrealdb and a schema-import
 # job — because SurrealDB needed a separate distributed store underneath it and a
-# separate pass to apply the schemas. YugabyteDB is both halves in one process, and
-# the schemas are sqlx migrations the services carry themselves.
+# separate pass to apply the schemas. YugabyteDB is both halves in one process.
+#
+# The separate pass came back, but it is NOT in this file: `scripts/migrate.sh` runs it
+# on the host, for the reasons in the schema section at the bottom.
 #
 # The one container here that is neither a database nor a proxy is stripe-cli, which
 # forwards webhooks *inward* to payment-service on :3006 — see the note on it below.
@@ -35,11 +37,10 @@ services:
   # The authoritative store, and the only thing in this file holding a volume that
   # matters. `docker compose down -v` is data loss, not a replay.
   #
-  # There is deliberately nothing here creating the per-service databases. Each
-  # service creates its own on first connect — see `shared::db::connect` — so a
-  # wiped volume comes back empty and correct with no step to remember. This file
-  # used to need the equivalent of the chart's `create-databases` hook and never
-  # had one, which made `down -v` fail every service at boot with `3D000`.
+  # The per-service databases are created and migrated by `scripts/migrate.sh`, run by
+  # hand after this is healthy — the ONLY thing that touches schema in dev. Services no
+  # longer create their own on first connect: `diesel_migrations` takes no lock around a
+  # run, so `replicas: N` all migrating at boot would race. See `diesel-migration.md`.
   yugabyte:
     # >= 2025.2 (LTS), and started through `yugabyted`. That PAIR is what sets the
     # tserver gflag `yb_enable_read_committed_isolation=true`, and the whole reserve
@@ -75,8 +76,19 @@ services:
     # host — this is the same 16 GB box CLAUDE.md pins `jobs = 4` for, and a build and
     # an unbounded tserver do not fit on it together. `yb_num_shards_per_tserver=1`
     # keeps a single node from splitting every table into eight tablets it cannot use.
+    # `--base_dir` is NOT optional, and its absence was silent data loss.
+    #
+    # `yugabyted` defaults its base dir to `$HOME/var`, and this image runs as root — so
+    # every tablet, WAL and catalogue went to `/root/var`, in the container's writable
+    # layer, while the named volume sat mounted at `/home/yugabyte/var` holding 4 KB of
+    # nothing. `docker compose down` then destroyed the layer and the databases with it,
+    # which looked like the volume "not persisting" when in fact it was never written to.
+    #
+    # So the flag and the mount below must name the SAME path. Changing one without the
+    # other puts it straight back.
     command: >
       bin/yugabyted start --background=false --advertise_address=yugabyte
+      --base_dir=/home/yugabyte/yb_data
       --tserver_flags=memory_limit_hard_bytes=1500000000,yb_num_shards_per_tserver=1
       --master_flags=memory_limit_hard_bytes=500000000
     ports:
@@ -85,7 +97,8 @@ services:
       # The yugabyted web UI, worth having when a query plan is a surprise.
       - "15433:15433"
     volumes:
-      - yb-data:/home/yugabyte/var
+      # Same path as `--base_dir` above. See the note there.
+      - yb-data:/home/yugabyte/yb_data
     healthcheck:
       # Exits non-zero until every process is actually serving, which is the same
       # question each service's boot asks a moment later.

@@ -1,12 +1,14 @@
 use std::time::Duration;
 
-use sqlx::{
-    Connection, PgConnection, PgPool,
-    postgres::{PgConnectOptions, PgPoolOptions},
-};
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
 use uuid::Uuid;
 
 use crate::error::myerror::{MyError, MyResult};
+
+/// The pool every service holds. `bb8` over `AsyncPgConnection`, replacing `sqlx::PgPool`.
+pub type Db = Pool<AsyncPgConnection>;
 
 /// Opens the service's own pool against its own database.
 ///
@@ -29,170 +31,103 @@ use crate::error::myerror::{MyError, MyResult};
 /// it mints a session id and replays `Attach`/`Signin`/`Use` onto it, which
 /// `bus/examples/clone_cost` priced at +27.5ms per transaction. A pool is a pool:
 /// `pool.begin()` takes an idle connection and gives it back on commit.
-/// ## The database creates itself
+/// ## The database is neither created nor migrated here
 ///
-/// A service's first boot against a fresh cluster finds no database to connect to, so
-/// this creates it and retries once. That cannot be a migration: `sqlx::migrate!` runs
-/// its files on a connection to the database being migrated, so a missing one fails at
-/// connect and the files are never read. (The transaction is *not* the obstacle — sqlx
-/// honours a leading `-- no-transaction`, which is what `CREATE DATABASE` would need.)
+/// Both moved to `apps/migrator`, the one process that touches schema. A service now
+/// assumes its database exists and is up to date, and fails loudly at connect if it is
+/// not — `3D000` from a pod that started before the migrator Job is a visible failure,
+/// which is the point.
 ///
-/// It replaced a Helm `post-install` hook that looped over the service list and created
-/// all five centrally. Three things improve by moving it here:
-///
-/// * There is one list of databases — the `DATABASE_URL`s themselves — instead of a
-///   second one in a chart that could disagree with them.
-/// * `docker compose` needs no equivalent. It never had one, so `down -v` deleted the
-///   databases and every service then failed at boot with `3D000`.
-/// * A service no longer waits on a hook that runs *after* it starts, which was a
-///   CrashLoopBackOff on every fresh install.
-///
-/// It assumes the role in `DATABASE_URL` may create databases. Both environments
-/// connect as `yugabyte` — the dev `.env`s and `k8s/chart/templates/services.yaml` —
-/// so it may. Give the services a non-superuser role and this is the line that stops
-/// working, loudly, on a fresh cluster only.
-pub async fn connect(url: &str) -> MyResult<PgPool> {
-    match pool(url).await {
-        Err(e) if is_missing_database(&e) => {
-            create_database(url).await?;
-            pool(url).await
-        }
-        other => other,
-    }
-}
+/// This reverses what used to be here, and the reason is the move off sqlx rather than a
+/// change of mind. Self-creation and boot-time migration in every replica were safe
+/// *because* `sqlx::migrate` took an advisory lock around the run. `diesel_migrations`
+/// takes no lock at all, so `replicas: N` all migrating at boot would race. Centralising
+/// is what puts that guarantee back — see `diesel-migration.md`.
+pub async fn connect(url: &str) -> MyResult<Db> {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
 
-async fn pool(url: &str) -> MyResult<PgPool> {
-    Ok(PgPoolOptions::new()
+    Pool::builder()
         // Sized for the shape of the work rather than guessed. A service runs
         // PARTITIONS projector lanes, each holding a connection only for as long as
         // one event's transaction, plus request handlers. Yugabyte's per-connection
         // cost is closer to PostgreSQL's than to a thread pool's, so this is
         // deliberately not large.
-        .max_connections(20)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(url)
-        .await?)
-}
-
-/// SQLSTATE 3D000: the server is up and reachable, and has no such database.
-///
-/// Deliberately narrow. A refused connection, a bad password or the wrong port must
-/// keep failing as themselves — creating a database is only ever the answer to *this*.
-fn is_missing_database(e: &MyError) -> bool {
-    matches!(
-        e,
-        MyError::Database(sqlx::Error::Database(d)) if d.code().as_deref() == Some("3D000")
-    )
-}
-
-/// Creates the database named in `url`, from a connection to the maintenance one.
-///
-/// The name is taken back off the parsed options rather than sliced out of the URL, so
-/// a password containing a `/` cannot confuse it.
-async fn create_database(url: &str) -> MyResult<()> {
-    let opts: PgConnectOptions = url
-        .parse()
-        .map_err(|e| MyError::Bus(format!("DATABASE_URL is not a postgres URL: {e}")))?;
-    let name = opts
-        .get_database()
-        .ok_or_else(|| MyError::Bus("DATABASE_URL names no database".to_string()))?
-        .to_owned();
-
-    // `yugabyte` is the cluster's own always-present database, the same one the Helm
-    // hook used to connect to. `postgres` would do; this matches the role name the
-    // URLs already carry.
-    let mut admin = PgConnection::connect_with(&opts.clone().database("yugabyte")).await?;
-
-    // Spliced, because Postgres cannot bind an identifier — the same constraint
-    // `table_for` exists for. Quoted because `user` is a reserved word, and any `"` in
-    // the name is doubled so the quoting cannot be escaped out of. The value comes from
-    // this service's own environment, never from a request.
-    let quoted = name.replace('"', "\"\"");
-    match sqlx::query(&format!("CREATE DATABASE \"{quoted}\""))
-        .execute(&mut admin)
+        .max_size(20)
+        .connection_timeout(Duration::from_secs(10))
+        .build(manager)
         .await
-    {
-        Ok(_) => {
-            tracing::info!(database = %name, "created");
-            Ok(())
-        }
-        // 42P04: another replica booting at the same time won the race. That is the
-        // outcome we wanted, so it is a success rather than something to retry.
-        Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42P04") => {
-            tracing::info!(database = %name, "already created by another replica");
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
+        .map_err(|e| MyError::Bus(format!("connect: {e}")))
 }
 
-/// The physical table an aggregate name maps to.
+/// One connection out of the pool, with the pool's own error folded into [`MyError`].
 ///
-/// An allowlist and not string interpolation, because **Postgres cannot bind an
-/// identifier**: `SELECT … FROM $1` is a syntax error, so the table name has to be
-/// spliced into the statement text and therefore must never come from a caller
-/// unchecked. Every name here is a literal in this file.
+/// Every read used to be `Repo::find(&self.db, …)` — sqlx's `PgExecutor` accepted the
+/// pool itself. diesel's does not, so a caller checks out first. This exists so that is
+/// one line rather than a `map_err` at ~90 call sites.
 ///
-/// It also carries the one rename in the schema. `user` is a reserved word, and the
-/// failure is silent rather than loud — an unquoted `FROM user` reads the
-/// current-user keyword and returns a row instead of erroring — so the table is
-/// `app_user` while the aggregate stays `user`: the await token `user:<id>@7`, the
-/// events and `aggregate_id("user", …)` are all unchanged.
-///
-/// `None` means the caller passed a name no service owns, which is a typo and is
-/// reported. It does **not** mean "this database has no such table" — that is a
-/// legitimate case and is handled by [`table_present`].
-pub fn table_for(aggregate: &str) -> Option<&'static str> {
-    Some(match aggregate {
-        "user" => "app_user",
-        "spot" => "spot",
-        "booking" => "booking",
-        "payment" => "payment",
-        "payout" => "payout",
-        "refresh_token" => "refresh_token",
-        _ => return None,
-    })
+/// Hold it for as long as the unit of work and no longer: a connection checked out
+/// across an `.await` on something that is not the database is a connection the next
+/// request cannot have.
+pub async fn conn(pool: &Db) -> MyResult<PooledConnection<'_, AsyncPgConnection>> {
+    pool.get().await.map_err(|e| MyError::Pool(e.to_string()))
 }
 
-fn resolve(aggregate: &str) -> MyResult<&'static str> {
-    table_for(aggregate).ok_or_else(|| {
-        MyError::Bus(format!(
-            "unknown aggregate {aggregate:?}; see db::table_for"
-        ))
-    })
-}
-
-/// Whether this error is "that table does not exist in this database".
-///
-/// Not a fault: each service's schema holds only the aggregates it projects, and a
-/// version can be asked about anywhere. SQLSTATE 42P01.
-///
-/// `payment` in view-service used to be the example of this. It is a real table there
-/// now — the wallet reads it — so that particular lookup resolves rather than escaping
-/// through here.
-/// Whether this database has that table, asked of the catalogue.
-///
-/// # Why not "try it and swallow 42P01"
-///
-/// Because a failed statement **aborts the surrounding transaction**, and both callers
-/// run inside one. Swallowing the error returns `Ok` to a caller that then commits —
-/// and Postgres answers a COMMIT on an aborted transaction with a silent ROLLBACK. The
-/// writes made before it disappear, the projector acks its message, and nothing
-/// reports a problem. `payment-service`'s host mirror consumed eighteen events that way
-/// and stayed empty; that is what this function exists to prevent.
-///
-/// `to_regclass` answers NULL for a table that is not there rather than raising, which
-/// is what makes it safe to ask mid-transaction.
-async fn table_present(conn: &mut PgConnection, table: &str) -> MyResult<bool> {
-    let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
-        .bind(table)
-        .fetch_one(conn)
-        .await?;
-    Ok(found.is_some())
-}
+// `table_for`, `resolve` and `table_present` were all here, and all three are gone with
+// the version functions that used them.
+//
+// `table_for` was an allowlist mapping an aggregate name to a physical table, and it
+// existed because **Postgres cannot bind an identifier**: `SELECT … FROM $1` is a syntax
+// error, so the table name had to be spliced into the statement text and therefore could
+// never come from a caller unchecked. Nothing splices a table name any more — the version
+// macros take a real diesel table, and `bus::await_version` asks each service through its
+// own `version_reader!` — so there is no spliced SQL left in this workspace for an
+// allowlist to guard.
+//
+// The one thing it carried that still matters: `user` is a reserved word, so the table is
+// `app_user` while the aggregate stays `user`. That mapping now lives where it is used, as
+// the `"user" => shared::schema::<svc>::app_user` arm of a service's reader. The await
+// token `user:<id>@7`, the events and `aggregate_id("user", …)` are all unchanged.
+//
+// `table_present` asked the catalogue `to_regclass($1)` before every version read and
+// write, because a service may project part of a stream without storing the aggregate at
+// all — payment-service mirrors two columns of a user into `host` and has no `app_user`.
+// It could not be "try it and swallow 42P01": a failed statement ABORTS the surrounding
+// transaction, both callers ran inside one, and Postgres answers a COMMIT on an aborted
+// transaction with a silent ROLLBACK. That is how payment-service's host mirror once
+// consumed eighteen events and stayed empty.
+//
+// The macros make the question unaskable rather than answering it at runtime: a caller
+// names a table from its own `shared::schema::<svc>` module, so a table this database does
+// not have is a name that does not exist. That check caught a real one — payment-service's
+// projector called `set_version(conn, "user", …)`, which resolved to `app_user`, which is
+// not in that database, so it had silently done nothing on every USERS event.
+//
+// `resolve` was the error arm for an aggregate name outside the allowlist. Also
+// unrepresentable now, for the same reason.
 
 /// The version this aggregate will have **after** the caller's write, having first
 /// taken a row lock on it.
+///
+/// ## A macro over a table, not a function over an aggregate name
+///
+/// This was `next_version(conn, "booking", &id)`: the name went through an allowlist,
+/// the table was spliced into a `format!`, and the row came back through a
+/// `QueryableByName` struct because `sql_query` deserializes by column *name*.
+///
+/// Every caller knows its table at compile time, so all of that was runtime machinery for
+/// a compile-time fact. As a macro the query is built by the DSL and monomorphised at each
+/// call site: no splicing, no allowlist, no `table_present` — a table this service's
+/// schema module does not declare is a compile error — and `.select(version)` loads
+/// straight into `i64`, which is why there is no struct here any more.
+///
+/// A macro rather than a generic function because `version` is a column on every table but
+/// not on the `Table` *trait*: a generic `fn` would need a `Versioned` trait, six impls,
+/// and a `FindDsl`/`SelectDsl`/`LoadQuery` bound stack longer than the query. Expanding at
+/// the call site needs none of it.
+///
+/// ```ignore
+/// let version = shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
+/// ```
 ///
 /// ## The `FOR UPDATE` is the concurrency control, and it is here so it cannot be forgotten
 ///
@@ -204,53 +139,65 @@ async fn table_present(conn: &mut PgConnection, table: &str) -> MyResult<bool> {
 /// downstream projection quietly missing an edit, with no error anywhere.
 ///
 /// So the lock is taken here rather than at each call site: every write path that
-/// bumps a version goes through this function, and a rule applied in one place is not
+/// bumps a version goes through this macro, and a rule applied in one place is not
 /// a rule anyone has to remember.
 ///
-/// Must still be called **inside** the transaction that then writes the row — the
+/// Must still be used **inside** the transaction that then writes the row — the
 /// lock is released at commit, and a lock taken in a different transaction protects
 /// nothing.
 ///
 /// Returns 1 for a row that does not exist yet. There is nothing to lock in that
 /// case and nothing to race either: a create mints its own uuid.
 ///
+/// `.max(0)` because the column is signed and this is what a negative one becomes: a row
+/// that looks fresh, so the next event applies. It cannot come from this application, and
+/// the alternative — trusting it — is a `next` below every version already stored.
+///
 /// Two write paths do **not** come through here and need their own lock, because in
 /// both the racing writers touch different rows and nothing collides:
 ///   - reserve, which locks the spot mirror row (`booking_service`);
-///   - `request_payout`, which takes `pg_advisory_xact_lock` on the owner id.
-pub async fn next_version(conn: &mut PgConnection, aggregate: &str, id: &Uuid) -> MyResult<u64> {
-    let table = resolve(aggregate)?;
+///   - `request_payout`, which takes `pg_advisory_xact_lock` on the host id.
+#[macro_export]
+macro_rules! next_version {
+    // `$($table:ident)::+` and not `$table:path`: a `path` fragment is an opaque AST node
+    // that cannot have `::table` appended to it, so the module has to arrive as the
+    // sequence of idents it is.
+    ($conn:expr, $($table:ident)::+, $id:expr) => {{
+        // Imported inside the expansion, and `as _` so the call site's own imports cannot
+        // clash — `diesel::prelude::*` would drag in the SYNC `RunQueryDsl` and make
+        // `.first()` ambiguous against the async one.
+        use ::diesel::OptionalExtension as _;
+        use ::diesel::QueryDsl as _;
+        use ::diesel_async::RunQueryDsl as _;
 
-    // Same catalogue check as `set_version`, and the same reason — this also runs
-    // inside the caller's write transaction. In practice only the service that owns an
-    // aggregate calls this, so the branch is not expected to be taken; it is here so
-    // that the failure mode, if it ever is, is "version 1" rather than a transaction
-    // that silently commits nothing.
-    if !table_present(&mut *conn, table).await? {
-        return Ok(1);
-    }
-
-    let sql = format!("SELECT version FROM {table} WHERE id = $1 FOR UPDATE");
-    let current: Option<i64> = sqlx::query_scalar(&sql).bind(id).fetch_optional(conn).await?;
-
-    Ok(current.unwrap_or(0).max(0) as u64 + 1)
+        $($table)::+::table
+            .find($id)
+            .select($($table)::+::version)
+            .for_update()
+            .first::<i64>($conn)
+            .await
+            .optional()
+            .map(|stored| stored.unwrap_or(0).max(0) + 1)
+    }};
 }
 
 /// Records the aggregate version a projector just applied.
 ///
-/// Called by the projector rather than by `bus::Tx`, because only the projector knows
-/// which table the aggregate lives in *here*: view-service holds `payout` but no
-/// `payment`, and payment-service projects users into a `host` mirror while having no
-/// `app_user` at all. Such a table is checked for first — see [`table_present`], which
-/// is where the interesting failure is written up — and a missing one makes this a
-/// no-op. A missing *row* in a table that does exist is a clean no-op too.
+/// The macro half of [`next_version!`] — same reasoning, same expansion rules. The
+/// aggregate NAME is still a parameter, because it is a protocol identifier rather than a
+/// table: it is what the log line names and what a client's await token (`user:<id>@7`)
+/// spells, and for `user` it differs from the table (`app_user`) on purpose.
 ///
 /// `WHERE version < $v` so a redelivered or out-of-order event cannot wind the
 /// version backwards. A client waiting on `user:<id>@7` must never see 7 and then 6.
 ///
+/// A missing *row* is a clean no-op. A missing *table* is no longer possible: the caller
+/// names a table its own schema module declares, which is the check `table_present` used
+/// to do at runtime — see the note in [`next_version!`].
+///
 /// ## Version gaps
 ///
-/// Versions are gapless per aggregate — [`next_version`] assigns them inside the
+/// Versions are gapless per aggregate — [`next_version!`] assigns them inside the
 /// writing transaction — so applying `$v` to a row at `$v - 2` means an event was
 /// missed, and nothing else in this codebase would say so: the `UPDATE` absorbs it
 /// and the status guards downstream drop the transition without a word.
@@ -263,52 +210,52 @@ pub async fn next_version(conn: &mut PgConnection, aggregate: &str, id: &Uuid) -
 ///
 /// A backfill run re-emits current state at its current version, so it will log these
 /// by the tableful. Expected.
-pub async fn set_version(
-    conn: &mut PgConnection,
-    aggregate: &str,
-    id: &Uuid,
-    version: u64,
-) -> MyResult<()> {
-    let table = resolve(aggregate)?;
+///
+/// ```ignore
+/// shared::set_version!(conn, "spot", shared::schema::view::spot, &spot_id, version)?;
+/// ```
+#[macro_export]
+macro_rules! set_version {
+    // See the note on the matcher in [`next_version!`].
+    ($conn:expr, $aggregate:expr, $($table:ident)::+, $id:expr, $version:expr) => {{
+        use ::diesel::ExpressionMethods as _;
+        use ::diesel::OptionalExtension as _;
+        use ::diesel::QueryDsl as _;
+        use ::diesel_async::RunQueryDsl as _;
 
-    // Is this table even in this database? A service may project part of a stream
-    // without storing the aggregate itself — payment-service mirrors two columns of a
-    // user into `host` and has no `app_user` at all. Asked first, and asked of the
-    // catalogue: see [`table_present`] for what happens otherwise.
-    if !table_present(&mut *conn, table).await? {
-        return Ok(());
-    }
+        async {
+            // A read before the write rather than `RETURNING`: the update is conditional,
+            // so it returns nothing at all in exactly the duplicate case this most wants
+            // to distinguish from a gap.
+            let stored: Option<i64> = $($table)::+::table
+                .find($id)
+                .select($($table)::+::version)
+                .first::<i64>(&mut *$conn)
+                .await
+                .optional()?;
 
-    // A read before the write rather than `RETURNING`: the update is conditional, so
-    // it returns nothing at all in exactly the duplicate case this most wants to
-    // distinguish from a gap.
-    let read = format!("SELECT version FROM {table} WHERE id = $1");
-    let stored: Option<i64> = sqlx::query_scalar(&read)
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await?;
+            if let Some(missing) = $crate::db::version_gap(stored, $version) {
+                ::tracing::error!(
+                    aggregate = %format!("{}:{}", $aggregate, $id),
+                    stored = stored.unwrap_or(0),
+                    got = $version,
+                    missing,
+                    "version gap: applying anyway, projection may be incomplete"
+                );
+            }
 
-    if let Some(missing) = version_gap(stored.map(|v| v.max(0) as u64), version) {
-        tracing::error!(
-            aggregate = %format!("{aggregate}:{id}"),
-            stored = stored.unwrap_or(0),
-            got = version,
-            missing,
-            "version gap: applying anyway, projection may be incomplete"
-        );
-    }
+            ::diesel::update($($table)::+::table.find($id))
+                .filter($($table)::+::version.lt($version))
+                .set($($table)::+::version.eq($version))
+                .execute(&mut *$conn)
+                .await?;
 
-    // No missing-table arm here either, and for the same reason: past the check above
-    // the table is there, and a genuine failure must reach the caller rather than be
-    // absorbed into a transaction that then commits nothing.
-    let write = format!("UPDATE {table} SET version = $2 WHERE id = $1 AND version < $2");
-    sqlx::query(&write)
-        .bind(id)
-        .bind(version as i64)
-        .execute(conn)
-        .await?;
-    Ok(())
+            Ok::<(), $crate::error::myerror::MyError>(())
+        }
+        .await
+    }};
 }
+
 
 /// How many events are missing between `stored` and `incoming`, if any.
 ///
@@ -321,14 +268,19 @@ pub async fn set_version(
 ///   `WHERE version < $v` absorbs it.
 /// - `incoming == stored + 1`: the ordinary next event.
 /// - anything higher: `Some(n)` events were never applied here.
-pub fn version_gap(stored: Option<u64>, incoming: u64) -> Option<u64> {
+///
+/// Signed, like the column it compares against — and the `> 0` filter is what makes the
+/// duplicate and redelivery cases fall out either way, so the sign never decided anything
+/// here. `checked_sub` stays because `stored + 1` on `i64::MAX` is the one overflow left,
+/// unreachable but free to rule out.
+pub fn version_gap(stored: Option<i64>, incoming: i64) -> Option<i64> {
     let stored = stored?;
     incoming
-        .checked_sub(stored + 1)
+        .checked_sub(stored.saturating_add(1))
         .filter(|missing| *missing > 0)
 }
 
-/// A per-owner lock key for `pg_advisory_xact_lock`, from the low 64 bits of a uuid.
+/// A per-host lock key for `pg_advisory_xact_lock`, from the low 64 bits of a uuid.
 ///
 /// Used by `request_payout`, which has nothing to lock: a balance is derived
 /// (`earnings − Σ payouts`), never stored, so two double-clicked withdrawals insert
@@ -337,13 +289,13 @@ pub fn version_gap(stored: Option<u64>, incoming: u64) -> Option<u64> {
 /// yet, and a first-time withdrawer has none. That phantom is what Read Committed
 /// permits, and it is why a `host` table used to exist purely to be bumped.
 ///
-/// The lock is taken on the owner id itself instead, so the table is gone.
+/// The lock is taken on the host id itself instead, so the table is gone.
 ///
 /// Xact-scoped (`_xact_`, never the session variant): released by COMMIT or ROLLBACK,
 /// so there is no unlock to forget on the `?` early-returns these handlers are full
 /// of — and no `Drop` that would have to await one.
 ///
-/// A hash collision between two owners is possible and harmless: they would briefly
+/// A hash collision between two hosts is possible and harmless: they would briefly
 /// serialise against each other, which costs a wait and never correctness. Across 64
 /// bits of a v4/v7 uuid it is not worth engineering around.
 pub fn advisory_key(id: &Uuid) -> i64 {
@@ -362,47 +314,42 @@ pub fn advisory_key(id: &Uuid) -> i64 {
 /// This replaced a string match on `"WriteConflict"` — the only surface a TiKV
 /// conflict had, because it arrived as an untyped `Internal` error whose kind was not
 /// even stable across access paths, with `bus/examples/tikv_spike.rs` existing purely
-/// to re-verify that string after an upgrade. SQLSTATE is typed and standard.
+/// to re-verify that string after an upgrade.
+///
+/// ## Why this is one enum arm and not two SQLSTATEs
+///
+/// It used to match `40001` *or* `40P01`. diesel exposes no SQLSTATE at all —
+/// `DatabaseErrorInformation` has no `code()` — so only what `DatabaseErrorKind` names
+/// is reachable, and that covers `40001` (`SerializationFailure`, mapped by diesel-async)
+/// but not `40P01` (deadlock), which lands in `Unknown`.
+///
+/// Dropped rather than recovered by matching the message, because a deadlock is not
+/// reachable here. The lock ordering is one-way everywhere: `reserve` takes the spot
+/// mirror row `FOR UPDATE` and then `next_version` on a brand-new `Uuid::now_v7()` that
+/// locks nothing, `transition` takes a booking row alone, and `request_payout` takes the
+/// advisory lock and then rows. Nothing acquires that pair in the opposite order, so
+/// there is no cycle to detect.
+///
+/// Worth knowing if that ever changes: nothing calls this today. There is no
+/// transaction-retry loop in the workspace — the event paths retry by NATS redelivery —
+/// so it is a backstop waiting for a caller, and the first one to appear should re-check
+/// the paragraph above rather than trust it.
 pub fn is_write_conflict(e: &MyError) -> bool {
     matches!(
         e,
-        MyError::Database(sqlx::Error::Database(d))
-            if matches!(d.code().as_deref(), Some("40001") | Some("40P01"))
+        MyError::Database(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::SerializationFailure,
+            _
+        ))
     )
 }
 
-/// Runs a service's migrations against its own database.
-///
-/// Called by every replica at boot, which is safe: `sqlx` takes an advisory lock
-/// around the run, migrations are versioned and applied once, and each service owns
-/// its own database so there is no contention between services at all — only between
-/// replicas of one, which is exactly what that lock covers.
-///
-/// This replaced applying schemas from *outside* the application: a ConfigMap of
-/// `.surql` files, a `--set-file` loop in `deploy.sh` because Helm cannot read
-/// outside its chart directory, and a post-install Job that POSTed them to `/sql`.
-/// `sqlx::migrate!` embeds the SQL in the binary, so there is nothing to mount and
-/// nothing to keep in step with the image.
-pub async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) -> MyResult<()> {
-    migrator
-        .run(pool)
-        .await
-        .map_err(|e| MyError::Bus(format!("migrate: {e}")))
-}
+// `migrate` is gone. Every service used to apply its own migrations at boot from
+// `sqlx::migrate!`, which was safe only because sqlx locks around the run.
+// `diesel_migrations` does not lock, so that became a race at `replicas: N`. Schema is
+// now `apps/migrator`'s job alone — one Compose one-shot in dev, one Helm hook Job in
+// production — and nothing in a service's startup path touches it.
 
-// `Querier` is gone, and so is the alias that briefly stood in for it. It existed so a
-// repository method could run against either the shared connection or an open
-// transaction, because `Surreal<Client>` and `Transaction<Client>` shared no trait.
-// sqlx already has one: `sqlx::PgExecutor` is implemented for `&PgPool` and for
-// `&mut PgConnection`, so a method taking `impl PgExecutor<'_>` serves both positions
-// with nothing of ours in between. A transaction reaches it as `&mut *tx` — `Transaction`
-// derefs to `PgConnection` — which is what every projector and service call site passes.
-//
-// The one wrinkle is that `PgExecutor` is consumed per statement, so a method issuing
-// two of them takes `&mut PgConnection` and reborrows — which is why `next_version`
-// and `set_version` above do, and why they are honest about only ever running inside
-// a transaction.
-//
 // `Cursor` is still gone, along with the `_projection` table it wrote: every replica
 // shares one database and pulls from one durable consumer per partition, so the
 // position lives in NATS. An unacked message is redelivered and reapplied, and every
@@ -434,51 +381,40 @@ mod tests {
         // Genuinely missed events — the one case nothing else says anything about.
         assert_eq!(version_gap(Some(16), 18), Some(1));
         assert_eq!(version_gap(Some(1), 5), Some(3));
+
+        // A stored version below zero is reachable in the type now that this is signed,
+        // and it reaches here unclamped: `set_version` reports the gap and applies
+        // anyway, so the only consequence is a larger number in a log line about a row
+        // nothing in this application could have written. `next_version` is where a
+        // negative is clamped, because there it would hand back a version *below* one
+        // already stored.
+        assert_eq!(version_gap(Some(-3), 5), Some(7));
     }
 
     /// The allowlist is what stands between an aggregate name and spliced SQL, so
     /// it must answer for exactly the names the services use and nothing else.
+    // `every_aggregate_resolves_and_nothing_else_does` was here, over `table_for`. It
+    // asserted that six aggregate names mapped to a table and that everything else —
+    // `""`, `"app_user"`, `"spot; DROP TABLE spot--"` — mapped to `None`, because the
+    // answer was about to be spliced into SQL.
+    //
+    // There is nothing left to assert. No table name is spliced anywhere: the version
+    // macros take a real diesel table, and an aggregate a service does not store is an
+    // absent match arm in its `version_reader!` rather than a string that fails a lookup.
+    // The injection case in particular is not a test any more, it is a type error.
+    //
+    // What the test really guarded — that the set of aggregates and the set of tables
+    // agree — is now checked by the compiler at every one of those call sites.
+
+    /// Two different hosts must not share a lock key by construction.
     #[test]
-    fn every_aggregate_resolves_and_nothing_else_does() {
-        for aggregate in [
-            "user",
-            "spot",
-            "booking",
-            "payment",
-            "payout",
-            "refresh_token",
-        ] {
-            assert!(table_for(aggregate).is_some(), "{aggregate}");
-        }
-
-        // The rename, and the reason it exists: `user` is reserved, and an unquoted
-        // `FROM user` returns the current-user keyword rather than erroring.
-        assert_eq!(table_for("user"), Some("app_user"));
-
-        // Anything else is a typo, and must be reported rather than spliced.
-        assert_eq!(
-            table_for("app_user"),
-            None,
-            "the aggregate is `user`, not the table name"
-        );
-        assert_eq!(
-            table_for("host"),
-            None,
-            "the host table is gone; see advisory_key"
-        );
-        assert_eq!(table_for(""), None);
-        assert_eq!(table_for("spot; DROP TABLE spot--"), None);
-    }
-
-    /// Two different owners must not share a lock key by construction.
-    #[test]
-    fn advisory_keys_differ_per_owner() {
+    fn advisory_keys_differ_per_host() {
         let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
         assert_ne!(advisory_key(&a), advisory_key(&b));
         assert_eq!(
             advisory_key(&a),
             advisory_key(&a),
-            "must be stable per owner"
+            "must be stable per host"
         );
     }
 }

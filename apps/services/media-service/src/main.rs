@@ -110,8 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // state, consumes no events and talks to no database. Alive IS ready.
     let app = Router::new()
         .route("/api/media/upload-url", post(route::upload_url))
-        .route("/healthz", get(ok))
-        .route("/readyz", get(ok))
+        .route("/healthz", get(StatusCode::OK))
+        .route("/readyz", get(StatusCode::OK))
         .with_state(state);
 
     // PORT differs per service in local dev so several can run on one host.
@@ -119,8 +119,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", CONFIG.port)).await?;
     tracing::info!(port = CONFIG.port, bucket = %CONFIG.s3_bucket, "media-service listening");
     Ok(axum::serve(listener, app).await?)
-}
-
-async fn ok() -> StatusCode {
-    StatusCode::OK
 }

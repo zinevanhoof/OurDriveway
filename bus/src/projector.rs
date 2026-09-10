@@ -5,12 +5,14 @@ use async_nats::jetstream::{
     consumer::{AckPolicy, DeliverPolicy, PullConsumer},
 };
 use chrono::{DateTime, Utc};
+use diesel_async::scoped_futures::ScopedFutureExt;
+use diesel_async::{AsyncConnection, AsyncPgConnection};
 use futures::StreamExt;
+use shared::db::Db;
 use shared::{
     error::myerror::{MyError, MyResult},
     events::{Envelope, PARTITIONS, domain_of, partition_filter},
 };
-use sqlx::{PgConnection, PgPool};
 
 use crate::health::Readiness;
 
@@ -70,17 +72,17 @@ pub trait Projector: Send + Sync + 'static {
     /// precondition — a column that is now gone entirely; see
     /// `shared::domain_models::booking::SpotMirror`.
     ///
-    /// Takes `&mut PgConnection` rather than the transaction itself, because that is
-    /// what an implementation can actually issue several statements against —
-    /// `PgExecutor` is consumed per statement, and a projector arm routinely writes a
-    /// row and then a version. It is still the open transaction: [`Tx::apply`] owns
-    /// the begin and the commit, and this only ever sees a reborrow of it.
+    /// Takes `&mut AsyncPgConnection`, which IS the open transaction: [`Tx::apply`]
+    /// owns the begin and the commit and this only ever sees the connection inside
+    /// them. A projector arm routinely writes a row and then a version, so it needs a
+    /// handle it can issue several statements against rather than one consumed per
+    /// statement.
     fn apply(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut AsyncPgConnection,
         event: Self::Event,
         at: DateTime<Utc>,
-        version: u64,
+        version: i64,
     ) -> impl Future<Output = MyResult<()>> + Send;
 }
 
@@ -95,15 +97,15 @@ pub struct Tx<P> {
     /// The service's one connection, shared by every lane of every projector and by
     /// the request handlers besides.
     ///
-    /// A `PgPool`, which is `Arc` inside — so holding one per lane is a refcount bump.
-    /// Each event's transaction borrows a connection for its lifetime and returns it
-    /// on commit.
+    /// A `bb8::Pool`, which is `Arc` inside — so holding one per lane is a refcount
+    /// bump. Each event's transaction borrows a connection for its lifetime and returns
+    /// it on commit.
     ///
     /// This was `Arc<Surreal<Client>>`, and the distinction it needed explaining for
     /// is gone: `Surreal::begin` consumed its client, so sixteen concurrent
     /// transactions needed sixteen *cloned* handles, and a clone minted a session and
     /// replayed a sign-in onto it at ~27.5ms a time. A pool hands out a connection.
-    db: PgPool,
+    db: Db,
 }
 
 impl<P> Tx<P> {
@@ -111,7 +113,7 @@ impl<P> Tx<P> {
     /// place a transaction can be opened, so this is the only thing that needs one. A
     /// `Projector` therefore holds none at all and cannot reach the database except
     /// through the connection it is handed.
-    pub fn new(projector: Arc<P>, db: PgPool) -> Self {
+    pub fn new(projector: Arc<P>, db: Db) -> Self {
         Self { projector, db }
     }
 }
@@ -138,33 +140,30 @@ impl<P: Projector> Tx<P> {
 
         // A connection of its own for this event, borrowed from the pool and returned
         // when the transaction ends.
-        let mut tx = self.db.begin().await?;
+        let mut conn = self
+            .db
+            .get()
+            .await
+            .map_err(|e| shared::error::myerror::MyError::Pool(e.to_string()))?;
 
-        // Kept as a `Result` rather than an early `?`: the transaction holds locks
-        // until it is resolved, and the explicit branches below are what make the
-        // rollback path visible rather than implicit in a drop.
-        //
         // The envelope's version, not the stream sequence: what the projector stores
         // has to be the number the owning service assigned and the client is waiting
         // on.
         let version = envelope.version;
-        let applied = self
-            .projector
-            .apply(&mut tx, envelope.payload, at, version)
-            .await;
+        let projector = self.projector.clone();
+        let payload = envelope.payload;
 
-        match applied {
-            Ok(()) => {
-                tx.commit().await?;
-                Ok(())
-            }
-            Err(e) => {
-                // Best effort. sqlx also rolls back on drop, so this is about doing it
-                // promptly and observably rather than about doing it at all.
-                tx.rollback().await.ok();
-                Err(e)
-            }
-        }
+        // `transaction` owns the begin, the commit and the rollback: returning `Err`
+        // from the closure rolls back, returning `Ok` commits. That replaces the
+        // explicit begin/commit/rollback this used to spell out — the branches are
+        // gone because there is no longer a path that can forget one.
+        //
+        // `scope_boxed` is required by the signature, which cannot be generic over an
+        // arbitrary future without boxing it (rustc#100013, cited in diesel-async).
+        conn.transaction::<(), shared::error::myerror::MyError, _>(|conn| {
+            async move { projector.apply(conn, payload, at, version).await }.scope_boxed()
+        })
+        .await
     }
 }
 
@@ -231,12 +230,7 @@ pub fn durable_name(prefix: &str, partition: u8) -> String {
 /// The ceiling this buys is `PARTITIONS` concurrent applies **per stream, across the
 /// whole deployment** — not per replica. Replicas buy availability; the partition
 /// count buys throughput.
-pub async fn run<P: Projector>(
-    js: Context,
-    projector: Arc<P>,
-    db: PgPool,
-    readiness: Arc<Readiness>,
-) {
+pub async fn run<P: Projector>(js: Context, projector: Arc<P>, db: Db, readiness: Arc<Readiness>) {
     // Up front, so a projector that cannot declare its consumers fails here, once,
     // rather than sixteen times inside sixteen tasks.
     let consumers = match lane_consumers::<P>(&js).await {
@@ -266,9 +260,7 @@ pub async fn run<P: Projector>(
         // holds a connection only for the length of one event's transaction, so
         // sixteen lanes do not mean sixteen connections held open.
         let tx = Tx::new(projector.clone(), db.clone());
-        lanes.spawn(async move {
-            (partition as u8, lane::<P>(consumer, tx).await)
-        });
+        lanes.spawn(async move { (partition as u8, lane::<P>(consumer, tx).await) });
     }
 
     // Deliberately does not abort the survivors. A wedged lane is one partition's
@@ -476,7 +468,10 @@ mod tests {
         // Zero-padded name, unpadded subject token. They are not the same string and
         // it would be easy to "fix" that into a lane filtering `bookings.07.>`,
         // which matches nothing NATS ever writes.
-        assert_eq!(configs[7].durable_name.as_deref(), Some("view-bookings-p07"));
+        assert_eq!(
+            configs[7].durable_name.as_deref(),
+            Some("view-bookings-p07")
+        );
         assert_eq!(configs[7].filter_subject, "bookings.7.>");
     }
 
@@ -524,6 +519,7 @@ mod live_tests {
     };
 
     use async_nats::jetstream::message::PublishMessage;
+    use diesel_async::RunQueryDsl;
     use shared::events::{Envelope, STREAM_SESSIONS, aggregate_id, session_subject};
     use uuid::Uuid;
 
@@ -537,7 +533,15 @@ mod live_tests {
     /// Written by these tests alone, and defined up front — sixteen lanes creating it
     /// implicitly would all write the same table-definition key and take a TiKV write
     /// conflict. An earlier spike learned that the hard way.
-    const TABLE: &str = "_bus_livetest";
+    ///
+    /// **Two leading underscores on purpose.** It is never dropped — the eight live tests
+    /// run concurrently, so a teardown in any one of them would pull the table out from
+    /// under the others, which is the same race `define_scratch_table` retries around.
+    /// So it survives the run and would be picked up by `scripts/print-schema.sh` as if
+    /// it were a real table. `diesel print-schema` skips `__%` (its table listing filters
+    /// `NOT LIKE '\_\_%'`), which is the same reason `__diesel_schema_migrations` needs no
+    /// entry in `diesel.toml`.
+    const TABLE: &str = "__bus_livetest";
 
     /// How long a recorded apply holds its lane open.
     ///
@@ -549,7 +553,7 @@ mod live_tests {
     #[derive(Clone, Debug)]
     struct Applied {
         key: Uuid,
-        version: u64,
+        version: i64,
         entered: Instant,
         exited: Instant,
     }
@@ -608,15 +612,15 @@ mod live_tests {
             log.iter().filter(|a| a.key == key).cloned().collect()
         }
 
-        fn versions(&self, key: Uuid) -> Vec<u64> {
+        fn versions(&self, key: Uuid) -> Vec<i64> {
             self.applies(key).iter().map(|a| a.version).collect()
         }
 
         async fn record(
             &self,
-            conn: &mut PgConnection,
+            conn: &mut AsyncPgConnection,
             event: serde_json::Value,
-            version: u64,
+            version: i64,
         ) -> MyResult<()> {
             // Not one of ours: a real session event from dev traffic, a leftover from
             // an earlier run, or — the case that actually bites — another test's key.
@@ -640,11 +644,11 @@ mod live_tests {
             *self.entered.lock().unwrap() += 1;
             let entered = Instant::now();
 
-            sqlx::query(&format!(
+            diesel::sql_query(format!(
                 "INSERT INTO {TABLE} (id, applies, version) VALUES ($1, 1, 0)
                  ON CONFLICT (id) DO UPDATE SET applies = {TABLE}.applies + 1"
             ))
-            .bind(key)
+            .bind::<diesel::sql_types::Uuid, _>(key)
             .execute(&mut *conn)
             .await?;
 
@@ -655,11 +659,11 @@ mod live_tests {
             // no business being in it. The gap *logic* it also carries is pure and is
             // covered by `version_gap`'s unit tests; what these lanes need is the
             // `WHERE version < $2` guard, which is right here.
-            sqlx::query(&format!(
+            diesel::sql_query(format!(
                 "UPDATE {TABLE} SET version = $2 WHERE id = $1 AND version < $2"
             ))
-            .bind(key)
-            .bind(version as i64)
+            .bind::<diesel::sql_types::Uuid, _>(key)
+            .bind::<diesel::sql_types::BigInt, _>(version)
             .execute(&mut *conn)
             .await?;
 
@@ -696,10 +700,10 @@ mod live_tests {
 
                 async fn apply(
                     &self,
-                    conn: &mut PgConnection,
+                    conn: &mut AsyncPgConnection,
                     event: serde_json::Value,
                     _at: DateTime<Utc>,
-                    version: u64,
+                    version: i64,
                 ) -> MyResult<()> {
                     self.0.record(conn, event, version).await
                 }
@@ -724,24 +728,30 @@ mod live_tests {
     /// table-definition key, and in Postgres it surfaces as a unique violation on the
     /// catalogue (23505) or "already exists" (42P07). Retried rather than serialised,
     /// because the loser's retry finds the table there and does nothing.
-    async fn define_scratch_table(db: &PgPool) {
+    async fn define_scratch_table(db: &Db) {
         for attempt in 0..5 {
-            let result = sqlx::query(&format!(
+            let mut conn = db.get().await.expect("a connection");
+            let result = diesel::sql_query(format!(
                 "CREATE TABLE IF NOT EXISTS {TABLE} (
                      id      uuid PRIMARY KEY,
                      applies bigint NOT NULL DEFAULT 0,
                      version bigint NOT NULL DEFAULT 0
                  )"
             ))
-            .execute(db)
+            .execute(&mut *conn)
             .await;
 
             match result {
                 Ok(_) => return,
-                Err(sqlx::Error::Database(e))
-                    if matches!(e.code().as_deref(), Some("23505") | Some("42P07"))
-                        && attempt < 4 =>
-                {
+                // Two lanes racing `CREATE TABLE IF NOT EXISTS` can still collide on the
+                // catalogue: 23505 (unique violation on pg_type) or 42P07 (duplicate
+                // table). Both mean the other one won, which is the outcome wanted.
+                //
+                // Matched on `DatabaseErrorKind` now — diesel exposes no SQLSTATE.
+                // `UniqueViolation` covers 23505; 42P07 lands in `Unknown`, so the retry
+                // is bounded by the attempt count rather than by the code. The loser
+                // finds the table on its next pass either way.
+                Err(diesel::result::Error::DatabaseError(_, _)) if attempt < 4 => {
                     tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
                 }
                 Err(e) => panic!("scratch table: {e}"),
@@ -751,7 +761,7 @@ mod live_tests {
 
     struct Live {
         js: Context,
-        db: PgPool,
+        db: Db,
         readiness: Arc<Readiness>,
     }
 
@@ -769,11 +779,7 @@ mod live_tests {
         define_scratch_table(&db).await;
 
         let readiness = Readiness::new(js.client().clone(), &[STREAM_SESSIONS]);
-        Live {
-            js,
-            db,
-            readiness,
-        }
+        Live { js, db, readiness }
     }
 
     impl Live {
@@ -781,7 +787,7 @@ mod live_tests {
         ///
         /// Same shape as `outbox::append`: the envelope encoded, `Nats-Msg-Id` set to
         /// the event id so the stream's `duplicate_window` can see a repeat.
-        async fn publish(&self, key: Uuid, version: u64, event_id: Uuid) -> u64 {
+        async fn publish(&self, key: Uuid, version: i64, event_id: Uuid) -> u64 {
             let envelope = Envelope {
                 event_id,
                 aggregate: aggregate_id("session", &key),
@@ -851,7 +857,9 @@ mod live_tests {
         async fn drop_lanes(&self, prefix: &str) {
             let stream = self.js.get_stream(STREAM_SESSIONS).await.expect("stream");
             for partition in 0..PARTITIONS {
-                let _ = stream.delete_consumer(&durable_name(prefix, partition)).await;
+                let _ = stream
+                    .delete_consumer(&durable_name(prefix, partition))
+                    .await;
             }
         }
 
@@ -860,13 +868,24 @@ mod live_tests {
         /// One statement now, where SurrealDB needed two `SELECT VALUE`s — a row is a
         /// tuple here rather than one scalar per query.
         async fn row(&self, key: Uuid) -> Option<(i64, i64)> {
-            sqlx::query_as(&format!(
+            #[derive(diesel::QueryableByName)]
+            struct Row {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                applies: i64,
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                version: i64,
+            }
+
+            let mut conn = self.db.get().await.ok()?;
+            let rows: Vec<Row> = diesel::sql_query(format!(
                 "SELECT applies, version FROM {TABLE} WHERE id = $1"
             ))
-            .bind(key)
-            .fetch_optional(&self.db)
+            .bind::<diesel::sql_types::Uuid, _>(key)
+            .load(&mut *conn)
             .await
-            .ok()?
+            .ok()?;
+
+            rows.into_iter().next().map(|r| (r.applies, r.version))
         }
     }
 
@@ -915,7 +934,11 @@ mod live_tests {
         .await;
         running.abort();
 
-        assert_eq!(recorder.versions(key), vec![1, 2, 3], "applied out of order");
+        assert_eq!(
+            recorder.versions(key),
+            vec![1, 2, 3],
+            "applied out of order"
+        );
 
         // Ordered is not the same claim as serial, and only the second one rules out
         // two replicas inside the same aggregate at once.
@@ -1110,9 +1133,11 @@ mod live_tests {
         // Killing it before it has the message would prove nothing — the survivor
         // would just be the first to receive it. `entered` counts entries into the
         // apply, and the 600s hold means it is still inside one.
-        until(Duration::from_secs(60), "the message to be in flight", || {
-            doomed.entered() > 0
-        })
+        until(
+            Duration::from_secs(60),
+            "the message to be in flight",
+            || doomed.entered() > 0,
+        )
         .await;
         one.abort();
 

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::{
@@ -19,13 +20,15 @@ use crate::{
 /// genuinely optional columns**. `BookingCreated` is always the first event for a
 /// booking and BOOKINGS never expires (`max_age` None), so a replay from sequence 1
 /// can only ever create this row complete.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::payment::booking)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct BookingMirror {
     pub id: Uuid,
     /// Which spot, so checkout can ask spot-service what to call it. The id alone —
     /// this service holds no spot data and consumes no SPOTS events.
     pub spot_id: Uuid,
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     pub renter_id: Uuid,
     pub amount_cents: i64,
     /// Wall-clock slots in the spot's zone, projected for exactly one reason: the
@@ -36,7 +39,6 @@ pub struct BookingMirror {
     ///
     /// A `jsonb` column, `NOT NULL DEFAULT '{}'` — so the `booked ?? {}` that used to
     /// be in every statement selecting this table is gone with the absent case.
-    #[sqlx(json)]
     pub booked: Booked,
     /// One of `domain_models::booking::status`. `completed` is deliberately absent
     /// from this table's CHECK — nothing publishes it, and "the host has earned
@@ -62,7 +64,7 @@ impl BookingMirror {
         Self {
             id: e.booking_id,
             spot_id: e.spot_id,
-            owner_id: e.owner_id,
+            host_id: e.host_id,
             renter_id: e.renter_id,
             amount_cents: e.amount_cents,
             booked: e.booked,
@@ -85,7 +87,8 @@ impl BookingMirror {
 /// `hold_until`: it is only ever cleared, never set, and a `?? column` patch cannot
 /// express that — see [`BookingMirrorPatch::status`] and
 /// `BookingMirrorRepository::transition`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = crate::schema::payment::booking)]
 pub struct BookingMirrorPatch {
     pub status: Option<String>,
     pub cancel_reason: Option<String>,
@@ -93,10 +96,10 @@ pub struct BookingMirrorPatch {
 }
 
 impl BookingMirrorPatch {
-    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
-    // positionally, so the binds live beside the `$n` placeholders in
-    // `BookingMirrorRepository::transition`. The live round-trip in payment-service
-    // is what would catch a mismatch.
+    // No `bind` — `AsChangeset` is the `SET` list. See the note in
+    // `domain_models::user::user`. What `AsChangeset` will NOT write is a column back
+    // to NULL, so `transition` assigns `hold_until` beside the patch; the live
+    // round-trip in payment-service is what catches that going missing.
 
     /// Paid. Clears the hold, which no longer means anything.
     ///

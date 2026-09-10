@@ -1,7 +1,9 @@
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::view::user::{ViewUser, ViewUserPatch};
 use shared::error::myerror::MyResult;
-use shared::projections::user::OwnerViewUser;
-use sqlx::PgExecutor;
+use shared::projections::user::AccountProjection;
+use shared::schema::view::app_user;
 use uuid::Uuid;
 
 /// The `app_user` table in the read model.
@@ -10,33 +12,22 @@ use uuid::Uuid;
 pub struct ViewUserRepository;
 
 impl ViewUserRepository {
-    /// The `/me` handler's read: the caller's own profile, `email` included.
+    /// `GET /api/view/account` — the caller's own profile, `email` included.
     ///
-    /// The columns are aliased `user_*` even though nothing is joined here. That is the
-    /// one convention `PublicViewUser` decodes by — see `shared::projections` — and it
-    /// is what lets the same type serve this read, owner-on-spot and renter-on-booking
-    /// without a per-site variant.
-    ///
-    /// No `WHERE` beyond the key: the row is chosen by a signature-verified claim, so
-    /// there is no comparison here to get wrong.
-    pub async fn find_owner_by_id(
-        ex: impl PgExecutor<'_>,
+    /// No `WHERE` beyond the key, and that *is* the `account` namespace's predicate: the
+    /// row is chosen by a signature-verified claim, so there is no comparison here to get
+    /// wrong. It is also why this is the only read that may hold
+    /// [`AccountProjection`]'s three scoped columns.
+    pub async fn find_for_account(
+        conn: &mut AsyncPgConnection,
         user_id: Uuid,
-    ) -> MyResult<Option<OwnerViewUser>> {
-        Ok(sqlx::query_as(
-            "SELECT id              AS user_id,
-                    first_name      AS user_first_name,
-                    last_name       AS user_last_name,
-                    profile_picture AS user_profile_picture,
-                    email           AS user_email,
-                    license_plates  AS user_license_plates,
-                    country         AS user_country
-               FROM app_user
-              WHERE id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(ex)
-        .await?)
+    ) -> MyResult<Option<AccountProjection>> {
+        Ok(app_user::table
+            .find(user_id)
+            .select(AccountProjection::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// Insert-or-replace the whole row.
@@ -44,62 +35,30 @@ impl ViewUserRepository {
     /// The struct's fields *are* the columns written, which is what
     /// `no_credential_columns_reach_the_read_model` leans on — nothing reaches this
     /// world-readable table that is not a field on [`ViewUser`].
-    pub async fn upsert(ex: impl PgExecutor<'_>, user: ViewUser) -> MyResult<()> {
-        sqlx::query(
-            "INSERT INTO app_user
-                 (id, version, first_name, last_name, profile_picture, email,
-                  license_plates, country)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (id) DO UPDATE SET
-                 version         = EXCLUDED.version,
-                 first_name      = EXCLUDED.first_name,
-                 last_name       = EXCLUDED.last_name,
-                 profile_picture = EXCLUDED.profile_picture,
-                 email           = EXCLUDED.email,
-                 license_plates  = EXCLUDED.license_plates,
-                 country         = EXCLUDED.country",
-        )
-        .bind(user.id)
-        .bind(user.version as i64)
-        .bind(user.first_name)
-        .bind(user.last_name)
-        .bind(user.profile_picture)
-        .bind(user.email)
-        .bind(user.license_plates)
-        .bind(user.country)
-        .execute(ex)
-        .await?;
+    pub async fn upsert(conn: &mut AsyncPgConnection, user: ViewUser) -> MyResult<()> {
+        diesel::insert_into(app_user::table)
+            .values(user.clone())
+            .on_conflict(app_user::id)
+            .do_update()
+            .set(user)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
     /// Update only the columns the patch carries. Does not create the row.
     ///
-    /// The six columns here are every column [`ViewUserPatch`] carries.
-    /// **The binds are positional**, so their order must match the `$n`.
+    /// The six columns here are every column [`ViewUserPatch`] carries. `AsChangeset`
+    /// omits an absent field rather than coalescing it — same effect, matched by name.
     pub async fn patch(
-        ex: impl PgExecutor<'_>,
+        conn: &mut AsyncPgConnection,
         user_id: Uuid,
         patch: ViewUserPatch,
     ) -> MyResult<()> {
-        sqlx::query(
-            "UPDATE app_user SET
-                 first_name      = COALESCE($2, first_name),
-                 last_name       = COALESCE($3, last_name),
-                 profile_picture = COALESCE($4, profile_picture),
-                 email           = COALESCE($5, email),
-                 license_plates  = COALESCE($6, license_plates),
-                 country         = COALESCE($7, country)
-             WHERE id = $1",
-        )
-        .bind(user_id)
-        .bind(patch.first_name)
-        .bind(patch.last_name)
-        .bind(patch.profile_picture)
-        .bind(patch.email)
-        .bind(patch.license_plates)
-        .bind(patch.country)
-        .execute(ex)
-        .await?;
+        diesel::update(app_user::table.find(user_id))
+            .set(&patch)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 }
@@ -112,7 +71,7 @@ impl ViewUserRepository {
 // existed because a record link could only be written if its target was already
 // projected, and the streams advance independently so it routinely was not.
 //
-// There are no record links. `owner_id`, `spot_id` and `renter_id` are plain uuids
-// with no foreign key (deliberately — see `migrations/view/0001_init.sql`), and a read
+// There are no record links. `host_id`, `spot_id` and `renter_id` are plain uuids
+// with no foreign key (deliberately — see `migrations/view/0001_init/up.sql`), and a read
 // LEFT JOINs to resolve them. A reference to a row that has not been projected yet is
 // an absent join rather than a null column that needs repairing later.

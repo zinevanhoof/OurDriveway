@@ -9,6 +9,26 @@ pub mod health;
 pub mod lease;
 pub mod outbox;
 pub mod projector;
+/// The two tables `bus` owns: `_outbox` and `_lease`.
+///
+/// **Generated**, by the bus pass in `scripts/print-schema.sh` — the doc lives here rather
+/// than in the file because `print-schema` would overwrite it there.
+///
+/// Every service database has an identical copy of both, created five times over by
+/// `migrations/<svc>/0001_init/up.sql`, because every service runs its own outbox relay
+/// and its own leader election. They are deliberately kept OUT of `shared::schema` (see
+/// the filter in `diesel.toml`): [`outbox::enqueue`] is generic over whichever database
+/// its caller holds, so it cannot name a per-service type — and with these declared only
+/// here, `bus::schema::_outbox` is the only one that exists. That is what makes "services
+/// reach the outbox through `bus`" a compiler rule rather than a convention.
+///
+/// The generation pass reads all five databases and refuses to write if they disagree,
+/// which is the one thing five copies of the same migration can get wrong.
+///
+/// No hand-written `allow_tables_to_appear_in_same_query!` decision survives here — the
+/// CLI emits one for the pair. Neither table is ever joined to anything, so it permits a
+/// query nobody writes.
+pub mod schema;
 pub mod service;
 pub mod worker;
 

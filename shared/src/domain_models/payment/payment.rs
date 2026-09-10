@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::events::payment::PaymentCreated;
@@ -35,19 +36,20 @@ pub mod status {
 ///
 /// Read entire rather than per-use-case: this replaced a `PaymentRow` that selected
 /// ten of the eleven columns anyway, on a row always addressed by a unique index.
-#[derive(Clone, Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
+#[diesel(table_name = crate::schema::payment::payment)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Payment {
     pub id: Uuid,
     /// See `Booking::version` — same field, same jobs.
-    #[sqlx(try_from = "i64")]
-    pub version: u64,
+    pub version: i64,
     /// `payment_booking … UNIQUE`, and load-bearing: one booking gets at most one
     /// PaymentIntent, so a second row for one booking means the renter could be
     /// charged twice.
     pub booking_id: Uuid,
     /// Who earns it. Denormalised off the event so the earnings query never
     /// dereferences a booking.
-    pub owner_id: Uuid,
+    pub host_id: Uuid,
     /// Who paid. Read so a session lookup can be scoped to the asking renter before
     /// Stripe is asked anything.
     pub renter_id: Uuid,
@@ -83,12 +85,12 @@ pub struct Payment {
 
 impl Payment {
     /// The row a `Created` writes. Everything else is a patch on top of this.
-    pub fn created(e: PaymentCreated, version: u64) -> Self {
+    pub fn created(e: PaymentCreated, version: i64) -> Self {
         Self {
             id: e.payment_id,
             version,
             booking_id: e.booking_id,
-            owner_id: e.owner_id,
+            host_id: e.host_id,
             renter_id: e.renter_id,
             amount_cents: e.amount_cents,
             session_id: e.session_id,
@@ -113,7 +115,8 @@ impl Payment {
 /// Only the four columns anything actually patches. The other eight are written
 /// once by [`Payment::created`] and never change, so they are not representable
 /// here — which is a little stronger than the all-columns version this replaced.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, AsChangeset)]
+#[diesel(table_name = crate::schema::payment::payment)]
 pub struct PaymentPatch {
     pub status: Option<String>,
     pub intent_id: Option<String>,
@@ -123,11 +126,9 @@ pub struct PaymentPatch {
 }
 
 impl PaymentPatch {
-    // No `bind` — see the note in `domain_models::user::user`. sqlx binds
-    // positionally, so the binds live beside the `$n` placeholders in
-    // `PaymentRepository::transition`. `set_covers_every_patchable_column` below is
-    // what still points at that statement, and the live round-trip in payment-service
-    // is what would actually catch a mismatch.
+    // No `bind` — `AsChangeset` is the `SET` list. See the note in
+    // `domain_models::user::user`. `set_covers_every_patchable_column` below is what
+    // fails the moment this struct grows a field.
 
     /// Paid — and the one place `intent_id` becomes known.
     ///

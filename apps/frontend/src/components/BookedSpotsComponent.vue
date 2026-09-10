@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { fetchMyBookings, viewKeys } from '@/api/viewApi';
-import type { BookingListItem } from '@/types/view';
+import { fetchRenterBookings, viewKeys } from '@/api/viewApi';
+import type { RenterBookingResponse } from '@/types/view';
 import {
     Tabs,
     TabsContent,
@@ -23,8 +23,8 @@ const queryClient = useQueryClient()
 // The `renterId` variable and the `pause` that guarded it are gone: the server takes the
 // renter from the token, so there is no id to wait for the session to rehydrate.
 const { data } = useQuery({
-    queryKey: viewKeys.myBookings,
-    queryFn: fetchMyBookings,
+    queryKey: viewKeys.renterBookings,
+    queryFn: fetchRenterBookings,
     staleTime: 0,
 })
 
@@ -43,7 +43,7 @@ const live = computed(() =>
 // One comparison against the server-folded end instant, in place of walking every
 // booking's date map. `Date.parse` rather than a string compare: the server emits
 // RFC 3339 with an offset, which doesn't sort against an ISO "Z" string.
-const stillToCome = (booking: BookingListItem) => Date.parse(booking.endsAt) > Date.now()
+const stillToCome = (booking: RenterBookingResponse) => Date.parse(booking.endsAt) > Date.now()
 
 const upcoming = computed(() => live.value.filter(stillToCome))
 const past = computed(() => live.value.filter((b) => !stillToCome(b)))

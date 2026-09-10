@@ -30,7 +30,7 @@ pub struct Envelope<T> {
     /// consumers hold several tables and `booking:<id>` and `payment:<id>` are
     /// different rows.
     pub aggregate: String,
-    /// This aggregate's version **after** the event was applied by its owner.
+    /// This aggregate's version **after** the event was applied by its host.
     ///
     /// Assigned inside the writing transaction, so it exists the moment the write
     /// commits — which is the whole reason it replaced the NATS stream sequence.
@@ -39,7 +39,13 @@ pub struct Envelope<T> {
     ///
     /// Monotonic per aggregate and gapless: a consumer holding 3 that receives 5
     /// knows it is missing 4, rather than applying it out of order.
-    pub version: u64,
+    ///
+    /// `i64`, matching the `bigint` column every version is read from and written to.
+    /// It was a `u64` on the grounds that a negative version should not be
+    /// representable, which cost a newtype at the column boundary and three
+    /// hand-written clamps at the `sql_query` reads that boundary never sees. JSON has
+    /// no signedness, so events written before that change decode after it.
+    pub version: i64,
     /// The only clock a projector may read.
     pub occurred_at: DateTime<Utc>,
     /// Whoever caused this, from a verified JWT claim. `None` for events raised by
@@ -63,7 +69,7 @@ pub struct Envelope<T> {
 
 impl<T> Envelope<T> {
     /// `aggregate` is `<table>:<uuid>` — build it with [`aggregate_id`].
-    pub fn new(payload: T, actor_id: Option<Uuid>, aggregate: String, version: u64) -> Self {
+    pub fn new(payload: T, actor_id: Option<Uuid>, aggregate: String, version: i64) -> Self {
         Self {
             event_id: Uuid::now_v7(),
             aggregate,
@@ -89,15 +95,21 @@ pub fn aggregate_id(table: &str, id: &Uuid) -> String {
 /// Replaces `format_seq`, which named a stream position. A client that waited on
 /// `SPOTS:4712` waited for every spot; this waits for one aggregate to reach one
 /// version, which is both narrower and answerable at commit time.
-pub fn format_version(aggregate: &str, version: u64) -> String {
+pub fn format_version(aggregate: &str, version: i64) -> String {
     format!("{aggregate}@{version}")
 }
 
 /// Splits `"user:019f…@7"` back into its halves. The inverse of
 /// [`format_version`], kept beside it so the two cannot drift.
-pub fn parse_version(s: &str) -> Option<(&str, u64)> {
+///
+/// **Parsed as `u64` and widened**, which is the one place unsignedness was ever load
+/// bearing: this reads a header a client writes, and `"-5".parse::<u64>()` fails, so
+/// `user:<id>@-5` is dropped here rather than becoming a wait that is satisfied before
+/// it starts. Everywhere else a version is an `i64`, because everywhere else it comes
+/// from `next_version` or from the column it was written to.
+pub fn parse_version(s: &str) -> Option<(&str, i64)> {
     let (aggregate, version) = s.rsplit_once('@')?;
-    Some((aggregate, version.parse().ok()?))
+    Some((aggregate, version.parse::<u64>().ok()?.try_into().ok()?))
 }
 
 /// `"user:019f…"` -> `("user", <uuid>)`. The inverse of [`aggregate_id`].
@@ -172,7 +184,11 @@ pub const PARTITIONS: u8 = 16;
 /// and `payout` tables now. If an *independent* ledger is ever wanted it has to be
 /// an explicit table somewhere else, not a side effect of never deleting anything.
 pub const STREAMS: &[(&str, &str, std::time::Duration)] = &[
-    (STREAM_USERS, "users", std::time::Duration::from_secs(7 * DAY)),
+    (
+        STREAM_USERS,
+        "users",
+        std::time::Duration::from_secs(7 * DAY),
+    ),
     // The one that was already bounded, and the longest: a refresh token lives 31
     // days, so its events stop meaning anything at exactly that point.
     (
@@ -180,7 +196,11 @@ pub const STREAMS: &[(&str, &str, std::time::Duration)] = &[
         "sessions",
         std::time::Duration::from_secs(31 * DAY),
     ),
-    (STREAM_SPOTS, "spots", std::time::Duration::from_secs(7 * DAY)),
+    (
+        STREAM_SPOTS,
+        "spots",
+        std::time::Duration::from_secs(7 * DAY),
+    ),
     (
         STREAM_BOOKINGS,
         "bookings",
@@ -314,8 +334,8 @@ pub fn payment_subject(booking_id: &Uuid) -> String {
 /// serializes them. Two withdraw requests racing — a double-clicked button — both read
 /// the same balance and both look affordable; that ordering is what makes exactly one
 /// of them win instead of paying out twice.
-pub fn payout_subject(owner_id: &Uuid) -> String {
-    format!("payments.payout.{owner_id}")
+pub fn payout_subject(host_id: &Uuid) -> String {
+    format!("payments.payout.{host_id}")
 }
 
 #[cfg(test)]
@@ -412,7 +432,9 @@ mod tests {
     /// A lane filter must claim its own partition and nothing else.
     #[test]
     fn lane_filters_do_not_overlap() {
-        let filters: Vec<_> = (0..PARTITIONS).map(|p| partition_filter("users", p)).collect();
+        let filters: Vec<_> = (0..PARTITIONS)
+            .map(|p| partition_filter("users", p))
+            .collect();
 
         assert_eq!(filters[0], "users.0.>");
         assert_eq!(filters[7], "users.7.>");
@@ -460,7 +482,11 @@ mod tests {
         let id = Uuid::now_v7();
         for (subject, _) in every_subject(&id) {
             let tokens: Vec<_> = subject.split('.').collect();
-            assert_eq!(tokens.len(), 3, "expected <domain>.<entity>.<id>: {subject}");
+            assert_eq!(
+                tokens.len(),
+                3,
+                "expected <domain>.<entity>.<id>: {subject}"
+            );
             assert_eq!(tokens[2], id.to_string(), "id must be the last token");
         }
     }

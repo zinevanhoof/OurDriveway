@@ -28,6 +28,22 @@ mod route;
 mod service;
 mod worker;
 
+bus::version_reader! {
+    /// Payments and payouts, plus the two mirrors they depend on.
+    ///
+    /// `"user"` maps to `host` — this database has no `app_user`, only the two columns
+    /// Stripe demands. It is a real wait now and it earns its place: a host sets their
+    /// country on their profile and then goes to onboard, and `ConnectService` reads that
+    /// country from this mirror. Without the wait, onboarding can read the row before the
+    /// USERS event lands and see no country — which is the one value Stripe fixes
+    /// permanently at account creation.
+    fn version_of;
+    "payment" => shared::schema::payment::payment,
+    "payout" => shared::schema::payment::payout,
+    "booking" => shared::schema::payment::booking,
+    "user" => shared::schema::payment::host,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub payment_service: Arc<PaymentService>,
@@ -93,7 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
     let db = shared::db::connect(&CONFIG.database_url).await?;
-    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/payment")).await?;
+    // Schema is NOT applied here. `apps/migrator` is the only thing that migrates —
+    // one Compose one-shot in dev, one Helm hook Job in production — because
+    // diesel_migrations takes no lock around a run and `replicas: N` would race.
+    // This process assumes its database exists and is current, and fails at connect
+    // above if it does not.
 
     // One pool for the whole process — projector lanes, election, relay, workers,
     // handlers and the await layer all share it. `PgPool` is `Arc` inside, so a clone
@@ -234,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Waits on the aggregate versions a client echoes back, against this
         // service's own database — see `bus::await_version`.
         .layer(axum::middleware::from_fn_with_state(
-            bus::AwaitVersions(await_db),
+            bus::AwaitVersions(await_db, version_of),
             bus::await_version::await_version,
         ))
         // After the layer, deliberately — a backfill is not a client read and has

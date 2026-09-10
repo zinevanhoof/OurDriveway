@@ -10,6 +10,7 @@ extern crate self as shared;
 
 pub mod claims;
 pub mod db;
+pub mod diesel_ext;
 pub mod domain_models;
 pub mod email_token;
 pub mod env;
@@ -24,6 +25,7 @@ pub mod projections;
 pub mod requests;
 pub mod responses;
 pub mod rpc;
+pub mod schema;
 pub(crate) mod validation;
 
 /// rustls ends up compiled with BOTH the `aws-lc-rs` and `ring` providers (pulled

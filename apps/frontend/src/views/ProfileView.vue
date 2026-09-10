@@ -3,7 +3,7 @@ import Separator from '@/components/ui/separator/Separator.vue';
 import Button from '@/components/ui/button/Button.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer';
 import { useQuery } from '@tanstack/vue-query';
-import { fetchMe, viewKeys } from '@/api/viewApi';
+import { fetchAccount, viewKeys } from '@/api/viewApi';
 import { useAuthStore } from '@/stores/auth.ts';
 import { computed, ref } from 'vue';
 import Avatar from '@/components/ui/avatar/Avatar.vue';
@@ -24,8 +24,8 @@ const router = useRouter()
 // this replaces passed `gqlRecordId(auth.user?.id)`, which needed the `u'<uuid>'`
 // spelling a record lookup takes — a distinction that no longer exists.
 const { data } = useQuery({
-    queryKey: viewKeys.me,
-    queryFn: fetchMe,
+    queryKey: viewKeys.account,
+    queryFn: fetchAccount,
 })
 
 // No `!` here: the query has not resolved on first render, so this really is

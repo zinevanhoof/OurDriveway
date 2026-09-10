@@ -63,8 +63,5 @@ fn not_blank(value: &String, _: &()) -> garde::Result {
 
 /// Same reason as `not_blank`: garde's `range` would phrase this in cents.
 fn at_least_minimum(value: &i64, _: &()) -> garde::Result {
-    require(
-        *value >= MIN_CENTS,
-        "The smallest withdrawal is €10.",
-    )
+    require(*value >= MIN_CENTS, "The smallest withdrawal is €10.")
 }

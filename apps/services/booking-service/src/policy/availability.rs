@@ -168,7 +168,7 @@ mod tests {
     }
 
     fn taken(start: &str, end: &str) -> Booked {
-        HashMap::from([(DATE.to_string(), vec![slot(start, end)])])
+        HashMap::from([(DATE.to_string(), vec![slot(start, end)])]).into()
     }
 
     #[test]

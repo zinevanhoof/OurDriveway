@@ -6,12 +6,36 @@ use shared::{
     events::{STREAM_BOOKINGS, STREAM_PAYMENTS, STREAM_SPOTS, STREAM_USERS},
 };
 
-use crate::projector::{BookingProjector, PaymentProjector, SpotProjector, UserProjector};
+use crate::{
+    projector::{BookingProjector, PaymentProjector, SpotProjector, UserProjector},
+    service::{
+        account_service::AccountService, host_service::HostService, public_service::PublicService,
+        renter_service::RenterService,
+    },
+};
 
 mod policy;
 mod projector;
 mod repository;
 mod route;
+mod service;
+
+bus::version_reader! {
+    /// Every aggregate the read model projects — which is why this is the service where
+    /// the header does the most work: a client writes to one of the four write services
+    /// and then reads here, so this is the wait that actually has to happen.
+    ///
+    /// `payment` and `payout` are both real waits now. When view-service held `payout`
+    /// but no `payment`, echoing a payment's version returned immediately; it holds both,
+    /// so a client that has just paid or just withdrawn waits for the projector rather
+    /// than reading a wallet without the thing it did in it.
+    fn version_of;
+    "user" => shared::schema::view::app_user,
+    "spot" => shared::schema::view::spot,
+    "booking" => shared::schema::view::booking,
+    "payment" => shared::schema::view::payment,
+    "payout" => shared::schema::view::payout,
+}
 
 /// The combined read model: every service's events projected into one database,
 /// serving all client reads.
@@ -19,10 +43,19 @@ mod route;
 /// It owns no truth. Every table is rebuildable from the log, and nothing here is
 /// ever consulted to make a decision — availability, pricing and authorization
 /// are answered by the service that owns them.
+///
+/// **One service per namespace**, which is one per file in `route/`.
+///
+/// The pool is theirs rather than the state's: a handler cannot borrow a connection, so it
+/// cannot take two for reads that have to agree — see `AccountService::wallet`. They share
+/// no rules with each other beyond that, because a namespace *is* a predicate and these
+/// are four different ones.
 #[derive(Clone)]
 pub struct AppState {
-    /// The pool. Handlers read through the repositories, which are stateless.
-    pub db: sqlx::PgPool,
+    pub account_service: Arc<AccountService>,
+    pub host_service: Arc<HostService>,
+    pub renter_service: Arc<RenterService>,
+    pub public_service: Arc<PublicService>,
 }
 
 /// Every variable this service reads, in one place.
@@ -76,7 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
     let db = shared::db::connect(&CONFIG.database_url).await?;
-    shared::db::migrate(&db, &sqlx::migrate!("../../../migrations/view")).await?;
+    // Schema is NOT applied here. `apps/migrator` is the only thing that migrates —
+    // one Compose one-shot in dev, one Helm hook Job in production — because
+    // diesel_migrations takes no lock around a run and `replicas: N` would race.
+    // This process assumes its database exists and is current, and fails at connect
+    // above if it does not.
 
     // One pool for the whole process — four projectors × PARTITIONS lanes, the
     // election, the relay, the handlers and the await layer all share it.
@@ -142,36 +179,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // *were* the authorization, evaluated by the database against `$auth`.
     //
     // No browser reaches this database now, and every rule those clauses expressed is a
-    // repository function — one per audience, each selecting the columns that audience
-    // may hold and matching the rows it may see. `migrations/view/0001_init.sql` records
+    // repository function — one per namespace, each selecting the columns that namespace
+    // may hold and matching the rows it may see. `migrations/view/0001_init/up.sql` records
     // the rules and the two problems that came with the old arrangement (a denied field
     // nulling a whole GraphQL array, and VULN-001's indexed-equality oracle).
     //
-    // Nine endpoints. One audience, one projection and one repository call each — see
-    // `route/mod.rs` for the rules that shape them.
+    // Ten endpoints in four namespaces, one predicate each — see `route/mod.rs`. The
+    // namespace is the authorization, so a route says who may read it in the same place
+    // it says what it returns, and each namespace's reads are one service in `service/`.
     //
     // Two of them are money, and they are here rather than on payment-service because
-    // reads are this service's job: `/me/wallet` is the history, `/me/balance` is what
-    // `GET /api/payment/earnings` used to answer.
+    // reads are this service's job: `/account/wallet` is the history, `/host/balance` is
+    // what `GET /api/payment/earnings` used to answer.
     let app = Router::new()
-        .route("/api/view/me", get(route::me::me))
-        .route("/api/view/me/spots", get(route::me::spots))
-        .route("/api/view/me/bookings", get(route::me::bookings))
-        .route("/api/view/me/wallet", get(route::me::wallet))
-        .route("/api/view/me/balance", get(route::me::balance))
-        .route("/api/view/spots/nearby", get(route::spot::nearby))
-        .route("/api/view/spots/{id}", get(route::spot::public))
-        .route("/api/view/spots/{id}/manage", get(route::spot::manage))
-        .route("/api/view/bookings/{id}", get(route::booking::detail))
+        .nest(
+            "/api/view/account",
+            Router::new()
+                .route("/", get(route::account::account))
+                .route("/wallet", get(route::account::wallet)),
+        )
+        .nest(
+            "/api/view/host",
+            Router::new()
+                .route("/spots", get(route::host::spots))
+                .route("/spots/{id}", get(route::host::spot))
+                .route("/balance", get(route::host::balance)),
+        )
+        .nest(
+            "/api/view/renter",
+            Router::new()
+                // `/next` before `/{id}`: axum matches the literal segment first either
+                // way, but the ordering is what a reader checks.
+                .route("/bookings", get(route::renter::bookings))
+                .route("/bookings/next", get(route::renter::next))
+                .route("/bookings/{id}", get(route::renter::booking)),
+        )
+        .nest(
+            "/api/view/public",
+            Router::new()
+                .route("/spots/nearby", get(route::public::nearby))
+                .route("/spots/{id}", get(route::public::spot)),
+        )
         // Waits on the aggregate versions a client echoes back, against this
         // service's own database — see `bus::await_version`. Transport-level, so it is
         // unaffected by the reads underneath it changing shape.
         .layer(axum::middleware::from_fn_with_state(
-            bus::AwaitVersions(await_db),
+            bus::AwaitVersions(await_db, version_of),
             bus::await_version::await_version,
         ))
         .merge(bus::health::routes(readiness))
-        .with_state(AppState { db });
+        .with_state(AppState {
+            account_service: Arc::new(AccountService { db: db.clone() }),
+            host_service: Arc::new(HostService { db: db.clone() }),
+            renter_service: Arc::new(RenterService { db: db.clone() }),
+            public_service: Arc::new(PublicService { db }),
+        });
 
     // PORT differs per service in local dev so several can run on one host.
     // Containerised, every service listens on 80.

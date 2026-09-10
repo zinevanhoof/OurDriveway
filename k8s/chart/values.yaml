@@ -46,8 +46,9 @@ mediaBase: &mediaBase https://images.ourdriveway.example.com
 settlementSecs: &settlementSecs "86400"
 
 # Keys are load-bearing three times over: the image is
-# ourdriveway-<name>-service, the schema key is <name>-schema.surql, and the
-# ingress path is /api/<name>. Rename one and all three follow.
+# ourdriveway-<name>-service, the database name is <name> (and so is its directory
+# under migrations/, which the migrator embeds), and the ingress path is /api/<name>.
+# Rename one and all three follow.
 services:
   user:
     env:
@@ -158,6 +159,12 @@ yugabyte:
 # secret and prints them back with `helm get values`, so a chart is a poor place
 # to put a signing key — and the database password is now in there too, as
 # YSQL_PASSWORD. Rotating it needs a `kubectl rollout restart`.
+#
+# The NAME still has to be here, though — `secretKeyRef.name` and `secretRef.name`
+# in services.yaml, yugabyte.yaml and migrator-job.yaml all read it, and while this
+# key was missing they rendered an empty name and every pod failed admission. It must
+# match the secret deploy.sh creates.
+secretName: app-secrets
 
 frontend:
   # Caddy serving the built SPA and nothing else — all routing lives in the

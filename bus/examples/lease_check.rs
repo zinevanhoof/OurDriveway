@@ -36,54 +36,85 @@ const NAME: &str = "leader-selftest";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared::install_default_crypto_provider();
 
-    let a = shared::db::connect(URL).await?;
-    let b = shared::db::connect(URL).await?;
+    // Two pools, and a checked-out connection from each. `lease::acquire` takes a
+    // connection rather than a pool so its real callers can hand it an open
+    // transaction; here the two connections stand in for two competing instances.
+    let pool_a = shared::db::connect(URL).await?;
+    let pool_b = shared::db::connect(URL).await?;
+    let mut a = pool_a.get().await?;
+    let mut b = pool_b.get().await?;
     let (alice, bob) = ("alice".to_string(), "bob".to_string());
 
     // Never inherit a lease from a previous run.
-    lease::release(&a, NAME, &alice).await.ok();
-    lease::release(&a, NAME, &bob).await.ok();
+    lease::release(&mut a, NAME, &alice).await.ok();
+    lease::release(&mut a, NAME, &bob).await.ok();
 
     let mut failures = 0;
     let mut check = |label: &str, got: bool, want: bool| {
         let ok = got == want;
-        println!(
-            "  {} {label}: {got}",
-            if ok { "✓" } else { "✗" }
-        );
+        println!("  {} {label}: {got}", if ok { "✓" } else { "✗" });
         if !ok {
             failures += 1;
         }
     };
 
     println!("\nuncontended");
-    check("alice takes a free lease", lease::acquire(&a, NAME, &alice).await?, true);
-    check("alice renews her own", lease::acquire(&a, NAME, &alice).await?, true);
-    check("bob refused while alice holds", lease::acquire(&b, NAME, &bob).await?, false);
+    check(
+        "alice takes a free lease",
+        lease::acquire(&mut a, NAME, &alice).await?,
+        true,
+    );
+    check(
+        "alice renews her own",
+        lease::acquire(&mut a, NAME, &alice).await?,
+        true,
+    );
+    check(
+        "bob refused while alice holds",
+        lease::acquire(&mut b, NAME, &bob).await?,
+        false,
+    );
 
     println!("\nhandover after release");
-    lease::release(&a, NAME, &alice).await?;
-    check("bob takes the released lease", lease::acquire(&b, NAME, &bob).await?, true);
-    check("alice now refused", lease::acquire(&a, NAME, &alice).await?, false);
+    lease::release(&mut a, NAME, &alice).await?;
+    check(
+        "bob takes the released lease",
+        lease::acquire(&mut b, NAME, &bob).await?,
+        true,
+    );
+    check(
+        "alice now refused",
+        lease::acquire(&mut a, NAME, &alice).await?,
+        false,
+    );
 
     // A losing racer must not be able to evict the winner.
     println!("\nrelease is scoped to the holder");
-    lease::release(&a, NAME, &alice).await?;
-    check("alice's release did not evict bob", lease::acquire(&a, NAME, &alice).await?, false);
-    check("bob still holds", lease::acquire(&b, NAME, &bob).await?, true);
+    lease::release(&mut a, NAME, &alice).await?;
+    check(
+        "alice's release did not evict bob",
+        lease::acquire(&mut a, NAME, &alice).await?,
+        false,
+    );
+    check(
+        "bob still holds",
+        lease::acquire(&mut b, NAME, &bob).await?,
+        true,
+    );
 
     // The one that matters: N instances starting at once must not all believe they
     // won. See the module doc above for why this is now the statement's `WHERE` doing
     // the work rather than a write-write conflict.
     println!("\ncontended start (8 instances, one free lease)");
-    lease::release(&b, NAME, &bob).await?;
+    lease::release(&mut b, NAME, &bob).await?;
     let mut set = tokio::task::JoinSet::new();
     for i in 0..8 {
         set.spawn(async move {
-            let db = shared::db::connect(URL).await.ok()?;
+            let pool = shared::db::connect(URL).await.ok()?;
+            let mut db = pool.get().await.ok()?;
             // `Ok(false)` is a clean loss; `Err` is losing the write race, which is
             // also a loss. Neither may be reported as a win.
-            lease::acquire(&db, NAME, &format!("instance-{i}"))
+            lease::acquire(&mut db, NAME, &format!("instance-{i}"))
                 .await
                 .ok()
                 .filter(|held| *held)
@@ -99,9 +130,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  winners: {winners:?}");
     check("exactly one instance won", winners.len() == 1, true);
 
-    lease::release(&a, NAME, &format!("instance-{}", winners.first().copied().unwrap_or(0)))
-        .await
-        .ok();
+    lease::release(
+        &mut a,
+        NAME,
+        &format!("instance-{}", winners.first().copied().unwrap_or(0)),
+    )
+    .await
+    .ok();
 
     println!("\n─────────────────────────────────────────────");
     if failures == 0 {
