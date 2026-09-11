@@ -29,7 +29,8 @@ import { Text, Title } from "@/components/base/text";
 import { IconBox } from "@/components/base/icon-box";
 import { stripe } from "@/lib/stripe";
 import { cssColorToHex, token } from "@/lib/theme";
-import { fetchAccount, fetchRenterBooking, viewKeys } from "@/api/viewApi";
+import { fetchAccount, fetchRenterBooking } from "@/api/viewApi";
+import { viewKeys } from "@/api/keys";
 import * as paymentApi from "@/api/paymentApi";
 import * as bookingApi from "@/api/bookingApi";
 import type {

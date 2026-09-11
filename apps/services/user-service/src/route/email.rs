@@ -1,5 +1,6 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse};
-use shared::responses::common::accepted;
+use axum::extract::State;
+use axum::http::{HeaderName, StatusCode};
+use shared::responses::common::X_VERSION;
 use shared::{
     error::myerror::MyResult,
     extract::Valid,
@@ -17,15 +18,15 @@ use crate::AppState;
 /// The frontend POSTs this from `/verify`; the link itself is a plain GET to a
 /// page. That split is not decoration: mail scanners prefetch links, so anything
 /// with an effect has to sit behind the verb they don't use.
-/// 202 with the log position rather than 204: the login that follows reads
+/// 202 with the version rather than 204: the login that follows reads
 /// `email_verified` from this service's own projection, so the client has to have
 /// something to wait on or it can be told to verify an address it just verified.
 pub async fn verify(
     State(state): State<AppState>,
     Valid(req): Valid<VerifyEmailRequest>,
-) -> MyResult<impl IntoResponse> {
-    let token = state.user_service.verify_email(req).await?;
-    Ok(accepted(token))
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state.user_service.verify_email(req).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 
 /// Re-sends the verification email.
@@ -36,7 +37,7 @@ pub async fn verify(
 pub async fn resend(
     State(state): State<AppState>,
     Valid(req): Valid<ResendVerificationRequest>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<StatusCode> {
     state.user_service.resend_verification(req).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -14,8 +14,8 @@ import {
 } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { signupUser } from '@/api/userApi'
-import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
+import { useSignup } from '@/api/userApi'
+import type { ApiError } from '@/api/client'
 import { passwordRules } from '@/lib/passwordSchema'
 
 const emit = defineEmits<{
@@ -48,17 +48,18 @@ const { handleSubmit, setErrors, isSubmitting } = useForm({
 
 const serverErrors = ref<string[]>([])
 
+const { mutateAsync: signup } = useSignup()
+
 const onSubmit = handleSubmit(async ({ confirmPassword, ...form }) => {
     serverErrors.value = []
-    const response = await signupUser(form)
 
-    if (response.ok) {
+    try {
+        await signup(form)
         emit('success')
-        return
+    } catch (e) {
+        const err = e as ApiError
+        if (!err.applyTo(setErrors)) serverErrors.value = err.detail
     }
-
-    if (await applyValidationErrors(response, setErrors)) return
-    serverErrors.value = await readErrorDetail(response)
 })
 </script>
 

@@ -1,19 +1,20 @@
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::response::IntoResponse;
+use axum::http::{HeaderName, StatusCode};
 use shared::error::myerror::MyResult;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::spot::{CreateSpotRequest, UpdateSpotRequest};
-use shared::responses::common::{accepted, backfilled};
+use shared::responses::common::{BackfilledResponse, X_VERSION};
 use uuid::Uuid;
 
 use crate::AppState;
 
 /// 202, not 201: the event is committed to the log, but the projections that
-/// answer reads are still catching up. `seq` is how a caller waits for its own
-/// write.
+/// answer reads are still catching up. The `X-Version` header is how a caller waits
+/// for its own write.
 ///
-/// Answers with the seq and nothing else — the minted id is not returned; see
+/// Answers with the version and nothing else — the minted id is not returned; see
 /// `SpotService::create_spot`.
 ///
 /// Plain JSON. Photos are already in R2 by the time this is called — the browser
@@ -23,11 +24,11 @@ pub async fn create_spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Valid(request): Valid<CreateSpotRequest>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
     // Ownership comes from the verified token, never from the request body.
-    let token = state.spot_service.create_spot(&user_id, request).await?;
+    let version = state.spot_service.create_spot(&user_id, request).await?;
 
-    Ok(accepted(token))
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 
 /// 202 for the same reason as create: the log has it, the projections haven't.
@@ -40,28 +41,30 @@ pub async fn update_spot(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Valid(request): Valid<UpdateSpotRequest>,
-) -> MyResult<impl IntoResponse> {
-    let token = state
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state
         .spot_service
         .update_spot(&user_id, &id, request)
         .await?;
 
-    Ok(accepted(token))
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 
 pub async fn delete_spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> MyResult<impl IntoResponse> {
-    let token = state.spot_service.delete_spot(&user_id, &id).await?;
-    Ok(accepted(token))
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state.spot_service.delete_spot(&user_id, &id).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 
 /// `POST /internal/backfill` — re-emit every spot, for rebuilding a consumer.
 ///
 /// Off the ingress and unauthenticated by construction; see the same handler in
 /// user-service for why that is the whole of the access control.
-pub async fn backfill(State(state): State<AppState>) -> MyResult<impl IntoResponse> {
-    Ok(backfilled(state.spot_service.backfill().await?))
+pub async fn backfill(State(state): State<AppState>) -> MyResult<Json<BackfilledResponse>> {
+    Ok(Json(BackfilledResponse {
+        events: state.spot_service.backfill().await?,
+    }))
 }

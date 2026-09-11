@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 use shared::error::myerror::{ContextExt, MyResult};
-use shared::responses::spot::AutocompleteAddressResponse;
+use shared::responses::spot::AddressSuggestResponse;
 
 use crate::CONFIG;
 
@@ -31,7 +31,7 @@ fn client() -> &'static reqwest::Client {
 ///
 /// `addressdetails=1` is what makes one call enough: the structured breakdown comes back
 /// with the suggestion, so picking one fills every field of the form with no follow-up.
-pub async fn autocomplete(query: &str) -> MyResult<Vec<AutocompleteAddressResponse>> {
+pub async fn autocomplete(query: &str) -> MyResult<Vec<AddressSuggestResponse>> {
     let key = CONFIG.locationiq_api_key.as_str();
     let resp = client()
         .get("https://api.locationiq.com/v1/autocomplete")
@@ -99,7 +99,7 @@ pub async fn geocode(address: &str) -> MyResult<Option<(f64, f64)>> {
 /// The text fields collapse "absent" and "empty" into the same thing on purpose: an empty
 /// `city` and no `city` at all are the same answer for a form, and [`text`] is what makes
 /// them one value rather than two cases.
-fn address_from(hit: &Value) -> AutocompleteAddressResponse {
+fn address_from(hit: &Value) -> AddressSuggestResponse {
     let a = &hit["address"];
     let pick = |key: &str| text(&a[key]).unwrap_or_default();
 
@@ -122,7 +122,7 @@ fn address_from(hit: &Value) -> AutocompleteAddressResponse {
         ],
     );
 
-    AutocompleteAddressResponse {
+    AddressSuggestResponse {
         line1,
         line2: None, // OSM has no clean line2; left for manual entry.
         city,

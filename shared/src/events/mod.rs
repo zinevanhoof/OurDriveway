@@ -451,13 +451,13 @@ mod tests {
     }
 
     #[test]
-    fn a_version_token_round_trips() {
+    fn a_version_round_trips() {
         let id = Uuid::now_v7();
         let agg = aggregate_id("user", &id);
-        let token = format_version(&agg, 7);
+        let version = format_version(&agg, 7);
 
-        assert_eq!(token, format!("user:{id}@7"));
-        assert_eq!(parse_version(&token), Some((agg.as_str(), 7)));
+        assert_eq!(version, format!("user:{id}@7"));
+        assert_eq!(parse_version(&version), Some((agg.as_str(), 7)));
     }
 
     /// `rsplit_once`, not `split_once`: the aggregate half contains a uuid, and a

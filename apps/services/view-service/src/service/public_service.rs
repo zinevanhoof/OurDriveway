@@ -1,7 +1,7 @@
 use chrono::Utc;
 use shared::{
     error::myerror::{ContextExt, MyResult},
-    responses::view::{PublicSpotResponse, SpotPinResponse},
+    responses::view::{NearbyResponse, PublicSpotResponse},
 };
 use uuid::Uuid;
 
@@ -67,8 +67,8 @@ impl PublicService {
         lng: f64,
         lat: f64,
         meters: f64,
-    ) -> MyResult<Vec<SpotPinResponse>> {
-        (meters > 0.0 && meters <= MAX_RADIUS_M).context_unprocessable_entity((
+    ) -> MyResult<Vec<NearbyResponse>> {
+        (meters > 0.0 && meters <= MAX_RADIUS_M).context_bad_request((
             "Invalid radius",
             "Search radius must be between 0 and 50km.",
         ))?;
@@ -78,7 +78,7 @@ impl PublicService {
         let spots =
             ViewSpotRepository::find_pins_for_public(&mut conn, caller, lng, lat, meters).await?;
 
-        Ok(spots.into_iter().map(SpotPinResponse::from).collect())
+        Ok(spots.into_iter().map(NearbyResponse::from).collect())
     }
 }
 

@@ -5,7 +5,9 @@
 // caller has when the user taps.
 import { useQuery } from "@tanstack/vue-query";
 import { computed } from "vue";
-import { fetchSpot, viewKeys } from "@/api/viewApi";
+import { fetchSpot } from "@/api/viewApi";
+import { viewKeys } from "@/api/keys";
+import type { ApiError } from "@/api/client";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import { formatDay, formatSlots, sortedDays } from "@/lib/bookingDates";
 import { CalendarDays, Star } from "@lucide/vue";
@@ -39,7 +41,7 @@ const emit = defineEmits<{ book: [] }>();
 // the second from cache exactly as urql's document dedupe did — and the three variables
 // that used to be needed (a record-id spelling, a plain uuid, and a `now`) are one path
 // parameter.
-const { data } = useQuery({
+const { data, isError, error, refetch } = useQuery({
   queryKey: computed(() => viewKeys.spot(props.spotId ?? "")),
   queryFn: () => fetchSpot(props.spotId!),
   enabled: computed(() => props.spotId !== null),
@@ -57,7 +59,13 @@ const days = computed(() => sortedDays(props.booking));
   <Drawer v-model:open="open">
     <DrawerContent @close-auto-focus.prevent
       class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
-      <div class="m-4 space-y-4">
+      <!-- A failed read used to render this sheet with every field blank, which looks
+           like a spot with no title, no price and no address rather than a failure. -->
+      <div v-if="isError" class="m-4 space-y-2 text-center">
+        <Text size="sm">{{ (error as ApiError).detail.join(' ') }}</Text>
+        <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
+      </div>
+      <div v-else class="m-4 space-y-4">
         <div class="flex h-40 gap-4 overflow-x-auto snap-x snap-mandatory no-scrollbar">
           <!-- `only:` = the sole image, so it fills the row instead of leaving a gap. -->
           <img v-for="key in spot?.images" :key="key" :src="key"

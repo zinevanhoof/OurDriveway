@@ -1,32 +1,14 @@
-import { apiFetch } from "./king";
-import { readErrorDetail } from "@/lib/serverErrors";
+import { useMutation } from "@tanstack/vue-query";
 
-type Kind = "spot" | "avatar";
-
-/**
- * What `POST /api/media/upload-url` answers.
- *
- * `url` is the field the backend actually sends — see `UploadUrlResponse` in
- * media-service's `route.rs`. It used to be `key`, a bucket path that each screen
- * then had to turn into something loadable; it is now the whole URL, already
- * loadable, and it is what the create/edit request must carry because
- * `shared::media::is_media_url` validates the origin and the path shape together.
- *
- * The two are NOT interchangeable and the mismatch was silent: reading a `key` that
- * no longer exists yields `undefined`, and `JSON.stringify` renders `undefined`
- * inside an array as `null` — so a create request went out with `images: [null]`
- * and failed validation with nothing in the console.
- */
-interface UploadUrlResponse {
-  url: string;
-  uploadUrl: string;
-}
+import { ApiError, post } from "./client";
+import type { MediaKind } from "@/types/requests/media/UploadUrlRequest";
+import type { UploadUrlResponse } from "@/types/responses/media/UploadUrlResponse";
 
 /**
  * Uploads one image straight to R2 and returns the URL to store.
  *
- * Two requests, and the second one does not go through `apiFetch`: it is a plain
- * PUT to Cloudflare against a presigned URL, so it must not carry our
+ * Two requests, and the second one does not go through the api client: it is a
+ * plain PUT to Cloudflare against a presigned URL, so it must not carry our
  * Authorization header or the SameSite cookie — the signature is the whole auth,
  * and an extra signed-header mismatch would just 403.
  *
@@ -34,22 +16,11 @@ interface UploadUrlResponse {
  * so they have to match what was declared or R2 rejects the upload. That is also
  * what enforces the size cap.
  */
-export async function uploadImage(file: File, kind: Kind): Promise<string> {
-  const minted = await apiFetch("/api/media/upload-url", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      kind,
-      contentType: file.type,
-      contentLength: file.size,
-    }),
-  });
-
-  if (!minted.ok) {
-    throw new Error((await readErrorDetail(minted)).join(" "));
-  }
-
-  const { url, uploadUrl }: UploadUrlResponse = await minted.json();
+export async function uploadImage(file: File, kind: MediaKind): Promise<string> {
+  const { url, uploadUrl } = await post<UploadUrlResponse>(
+    "/api/media/upload-url",
+    { kind, contentType: file.type, contentLength: file.size },
+  );
 
   const uploaded = await fetch(uploadUrl, {
     method: "PUT",
@@ -57,8 +28,16 @@ export async function uploadImage(file: File, kind: Kind): Promise<string> {
     body: file,
   });
 
+  // R2's failures are not `MyError` bodies, so this is the one place that mints an
+  // `ApiError` by hand rather than parsing one. It is still an `ApiError`, so a
+  // caller catching the mint above and the upload here has one type to handle.
   if (!uploaded.ok) {
-    throw new Error(`Upload failed (${uploaded.status}). Please try again.`);
+    throw new ApiError(
+      uploaded.status,
+      "Upload failed",
+      [`Upload failed (${uploaded.status}). Please try again.`],
+      {},
+    );
   }
 
   return url;
@@ -73,7 +52,7 @@ export async function uploadImage(file: File, kind: Kind): Promise<string> {
  */
 export function uploadNewImages(
   images: (string | File)[],
-  kind: Kind,
+  kind: MediaKind,
 ): Promise<string[]> {
   return Promise.all(
     images.map((image) =>
@@ -81,3 +60,19 @@ export function uploadNewImages(
     ),
   );
 }
+
+/**
+ * No cache to invalidate — an upload writes to R2, not to a projection. This exists
+ * for `isPending` and a typed `error`, which the two spot forms were tracking with
+ * refs of their own.
+ */
+export const useUploadImages = () =>
+  useMutation({
+    mutationFn: ({
+      images,
+      kind,
+    }: {
+      images: (string | File)[];
+      kind: MediaKind;
+    }) => uploadNewImages(images, kind),
+  });

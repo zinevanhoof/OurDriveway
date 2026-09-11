@@ -11,9 +11,12 @@
 use axum::{
     Json,
     extract::{Path, State},
-    response::IntoResponse,
 };
-use shared::{error::myerror::MyResult, extractors::authed_jwt::AuthedJwt};
+use shared::{
+    error::myerror::MyResult,
+    extractors::authed_jwt::AuthedJwt,
+    responses::view::{NextBookingResponse, RenterBookingResponse},
+};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -25,7 +28,7 @@ use crate::AppState;
 pub async fn bookings(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<Vec<RenterBookingResponse>>> {
     Ok(Json(state.renter_service.bookings(user_id).await?))
 }
 
@@ -37,7 +40,7 @@ pub async fn bookings(
 pub async fn next(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<Option<NextBookingResponse>>> {
     Ok(Json(state.renter_service.next(user_id).await?))
 }
 
@@ -52,7 +55,7 @@ pub async fn booking(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Path(booking_id): Path<Uuid>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<RenterBookingResponse>> {
     Ok(Json(
         state.renter_service.booking(booking_id, user_id).await?,
     ))

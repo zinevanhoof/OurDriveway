@@ -1,4 +1,4 @@
-use axum::{Json, extract::State, response::IntoResponse};
+use axum::{Json, extract::State};
 use shared::{
     error::myerror::MyResult,
     extractors::authed_jwt::AuthedJwt,
@@ -18,7 +18,7 @@ use crate::{AppState, service::connect_service::ConnectStatus};
 pub async fn status(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<ConnectStatusResponse>> {
     let (state, bank_last4) = match state.connect_service.status(&user_id).await? {
         ConnectStatus::NeedsCountry => ("needs_country", None),
         ConnectStatus::None => ("none", None),
@@ -38,7 +38,7 @@ pub async fn status(
 pub async fn account_session(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<AccountSessionResponse>> {
     Ok(Json(AccountSessionResponse {
         client_secret: state.connect_service.account_session(&user_id).await?,
     }))

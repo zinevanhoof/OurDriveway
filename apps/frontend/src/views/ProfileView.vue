@@ -3,7 +3,8 @@ import Separator from '@/components/ui/separator/Separator.vue';
 import Button from '@/components/ui/button/Button.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer';
 import { useQuery } from '@tanstack/vue-query';
-import { fetchAccount, viewKeys } from '@/api/viewApi';
+import { fetchAccount } from '@/api/viewApi';
+import { viewKeys } from '@/api/keys';
 import { useAuthStore } from '@/stores/auth.ts';
 import { computed, ref } from 'vue';
 import Avatar from '@/components/ui/avatar/Avatar.vue';
@@ -15,7 +16,7 @@ import { Surface } from '@/components/base/surface';
 import { Text, Title } from '@/components/base/text';
 import { IconBox } from '@/components/base/icon-box';
 import { useRouter } from 'vue-router';
-import { logoutUser } from '@/api/userApi';
+import { useLogout } from '@/api/userApi';
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -38,8 +39,13 @@ const me = computed(() => data.value?.profile)
 // what routes to login. No router.push here for that reason.
 const confirmOpen = ref(false)
 
+const { mutateAsync: endSession } = useLogout()
+
 const logout = async () => {
-    await logoutUser()
+    // Even a failed revoke ends the session here: the refresh cookie may already be
+    // gone, and leaving someone signed in because logout 500'd is the wrong way to
+    // fail. `useLogout` clears the query cache either way.
+    await endSession().catch(() => {})
     auth.logout()
 }
 </script>

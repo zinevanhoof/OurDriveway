@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use aws_sdk_s3::presigning::PresigningConfig;
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{Json, extract::State, http::StatusCode};
 use shared::error::myerror::{MyError, MyResult};
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::media;
@@ -20,10 +20,10 @@ pub async fn upload_url(
     _: AuthedJwt,
     State(state): State<AppState>,
     Json(request): Json<UploadUrlRequest>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<UploadUrlResponse>> {
     let extension = extension_for(&request.content_type).ok_or_else(|| {
         MyError::api(
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
             "Unsupported image type",
             "Photos must be JPEG, PNG or WebP.",
         )
@@ -31,7 +31,7 @@ pub async fn upload_url(
 
     if request.content_length == 0 || request.content_length > CONFIG.max_upload_bytes {
         return Err(MyError::api(
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
             "Image too large",
             format!(
                 "Each photo must be under {} MB.",

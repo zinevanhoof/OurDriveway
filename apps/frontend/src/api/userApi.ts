@@ -1,68 +1,53 @@
-import { apiFetch } from "./king";
-import { recordSeq } from "@/lib/awaitSeq";
-import { LoginRequest } from "@/types/requests/LoginRequest";
-import { SignupRequest } from "@/types/requests/SignupRequest";
+import { useMutation, useQueryClient } from "@tanstack/vue-query";
 
-// Every write below runs through `record`, including the three that answer with
-// something other than a 202: login and refresh carry a SESSIONS position on the
-// AuthResponse, and signup and verify answer 202 like the rest. user-service now
-// mounts the await_seq layer, so those positions are what make the *next* call to
-// it — a second signup submit, the login after a verification — read what this one
-// just wrote, on whichever replica takes it.
-const loginUser = async ({
-  email,
-  password,
-}: LoginRequest): Promise<Response> =>
-  record(
-    await apiFetch("/api/user/login", {
-      method: "POST",
-      body: JSON.stringify({
-        email,
-        password,
-      }),
-      headers: {
-        "Content-Type": "application/json",
-      },
-    }),
-  );
+import { patch, post } from "./client";
+import { viewKeys } from "./keys";
+import type { LoginRequest } from "@/types/requests/user/LoginRequest";
+import type { SignupRequest } from "@/types/requests/user/SignupRequest";
+import type {
+  ChangePasswordRequest,
+  UpdateProfileRequest,
+} from "@/types/requests/user/UpdateUserRequest";
+import type { LoginResponse } from "@/types/responses/user/LoginResponse";
+import type { RefreshResponse } from "@/types/responses/user/RefreshResponse";
 
-const signupUser = async ({
-  firstName,
-  lastName,
-  email,
-  password,
-}: SignupRequest): Promise<Response> =>
-  record(
-    await apiFetch("/api/user/signup", {
-      method: "POST",
-      body: JSON.stringify({
-        firstName,
-        lastName,
-        email,
-        password,
-      }),
-      headers: {
-        "Content-Type": "application/json",
-      },
-    }),
-  );
+// Every function here used to return a raw `Response` and leave the component to
+// branch on its status. They return their parsed body or throw an `ApiError` now,
+// like the rest of the api layer.
+//
+// Nothing calls `recordVersion`. The version each of these writes reaches arrives as
+// the `X-Version` header and is recorded by the transport — including on login
+// and refresh, which carry the session's version so the *next* call to user-service
+// reads what this one just wrote, on whichever replica takes it.
+
+/**
+ * Exchanges credentials for an access token, and sets the refresh cookie.
+ *
+ * A wrong password is a 401 with `detail: ["Invalid credentials"]`, and it reaches
+ * the caller intact — which it did not before. `king.ts` read a 401's body to
+ * decide whether to refresh, without cloning, so the form's own read of it threw
+ * and every wrong password rendered as "Something went wrong. Please try again."
+ * See the note at the top of `client.ts`.
+ *
+ * An unverified address is a **403**, which is a different conversation: the fix is
+ * a link in their inbox, not another guess.
+ */
+export const login = (body: LoginRequest) =>
+  post<LoginResponse>("/api/user/login", body);
+
+export const signup = (body: SignupRequest) =>
+  post<void>("/api/user/signup", body);
 
 /**
  * Confirms an address from the token in a mailed link.
  *
  * A POST, not a GET, even though it is reached by clicking a link: mail scanners
  * prefetch links, so the link itself goes to a page and only this call has an
- * effect. Safe to run twice — the backend treats re-verification as a no-op
- * rather than an error, which is what makes a prefetch harmless.
+ * effect. Safe to run twice — the backend treats re-verification as a no-op rather
+ * than an error, which is what makes a prefetch harmless.
  */
-const verifyEmail = async (token: string): Promise<Response> =>
-  record(
-    await apiFetch("/api/user/email/verify", {
-      method: "POST",
-      body: JSON.stringify({ token }),
-      headers: { "Content-Type": "application/json" },
-    }),
-  );
+export const verifyEmail = (token: string) =>
+  post<void>("/api/user/email/verify", { token });
 
 /**
  * Asks for the verification link again.
@@ -70,114 +55,70 @@ const verifyEmail = async (token: string): Promise<Response> =>
  * Always 204, even for an address with no account — the backend refuses to say
  * which addresses are registered, so there is nothing here to branch on.
  */
-const resendVerification = async (email: string): Promise<Response> =>
-  apiFetch("/api/user/email/resend", {
-    method: "POST",
-    body: JSON.stringify({ email }),
-    headers: { "Content-Type": "application/json" },
-  });
+export const resendVerification = (email: string) =>
+  post<void>("/api/user/email/resend", { email });
 
-const logoutUser = async () => {
-  await apiFetch("/api/user/session/logout", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-  });
-};
+export const logout = () => post<void>("/api/user/session/logout");
 
-const refreshUser = async (): Promise<Response> =>
-  record(
-    await apiFetch("/api/user/session/refresh", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    }),
-  );
+/**
+ * Rotates the session from the httponly refresh cookie.
+ *
+ * Not a hook and never will be: `refresh.ts` calls it from inside the transport's
+ * own 401 path, and `main.ts` calls it before the app — and its QueryClient —
+ * exists.
+ */
+export const refreshSession = () =>
+  post<RefreshResponse>("/api/user/session/refresh");
 
 /**
  * The two halves of `PATCH /api/user`. Every field is optional server-side, where
  * omitted means "unchanged" — which is what lets one endpoint serve both screens,
- * each sending only its own half.
- *
- * They are two types here rather than one optional-everything type because each
- * screen really does submit its whole half, and the server refuses a body carrying
- * both: it publishes one event per request, and a password change is a different
+ * each sending only its own half. The server refuses a body carrying both, with a
+ * 409: it publishes one event per request, and a password change is a different
  * event from a profile edit.
  */
-export type UpdateProfileRequest = {
-  firstName: string;
-  lastName: string;
-  email: string;
-  licensePlates: string[];
-  /**
-   * ISO 3166-1 alpha-2, or omitted for "unchanged".
-   *
-   * Where the user banks, not where they live — it is what Stripe opens their payout
-   * account with, and it cannot be changed once that account exists.
-   */
-  country?: string;
-  /** Only required when `email` differs from the stored one; the server decides. */
-  currentPassword?: string;
-  /**
-   * A media URL under `avatars/`, or omitted for "unchanged" — which is what most
-   * saves send, since the picture only changes when the user picks a new one.
-   * There is no way to express "remove", because there is no UI for it.
-   */
-  profilePicture?: string;
-};
+export const updateProfile = (body: UpdateProfileRequest) =>
+  patch<void>("/api/user", body);
 
-export type ChangePasswordRequest = {
-  currentPassword: string;
-  newPassword: string;
-};
+/** Same endpoint, the other half. */
+export const changePassword = (body: ChangePasswordRequest) =>
+  patch<void>("/api/user", body);
 
-/**
- * Saves the edit-profile form. Returns the raw Response, like the rest of this
- * file, so the form can map a 422's `errors` map back onto its own fields.
- *
- * Answers 202 with `{ seq }`: the event is in the log, but the projection that
- * answers reads is still catching up, and recording the seq is what makes the
- * next query wait for this write.
- */
-const updateProfile = (body: UpdateProfileRequest): Promise<Response> =>
-  patchUser(body);
+// ─── hooks ──────────────────────────────────────────────────────────────────
+//
+// The invalidations below used to live in the components, next to the `await`
+// rather than next to the write — which is the pair that drifts. A write knows
+// what it changed; the screen that happened to trigger it does not.
 
-/** Same endpoint, the other half — see [UpdateProfileRequest]. */
-const changePassword = (body: ChangePasswordRequest): Promise<Response> =>
-  patchUser(body);
+export const useLogin = () => useMutation({ mutationFn: login });
 
-const patchUser = async (
-  body: UpdateProfileRequest | ChangePasswordRequest,
-): Promise<Response> =>
-  record(
-    await apiFetch("/api/user", {
-      method: "PATCH",
-      body: JSON.stringify(body),
-      headers: { "Content-Type": "application/json" },
-    }),
-  );
+export const useSignup = () => useMutation({ mutationFn: signup });
 
-/** Captures the log position from a 202 without consuming the caller's body. */
-async function record(response: Response): Promise<Response> {
-  if (response.ok) {
-    const { seq } = await response
-      .clone()
-      .json()
-      .catch(() => ({ seq: null }));
-    recordSeq(seq);
-  }
-  return response;
+export const useVerifyEmail = () => useMutation({ mutationFn: verifyEmail });
+
+export const useResendVerification = () =>
+  useMutation({ mutationFn: resendVerification });
+
+export function useLogout() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: logout,
+    // Every cached read belongs to the session that just ended. `clear` rather
+    // than `invalidateQueries`, which would refetch them all as the anonymous
+    // user on the way out.
+    onSettled: () => queryClient.clear(),
+  });
 }
 
-export {
-  loginUser,
-  signupUser,
-  logoutUser,
-  refreshUser,
-  updateProfile,
-  changePassword,
-  verifyEmail,
-  resendVerification,
-};
+export function useUpdateProfile() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: updateProfile,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: viewKeys.account }),
+  });
+}
+
+export const useChangePassword = () =>
+  useMutation({ mutationFn: changePassword });

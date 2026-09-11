@@ -124,7 +124,7 @@ impl ConnectService {
                     .await?
                     .context_not_found(("Not Found", "Could not find your account."))?;
 
-                let country = host.country.as_deref().context_unprocessable_entity((
+                let country = host.country.as_deref().context_conflict((
                     "Country Required",
                     "Add the country you bank in to your profile before setting up payouts.",
                 ))?;

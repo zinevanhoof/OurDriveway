@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useQuery, useQueryClient } from '@tanstack/vue-query';
+import { useQuery } from '@tanstack/vue-query';
 import { computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useForm } from 'vee-validate'
@@ -19,8 +19,10 @@ import CreateSpotBasicInfo from '@/components/forms/create-spot-form/CreateSpotB
 import CreateSpotAvailability from '@/components/forms/create-spot-form/CreateSpotAvailability.vue';
 import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImages.vue';
 
-import { fetchHostSpot, viewKeys } from '@/api/viewApi';
-import { deleteSpot, updateSpot } from '@/api/spotApi';
+import { fetchHostSpot } from '@/api/viewApi';
+import { viewKeys } from '@/api/keys';
+import { useDeleteSpot, useUpdateSpot } from '@/api/spotApi';
+import type { ApiError } from '@/api/client';
 import { uploadNewImages } from '@/api/mediaApi';
 import { bookedOutside, mergeBooked } from '@/lib/bookingAvailability';
 import { formatDay, formatSlots, todayIn } from '@/lib/bookingDates';
@@ -31,7 +33,6 @@ const { id } = defineProps<{ id: string }>()
 
 const router = useRouter()
 
-const queryClient = useQueryClient()
 
 const { data } = useQuery({
     queryKey: viewKeys.hostSpot(id),
@@ -69,8 +70,8 @@ const emptyWeek = (): Availability['weekly'] =>
 const availability = ref<Availability>({ weekly: emptyWeek(), single: {} })
 const images = ref<(string | File)[]>([])
 
-const loading = ref(false)
-const deleting = ref(false)
+const { mutateAsync: save, isPending: loading } = useUpdateSpot()
+const { mutateAsync: destroy, isPending: deleting } = useDeleteSpot()
 const confirmOpen = ref(false)
 const slotErrors = ref<string[]>([])
 const imageErrors = ref<string[]>([])
@@ -119,11 +120,6 @@ const hasSlots = () =>
 const casualties = computed(() =>
     bookedOutside(availability.value, mergeBooked(data.value?.bookings), today.value))
 
-// The spot's own key covers the edit; `spots` also clears the host's list and any
-// radius result this listing appears in.
-const invalidateSpot = () =>
-    queryClient.invalidateQueries({ queryKey: viewKeys.spots })
-
 const submit = handleSubmit(async (values) => {
     formErrors.value = []
     slotErrors.value = []
@@ -137,65 +133,60 @@ const submit = handleSubmit(async (values) => {
     if (slotErrors.value.length || imageErrors.value.length)
         return
 
-    loading.value = true
+    // Which half of the try threw: an upload failure belongs under the picker.
+    let uploading = false
     try {
         // Kept photos are already keys and pass straight through; only the newly
         // picked Files are uploaded. One list, in the host's display order, so the
         // server never has to work out what changed.
+        uploading = true
         const imageUrls = await uploadNewImages(images.value, 'spot')
+        uploading = false
 
         const { pricePerHour, ...rest } = values
-        const response = await updateSpot(id, {
-            ...rest,
-            pricePerHourCents: eurosToCents(pricePerHour),
-            availability: availability.value,
-            images: imageUrls,
+        await save({
+            spotId: id,
+            body: {
+                ...rest,
+                pricePerHourCents: eurosToCents(pricePerHour),
+                availability: availability.value,
+                images: imageUrls,
+            },
         })
-        if (!response.ok) {
-            showServerErrors(await response.json().catch(() => ({})))
-            return
-        }
-        await invalidateSpot()
         router.back()
-    } catch (error) {
+    } catch (e) {
+        const err = e as ApiError
         // A failed upload leaves the listing exactly as it was — nothing was saved.
-        imageErrors.value.push(error instanceof Error ? error.message : 'Upload failed.')
-    } finally {
-        loading.value = false
+        if (uploading) imageErrors.value.push(err.detail[0])
+        else showServerErrors(err)
     }
 })
 
 const remove = async () => {
-    deleting.value = true
     try {
-        await deleteSpot(id)
+        await destroy(id)
         // Past the manage screen, which is about to 404 on a spot that no longer
         // lists. `refreshSpots` makes the list refetch instead of serving its cache.
         router.replace({ name: 'spots', state: { refreshSpots: true } })
     } catch (e) {
         confirmOpen.value = false
-        formErrors.value = [e instanceof Error ? e.message : 'Something went wrong. Please try again.']
-    } finally {
-        deleting.value = false
+        formErrors.value = (e as ApiError).detail
     }
 }
 
-// Backend field paths are snake_case and only some of them map to a form field.
-const toCamel = (k: string) => k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
+// Only some backend field paths map to a form field; availability's belong under
+// the slot picker. The paths arrive camelCase — the server converts garde's
+// snake_case ones now, so the `toCamel` that used to be here is gone.
 const FORM_FIELDS = ['title', 'description', 'pricePerHour']
 
-const showServerErrors = (body: {
-    errors?: Record<string, string[]>,
-    detail?: string[],
-}) => {
-    if (!body.errors) {
-        formErrors.value = body.detail ?? ['Something went wrong. Please try again.']
+const showServerErrors = (err: ApiError) => {
+    if (Object.keys(err.fields).length === 0) {
+        formErrors.value = err.detail
         return
     }
 
     const fieldErrors: Record<string, string[]> = {}
-    for (const [path, messages] of Object.entries(body.errors)) {
-        const key = toCamel(path)
+    for (const [key, messages] of Object.entries(err.fields)) {
         if (key.startsWith('availability'))
             slotErrors.value.push(...messages)
         else if (key.startsWith('images'))

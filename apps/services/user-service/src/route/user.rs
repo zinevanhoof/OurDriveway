@@ -1,6 +1,10 @@
-use axum::{extract::State, response::IntoResponse};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderName, StatusCode},
+};
 use shared::extractors::authed_jwt::AuthedJwt;
-use shared::responses::common::{accepted, backfilled};
+use shared::responses::common::{BackfilledResponse, X_VERSION};
 use shared::{error::myerror::MyResult, extract::Valid, requests::user::UpdateUserRequest};
 
 use crate::AppState;
@@ -14,9 +18,9 @@ pub async fn update_user(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Valid(req): Valid<UpdateUserRequest>,
-) -> MyResult<impl IntoResponse> {
-    let token = state.user_service.update_user(&user_id, req).await?;
-    Ok(accepted(token))
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state.user_service.update_user(&user_id, req).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 
 /// `POST /internal/backfill` — re-emit every user, for rebuilding a consumer.
@@ -37,6 +41,8 @@ pub async fn update_user(
 /// Synchronous, so the count in the response is the real one and a script can wait
 /// on it. It walks whole tables — see the ponytail note in `UserRepository::all` for
 /// when that stops being reasonable.
-pub async fn backfill(State(state): State<AppState>) -> MyResult<impl IntoResponse> {
-    Ok(backfilled(state.user_service.backfill().await?))
+pub async fn backfill(State(state): State<AppState>) -> MyResult<Json<BackfilledResponse>> {
+    Ok(Json(BackfilledResponse {
+        events: state.user_service.backfill().await?,
+    }))
 }

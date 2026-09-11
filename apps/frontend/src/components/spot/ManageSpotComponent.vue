@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import { useQuery, useQueryClient } from '@tanstack/vue-query';
+import { useQuery } from '@tanstack/vue-query';
 import Button from '../ui/button/Button.vue';
-import { fetchHostSpot, viewKeys } from '@/api/viewApi';
-import type { HostBookingResponse } from '@/types/view';
+import { fetchHostSpot } from '@/api/viewApi';
+import { viewKeys } from '@/api/keys';
+import type { HostBookingResponse } from '@/types/responses/view/HostBookingResponse';
 import { computed, ref } from 'vue';
 import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
 import { formatDay, formatSlots, sortedDays, todayIn } from '@/lib/bookingDates.ts';
-import { deleteSpot, updateSpot } from '@/api/spotApi.ts';
-import { readErrorDetail } from '@/lib/serverErrors.ts';
+import { useDeleteSpot, useUpdateSpot } from '@/api/spotApi';
+import type { ApiError } from '@/api/client';
 import type { TimeSlot, WeeklyAvailability } from '@/types/domain/spot';
 
 import Avatar from "../ui/avatar/Avatar.vue";
@@ -26,7 +27,6 @@ const { id } = defineProps<{ id: string }>()
 
 const router = useRouter()
 
-const queryClient = useQueryClient()
 
 // One request, one path parameter. `MANAGE_SPOT` needed three variables — the spot in
 // two different spellings plus a `now` for the bookings filter — and the "read once per
@@ -56,15 +56,15 @@ const errors = ref<string[]>([])
 // `{ active }` and nothing else: an edit only touches the fields it carries, and a
 // toggle that also resubmitted availability would run the backend's
 // cancel-what-no-longer-fits pass off a read that may be a moment stale.
+const { mutateAsync: save } = useUpdateSpot()
+
 const toggleLive = async (active: boolean) => {
     pending.value = active
     errors.value = []
     try {
-        const response = await updateSpot(id, { active })
-        if (!response.ok) throw new Error((await readErrorDetail(response)).join(' '))
-        await queryClient.invalidateQueries({ queryKey: viewKeys.spots })
+        await save({ spotId: id, body: { active } })
     } catch (e) {
-        errors.value = [e instanceof Error ? e.message : 'Could not change the listing.']
+        errors.value = (e as ApiError).detail
     } finally {
         pending.value = undefined
     }
@@ -73,18 +73,15 @@ const toggleLive = async (active: boolean) => {
 // ─── delete ─────────────────────────────────────────────────────────────────
 
 const confirmOpen = ref(false)
-const deleting = ref(false)
+const { mutateAsync: destroy, isPending: deleting } = useDeleteSpot()
 
 const remove = async () => {
-    deleting.value = true
     try {
-        await deleteSpot(id)
+        await destroy(id)
         router.replace({ name: 'spots', state: { refreshSpots: true } })
     } catch (e) {
         confirmOpen.value = false
-        errors.value = [e instanceof Error ? e.message : 'Could not delete the listing.']
-    } finally {
-        deleting.value = false
+        errors.value = (e as ApiError).detail
     }
 }
 

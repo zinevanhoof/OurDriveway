@@ -5,5 +5,5 @@
 # missing bind-mount source itself, as root, and then `npm run build` fails with
 # EACCES on the first file it tries to write. Keeping the directory in the repo
 # means it always exists and always belongs to whoever cloned it.
-/dist/*
+/dist
 !/dist/.gitkeep

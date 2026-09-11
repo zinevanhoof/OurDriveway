@@ -1,7 +1,7 @@
-use axum::{Json, extract::Query, response::IntoResponse};
+use axum::{Json, extract::Query};
 use shared::{
     error::myerror::MyResult, extractors::authed_jwt::AuthedJwt,
-    requests::spot::AddressSuggestQuery,
+    requests::spot::AddressSuggestQuery, responses::spot::AddressSuggestResponse,
 };
 
 use crate::client::locationiq;
@@ -10,6 +10,6 @@ use crate::client::locationiq;
 pub async fn suggest(
     _: AuthedJwt,
     Query(request): Query<AddressSuggestQuery>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<Vec<AddressSuggestResponse>>> {
     Ok(Json(locationiq::autocomplete(&request.q).await?))
 }

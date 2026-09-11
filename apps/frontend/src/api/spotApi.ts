@@ -1,19 +1,20 @@
-import { apiFetch } from "./king";
-import { recordSeq } from "@/lib/awaitSeq";
-import { readErrorDetail } from "@/lib/serverErrors";
+import { useMutation, useQueryClient } from "@tanstack/vue-query";
+
+import { del, get, patch, post, query } from "./client";
+import { viewKeys } from "./keys";
+import type { CreateSpotRequest } from "@/types/requests/spot/CreateSpotRequest";
+import type { UpdateSpotRequest } from "@/types/requests/spot/UpdateSpotRequest";
+import type { AddressSuggestResponse } from "@/types/responses/spot/AddressSuggestResponse";
 
 /**
  * Creates a listing.
  *
- * Returns the raw Response rather than throwing, because the create form maps a
- * 422's `errors` map back onto its own fields — see `showServerErrors` there.
- * Every write here answers 202 with `{ seq }`: the event is in the log, but the
- * projections that answer reads are still catching up, and recording the seq is
- * what makes the next query wait for this write.
+ * `createSpot` and `updateSpot` used to take `request: object`, which accepted
+ * anything at all — so `CreateSpotRequest` sat in `types/` imported by nothing
+ * while the create form hand-built a literal. They are typed now.
  */
-export async function createSpot(request: object): Promise<Response> {
-  return record(await apiFetch("/api/spot", json("POST", request)));
-}
+export const createSpot = (body: CreateSpotRequest) =>
+  post<void>("/api/spot", body);
 
 /**
  * Saves an edit. The edit form sends its whole state: `images` is the host's whole
@@ -25,35 +26,66 @@ export async function createSpot(request: object): Promise<Response> {
  * else, which is what keeps a toggle from resubmitting availability — the field
  * the backend cancels bookings over.
  */
-export async function updateSpot(spotId: string, request: object): Promise<Response> {
-  return record(await apiFetch(`/api/spot/${spotId}`, json("PATCH", request)));
-}
+export const updateSpot = (spotId: string, body: UpdateSpotRequest) =>
+  patch<void>(`/api/spot/${spotId}`, body);
 
 /**
  * Withdraws the listing for good, and with it every booking it still owes — the
  * server cancels those and they become refunds. Not reversible from the UI.
  */
-export async function deleteSpot(spotId: string): Promise<void> {
-  const res = await apiFetch(`/api/spot/${spotId}`, { method: "DELETE" });
-  if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
-  recordSeq((await res.json()).seq);
+export const deleteSpot = (spotId: string) => del<void>(`/api/spot/${spotId}`);
+
+/**
+ * Type-ahead suggestions, proxied through spot-service to keep the LocationIQ key
+ * server-side.
+ *
+ * Each item already carries every `Address` field, so a pick fills the form with no
+ * follow-up request.
+ *
+ * This used to swallow every failure with `return []`, which made a broken
+ * proxy indistinguishable from an address that does not exist. It throws like
+ * everything else now; the two call sites are debounced typeaheads that catch and
+ * fall back to showing nothing, which is the same behaviour written down where it
+ * can be seen.
+ */
+export const suggestAddress = (q: string) =>
+  get<AddressSuggestResponse[]>(`/api/spot/address/suggest${query({ q })}`);
+
+// ─── hooks ──────────────────────────────────────────────────────────────────
+
+export function useCreateSpot() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: createSpot,
+    // `["spots"]` is a prefix, so this covers the host list, the public detail and
+    // every nearby query in one.
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: viewKeys.spots }),
+  });
 }
 
-function json(method: string, body: object): RequestInit {
-  return {
-    method,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  };
+export function useUpdateSpot() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ spotId, body }: { spotId: string; body: UpdateSpotRequest }) =>
+      updateSpot(spotId, body),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: viewKeys.spots }),
+  });
 }
 
-async function record(response: Response): Promise<Response> {
-  if (response.ok) {
-    const body = await response
-      .clone()
-      .json()
-      .catch(() => null);
-    recordSeq(body?.seq);
-  }
-  return response;
+export function useDeleteSpot() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: deleteSpot,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: viewKeys.spots });
+      // Deleting a spot cancels the bookings on it, which become refunds — so the
+      // renter's list and the wallet are both stale now, not just the spot.
+      queryClient.invalidateQueries({ queryKey: viewKeys.bookings });
+      queryClient.invalidateQueries({ queryKey: viewKeys.wallet });
+      queryClient.invalidateQueries({ queryKey: viewKeys.balance });
+    },
+  });
 }

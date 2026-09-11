@@ -5,7 +5,7 @@
 //! projector take, so an immediate follow-up read can legitimately land before its
 //! own write is visible — you create a spot and it is not in the list.
 //!
-//! The client echoes that token on its next read and this layer holds the request
+//! The client echoes that version on its next read and this layer holds the request
 //! until the projection has reached it.
 //!
 //! ## Why not the stream sequence

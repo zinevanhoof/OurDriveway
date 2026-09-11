@@ -11,9 +11,12 @@
 use axum::{
     Json,
     extract::{Path, State},
-    response::IntoResponse,
 };
-use shared::{error::myerror::MyResult, extractors::authed_jwt::AuthedJwt};
+use shared::{
+    error::myerror::MyResult,
+    extractors::authed_jwt::AuthedJwt,
+    responses::view::{BalanceResponse, HostSpotListItemResponse, HostSpotResponse},
+};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -25,7 +28,7 @@ use crate::AppState;
 pub async fn spots(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<Vec<HostSpotListItemResponse>>> {
     Ok(Json(state.host_service.spots(user_id).await?))
 }
 
@@ -42,7 +45,7 @@ pub async fn spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Path(spot_id): Path<Uuid>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<HostSpotResponse>> {
     Ok(Json(state.host_service.spot(spot_id, user_id).await?))
 }
 
@@ -56,6 +59,6 @@ pub async fn spot(
 pub async fn balance(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<BalanceResponse>> {
     Ok(Json(state.host_service.balance(user_id).await?))
 }

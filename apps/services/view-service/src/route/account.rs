@@ -13,10 +13,13 @@
 use axum::{
     Json,
     extract::{Query, State},
-    response::IntoResponse,
 };
 use serde::Deserialize;
-use shared::{error::myerror::MyResult, extractors::authed_jwt::AuthedJwt};
+use shared::{
+    error::myerror::MyResult,
+    extractors::authed_jwt::AuthedJwt,
+    responses::view::{AccountResponse, WalletResponse},
+};
 
 use crate::AppState;
 
@@ -30,7 +33,7 @@ use crate::AppState;
 pub async fn account(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<AccountResponse>> {
     Ok(Json(state.account_service.account(user_id).await?))
 }
 
@@ -57,6 +60,6 @@ pub async fn wallet(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Query(q): Query<WalletQuery>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<WalletResponse>> {
     Ok(Json(state.account_service.wallet(user_id, q.month).await?))
 }

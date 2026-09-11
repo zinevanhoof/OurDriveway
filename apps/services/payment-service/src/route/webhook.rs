@@ -2,7 +2,6 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
 };
 use shared::error::myerror::{ContextExt, MyResult};
 
@@ -23,7 +22,7 @@ pub async fn stripe_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<StatusCode> {
     let signature = headers
         .get(SIGNATURE)
         .and_then(|v| v.to_str().ok())

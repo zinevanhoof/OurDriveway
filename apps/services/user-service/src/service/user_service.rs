@@ -46,8 +46,8 @@ impl UserService {
         // see, and `email_idx … UNIQUE` for the backstop behind both.
         //
         // A double-submitted form only gets the 409 if the first signup has been
-        // projected before the second one reads. That is what the seq this returns
-        // buys: the same client's second request carries `USERS:<seq>` and the
+        // projected before the second one reads. That is what the version this returns
+        // buys: the same client's second request carries `user:<id>@<n>` and the
         // layer holds it until the row is there. Without the echo it falls through
         // to the dedupe window below, which is silent — the same account, answered
         // twice with success.
@@ -108,7 +108,7 @@ impl UserService {
         // side effect of the same commit rather than the thing that caused it.
         let mut conn = db::conn(&self.db).await?;
 
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     let version = shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
@@ -126,16 +126,15 @@ impl UserService {
                         version,
                     );
                     envelope.event_id = event_id;
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok(await_token)
+        Ok(version)
     }
 
     /// Checks credentials and returns the user they belong to.
@@ -208,7 +207,7 @@ impl UserService {
 
         let mut conn = db::conn(&self.db).await?;
 
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     // Read inside the transaction: the token proves which account, but this
@@ -242,16 +241,15 @@ impl UserService {
                         aggregate_id("user", &user_id),
                         version,
                     );
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok(await_token)
+        Ok(version)
     }
 
     /// Asks notification-service to send the verification link again.
@@ -275,7 +273,7 @@ impl UserService {
             return Ok(());
         }
 
-        // No seq answered and none needed: `VerificationRequested` is projected by
+        // No version answered and none needed: `VerificationRequested` is projected by
         // nothing — it is a message to notification-service — so there is no state
         // here for a follow-up read to be waiting on.
         // A transaction for an event that writes no row, which looks odd until you
@@ -359,7 +357,7 @@ impl UserService {
                     || license_plates.is_some()
                     || country.is_some()
                     || profile_picture.is_some();
-                (!profile_too).context_unprocessable_entity((
+                (!profile_too).context_conflict((
                     "One change at a time",
                     "Send a password change on its own.",
                 ))?;
@@ -367,7 +365,7 @@ impl UserService {
                 // Proves the caller owns the account rather than merely holding an
                 // access token for it — the same reason an email change pays for it
                 // below.
-                let current = current_password.as_deref().context_unprocessable_entity((
+                let current = current_password.as_deref().context_conflict((
                     "Password required",
                     "Enter your current password to set a new one.",
                 ))?;
@@ -396,7 +394,7 @@ impl UserService {
                     .map(Email::as_str)
                     .filter(|e| *e != existing.email)
                 {
-                    let current = current_password.as_deref().context_unprocessable_entity((
+                    let current = current_password.as_deref().context_conflict((
                         "Password required",
                         "Enter your current password to change your email address.",
                     ))?;
@@ -437,7 +435,7 @@ impl UserService {
 
         let mut conn = db::conn(&self.db).await?;
 
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     let version = shared::next_version!(conn, shared::schema::user::app_user, &user_uuid)?;
@@ -487,16 +485,15 @@ impl UserService {
                         aggregate_id("user", &user_uuid),
                         version,
                     );
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &user_subject(&user_uuid), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok(await_token)
+        Ok(version)
     }
 
     /// Re-emits every user as the events that reproduce their current row, for a

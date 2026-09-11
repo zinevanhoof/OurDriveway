@@ -183,10 +183,11 @@ async function submit() {
 
     busy.value = true;
     try {
+        // `amountCents` is not sent. The server recomputes the price from the spot
+        // and the minutes it authorises; the figure on screen is display only.
         const booking = await bookingApi.createBooking({
             spotId: props.spot.id,
             booked,
-            amountCents: totals.value.amountCents,
         });
 
         // The session is created here rather than by the checkout screen, so that screen

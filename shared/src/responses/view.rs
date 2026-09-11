@@ -1,4 +1,6 @@
-//! What view-service **answers with**. One response per route, named for the route.
+//! What view-service **answers with**. One response per route, named for the route's
+//! query where it has one (`NearbyQuery` → [`NearbyResponse`]), for its handler where it
+//! does not.
 //!
 //! Serde only — diesel never sees a type in this file. Each one is built from a
 //! projection in [`crate::projections`] by a `From` impl at the bottom of its section,
@@ -160,10 +162,11 @@ impl From<PublicBookingProjection> for PublicBookingResponse {
     }
 }
 
-/// `GET /api/view/public/spots/nearby` — one map pin.
+/// `GET /api/view/public/spots/nearby` — one map pin, answering view-service's
+/// `NearbyQuery`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SpotPinResponse {
+pub struct NearbyResponse {
     pub id: Uuid,
     pub title: String,
     /// EUR cents.
@@ -175,7 +178,7 @@ pub struct SpotPinResponse {
     pub availability: Availability,
 }
 
-impl From<PublicSpotPinProjection> for SpotPinResponse {
+impl From<PublicSpotPinProjection> for NearbyResponse {
     fn from(s: PublicSpotPinProjection) -> Self {
         Self {
             id: s.id,
@@ -442,14 +445,15 @@ impl WalletTransactionResponse {
     }
 }
 
-/// `GET /api/view/account/wallet?month=YYYY-MM` — one month, which is also one page.
+/// `GET /api/view/account/wallet?month=YYYY-MM` — one month, which is also one page,
+/// answering view-service's `WalletQuery`.
 ///
 /// `next_month` is the cursor: the next older month that holds anything, or `null` at the
 /// end of the history. Without it a client would ask for the previous month, get nothing,
 /// and either stop — hiding everything behind a quiet month — or walk backwards forever.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WalletMonthResponse {
+pub struct WalletResponse {
     /// `"YYYY-MM"`, as asked for.
     pub month: String,
     /// Everything that came in, as a positive figure.

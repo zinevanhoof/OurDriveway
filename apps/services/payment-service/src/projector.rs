@@ -139,7 +139,7 @@ impl Projector for UserProjector {
         // declares no `app_user`, so the old spelling no longer compiles.
         //
         // The aggregate stays `"user"` because that is the protocol name — what the log
-        // line and a client's `user:<id>@N` token spell — while `host` is where this
+        // line and a client's `user:<id>@N` version spell — while `host` is where this
         // service happens to keep it. They differ here exactly as `user`/`app_user` do
         // everywhere else.
         shared::set_version!(conn, "user", shared::schema::payment::host, &user_id, version)

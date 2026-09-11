@@ -8,7 +8,8 @@ import { ChevronRight, MapPin, Plus, TrendingUp } from '@lucide/vue';
 import Button from '@/components/ui/button/Button.vue';
 import { Badge } from '@/components/ui/badge';
 import { useRouter } from 'vue-router';
-import { fetchHostSpots, viewKeys } from '@/api/viewApi';
+import { fetchHostSpots } from '@/api/viewApi';
+import { viewKeys } from '@/api/keys';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { computed, onMounted } from 'vue';
 
@@ -27,7 +28,7 @@ const { data } = useQuery({
 const spots = computed(() => data.value ?? [])
 
 // A spot created in AddSpotView would otherwise be served from cache on arrival here.
-// `recordSeq` already made the request wait for the projection; this is only about the
+// The write's `X-Version` already made the request wait for the projection; this is only about the
 // client's own cache being fresher than `staleTime`.
 onMounted(() => {
     if (history.state.refreshSpots) {

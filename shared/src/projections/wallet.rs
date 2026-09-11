@@ -21,7 +21,7 @@ pub mod kind {
     /// A charge given back. Positive for the renter, negative for the host.
     pub const REFUND: &str = "refund";
     /// The caller withdrawing their own balance. Negative, and deliberately not counted
-    /// as money out — see `responses::view::WalletMonthResponse`.
+    /// as money out — see `responses::view::WalletResponse`.
     pub const PAYOUT: &str = "payout";
 }
 

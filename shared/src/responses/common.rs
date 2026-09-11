@@ -1,49 +1,35 @@
-//! The reply every write in the system shares.
+//! What more than one handler puts in a response.
 
-use axum::{Json, http::StatusCode};
+use axum::http::HeaderName;
 use serde::Serialize;
 
-/// What a write answers with: the position its event landed at in the log.
+/// Where a write's event landed, on the way back out.
 ///
-/// One definition rather than one per service — it used to be copied into user-,
-/// spot- and booking-service's route modules, each with its own `format!` of the
-/// same string.
-#[derive(Serialize)]
-pub struct AcceptedResponse {
-    /// `"SPOTS:4712"`. Built by `bus::format_seq`, and read back by the
-    /// `bus::await_version` layer when the client echoes it as `X-Await-Version`.
-    pub seq: String,
-}
-
-/// The standard answer to a write: 202 and where it landed.
+/// The mirror of [`bus::AWAIT_VERSION`], which is the same version on the way back
+/// **in**. It lives here rather than beside that one, which would put both halves of
+/// the mechanism in a single file: `bus` depends on this crate and not the other way
+/// round, and every writing handler needs the name.
 ///
-/// 202, not 200/201: the event is committed to the log, but the projections that
-/// answer reads — the publishing service's *and* view-service's — are still
-/// catching up. `seq` is how the caller waits for its own write on the next read.
+/// A write answers `202` with this header and, usually, no body. 202 rather than
+/// 200/201 because the event is committed to the log but the projections that answer
+/// reads — the writing service's *and* view-service's — are still catching up; this
+/// header is how the caller waits for its own write on the next read. Handlers spell
+/// it out: `(StatusCode::ACCEPTED, [(X_VERSION, version)])`.
 ///
-/// Takes the string already formatted rather than a stream and a sequence,
-/// because the formatter lives in `bus` and `bus` depends on this crate — not the
-/// other way round. Call sites read `accepted(format_seq(STREAM_SPOTS, seq))`,
-/// which is also the honest description: this crate owns the response shape, `bus`
-/// owns the log position inside it.
-pub fn accepted(seq: String) -> (StatusCode, Json<AcceptedResponse>) {
-    (StatusCode::ACCEPTED, Json(AcceptedResponse { seq }))
-}
+/// A response header rather than a body field because it is metadata about the
+/// request, not an answer to it — and because every writer was otherwise obliged to
+/// thread the version through a struct that had no other reason to exist. The client
+/// reads it once, in its fetch wrapper, instead of at every call site.
+pub const X_VERSION: HeaderName = HeaderName::from_static("x-version");
 
 /// What `POST /internal/backfill` answers: how many events it enqueued.
+///
+/// 200, not the 202 every other write answers with, and without [`X_VERSION`]. 202
+/// means "accepted, and the projections have not caught up", which is why it comes
+/// with a version to wait on. A backfill has no such version — it re-emits many
+/// aggregates at once. What it *can* say truthfully is that the work it was asked to
+/// do is finished: the events are in `_outbox` and the relay carries them from there.
 #[derive(Serialize)]
 pub struct BackfilledResponse {
     pub events: usize,
-}
-
-/// 200, not the 202 every other write here answers with.
-///
-/// The difference is real rather than cosmetic: 202 means "accepted, and the
-/// projections have not caught up", which is why it comes with a token to wait on.
-/// A backfill has no such token — it re-emits many aggregates at once, and there is
-/// no single version to wait for. What it *can* say truthfully is that the work it
-/// was asked to do is finished: the events are in `_outbox` and the relay carries
-/// them from there.
-pub fn backfilled(events: usize) -> (StatusCode, Json<BackfilledResponse>) {
-    (StatusCode::OK, Json(BackfilledResponse { events }))
 }

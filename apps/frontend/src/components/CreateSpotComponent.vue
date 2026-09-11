@@ -17,8 +17,9 @@ import CreateSpotAvailability from '@/components/forms/create-spot-form/CreateSp
 import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImages.vue';
 
 import type { Availability } from '@/types/domain/spot'
-import type { CreateSpotRequest } from '@/types/requests/CreateSpotRequest'
-import { createSpot } from '@/api/spotApi'
+import type { CreateSpotRequest } from '@/types/requests/spot/CreateSpotRequest'
+import { useCreateSpot } from '@/api/spotApi'
+import type { ApiError } from '@/api/client'
 import { uploadNewImages } from '@/api/mediaApi'
 
 const router = useRouter()
@@ -64,6 +65,8 @@ const slotErrors = ref<string[]>([])
 const imageErrors = ref<string[]>([])
 const formErrors = ref<string[]>([])
 
+const { mutateAsync: create } = useCreateSpot()
+
 const hasSlots = () =>
     Object.values(availability.value.weekly).some(slots => slots.length)
     || Object.values(availability.value.single).some(slots => slots.length)
@@ -82,11 +85,16 @@ const submit = handleSubmit(async (values) => {
         return
 
     loading.value = true
+    // Which half of the try threw: an upload failure belongs under the picker, a
+    // create failure under the form.
+    let uploading = false
     try {
         // Photos go to R2 first, and only their keys are sent below — no image
         // bytes reach the backend at all. Uploading before the create means a
         // failure here costs nothing: no spot exists yet to be left half-made.
+        uploading = true
         const imageUrls = await uploadNewImages(images.value, 'spot')
+        uploading = false
 
         const { pricePerHour, ...rest } = values
         const request: CreateSpotRequest = {
@@ -95,6 +103,11 @@ const submit = handleSubmit(async (values) => {
             pricePerHourCents: eurosToCents(pricePerHour),
             address: {
                 ...values.address,
+                // The inputs are optional, so a blank one is `undefined`; the wire
+                // type is `string | null`, matching the server's `Option<String>`,
+                // which serializes an absent line as null rather than omitting it.
+                line2: values.address.line2 ?? null,
+                region: values.address.region ?? null,
                 formatted: [
                     values.address.line1,
                     values.address.line2,
@@ -107,38 +120,38 @@ const submit = handleSubmit(async (values) => {
             images: imageUrls,
         }
 
-        const response = await createSpot(request)
-        if (!response.ok) {
-            showServerErrors(await response.json().catch(() => ({})))
-            return
-        }
+        await create(request)
         // `refreshSpots` tells SpotsView to refetch instead of serving the cached list.
         router.replace({ name: 'spots', state: { refreshSpots: true } })
-    } catch (error) {
+    } catch (e) {
+        const err = e as ApiError
+
         // An upload that never reached R2 leaves nothing behind, so the only thing
-        // to do is say so and let them press save again.
-        imageErrors.value.push(error instanceof Error ? error.message : 'Upload failed.')
+        // to do is say so and let them press save again — under the picker, not
+        // under the form, which is what `uploading` is for.
+        if (uploading) imageErrors.value.push(err.detail[0])
+        else showServerErrors(err)
     } finally {
         loading.value = false
     }
 })
 
-// Backend field paths are snake_case and only some of them map to a form field.
-const toCamel = (k: string) => k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
+// Only some backend field paths map to a form field; the rest are form-level, and
+// availability's belong under the slot picker rather than under an input.
+//
+// The paths arrive camelCase — `MyError::into_response` converts garde's snake_case
+// ones now, so the private `toCamel` that used to live here (and its twin in
+// EditSpotComponent, and the shared one in lib/serverErrors) is gone.
 const FORM_FIELDS = ['title', 'description', 'pricePerHour', 'address']
 
-const showServerErrors = (body: {
-    errors?: Record<string, string[]>,
-    detail?: string[],
-}) => {
-    if (!body.errors) {
-        formErrors.value = body.detail ?? ['Something went wrong. Please try again.']
+const showServerErrors = (err: ApiError) => {
+    if (!err.fields || Object.keys(err.fields).length === 0) {
+        formErrors.value = err.detail
         return
     }
 
     const fieldErrors: Record<string, string[]> = {}
-    for (const [path, messages] of Object.entries(body.errors)) {
-        const key = toCamel(path)
+    for (const [key, messages] of Object.entries(err.fields)) {
         if (key.startsWith('availability'))
             slotErrors.value.push(...messages)
         else if (FORM_FIELDS.some(f => key === f || key.startsWith(`${f}.`)))

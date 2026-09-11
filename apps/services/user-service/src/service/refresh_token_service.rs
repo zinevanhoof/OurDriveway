@@ -27,7 +27,7 @@ use crate::{
 ///
 /// This one used to be the strongest case for it: the refresh token goes into an
 /// httponly cookie, so the *token* is not something the client can echo. But the
-/// SESSIONS position is, and `AuthResponse` now carries it, so `/refresh` reading
+/// SESSIONS position is, and login's `X-Version` header now carries it, so `/refresh` reading
 /// the projection too early is covered by the layer on whichever replica takes it —
 /// which the old per-instance wait never was.
 pub struct RefreshTokenService {
@@ -42,7 +42,7 @@ impl RefreshTokenService {
     /// check the password. Sessions publish onto the *user's* subject, so one
     /// user's whole session history stays on one ordered subject.
     ///
-    /// Returns `(access token, refresh token, await token)`. The last is
+    /// Returns `(access token, refresh token, version)`. The last is
     /// `refresh_token:<id>@<version>`, which the client echoes so its next
     /// `/refresh` sees this session.
     pub async fn issue(&self, user: &User) -> MyResult<(String, String, String)> {
@@ -71,7 +71,7 @@ impl RefreshTokenService {
         // rolls back, and there is no path that can forget either. `scope_boxed` is
         // required by the signature — it cannot be generic over an arbitrary future
         // without boxing (rustc#100013).
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     let version = shared::next_version!(conn, shared::schema::user::refresh_token, &token_id)?;
@@ -89,19 +89,18 @@ impl RefreshTokenService {
                         aggregate_id("refresh_token", &token_id),
                         version,
                     );
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     // Still the user's subject: one user's whole session history stays on
                     // one ordered subject, even though each session versions
                     // independently.
                     outbox::enqueue(conn, &session_subject(&user_id), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok((jwt, refresh_token.to_string(), await_token))
+        Ok((jwt, refresh_token.to_string(), version))
     }
 
     /// Trades a valid refresh token for a fresh pair.
@@ -142,7 +141,7 @@ impl RefreshTokenService {
 
         let mut conn = db::conn(&self.db).await?;
 
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     let version = shared::next_version!(conn, shared::schema::user::refresh_token, &token_id)?;
@@ -173,16 +172,15 @@ impl RefreshTokenService {
                         aggregate_id("refresh_token", &token_id),
                         version,
                     );
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &session_subject(&user_uuid), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok((jwt, new_refresh.to_string(), await_token))
+        Ok((jwt, new_refresh.to_string(), version))
     }
 
     /// Ends a session. An unknown token is not an error: logging out something

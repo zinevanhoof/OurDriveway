@@ -8,10 +8,13 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    response::IntoResponse,
 };
 use serde::Deserialize;
-use shared::{error::myerror::MyResult, extractors::authed_jwt::AuthedJwt};
+use shared::{
+    error::myerror::MyResult,
+    extractors::authed_jwt::AuthedJwt,
+    responses::view::{NearbyResponse, PublicSpotResponse},
+};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -29,7 +32,7 @@ pub async fn spot(
     _: AuthedJwt,
     State(state): State<AppState>,
     Path(spot_id): Path<Uuid>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<PublicSpotResponse>> {
     Ok(Json(state.public_service.spot(spot_id).await?))
 }
 
@@ -61,7 +64,7 @@ pub async fn nearby(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Query(q): Query<NearbyQuery>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<Vec<NearbyResponse>>> {
     Ok(Json(
         state
             .public_service

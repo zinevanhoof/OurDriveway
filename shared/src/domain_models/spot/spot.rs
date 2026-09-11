@@ -25,7 +25,7 @@ pub struct Spot {
     /// is enough where every read used to carry `record::id(id) AS id`.
     pub id: Uuid,
     /// Bumped by spot-service inside the transaction that writes this row. The
-    /// token a client waits on, the key concurrent writers collide on, and the gap
+    /// version a client waits on, the key concurrent writers collide on, and the gap
     /// detector for an out-of-order event — see `shared::events::Envelope`.
     ///
     /// On the model rather than only in the schema so a whole-row write carries it,

@@ -22,8 +22,10 @@ import { useIntersectionObserver } from '@vueuse/core'
 import { ArrowUpRight, Banknote, CarFront, Clock, Landmark, RotateCcw } from '@lucide/vue'
 import { formatCents } from '@/lib/money'
 import { formatDay, formatSlots, sortedDays } from '@/lib/bookingDates'
-import { fetchBalance, fetchWallet, viewKeys } from '@/api/viewApi'
-import type { WalletTransactionResponse } from '@/types/view'
+import { fetchBalance, fetchWallet } from '@/api/viewApi';
+import { viewKeys } from '@/api/keys';
+import type { ApiError } from '@/api/client';
+import type { WalletTransactionResponse } from '@/types/responses/view/WalletTransactionResponse';
 import Button from '../ui/button/Button.vue'
 import { Badge } from '@/components/ui/badge'
 import { Surface } from '@/components/base/surface'
@@ -43,7 +45,7 @@ const { data: balance } = useQuery({
 // `pageParam` is a month string, and `undefined` on the first page means "whichever
 // month it is where the server is". The client deliberately does not compute that
 // itself: the month a row falls in is decided by the same boundaries the query uses.
-const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending } = useInfiniteQuery({
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending, isError, error, refetch } = useInfiniteQuery({
     queryKey: viewKeys.wallet,
     queryFn: ({ pageParam }) => fetchWallet(pageParam),
     initialPageParam: undefined as string | undefined,
@@ -213,6 +215,12 @@ watchEffect(() => {
         <Text v-if="isPending" size="sm" class="py-6 text-center">
             Loading…
         </Text>
+        <!-- A failed read used to render as an empty history, which reads as "you have
+             never earned anything" — the one wrong thing this screen can say. -->
+        <div v-else-if="isError" class="space-y-2 py-6 text-center">
+            <Text size="sm">{{ (error as ApiError).detail.join(' ') }}</Text>
+            <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
+        </div>
         <!-- `hasNextPage` because a quiet current month is not an empty history: there
              are older months to come, and saying "nothing" over them is a lie. -->
         <Text v-else-if="!hasNextPage && !months.length" size="sm" class="py-6 text-center">

@@ -404,7 +404,7 @@ impl PaymentService {
     ) -> MyResult<(String, i64)> {
         let mut conn = db::conn(&self.db).await?;
 
-        let (await_token, amount_cents) = conn
+        let (version, amount_cents) = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     // First statement in the transaction. Everything below depends on it.
@@ -448,20 +448,20 @@ impl PaymentService {
                     );
                     // The payout's own version is what the client waits on — view-service
                     // records that, not the host counter this transaction contended over.
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
+                    let version = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &payout_subject(host_id), &envelope).await?;
                     // Both values are computed INSIDE the lock, so both leave the
                     // transaction together — `amount_cents` is what the balance said at
                     // the moment it was held, and reporting a figure read outside it
                     // would be the very race the lock exists to close.
-                    Ok((await_token, amount_cents))
+                    Ok((version, amount_cents))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok((await_token, amount_cents))
+        Ok((version, amount_cents))
     }
 
     /// Re-emits everything on this stream as the events that reproduce it, for a
@@ -613,9 +613,19 @@ impl PaymentService {
 
 /// A refused withdrawal, as the screen should read it.
 ///
-/// All three are **422**, not 409: nothing here is a conflict to retry. The balance was
-/// read under the lock, so by the time this answers the figure it names is the true
-/// one, and repeating the same request would get the same refusal.
+/// All three are **409**. They were 422, on the argument that nothing here is a
+/// conflict to *retry*: the balance was read under the lock, so the figure this names
+/// is the true one and repeating the request would get the same refusal.
+///
+/// That argument was about retryability, which is not what 409 means — 409 is a
+/// request at odds with the current state of the resource, and asking for money that
+/// is not in the balance is exactly that. The refusal being permanent rather than
+/// transient does not make it less of a conflict.
+///
+/// The forcing reason is narrower, though: **422 belongs to garde alone**, so that a
+/// client reading a 422 can go straight to the `errors` map without first checking
+/// whether this particular one carries a `detail` instead. None of these three could
+/// have been a garde rule — each needs the balance read under an advisory lock.
 ///
 /// The detail is written for a host, in euros, and reaches the form verbatim — which is
 /// also why `AboveAvailable` carries the number rather than saying "too much".
@@ -642,5 +652,5 @@ fn refused(rejection: Rejection) -> MyError {
         ),
     };
 
-    MyError::api(StatusCode::UNPROCESSABLE_ENTITY, title, detail)
+    MyError::api(StatusCode::CONFLICT, title, detail)
 }

@@ -19,7 +19,6 @@
  */
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { toast } from 'vue-sonner'
 import { Landmark } from '@lucide/vue'
 import FullScreenLayoutComponent from '../FullScreenLayoutComponent.vue'
@@ -31,8 +30,8 @@ import { Text, Title } from '@/components/base/text'
 import { IconBox } from '@/components/base/icon-box'
 import { centsToEuros, eurosToCents, formatCents } from '@/lib/money.ts'
 import { mountConnect } from '@/lib/connect'
-import { viewKeys } from '@/api/viewApi'
 import * as paymentApi from '@/api/paymentApi'
+import type { ApiError } from '@/api/client'
 
 const { maxWithdraw } = defineProps<{
     maxWithdraw: number
@@ -48,26 +47,22 @@ const { maxWithdraw } = defineProps<{
 const MIN_CENTS = 1000
 
 const router = useRouter()
-const queryClient = useQueryClient()
 
 // Whether this host can be paid at all. Its own query rather than a prop: this is the
 // question the screen exists to answer for itself, and it is answered from Stripe live
 // — a host who finished onboarding thirty seconds ago must see the form.
+// `useConnectStatus` carries the `staleTime: 0` this needs — onboarding happens in an
+// iframe on this page, so a cached "not yet" outlives the moment it stops being true.
 const {
     data: connectStatus,
     isPending: statusPending,
     isError: statusFailed,
     refetch: refetchStatus,
-} = useQuery({
-    queryKey: ['connect', 'account'],
-    queryFn: paymentApi.fetchConnectStatus,
-    // Onboarding happens in an iframe on this page, so a cached "not yet" outlives the
-    // moment it stops being true.
-    staleTime: 0,
-})
+} = paymentApi.useConnectStatus()
+
+const { mutateAsync: requestPayout, isPending: busy } = paymentApi.useRequestPayout()
 
 const amount = ref(String(centsToEuros(maxWithdraw).toFixed(2)))
-const busy = ref(false)
 
 /** What the field means, in cents. `0` for anything unparseable, which fails the same. */
 const cents = computed(() => {
@@ -103,34 +98,27 @@ function selectAll(event: FocusEvent) {
 
 async function withdraw() {
     if (problem.value || busy.value) return
-    busy.value = true
 
     try {
         // The server's figure, not `cents.value` — it recomputed under the lock and may
         // have paid less.
-        const paid = await paymentApi.requestPayout(cents.value)
+        const { amountCents: paid } = await requestPayout(cents.value)
 
-        // Both are stale the moment the payout commits: the balance is lower and the
-        // history has a row it did not have. `requestPayout` recorded the version, so
-        // the refetch waits for the projection rather than racing it.
-        await Promise.all([
-            queryClient.invalidateQueries({ queryKey: viewKeys.balance }),
-            queryClient.invalidateQueries({ queryKey: viewKeys.wallet }),
-        ])
-
+        // `useRequestPayout` invalidates the balance and the wallet — both are stale
+        // the moment the payout commits. The `X-Version` recorded on the write makes
+        // those refetches wait for the projection rather than racing it.
+        //
         // `replace`, never `push`: the back button must not return to a withdraw form
         // for money that is already gone.
         router.replace({ name: 'wallet' })
         toast.success(`${formatCents(paid)} on its way`, {
             description: 'It should reach your bank in a couple of days.',
         })
-    } catch (e: any) {
-        // Includes the 422s — below the minimum, more than available, nothing settled.
+    } catch (e) {
+        // Includes the 409s — below the minimum, more than available, nothing settled.
         // All of them are terminal and none is worth a retry, so the message is the
         // whole response.
-        toast.error("Couldn't withdraw", { description: e.message })
-    } finally {
-        busy.value = false
+        toast.error("Couldn't withdraw", { description: (e as ApiError).detail.join(' ') })
     }
 }
 

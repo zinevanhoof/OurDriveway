@@ -14,13 +14,13 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Surface } from '@/components/base/surface'
 import { Text, Title } from '@/components/base/text'
-import { loginUser, resendVerification } from '@/api/userApi'
-import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
-import { AuthResponse } from '@/types/response/AuthResponse'
+import { useLogin, useResendVerification } from '@/api/userApi'
+import type { ApiError } from '@/api/client'
+import type { LoginResponse } from '@/types/responses/user/LoginResponse'
 import { toast } from 'vue-sonner'
 
 const emit = defineEmits<{
-    success: [AuthResponse]
+    success: [LoginResponse]
 }>()
 
 const formSchema = toTypedSchema(
@@ -45,33 +45,35 @@ const serverErrors = ref<string[]>([])
 // their inbox, not another guess — so it gets its own state and a resend button
 // instead of a red message under the form.
 const unverified = ref(false)
-const resending = ref(false)
+
+const { mutateAsync: login } = useLogin()
+const { mutateAsync: resendLink, isPending: resending } = useResendVerification()
 
 const onSubmit = handleSubmit(async (data) => {
     serverErrors.value = []
     unverified.value = false
-    const response = await loginUser(data)
 
-    if (response.ok) {
-        const auth: AuthResponse = await response.json()
-        emit('success', auth)
-        return
+    try {
+        emit('success', await login(data))
+    } catch (e) {
+        const err = e as ApiError
+
+        if (err.isForbidden) {
+            unverified.value = true
+            return
+        }
+
+        // 422 puts a message under the offending input. Everything else — a 401
+        // for a wrong password above all — is form-level, and `detail` now
+        // carries the backend's own words: "Invalid credentials", where this
+        // used to render "Something went wrong. Please try again." because the
+        // old client had already drained the response body.
+        if (!err.applyTo(setErrors)) serverErrors.value = err.detail
     }
-
-    if (response.status === 403) {
-        unverified.value = true
-        return
-    }
-
-    // 422 -> per-field errors; anything else (e.g. 401 invalid credentials) -> form-level detail
-    if (await applyValidationErrors(response, setErrors)) return
-    serverErrors.value = await readErrorDetail(response)
 })
 
 const resend = async () => {
-    resending.value = true
-    await resendVerification(values.email ?? '')
-    resending.value = false
+    await resendLink(values.email ?? '')
     toast.success('New link sent. Check your inbox.')
 }
 </script>

@@ -46,8 +46,8 @@ pub struct SpotService {
 }
 
 impl SpotService {
-    /// Returns only the await token (`spot:<id>@<version>`), like every other
-    /// write here.
+    /// Returns only the version (`spot:<id>@<version>`), like every other write
+    /// here.
     ///
     /// The minted `spot_id` is deliberately not returned. Nothing asks for it: the
     /// create form navigates to the list and refetches, and the id would be a
@@ -67,7 +67,7 @@ impl SpotService {
         // No confident match -> reject; the frontend renders `detail` from 422s.
         let (lng, lat) = locationiq::geocode(&request.address.formatted)
             .await?
-            .context_unprocessable_entity((
+            .context_bad_request((
                 "Address could not be verified",
                 "We couldn't locate that address. Please check the fields.",
             ))?;
@@ -95,7 +95,7 @@ impl SpotService {
         let now = Utc::now();
         let mut conn = db::conn(&self.db).await?;
 
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     let version = shared::next_version!(conn, shared::schema::spot::spot, &spot_id)?;
@@ -112,16 +112,15 @@ impl SpotService {
                         aggregate_id("spot", &spot_id),
                         version,
                     );
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &spot_subject(&spot_id), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok(await_token)
+        Ok(version)
     }
 
     /// An edit of an existing listing, and also the live switch — that is one
@@ -150,7 +149,7 @@ impl SpotService {
         let now = Utc::now();
         let mut conn = db::conn(&self.db).await?;
 
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     // Locks the row, which is what serialises two concurrent edits of one spot
@@ -169,16 +168,15 @@ impl SpotService {
                         aggregate_id("spot", &spot.id),
                         version,
                     );
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &spot_subject(&spot.id), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok(await_token)
+        Ok(version)
     }
 
     /// Withdraw the listing for good. booking-service reacts to this by cancelling
@@ -189,7 +187,7 @@ impl SpotService {
         let now = Utc::now();
         let mut conn = db::conn(&self.db).await?;
 
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     let version = shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
@@ -205,16 +203,15 @@ impl SpotService {
                         aggregate_id("spot", &spot.id),
                         version,
                     );
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &spot_subject(&spot.id), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok(await_token)
+        Ok(version)
     }
 
     /// Resolves a spot the caller is allowed to write to.

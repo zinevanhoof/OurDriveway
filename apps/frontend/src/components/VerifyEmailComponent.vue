@@ -8,8 +8,8 @@ import { Text, Title } from '@/components/base/text'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
-import { verifyEmail, resendVerification } from '@/api/userApi'
-import { readErrorDetail } from '@/lib/serverErrors'
+import { useVerifyEmail, useResendVerification } from '@/api/userApi'
+import type { ApiError } from '@/api/client'
 
 const route = useRoute()
 const router = useRouter()
@@ -21,7 +21,9 @@ const error = ref<string>('')
 // Prefilled from nothing — the token carries the user id, not their address, so
 // a failed verification cannot tell us who to re-send to and has to ask.
 const email = ref<string>('')
-const resending = ref(false)
+
+const { mutateAsync: verify } = useVerifyEmail()
+const { mutateAsync: resendLink, isPending: resending } = useResendVerification()
 
 /**
  * Runs on mount rather than behind a button.
@@ -42,20 +44,17 @@ onMounted(async () => {
         return
     }
 
-    const response = await verifyEmail(token)
-    if (response.ok) {
+    try {
+        await verify(token)
         state.value = 'verified'
-        return
+    } catch (e) {
+        state.value = 'failed'
+        error.value = (e as ApiError).detail[0]
     }
-
-    state.value = 'failed'
-    error.value = (await readErrorDetail(response))[0]
 })
 
 const resend = async () => {
-    resending.value = true
-    await resendVerification(email.value)
-    resending.value = false
+    await resendLink(email.value)
     // Always the same message: the backend refuses to say whether the address is
     // registered, and echoing a difference here would undo that.
     toast.success('If that address has an account, a new link is on its way.')

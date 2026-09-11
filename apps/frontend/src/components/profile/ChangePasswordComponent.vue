@@ -12,8 +12,8 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Spinner } from '@/components/ui/spinner'
 
-import { changePassword } from '@/api/userApi'
-import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
+import { useChangePassword } from '@/api/userApi'
+import type { ApiError } from '@/api/client'
 import { passwordRules } from '@/lib/passwordSchema'
 
 const router = useRouter()
@@ -38,27 +38,22 @@ const { handleSubmit, setErrors } = useForm({
     initialValues: { currentPassword: '', newPassword: '', confirmPassword: '' },
 })
 
-const loading = ref(false)
 const formErrors = ref<string[]>([])
+
+const { mutateAsync: change, isPending: loading } = useChangePassword()
 
 const submit = handleSubmit(async ({ confirmPassword, ...form }) => {
     formErrors.value = []
-    loading.value = true
     try {
-        const response = await changePassword(form)
-
-        if (!response.ok) {
-            if (await applyValidationErrors(response, setErrors)) return
-            formErrors.value = await readErrorDetail(response)
-            return
-        }
+        await change(form)
 
         // Sessions are deliberately left alone, so there is nothing to re-auth:
         // the current access and refresh tokens keep working.
         toast.success('Password changed')
         router.back()
-    } finally {
-        loading.value = false
+    } catch (e) {
+        const err = e as ApiError
+        if (!err.applyTo(setErrors)) formErrors.value = err.detail
     }
 })
 </script>

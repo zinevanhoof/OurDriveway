@@ -29,7 +29,7 @@ pub struct User {
     /// unwrap now, so `SELECT *` is enough.
     pub id: Uuid,
     /// Bumped by user-service inside the transaction that writes this row. The
-    /// token a client waits on, and the gap detector for an out-of-order event —
+    /// version a client waits on, and the gap detector for an out-of-order event —
     /// see `shared::events::Envelope`.
     ///
     /// It is no longer "the key concurrent writers collide on": under Read Committed

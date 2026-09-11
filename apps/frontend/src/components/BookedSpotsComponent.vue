@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { fetchRenterBookings, viewKeys } from '@/api/viewApi';
-import type { RenterBookingResponse } from '@/types/view';
+import { fetchRenterBookings } from '@/api/viewApi';
+import { viewKeys } from '@/api/keys';
+import type { RenterBookingResponse } from '@/types/responses/view/RenterBookingResponse';
 import {
     Tabs,
     TabsContent,

@@ -7,7 +7,7 @@ import {
 } from '@/components/ui/tabs'
 import LoginForm from './forms/login-signup-form/LoginForm.vue'
 import SignupForm from './forms/login-signup-form/SignupForm.vue'
-import { AuthResponse } from '@/types/response/AuthResponse.ts'
+import type { LoginResponse } from '@/types/responses/user/LoginResponse'
 import { useAuthStore } from '@/stores/auth.ts'
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -19,8 +19,8 @@ const router = useRouter()
 
 const tab = ref<string>('login')
 
-const login = async (response: AuthResponse) => {
-    auth.setAccessToken(response.access_token)
+const login = async (response: LoginResponse) => {
+    auth.setAccessToken(response.accessToken)
     const user = await fetchMe()
     auth.setUser(user)
     router.push({ name: 'home' })

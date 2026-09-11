@@ -18,12 +18,13 @@ import AvatarImage from '@/components/ui/avatar/AvatarImage.vue'
 import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue'
 import { Text, Title } from '@/components/base/text'
 
-import { fetchAccount, viewKeys } from '@/api/viewApi'
-import { updateProfile } from '@/api/userApi'
+import { fetchAccount } from '@/api/viewApi';
+import { viewKeys } from '@/api/keys';
+import { useUpdateProfile } from '@/api/userApi'
 import { uploadImage } from '@/api/mediaApi'
 import { fetchMe } from '@/api/me'
 import { useAuthStore } from '@/stores/auth'
-import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
+import type { ApiError } from '@/api/client'
 import { countryOptions } from '@/lib/countries'
 
 const router = useRouter()
@@ -86,7 +87,7 @@ const { fields: plates, push: addPlate, remove: removePlate } = useFieldArray<st
 
 const emailChanged = computed(() => !!loadedEmail.value && values.email !== loadedEmail.value)
 
-const loading = ref(false)
+const { mutateAsync: save, isPending: loading } = useUpdateProfile()
 const formErrors = ref<string[]>([])
 
 // Prefills once the query lands, and again if it refetches while untouched —
@@ -127,9 +128,8 @@ onScopeDispose(revoke)
 
 const submit = handleSubmit(async (form) => {
     formErrors.value = []
-    loading.value = true
     try {
-        const response = await updateProfile({
+        await save({
             ...form,
             // Trimmed here because the schema validates the trimmed length but
             // zod's .trim() doesn't rewrite the value bound to the input.
@@ -147,31 +147,24 @@ const submit = handleSubmit(async (form) => {
                 : undefined,
         })
 
-        if (!response.ok) {
-            if (await applyValidationErrors(response, setErrors)) return
-            formErrors.value = await readErrorDetail(response)
-            return
-        }
-
-        // Invalidate rather than refetch-and-forget. graphcache used to normalize by
-        // entity id, so writing a user updated every cached reference to that person
-        // at once; vue-query caches per key, so the keys that could hold a stale copy
-        // have to be named. `me` is this screen; `spots` and `bookings` embed a host
-        // and a renter profile respectively.
+        // `useUpdateProfile` invalidates `account` itself. These two are extra
+        // because a profile is embedded elsewhere: `spots` carries a host and
+        // `bookings` carries a renter. graphcache used to normalize by entity id, so
+        // writing a user updated every reference to that person at once; vue-query
+        // caches per key, so the keys that could hold a stale copy have to be named.
         //
-        // `recordSeq` in the write above already made the next request wait for the
-        // projection, so these refetches see the new row rather than racing it.
-        await queryClient.invalidateQueries({ queryKey: viewKeys.account })
+        // The `X-Version` recorded on the write above already makes these refetches
+        // wait for the projection rather than racing it.
         await queryClient.invalidateQueries({ queryKey: viewKeys.spots })
         await queryClient.invalidateQueries({ queryKey: viewKeys.bookings })
         // The header reads the store, not the query.
         auth.setUser(await fetchMe())
         router.back()
-    } catch (error) {
-        // The upload runs before the PATCH, so a failure here saved nothing.
-        formErrors.value = [error instanceof Error ? error.message : 'Upload failed.']
-    } finally {
-        loading.value = false
+    } catch (e) {
+        const err = e as ApiError
+        // The upload runs before the PATCH, so a failure there saved nothing; either
+        // way the message belongs at form level.
+        if (!err.applyTo(setErrors)) formErrors.value = err.detail
     }
 })
 </script>

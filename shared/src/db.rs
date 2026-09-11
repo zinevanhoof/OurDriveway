@@ -85,8 +85,8 @@ pub async fn conn(pool: &Db) -> MyResult<PooledConnection<'_, AsyncPgConnection>
 //
 // The one thing it carried that still matters: `user` is a reserved word, so the table is
 // `app_user` while the aggregate stays `user`. That mapping now lives where it is used, as
-// the `"user" => shared::schema::<svc>::app_user` arm of a service's reader. The await
-// token `user:<id>@7`, the events and `aggregate_id("user", …)` are all unchanged.
+// the `"user" => shared::schema::<svc>::app_user` arm of a service's reader. The version
+// `user:<id>@7`, the events and `aggregate_id("user", …)` are all unchanged.
 //
 // `table_present` asked the catalogue `to_regclass($1)` before every version read and
 // write, because a service may project part of a stream without storing the aggregate at
@@ -185,7 +185,7 @@ macro_rules! next_version {
 ///
 /// The macro half of [`next_version!`] — same reasoning, same expansion rules. The
 /// aggregate NAME is still a parameter, because it is a protocol identifier rather than a
-/// table: it is what the log line names and what a client's await token (`user:<id>@7`)
+/// table: it is what the log line names and what a client's version (`user:<id>@7`)
 /// spells, and for `user` it differs from the table (`app_user`) on purpose.
 ///
 /// `WHERE version < $v` so a redelivered or out-of-order event cannot wind the

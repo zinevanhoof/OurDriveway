@@ -1,10 +1,12 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-/// A checkout the renter can now pay.
+/// What `POST /api/payment/session` answers a
+/// [`crate::requests::payment::CreateSessionRequest`] with: a checkout the renter can now
+/// pay.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionResponse {
+pub struct CreateSessionResponse {
     /// The handle the checkout screen navigates with. Everything it needs afterwards —
     /// the client secret, the booking, the outcome — it fetches back from this id, which
     /// is why it is the only thing that ever appears in a checkout URL.
@@ -41,10 +43,12 @@ pub struct SessionStateResponse {
 /// that had not settled when the page was drawn is gone from the balance by the time
 /// the request arrives. This is the only figure that is true, which is why the screen
 /// prints this one back rather than the one it sent.
+///
+/// The version this write reached leaves as the `X-Version` header rather than a
+/// field here — see [`super::common::X_VERSION`].
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PayoutResponse {
-    pub seq: String,
     pub amount_cents: i64,
 }
 

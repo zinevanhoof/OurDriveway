@@ -88,7 +88,7 @@ impl IntoResponse for MyError {
 
                 for (path, err) in report.iter() {
                     errors
-                        .entry(path.to_string())
+                        .entry(camel(&path.to_string()))
                         .or_default()
                         .push(err.to_string());
                 }
@@ -116,6 +116,39 @@ impl IntoResponse for MyError {
         };
         (status, Json(body)).into_response()
     }
+}
+
+/// `license_plates[0]` -> `licensePlates[0]`. A no-op on a name already camelCase.
+///
+/// Garde builds its paths out of the *Rust* field names, but every request struct on
+/// the wire carries `#[serde(rename_all = "camelCase")]` — so a 422's keys were the
+/// one snake_case thing left in the whole API, and every client had to undo it. The
+/// frontend did, in `lib/serverErrors.ts`, and two components had their own copies of
+/// that copy.
+///
+/// This is exact rather than a heuristic, and the test below is what keeps it exact:
+/// no request struct carries a per-field `#[serde(rename = …)]`, so `rename_all` is
+/// the only transform standing between a field's Rust name and its wire name, and
+/// this reproduces it. Add a per-field rename and the test fails.
+///
+/// Bracket and dot segments pass through untouched — garde appends `[0]` for a vec
+/// element and joins `dive`d fields with `.`, neither of which serde ever sees.
+fn camel(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut upper_next = false;
+
+    for c in path.chars() {
+        match c {
+            '_' => upper_next = true,
+            _ if upper_next => {
+                out.extend(c.to_uppercase());
+                upper_next = false;
+            }
+            _ => out.push(c),
+        }
+    }
+
+    out
 }
 
 /// Ergonomic `.context_bad_request((title, detail))?` on `Result`, `Option` and
@@ -268,6 +301,67 @@ mod tests {
         assert_eq!(
             name_errors, 2,
             "grouping must keep both messages, not overwrite"
+        );
+    }
+
+    /// `camel` has to agree with `#[serde(rename_all = "camelCase")]`, because that
+    /// is what named the field in the request the client sent.
+    #[test]
+    fn garde_paths_are_camel_cased_like_serde_renames_them() {
+        assert_eq!(camel("first_name"), "firstName");
+        assert_eq!(camel("price_per_hour_cents"), "pricePerHourCents");
+
+        // Already camel, or a single word: untouched.
+        assert_eq!(camel("email"), "email");
+        assert_eq!(camel("licensePlates"), "licensePlates");
+
+        // Garde's own syntax rides along unharmed — `[i]` for a vec element, `.` for
+        // a `dive`d field. Serde never sees either.
+        assert_eq!(camel("license_plates[0]"), "licensePlates[0]");
+        assert_eq!(camel("availability.single"), "availability.single");
+        assert_eq!(camel("availability.price_per_hour"), "availability.pricePerHour");
+
+        // A digit after the underscore: `to_uppercase` is a no-op on it and the
+        // underscore still goes, which is exactly what serde does with `line_1`.
+        assert_eq!(camel("line_1"), "line1");
+    }
+
+    /// The claim `camel` rests on: `rename_all` is the ONLY thing between a Rust
+    /// field name and its wire name, so reproducing `rename_all` is exact.
+    ///
+    /// A per-field `#[serde(rename = "...")]` anywhere in `requests/` breaks that,
+    /// silently — the 422 would name a field the client does not have. This fails
+    /// loudly instead.
+    #[test]
+    fn no_request_struct_carries_a_per_field_serde_rename() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/requests");
+        let mut offenders = Vec::new();
+
+        fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("requests/ must exist") {
+                let path = entry.expect("readable entry").path();
+                if path.is_dir() {
+                    walk(&path, offenders);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let src = std::fs::read_to_string(&path).expect("readable file");
+                    for (i, line) in src.lines().enumerate() {
+                        // `rename_all` is the container-level one, and the point of
+                        // this test. Only a bare `rename =` is the problem.
+                        if line.contains("serde(rename") && !line.contains("rename_all") {
+                            offenders.push(format!("{}:{}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        walk(std::path::Path::new(dir), &mut offenders);
+
+        assert!(
+            offenders.is_empty(),
+            "a per-field serde rename makes `camel` wrong for that field — teach \
+             `camel` about it, or drop the rename:\n{}",
+            offenders.join("\n")
         );
     }
 }

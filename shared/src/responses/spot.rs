@@ -1,6 +1,7 @@
 use serde::Serialize;
 
-/// One type-ahead suggestion from `GET /api/spot/address/suggest`.
+/// One type-ahead suggestion from `GET /api/spot/address/suggest`, answering a
+/// [`crate::requests::spot::AddressSuggestQuery`].
 ///
 /// A suggestion, **not an address of record.** The six text fields are what the create
 /// form fills itself in with; what it submits is validated and re-geocoded server-side,
@@ -17,7 +18,7 @@ use serde::Serialize;
 /// fly to.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AutocompleteAddressResponse {
+pub struct AddressSuggestResponse {
     pub line1: String,
     pub line2: Option<String>,
     pub city: String,

@@ -7,8 +7,9 @@ import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDate
 import { locateUser, nearer, type Position } from '@/lib/geo';
 import { mergeBooked } from '@/lib/bookingAvailability';
 import { useAuthStore } from '@/stores/auth';
-import { fetchBalance, fetchNextBooking, fetchSpot, fetchSpotsNear, viewKeys } from '@/api/viewApi';
-import type { NextBookingResponse } from '@/types/view';
+import { fetchBalance, fetchNextBooking, fetchSpot, fetchSpotsNear } from '@/api/viewApi';
+import { viewKeys } from '@/api/keys';
+import type { NextBookingResponse } from '@/types/responses/view/NextBookingResponse';
 import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import BookingFormComponent from '@/components/BookingFormComponent.vue';

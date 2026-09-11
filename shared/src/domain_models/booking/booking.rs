@@ -34,7 +34,7 @@ pub mod status {
 pub struct Booking {
     pub id: Uuid,
     /// Bumped by booking-service inside the transaction that writes this row.
-    /// The token a client waits on, and the gap detector for an out-of-order event —
+    /// The version a client waits on, and the gap detector for an out-of-order event —
     /// see `shared::events::Envelope`. No longer the key concurrent writers collide
     /// on; see `shared::db::next_version`.
     pub version: i64,

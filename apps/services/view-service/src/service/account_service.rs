@@ -1,7 +1,7 @@
 use chrono::Utc;
 use shared::{
     error::myerror::{ContextExt, MyResult},
-    responses::view::{AccountResponse, WalletMonthResponse, WalletTransactionResponse},
+    responses::view::{AccountResponse, WalletResponse, WalletTransactionResponse},
 };
 use uuid::Uuid;
 
@@ -68,12 +68,12 @@ impl AccountService {
         &self,
         user_id: Uuid,
         month: Option<String>,
-    ) -> MyResult<WalletMonthResponse> {
+    ) -> MyResult<WalletResponse> {
         let now = Utc::now();
         let month = month.unwrap_or_else(|| policy::wallet::label(now));
 
         let (start, end) = policy::wallet::bounds(&month)
-            .context_unprocessable_entity(("Invalid month", "Ask for a month as YYYY-MM."))?;
+            .context_bad_request(("Invalid month", "Ask for a month as YYYY-MM."))?;
 
         // One connection for both statements: the rows and the cursor over them should not
         // come back from two different pooled connections.
@@ -90,7 +90,7 @@ impl AccountService {
 
         let settled = settled_before(now);
 
-        Ok(WalletMonthResponse {
+        Ok(WalletResponse {
             month,
             in_cents,
             out_cents,

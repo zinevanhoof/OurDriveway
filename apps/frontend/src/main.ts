@@ -36,14 +36,14 @@ async function bootstrap() {
 
   // Replaced the urql client and its exchange chain. Two of those three exchanges have
   // no equivalent here because they have no job left: `authExchange` refreshed a token
-  // on a 401, which `apiFetch` already does for every request in the app; and
+  // on a 401, which `api/client.ts` already does for every request in the app; and
   // `cacheExchange` (graphcache) normalized entities by id, which only mattered because
   // one GraphQL document could return a `user` that another had already fetched.
   //
   // **That normalization is the real behavioural change.** graphcache kept one `user`
   // entity backing every reference to that person, so updating a profile updated it
   // everywhere at once. vue-query caches per query key instead, so a write invalidates
-  // keys — see `viewKeys` in api/viewApi.ts.
+  // keys — see `viewKeys` in api/keys.ts.
   app.use(VueQueryPlugin, {
     queryClient: new QueryClient({
       defaultOptions: {
@@ -53,8 +53,8 @@ async function bootstrap() {
           // request until this client's own writes are visible, so a short stale
           // window costs nothing and saves a refetch on every remount.
           staleTime: 30_000,
-          // `apiFetch` returns the response for a 401 it could not refresh, and the
-          // router sends the user to login. Retrying that is noise.
+          // A 401 the transport could not refresh has already logged the user out,
+          // and the router sends them to login. Retrying that is noise.
           retry: 1,
           refetchOnWindowFocus: false,
         },

@@ -1,16 +1,15 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderName, StatusCode},
 };
 use shared::{
     error::myerror::MyResult,
     extract::Valid,
     extractors::authed_jwt::AuthedJwt,
     requests::payment::{CreateSessionRequest, PayoutRequest},
-    responses::common::backfilled,
-    responses::payment::{PayoutResponse, SessionResponse, SessionStateResponse},
+    responses::common::{BackfilledResponse, X_VERSION},
+    responses::payment::{CreateSessionResponse, PayoutResponse, SessionStateResponse},
 };
 
 use crate::{AppState, client::stripe::SessionStatus};
@@ -24,19 +23,16 @@ pub async fn create_session(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Valid(request): Valid<CreateSessionRequest>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<CreateSessionResponse>> {
     let session = state
         .payment_service
         .create_session(&user_id, request)
         .await?;
 
-    Ok((
-        StatusCode::OK,
-        Json(SessionResponse {
-            session_id: session.session_id,
-            client_secret: session.client_secret,
-        }),
-    ))
+    Ok(Json(CreateSessionResponse {
+        session_id: session.session_id,
+        client_secret: session.client_secret,
+    }))
 }
 
 /// What became of a checkout, for the screen the renter lands on.
@@ -47,7 +43,7 @@ pub async fn session_state(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<Json<SessionStateResponse>> {
     let (state, booking_id) = state
         .payment_service
         .session_state(&user_id, &session_id)
@@ -82,25 +78,23 @@ pub async fn session_state(
 /// balance to take. It is still not trusted — `request_payout` re-reads the balance
 /// under an advisory lock and refuses anything larger, rather than clamping.
 ///
-/// 202 with a `seq`, like every other write. The transfer itself has not happened when
-/// this answers: the payout row lands as `requested`, and a worker turns it into
+/// 202 with the version, like every other write. The transfer itself has not happened
+/// when this answers: the payout row lands as `requested`, and a worker turns it into
 /// `paid` or `failed` a moment later.
 pub async fn request_payout(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Valid(request): Valid<PayoutRequest>,
-) -> MyResult<impl IntoResponse> {
-    let (token, amount_cents) = state
+) -> MyResult<(StatusCode, [(HeaderName, String); 1], Json<PayoutResponse>)> {
+    let (version, amount_cents) = state
         .payment_service
         .request_payout(&user_id, request.amount_cents)
         .await?;
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(PayoutResponse {
-            seq: token,
-            amount_cents,
-        }),
+        [(X_VERSION, version)],
+        Json(PayoutResponse { amount_cents }),
     ))
 }
 
@@ -111,6 +105,8 @@ pub async fn request_payout(
 ///
 /// Payouts only. `PaymentService::backfill` says why the payments themselves have
 /// nothing downstream to rebuild.
-pub async fn backfill(State(state): State<AppState>) -> MyResult<impl IntoResponse> {
-    Ok(backfilled(state.payment_service.backfill().await?))
+pub async fn backfill(State(state): State<AppState>) -> MyResult<Json<BackfilledResponse>> {
+    Ok(Json(BackfilledResponse {
+        events: state.payment_service.backfill().await?,
+    }))
 }

@@ -1,7 +1,13 @@
-import { apiFetch } from "./king";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
+
+import { get, post } from "./client";
 import { native } from "./http";
-import { recordSeq } from "@/lib/awaitSeq";
-import { readErrorDetail } from "@/lib/serverErrors";
+import { viewKeys } from "./keys";
+import type { AccountSessionResponse } from "@/types/responses/payment/AccountSessionResponse";
+import type { ConnectStatusResponse } from "@/types/responses/payment/ConnectStatusResponse";
+import type { CreateSessionResponse } from "@/types/responses/payment/CreateSessionResponse";
+import type { PayoutResponse } from "@/types/responses/payment/PayoutResponse";
+import type { SessionStateResponse } from "@/types/responses/payment/SessionStateResponse";
 
 /**
  * Where Stripe sends the renter back after a redirect payment method.
@@ -39,65 +45,32 @@ function returnUrl(): string {
   return `${origin}${path}?session_id={CHECKOUT_SESSION_ID}`;
 }
 
-export type NewSession = {
-  /** The only handle checkout carries in its URL. */
-  sessionId: string;
-  clientSecret: string;
-};
-
 /**
  * Starts payment for a booking that is already held, by creating a Checkout Session.
  *
- * The amount is never sent: the server takes it from the booking as it priced it at
- * reserve time, so the figure on screen is display and the figure charged is the
- * server's. Idempotent per booking — calling this again returns the *same* session,
- * which is what makes "Continue payment" on a reserved booking safe.
+ * Idempotent per booking — calling this again returns the *same* session, which is what
+ * makes "Continue payment" on a reserved booking safe.
  *
- * The return URL is decided here rather than server-side, because only this side knows
- * whether it is running in a browser or in Tauri — see `returnUrl` above.
- *
- * Deliberately does **not** `recordSeq`. This client reads nothing from the PAYMENTS
- * stream, so there is no write to wait for, and echoing a PAYMENTS position on
- * subsequent reads would make view-service block on a projection nothing needs.
+ * The server sends no `X-Version` on this, which is the enforcement of what used to be a
+ * comment: this client reads nothing from the PAYMENTS stream, so there is no write to
+ * wait for, and echoing a PAYMENTS position on subsequent reads would make view-service
+ * block on a projection nothing needs.
  */
-export async function createSession(bookingId: string): Promise<NewSession> {
-  const res = await apiFetch("/api/payment/session", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bookingId, returnUrl: returnUrl() }),
+export const createSession = (bookingId: string) =>
+  post<CreateSessionResponse>("/api/payment/session", {
+    bookingId,
+    returnUrl: returnUrl(),
   });
-  if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
-
-  return await res.json();
-}
-
-export type SessionState = {
-  /** Stripe's own answer, not ours. */
-  status: "complete" | "open" | "expired";
-  /** Money actually arrived, as opposed to a complete session still processing. */
-  paid: boolean;
-  /** Present while the session is still payable. */
-  clientSecret: string | null;
-  /** So checkout can release the hold without the booking id being in the URL. */
-  bookingId: string;
-};
 
 /**
  * What became of a checkout.
  *
  * The whole reason checkout needs nothing but a session id in its URL: this turns that
  * id back into the client secret to mount against, the booking to release, and Stripe's
- * verdict on whether it was paid.
- *
- * The verdict comes from Stripe rather than our own projection on purpose — the
- * projection lags the webhook, and from the outside "not confirmed yet" and "declined"
- * look identical. 404 for a session that isn't yours.
+ * verdict on whether it was paid. 404 for a session that isn't yours.
  */
-export async function sessionState(sessionId: string): Promise<SessionState> {
-  const res = await apiFetch(`/api/payment/session/${sessionId}`);
-  if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
-  return await res.json();
-}
+export const sessionState = (sessionId: string) =>
+  get<SessionStateResponse>(`/api/payment/session/${sessionId}`);
 
 // `earnings()` was here, behind `GET /api/payment/earnings`. It is
 // `viewApi.fetchBalance()` now: payment-service writes and view-service reads, and the
@@ -113,45 +86,15 @@ export async function sessionState(sessionId: string): Promise<SessionState> {
  * the figure returned is the only one that is true — print that one, never the one sent.
  *
  * Two of these racing is resolved by the same lock: the loser re-reads, finds nothing
- * left, and gets **422**. It is not a 409 and there is no retry to write — by the time
- * it answers, there genuinely is nothing to take out.
+ * left, and gets **409**. There is no retry to write — by the time it answers, there
+ * genuinely is nothing to take out. (It was a 422 until 422 became garde's alone.)
  *
- * `recordSeq` is what makes the wallet show the withdrawal on arrival. The response is
- * a 202: the payout row exists in payment-service, but the projection the wallet reads
- * is still catching up, and without recording the version here the very next balance
- * read can legitimately answer from before this write.
- *
- * The transfer itself has *not* happened yet when this resolves. The row lands as
- * pending and a worker turns it into paid or failed a moment later, which is why there
- * is nothing to await beyond the projection.
+ * The transfer itself has *not* happened when this resolves. The row lands as pending and
+ * a worker turns it into paid or failed a moment later, which is why there is nothing to
+ * await beyond the projection.
  */
-export async function requestPayout(amountCents: number): Promise<number> {
-  const res = await apiFetch("/api/payment/payout", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ amountCents }),
-  });
-  if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
-
-  const body = await res.json();
-  recordSeq(body.seq);
-  return body.amountCents;
-}
-
-export type ConnectStatus = {
-  /**
-   * `needs_country` — no account, and no country on the profile to open one with.
-   * Stripe fixes the country permanently when the account is created, so it is asked
-   * for first rather than guessed.
-   * `none` — ready to onboard; nothing exists at Stripe yet.
-   * `onboarding` — an account exists but Stripe will not pay it: abandoned halfway, or
-   * submitted and under review.
-   * `enabled` — payouts are on, and the withdraw form is safe to show.
-   */
-  state: "needs_country" | "none" | "onboarding" | "enabled";
-  /** Last four of the bank account Stripe pays into. Null when it hands back none. */
-  bankLast4: string | null;
-};
+export const requestPayout = (amountCents: number) =>
+  post<PayoutResponse>("/api/payment/payout", { amountCents });
 
 /**
  * Whether the caller can be paid, and where.
@@ -161,24 +104,47 @@ export type ConnectStatus = {
  * reason. A cached copy would go stale in exactly the moment that matters: a host
  * finishing onboarding in Stripe's own iframe and expecting the form to appear.
  */
-export async function fetchConnectStatus(): Promise<ConnectStatus> {
-  const res = await apiFetch("/api/payment/connect/account");
-  if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
-  return await res.json();
-}
+export const fetchConnectStatus = () =>
+  get<ConnectStatusResponse>("/api/payment/connect/account");
 
 /**
  * A client secret for Connect's embedded components, creating the caller's connected
  * account on the first call.
  *
  * POST, because it is not a read: the first one creates an account at Stripe. Called on
- * mount and again whenever a component asks for a fresh secret — see `lib/connect.ts`.
- *
- * Deliberately does **not** `recordSeq`: nothing here writes to a stream, and there is
- * no projection to wait for.
+ * mount and again whenever a component asks for a fresh secret — see `lib/connect.ts`,
+ * which is also why this stays a plain function: it is passed to Stripe as a callback,
+ * outside any component's setup, where a hook cannot go.
  */
-export async function createAccountSession(): Promise<string> {
-  const res = await apiFetch("/api/payment/connect/session", { method: "POST" });
-  if (!res.ok) throw new Error((await readErrorDetail(res)).join(" "));
-  return (await res.json()).clientSecret;
+export const createAccountSession = async () =>
+  (await post<AccountSessionResponse>("/api/payment/connect/session"))
+    .clientSecret;
+
+// ─── hooks ──────────────────────────────────────────────────────────────────
+
+export const useCreateSession = () => useMutation({ mutationFn: createSession });
+
+/**
+ * `staleTime: 0` on purpose. Everything else in the app tolerates a stale window
+ * because `X-Await-Version` holds a read until this client's own writes land — but
+ * this answer comes from Stripe, which we never wrote to, so there is no version to
+ * wait on and no reason to trust a cached copy.
+ */
+export const useConnectStatus = () =>
+  useQuery({
+    queryKey: viewKeys.connectAccount,
+    queryFn: fetchConnectStatus,
+    staleTime: 0,
+  });
+
+export function useRequestPayout() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: requestPayout,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: viewKeys.balance });
+      queryClient.invalidateQueries({ queryKey: viewKeys.wallet });
+    },
+  });
 }

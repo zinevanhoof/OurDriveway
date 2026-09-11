@@ -1,12 +1,11 @@
 use axum::extract::State;
-use axum::response::IntoResponse;
 use axum_extra::extract::CookieJar;
 use shared::error::myerror::{ContextExt, MyResult};
 use uuid::Uuid;
 
 use crate::AppState;
 
-pub async fn logout(jar: CookieJar, State(state): State<AppState>) -> MyResult<impl IntoResponse> {
+pub async fn logout(jar: CookieJar, State(state): State<AppState>) -> MyResult<CookieJar> {
     let refresh_token = jar
         .get("refresh-token")
         .map(|c| c.value())

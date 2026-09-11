@@ -1,22 +1,21 @@
-import { apiFetch } from "@/api/king";
-import type {
-  AccountResponse,
-  BalanceResponse,
-  HostSpotListItemResponse,
-  HostSpotResponse,
-  NextBookingResponse,
-  PublicSpotResponse,
-  RenterBookingResponse,
-  SpotPinResponse,
-  WalletMonthResponse,
-} from "@/types/view";
+import { get, query } from "@/api/client";
+import type { AccountResponse } from "@/types/responses/view/AccountResponse";
+import type { BalanceResponse } from "@/types/responses/view/BalanceResponse";
+import type { HostSpotListItemResponse } from "@/types/responses/view/HostSpotListItemResponse";
+import type { HostSpotResponse } from "@/types/responses/view/HostSpotResponse";
+import type { NearbyResponse } from "@/types/responses/view/NearbyResponse";
+import type { NextBookingResponse } from "@/types/responses/view/NextBookingResponse";
+import type { PublicSpotResponse } from "@/types/responses/view/PublicSpotResponse";
+import type { RenterBookingResponse } from "@/types/responses/view/RenterBookingResponse";
+import type { WalletResponse } from "@/types/responses/view/WalletResponse";
 
 // Every read the client makes, over plain REST.
 //
-// This replaced eleven GraphQL documents and the urql client under them. `apiFetch`
-// already carries the three things every request needs — the bearer token, the
-// 401-refresh-and-retry, and `X-Await-Version` — so there is nothing left for an
-// exchange chain to do.
+// This replaced eleven GraphQL documents and the urql client under them. `get`
+// already carries the bearer token, the 401-refresh-and-retry, `X-Await-Version`
+// and error parsing, so there is nothing left for an exchange chain to do. The
+// private `get<T>` that used to be at the top of this file is now
+// `api/client.ts`, shared by every module rather than by this one.
 //
 // ## Four namespaces, one predicate each
 //
@@ -44,40 +43,6 @@ import type {
 // everyone else's rows; with the clauses gone it would be a request rather than a claim,
 // so the server takes the caller from the verified token.
 
-async function get<T>(path: string): Promise<T> {
-  const res = await apiFetch(path);
-  if (!res.ok) throw new Error(`${path} failed: ${res.status}`);
-  return (await res.json()) as T;
-}
-
-/**
- * Query keys, in one place.
- *
- * vue-query caches by key, so a key is what a write has to name to invalidate a read.
- * Kept together because the two ends are otherwise a string literal in a component and a
- * matching one in a mutation handler, which is exactly the pair that drifts.
- *
- * Hierarchical on purpose: `["spots"]` invalidates every spot query including
- * `["spots", id]` and `["spots", id, "host"]`, which is what a create, an edit or a delete
- * wants.
- */
-export const viewKeys = {
-  account: ["account"] as const,
-  spots: ["spots"] as const,
-  hostSpots: ["spots", "host"] as const,
-  nearby: (lng: number, lat: number, meters: number) =>
-    ["spots", "near", lng, lat, meters] as const,
-  spot: (id: string) => ["spots", id] as const,
-  hostSpot: (id: string) => ["spots", id, "host"] as const,
-  bookings: ["bookings"] as const,
-  renterBookings: ["bookings", "renter"] as const,
-  nextBooking: ["bookings", "next"] as const,
-  booking: (id: string) => ["bookings", id] as const,
-  /** Every page of the wallet: `useInfiniteQuery` holds all its months under this. */
-  wallet: ["wallet"] as const,
-  balance: ["balance"] as const,
-};
-
 // ─── account ────────────────────────────────────────────────────────────────
 
 /** The caller's own profile, chosen by the server from the verified claim. */
@@ -95,11 +60,7 @@ export const fetchAccount = () => get<AccountResponse>("/api/view/account");
  * omits what entered it is not a wallet.
  */
 export const fetchWallet = (month?: string) =>
-  get<WalletMonthResponse>(
-    month
-      ? `/api/view/account/wallet?month=${month}`
-      : "/api/view/account/wallet",
-  );
+  get<WalletResponse>(`/api/view/account/wallet${query({ month })}`);
 
 // ─── host ───────────────────────────────────────────────────────────────────
 
@@ -162,8 +123,12 @@ export const fetchRenterBooking = (id: string) =>
  * somewhere to park. It is now unconditional server-side, so there is no flag here.
  */
 export const fetchSpotsNear = (lng: number, lat: number, meters: number) =>
-  get<SpotPinResponse[]>(
-    `/api/view/public/spots/nearby?lng=${lng}&lat=${lat}&meters=${Math.round(meters)}`,
+  get<NearbyResponse[]>(
+    `/api/view/public/spots/nearby${query({
+      lng,
+      lat,
+      meters: Math.round(meters),
+    })}`,
   );
 
 /**

@@ -16,7 +16,6 @@ use shared::{
     },
     general_models::booking::Booked,
     requests::booking::CreateBookingRequest,
-    responses::booking::CreatedResponse,
 };
 use uuid::Uuid;
 
@@ -77,11 +76,11 @@ impl BookingService {
     /// creating one *entails*, not a separate thing a client can ask for. The
     /// initial `status` is still `reserved`, because that is what the row is.
     ///
-    /// Returns the wire shape directly. The id is in it because the client cannot
+    /// Returns `(version, booking id)`. The id goes back because the client cannot
     /// get it any other way and needs it immediately — it opens a Stripe Checkout
-    /// Session from it before any projection could have caught up. The seq is
-    /// formatted here rather than by the route because *this* is what knows the
-    /// event went to BOOKINGS; the route only picks the status code.
+    /// Session from it before any projection could have caught up. The version is
+    /// formatted here rather than by the route because *this* is what knows which
+    /// aggregate the event belongs to; the route only builds the response.
     ///
     /// The overlap check below is advisory — it turns a lost race into a clean 409
     /// naming the slot. The actual guarantee is the compare-and-swap on publish:
@@ -91,7 +90,7 @@ impl BookingService {
         &self,
         renter_id: &Uuid,
         request: CreateBookingRequest,
-    ) -> MyResult<CreatedResponse> {
+    ) -> MyResult<(String, Uuid)> {
         let spot_key = request.spot_id;
         // The request spells the bare map — its garde rules are written against that —
         // so this is where it becomes the domain type.
@@ -106,7 +105,7 @@ impl BookingService {
 
         // Returns the version to report: 1 for a booking this call creates, or the
         // existing row's for the idempotent-retry path below.
-        let seq_version = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     // ── THE SERIALISATION POINT ──────────────────────────────────────────
@@ -148,7 +147,7 @@ impl BookingService {
                         "Unavailable",
                         "This spot is no longer accepting bookings.",
                     ))?;
-                    (host_id != *renter_id).context_unprocessable_entity((
+                    (host_id != *renter_id).context_conflict((
                         "Not allowed",
                         "You can't book your own spot.",
                     ))?;
@@ -173,7 +172,7 @@ impl BookingService {
                         .timezone
                         .as_deref()
                         .and_then(|tz| schedule::ends_at(&requested, tz))
-                        .context_unprocessable_entity(NOT_READY)?;
+                        .context_conflict(NOT_READY)?;
 
                     let created = BookingCreated {
                         booking_id,
@@ -205,10 +204,10 @@ impl BookingService {
             })
             .await?;
 
-        Ok(CreatedResponse {
-            id: booking_id,
-            seq: format_version(&aggregate_id("booking", &booking_id), seq_version),
-        })
+        Ok((
+            format_version(&aggregate_id("booking", &booking_id), version),
+            booking_id,
+        ))
     }
 
     /// The renter backed out of checkout. Frees the slots immediately rather than
@@ -323,7 +322,7 @@ impl BookingService {
     ) -> MyResult<String> {
         let mut conn = db::conn(&self.db).await?;
 
-        let await_token = conn
+        let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
                     let version = shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
@@ -338,16 +337,15 @@ impl BookingService {
                         aggregate_id("booking", &booking_id),
                         version,
                     );
-                    let await_token = format_version(&envelope.aggregate, envelope.version);
 
                     outbox::enqueue(conn, &booking_subject(&spot_id), &envelope).await?;
-                    Ok(await_token)
+                    Ok(format_version(&envelope.aggregate, envelope.version))
                 }
                 .scope_boxed()
             })
             .await?;
 
-        Ok(await_token)
+        Ok(version)
     }
 
     /// Re-emits every booking as the events that reproduce its current row, for a
@@ -397,10 +395,18 @@ impl BookingService {
 // read sees the winner's booking, so it falls through to `Rejection::Taken` below and
 // names the slot. Better answer, and one fewer error shape.
 
+/// 422 appears nowhere here, and that is deliberate: it is garde's alone, so a client
+/// can read `errors` off a 422 without checking whether this particular one carries a
+/// `detail` instead. These three are decided against the host's calendar and the
+/// bookings already on it, which is state rather than shape — nothing garde could
+/// have caught from the request value.
 fn reject(rejection: Rejection) -> MyError {
     match rejection {
+        // 409, alongside `Taken` below: both are the calendar refusing, and the
+        // difference between "never open then" and "no longer free" is not a
+        // difference in what the client should do about it.
         Rejection::Closed { date, slot } => MyError::api(
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::CONFLICT,
             "Outside opening hours",
             format!("The host isn't open {}–{} on {date}.", slot.start, slot.end),
         ),
@@ -409,8 +415,11 @@ fn reject(rejection: Rejection) -> MyError {
             "Already booked",
             format!("{}–{} on {date} is no longer free.", slot.start, slot.end),
         ),
+        // 400, not 409: unparseable times are a bad request, and no amount of waiting
+        // makes them good. `Valid<CreateBookingRequest>` catches the ordinary cases
+        // before this — reaching here means a shape garde's rules do not describe.
         Rejection::Malformed => MyError::api(
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
             "Invalid times",
             "Those time slots don't look right.",
         ),

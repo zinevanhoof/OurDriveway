@@ -1,12 +1,12 @@
 // Read-your-own-writes, keyed by aggregate.
 //
-// A write answers with the version its aggregate reached — `202 { id, seq:
-// "spot:019f…@3" }`. Reads are served from projections that lag the write by
+// A write answers with the version its aggregate reached, in the `X-Version`
+// header — `spot:019f…@3`. Reads are served from projections that lag the write by
 // however long the outbox relay and the projector take, so an immediate follow-up
 // read can legitimately land before its own write is visible: you create a spot
 // and it isn't in the list.
 //
-// Echoing the token back on subsequent requests lets the read side block until it
+// Echoing the version back on subsequent requests lets the read side block until it
 // has reached that version (see bus/src/await_version.rs, capped at 2s).
 //
 // This used to carry a log position — `SPOTS:4712`. Two reasons it no longer can:
@@ -20,31 +20,31 @@ const HEADER = "X-Await-Version";
 let latest: Record<string, number> = {};
 
 /**
- * Records the version token from a write response.
+ * Records the version from a write response's `X-Version` header.
  *
  * One entry per aggregate, each only ever moving forward. Per *aggregate* and not
  * per stream: two spots are two independent rows, and waiting on one must not make
  * a reader wait on the other.
  */
-export function recordSeq(token: string | null | undefined): void {
-  if (!token) return;
+export function recordVersion(version: string | null | undefined): void {
+  if (!version) return;
 
-  // `<table>:<uuid>@<version>`. Split from the right on `@` so the aggregate half
+  // `<table>:<uuid>@<n>`. Split from the right on `@` so the aggregate half
   // stays intact, mirroring `parse_version` on the server.
-  const at = token.lastIndexOf("@");
+  const at = version.lastIndexOf("@");
   if (at < 0) return;
 
-  const aggregate = token.slice(0, at);
-  const digits = token.slice(at + 1);
+  const aggregate = version.slice(0, at);
+  const digits = version.slice(at + 1);
 
   // `/^\d+$/` rather than `Number.isInteger(Number(digits))`: `Number("")` is 0,
   // and 0 is a perfectly good integer — so `spot:…@` would have recorded version
   // 0 instead of being rejected. The self-check below caught exactly that.
   if (!aggregate.includes(":") || !/^\d+$/.test(digits)) return;
 
-  const version = Number(digits);
+  const reached = Number(digits);
 
-  latest[aggregate] = Math.max(version, latest[aggregate] ?? 0);
+  latest[aggregate] = Math.max(reached, latest[aggregate] ?? 0);
 }
 
 /**
@@ -58,7 +58,7 @@ export function recordSeq(token: string | null | undefined): void {
  * while clearing after one use would leave concurrent requests, and requests that
  * land on a different instance later, unprotected.
  */
-export function awaitSeqHeader(): Record<string, string> {
+export function awaitVersionHeader(): Record<string, string> {
   const value = Object.entries(latest)
     .map(([aggregate, version]) => `${aggregate}@${version}`)
     .join(",");
@@ -67,12 +67,12 @@ export function awaitSeqHeader(): Record<string, string> {
 }
 
 /** Test seam. */
-export function resetSeq(): void {
+export function resetVersions(): void {
   latest = {};
 }
 
 // ponytail: runnable self-check for the ordering rules — call demo() from a
-// scratch script (`npx tsx`) if you touch recordSeq().
+// scratch script (`npx tsx`) if you touch recordVersion().
 export function demo() {
   const eq = (got: unknown, want: unknown, what: string) => {
     if (JSON.stringify(got) !== JSON.stringify(want))
@@ -84,41 +84,41 @@ export function demo() {
   const A = "spot:019f0000-0000-7000-8000-000000000001";
   const B = "booking:019f0000-0000-7000-8000-000000000002";
 
-  resetSeq();
-  eq(awaitSeqHeader(), {}, "no writes yet -> no header");
+  resetVersions();
+  eq(awaitVersionHeader(), {}, "no writes yet -> no header");
 
-  recordSeq(`${A}@10`);
-  eq(awaitSeqHeader(), { "X-Await-Version": `${A}@10` }, "first write");
+  recordVersion(`${A}@10`);
+  eq(awaitVersionHeader(), { "X-Await-Version": `${A}@10` }, "first write");
 
-  recordSeq(`${A}@4`); // an older ack arriving late must not rewind us
-  eq(awaitSeqHeader(), { "X-Await-Version": `${A}@10` }, "never moves backwards");
+  recordVersion(`${A}@4`); // an older ack arriving late must not rewind us
+  eq(awaitVersionHeader(), { "X-Await-Version": `${A}@10` }, "never moves backwards");
 
-  recordSeq(`${A}@11`);
-  eq(awaitSeqHeader(), { "X-Await-Version": `${A}@11` }, "moves forward");
+  recordVersion(`${A}@11`);
+  eq(awaitVersionHeader(), { "X-Await-Version": `${A}@11` }, "moves forward");
 
   // A second aggregate is kept alongside the first, not instead of it — the whole
   // point of the map. A booking must not cost a pending spot write its position.
-  recordSeq(`${B}@2`);
+  recordVersion(`${B}@2`);
   eq(
-    awaitSeqHeader(),
+    awaitVersionHeader(),
     { "X-Await-Version": `${A}@11,${B}@2` },
     "aggregates are tracked side by side",
   );
 
-  recordSeq(`${A}@12`); // and each still moves independently
+  recordVersion(`${A}@12`); // and each still moves independently
   eq(
-    awaitSeqHeader(),
+    awaitVersionHeader(),
     { "X-Await-Version": `${A}@12,${B}@2` },
     "each aggregate moves on its own",
   );
 
   // Junk must not land an entry. The old stream form is junk now, which is the
   // one that would otherwise slip through: it has no `@`.
-  resetSeq();
+  resetVersions();
   for (const bad of ["SPOTS:4712", "", "nope", `${A}@`, `${A}@x`, "@3"]) {
-    recordSeq(bad);
+    recordVersion(bad);
   }
-  eq(awaitSeqHeader(), {}, "malformed tokens are ignored");
+  eq(awaitVersionHeader(), {}, "malformed versions are ignored");
 
   return "ok";
 }
