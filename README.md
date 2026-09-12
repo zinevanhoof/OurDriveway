@@ -19,11 +19,13 @@ pays for it. Once the booking is over and has settled, the host can withdraw the
 A walkthrough of the running app, recorded on the Android build — the same Vue frontend
 the web app uses, wrapped in the Tauri shell, against the real services.
 
-<!-- To swap the video: drag the .mp4 into a comment box on a GitHub issue, wait for the
-     upload, and paste the https://github.com/user-attachments/assets/… URL it gives back
-     on its own line below. GitHub only renders an inline player for that kind of URL. -->
+<!-- To replace the video: drag the .mp4 into a comment box on a GitHub issue, wait for
+     the upload, and paste the https://github.com/user-attachments/assets/… URL it gives
+     back on its own line below — GitHub renders an inline player only for that kind of
+     URL, and it has to be its own paragraph. Keep the file under 10 MB, which is the
+     attachment ceiling for video; the one below is 540×1200, CRF 27, ~7.4 MB. -->
 
-https://github.com/user-attachments/assets/REPLACE-ME
+https://github.com/user-attachments/assets/8c8c9894-14c5-4362-84c5-5c076cd748a3
 
 ---
 
