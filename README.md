@@ -21,9 +21,9 @@ the web app uses, wrapped in the Tauri shell, against the real services.
 
 Watch it as a **work in progress**: it shows the core flow working end to end, not a
 finished product — see [Status and known gaps](#status-and-known-gaps). The frontend is
-also a **development build**, `npm run tauri android dev`, which serves the app from the
-Vite dev server over the LAN: unminified, unbundled, with HMR attached. Cold screens and
-first loads are slower in the video than in a release build for that reason alone.
+also a **development build** on both sides, `npm run tauri android dev` — the web layer
+from the Vite dev server, the native Tauri shell a debug `cargo` build — so it runs
+slower in the video than a release build would.
 
 <!-- To replace the video: drag the .mp4 into a comment box on a GitHub issue, wait for
      the upload, and paste the https://github.com/user-attachments/assets/… URL it gives
