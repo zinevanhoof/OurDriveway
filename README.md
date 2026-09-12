@@ -542,6 +542,25 @@ publishes images to GHCR from `main`.
 
 ## Deploying
 
+### Branches
+
+**`main` is the production branch.** `dev` is where work lands first and reaches `main`
+through a pull request; nothing is committed to `main` directly.
+
+Both paths run [`.github/workflows/ci.yml`](.github/workflows/ci.yml), but they stop at
+different points. A pull request runs `cargo test --workspace` and the frontend's
+`vue-tsc --noEmit && vite build`, and that is all — nothing is published for code that was
+never merged. A push to `main` runs the same tests and then, only if they pass, builds all
+nine images with `docker buildx bake`, pushes them to `ghcr.io` tagged with the commit sha,
+and moves `:latest` onto them once every image is up, so a partial failure leaves the
+previous release serving. Older tags are pruned to roughly twenty pushes of rollback depth.
+
+What that automates is **publishing, not deployment**: a green `main` means the images for
+that commit exist in the registry. Rolling the cluster onto them is still a deliberate
+`k8s/deploy.sh prod`.
+
+### The cluster
+
 Production is **Kubernetes with plain Helm**: one chart, `values-local.yaml` for a k3d
 cluster and `values-prod.yaml` for a VPS behind Cloudflare.
 
