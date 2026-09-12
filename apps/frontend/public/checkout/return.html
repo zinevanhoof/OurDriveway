@@ -8,10 +8,11 @@
     <!--
       Bounces a redirect payment back into the native app.
 
-      Reached only in the *system browser*, never in the webview: CheckoutComponent cancels
-      the off-origin navigation and hands the bank URL to the OS, so the whole redirect
-      chain — bank, Stripe, this page — happens in Chrome. That is the point. A browser
-      dispatches `ourdriveway://` to the OS; a webview answers ERR_UNKNOWN_URL_SCHEME.
+      Normally reached inside the webview itself: the whole redirect chain — bank, Stripe,
+      this page — loads there, and `catch_deep_link` in src-tauri/src/lib.rs catches the
+      `ourdriveway://` hop below and navigates the app back to /checkout. A webview would
+      otherwise answer that scheme with ERR_UNKNOWN_URL_SCHEME. If a payment ever finishes
+      in the system browser instead, the OS routes the same link to the app as an intent.
 
       And it has to be this page rather than the scheme directly, because Stripe.js refuses
       a non-http(s) `return_url` at confirm time even though the REST API stores one happily.

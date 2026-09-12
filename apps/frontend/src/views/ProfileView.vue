@@ -51,7 +51,7 @@ const logout = async () => {
 </script>
 
 <template>
-    <div class="px-4 space-y-2">
+    <div class="px-4 pb-2 space-y-2">
         <Surface v-if="me" variant="elevated" size="lg" class="gap-2">
             <Surface variant="none" size="none" orientation="horizontal" class="gap-3">
                 <!-- Goes to the edit screen rather than opening a picker here. This

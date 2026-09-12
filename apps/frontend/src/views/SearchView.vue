@@ -3,5 +3,6 @@ import LocationMap from '@/components/map/LocationMap.vue';
 </script>
 
 <template>
-  <LocationMap class="h-full w-full" :lng="5.263433" :lat="51.0742837" :zoom="13" />
+  <!-- Hasselt, Grote Markt — until the user's own location comes in. -->
+  <LocationMap class="h-full w-full" :lng="5.3378" :lat="50.9306" :zoom="13" />
 </template>

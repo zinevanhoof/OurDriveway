@@ -139,7 +139,7 @@ yugabyte:
   # Committed, which booking-service's reserve path depends on to not double-book —
   # see the header of templates/yugabyte.yaml. This is a correctness constraint, not a
   # preference. Keep it in step with docker/docker-compose-dev.yml.
-  image: yugabytedb/yugabyte:2025.2.5.2-b5
+  image: yugabytedb/yugabyte:2026.1.1.2-b9
   storage: 20Gi
   resources:
     requests:

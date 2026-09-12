@@ -33,3 +33,9 @@ shared = { path = "../shared" }
 # and it is already in the workspace graph, so nothing new compiles.
 [dev-dependencies]
 argon2 = { workspace = true }
+# `examples/demo_seed.rs` only: a booking's `ends_at` is its last slot in the spot's
+# own zone, MEDIA_BASE is read from spot-service's .env, and the seed triggers each
+# service's `/internal/backfill` over HTTP. All three are already in the workspace graph.
+chrono-tz = { workspace = true }
+dotenvy = { workspace = true }
+reqwest = { workspace = true }

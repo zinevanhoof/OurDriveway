@@ -1,11 +1,9 @@
 <script setup lang="ts">
-import { useQuery, useQueryClient } from "@tanstack/vue-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { onMounted, onBeforeUnmount, ref, computed, watch, h, render } from "vue";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import type { FeatureCollection } from "geojson";
-import { pinsFromFeatures, type PinData } from "@/lib/mapPins";
-import { useDebounceFn } from "@vueuse/core";
+import { clusterPins, type MapSpot, type PinData } from "@/lib/mapPins";
 import { toast } from "vue-sonner";
 import { fetchSpot, fetchSpotsNear } from "@/api/viewApi";
 import { viewKeys } from "@/api/keys";
@@ -60,6 +58,11 @@ const { data: spotsInRadius } = useQuery({
   ),
   queryFn: () => fetchSpotsNear(center.value![0], center.value![1], meters.value),
   enabled: computed(() => center.value !== null),
+  // Every pan is a new key, and a new key starts out with no data — which emptied the
+  // source and blinked every pin off until the response landed. Holding the previous
+  // result until then means the pins are replaced in one step, never removed first;
+  // `syncMarkers` diffs by key, so the ones still in view don't even re-mount.
+  placeholderData: keepPreviousData,
 });
 
 // Full detail for the selected pin, fetched on click (disabled until then) so nothing
@@ -94,13 +97,15 @@ const matchedSpots = computed(() =>
 
 // Refetch spots whenever the viewport settles. Radius = center → NE corner, so
 // the circle covers the whole rectangular viewport (over-fetches a little).
+//
+// Straight off `moveend`, no debounce: it fires once, after a drag's inertia has run
+// out, so there is no burst to smooth — a delay only left the old area on screen.
 function refreshBounds() {
   if (!map) return;
   const c = map.getCenter();
   center.value = [c.lng, c.lat];
   meters.value = c.distanceTo(map.getBounds().getNorthEast());
 }
-const onMoveEnd = useDebounceFn(refreshBounds, 1000);
 
 // Drawer visibility is just "is a pin selected"; closing clears selection, which
 // also animates the pin back down via the selectedId watch below.
@@ -121,53 +126,46 @@ watch(bookingOpen, (isOpen) => {
 
 // ─── Clustering ────────────────────────────────────────────────────────────────
 // Several spots can share one address (an apartment block's parking, a house with
-// two driveways), so their markers land on the exact same pixel. MapLibre clusters
-// GeoJSON *sources* natively — but only renders them through circle/symbol layers,
-// which can't draw a Vue price bubble. So the source is used purely as a spatial
-// index: MapLibre runs supercluster in its worker, we read the result back with
-// querySourceFeatures and keep placing our own HTML markers.
-const SOURCE_ID = "spots";
+// two driveways), so their markers land on the exact same pixel. Nearby spots are
+// grouped into one pin by `clusterPins`, computed here rather than by a clustered
+// MapLibre source — see `lib/mapPins.ts` for why reading clusters back out of tiles
+// drew a group and its members at the same time.
 
-type ClusterSpot = { id: string; title: string; price: number };
-// The open cluster's id is kept alongside its members so its pin can stay in the
+// The open group's key is kept alongside its members so its pin can stay in the
 // raised state while the drawer is up, exactly like a selected single spot.
-const openCluster = ref<{ id: number; spots: ClusterSpot[] } | null>(null);
+const openCluster = ref<{ key: string; spots: MapSpot[] } | null>(null);
 
 const clusterOpen = computed({
   get: () => openCluster.value !== null,
   set: (v) => { if (!v) openCluster.value = null; },
 });
 
-function toFeatureCollection(spots: any[]): FeatureCollection {
-  return {
-    type: "FeatureCollection",
-    // Properties are what come back from getClusterLeaves, so everything the
-    // cluster list renders has to live here — supercluster only keeps these.
-    features: spots.map((s: any) => ({
-      type: "Feature",
-      // Two columns, not a geometry. `location { coordinates }` was a GeoJSON point
-      // the database assembled; PostGIS is unavailable on YSQL, so lng/lat are stored
-      // and returned separately — and GeoJSON wants them in exactly that order anyway.
-      geometry: { type: "Point", coordinates: [s.lng, s.lat] },
-      properties: { id: s.id, title: s.title, price: s.pricePerHour },
-    })),
-  };
-}
+// Two columns, not a geometry: PostGIS is unavailable on YSQL, so lng/lat come back
+// separately.
+const mapSpots = computed<MapSpot[]>(() =>
+  matchedSpots.value.map((s) => ({
+    id: s.id,
+    title: s.title,
+    price: s.pricePerHour,
+    lng: s.lng,
+    lat: s.lat,
+  })),
+);
 
 type Pin = PinData & { div: HTMLDivElement; marker: maplibregl.Marker };
 const pins = new Map<string, Pin>();
 
 function renderPin(p: Pin) {
-  const selected = p.clusterId !== null
-    ? p.clusterId === openCluster.value?.id
-    : p.spotId === selectedId.value;
+  const selected = p.spots.length > 1
+    ? p.key === openCluster.value?.key
+    : p.spots[0].id === selectedId.value;
   // Raise the marker element itself — MapLibre sets an inline z-index per marker
   // by latitude, so a z-class on the inner button can't lift it above siblings.
   p.div.style.zIndex = selected ? "10" : "";
   render(
     h(MapPinComponent, {
       pricePerHour: p.price,
-      count: p.count,
+      count: p.spots.length,
       selected,
       onSelect: () => selectPin(p),
     }),
@@ -178,18 +176,12 @@ function renderPin(p: Pin) {
 // A cluster opens a list, it never zooms to expand. Spots at identical coordinates
 // stay clustered at every zoom level, so zoom-to-expand would loop forever without
 // ever reaching them — and that is exactly the case this whole feature exists for.
-async function selectPin(p: Pin) {
-  if (p.clusterId === null) {
-    selectedId.value = p.spotId;
+function selectPin(p: Pin) {
+  if (p.spots.length === 1) {
+    selectedId.value = p.spots[0].id;
     return;
   }
-  const source = map?.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
-  if (!source) return;
-  const leaves = await source.getClusterLeaves(p.clusterId, p.count, 0);
-  openCluster.value = {
-    id: p.clusterId,
-    spots: leaves.map((f) => f.properties as ClusterSpot),
-  };
+  openCluster.value = { key: p.key, spots: p.spots };
 }
 
 function openSpot(id: string) {
@@ -197,13 +189,20 @@ function openSpot(id: string) {
   selectedId.value = id;
 }
 
-// Rebuilds the marker set from whatever the source currently holds. Diffed by key
-// rather than cleared and refilled: this runs on every `idle`, and recreating every
-// marker each time flickers and restarts the selection transition.
-function syncMarkers() {
-  if (!map?.getSource(SOURCE_ID)) return;
+// Rebuilds the marker set for the current spots and zoom level. Diffed by key rather
+// than cleared and refilled: recreating every marker flickers and restarts the
+// selection transition, and a pin whose members did not change keeps its marker.
+//
+// Nothing here runs while panning — MapLibre moves the markers itself. Only new data
+// or crossing a whole zoom level changes the groups, and both land here straight away,
+// mid-gesture included.
+let zoomLevel: number | null = null;
 
-  const next = pinsFromFeatures(map.querySourceFeatures(SOURCE_ID));
+function syncMarkers() {
+  if (!map) return;
+  zoomLevel = Math.floor(map.getZoom());
+
+  const next = clusterPins(mapSpots.value, zoomLevel);
 
   for (const [key, pin] of pins) {
     if (next.has(key)) continue;
@@ -214,7 +213,7 @@ function syncMarkers() {
   for (const [key, d] of next) {
     const existing = pins.get(key);
     if (existing) {
-      Object.assign(existing, d); // a cluster's count and cheapest price shift as it grows
+      Object.assign(existing, d); // a refetched spot may have a new price or title
       renderPin(existing);
       continue;
     }
@@ -229,10 +228,7 @@ function syncMarkers() {
   }
 }
 
-watch(matchedSpots, (spots) => {
-  const source = map?.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
-  source?.setData(toFeatureCollection(spots));
-});
+watch(mapSpots, syncMarkers);
 
 // Selection change: re-render each pin into its existing div → class flips,
 // CSS transition animates the jump up and the shrink back. Closing either drawer
@@ -259,32 +255,14 @@ onMounted(async () => {
     }
   });
   map.on("load", () => {
-    map!.addSource(SOURCE_ID, {
-      type: "geojson",
-      data: toFeatureCollection(matchedSpots.value),
-      cluster: true,
-      clusterRadius: 50,
-      // Cluster at every zoom the map allows. The default stops clustering a level
-      // below the source maxzoom, and past that point spots sharing an address go
-      // back to being separate markers stacked on one pixel — the bug this fixes.
-      maxzoom: 22,
-      clusterMaxZoom: 22,
-    });
-    // querySourceFeatures only sees *loaded* tiles, and MapLibre only loads tiles
-    // for a source some layer actually draws. This layer exists solely to mark the
-    // source as used — zero-radius circles render nothing.
-    map!.addLayer({
-      id: `${SOURCE_ID}-index`,
-      type: "circle",
-      source: SOURCE_ID,
-      paint: { "circle-radius": 0 },
-    });
     refreshBounds(); // initial fetch at the fallback center
   });
-  map.on("moveend", onMoveEnd);
-  // `idle` is the one event that guarantees tiles are loaded and clustering has
-  // settled, which is exactly what querySourceFeatures needs.
-  map.on("idle", syncMarkers);
+  map.on("moveend", refreshBounds);
+  // Regroup the moment a zoom gesture crosses a whole level, not when it ends. `zoom`
+  // fires every frame of a zoom, so this compares levels and only regroups on a change.
+  map.on("zoom", () => {
+    if (Math.floor(map!.getZoom()) !== zoomLevel) syncMarkers();
+  });
 
   const here = await locateUser();
   if (here) {

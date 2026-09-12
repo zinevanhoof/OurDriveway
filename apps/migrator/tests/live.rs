@@ -24,6 +24,20 @@ const BASE: &str = "postgres://yugabyte@127.0.0.1:5433";
 /// assertion needs to be meaningful.
 const FIXTURE: EmbeddedMigrations = embed_migrations!("../../migrations/user");
 
+/// Held by every test that creates a database, so no two of them do it at once.
+///
+/// YugabyteDB 2026.1 does not run concurrent `CREATE DATABASE`s side by side: one wins and
+/// the others fail with `Keyspace '<name>' already exists` — for names that never existed
+/// — and leave a half-made keyspace behind that blocks the name for up to a minute, which
+/// `DROP DATABASE IF EXISTS` cannot see. 2025.2 ran the same three concurrent creates
+/// cleanly; both tags were measured side by side before this lock went in.
+///
+/// The migrator itself never meets it: `run_all` creates the five databases one after
+/// another. Only this file created them in parallel, as a side effect of cargo's test
+/// threads. `tokio`'s mutex and not `std`'s, because each `#[tokio::test]` is its own
+/// runtime and one failing test must not poison the lock for the rest.
+static CREATES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn scratch(name: &str) -> migrator::Database {
     // Leaked so the `&'static str` the API wants can be per-test. A handful of
     // strings for the life of the test binary.
@@ -110,6 +124,7 @@ async fn applied_count(name: &str) -> i64 {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker/docker-compose-dev.yml"]
 async fn an_empty_database_is_created_migrated_and_then_left_alone() {
+    let _creates = CREATES.lock().await;
     let db = scratch("migrator_test_fresh");
     drop_database(db.name).await;
 
@@ -137,6 +152,7 @@ async fn an_empty_database_is_created_migrated_and_then_left_alone() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker/docker-compose-dev.yml"]
 async fn an_existing_database_is_migrated_in_place() {
+    let _creates = CREATES.lock().await;
     let db = scratch("migrator_test_existing");
     drop_database(db.name).await;
 
@@ -183,6 +199,7 @@ async fn a_missing_url_fails_by_name() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker/docker-compose-dev.yml"]
 async fn a_failing_migration_is_an_error_naming_its_database() {
+    let _creates = CREATES.lock().await;
     let db = scratch("migrator_test_conflict");
     drop_database(db.name).await;
 
@@ -217,6 +234,7 @@ async fn a_failing_migration_is_an_error_naming_its_database() {
 async fn every_database_keeps_its_own_ledger() {
     const OTHER: EmbeddedMigrations = embed_migrations!("../../migrations/spot");
 
+    let _creates = CREATES.lock().await;
     let a = scratch("migrator_test_ledger_a");
     drop_database(a.name).await;
     migrator::run_one(scratch("migrator_test_ledger_a"))

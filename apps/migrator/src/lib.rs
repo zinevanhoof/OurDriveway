@@ -128,6 +128,11 @@ impl std::error::Error for Error {}
 /// `payment` and `view` untouched. Unwinding the two that succeeded would be a second set
 /// of migrations that can themselves fail; the supported recovery is to fix the broken
 /// migration and run this again, which is a no-op for everything already applied.
+///
+/// **Sequential on purpose — do not `join!` it.** YugabyteDB 2026.1 refuses concurrent
+/// `CREATE DATABASE`s: all but one fail with a misleading `Keyspace '<name>' already
+/// exists` and leave the name blocked for up to a minute. See `CREATES` in
+/// `tests/live.rs`, where it was found.
 pub async fn run_all() -> Result<(), Error> {
     for db in databases() {
         run_one(db).await?;

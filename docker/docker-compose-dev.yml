@@ -66,7 +66,7 @@ services:
     # gflag, not a session GUC, and ysqlsh replies "unrecognized configuration
     # parameter". `BEGIN; SHOW transaction_isolation;` is the session-level check and
     # must say "read committed".
-    image: yugabytedb/yugabyte:2025.2.5.2-b5
+    image: yugabytedb/yugabyte:2026.1.1.2-b9
     restart: unless-stopped
     # `--advertise_address` is not optional: without it every process binds the
     # container's own IP and nothing resolves it by name. Same class of mistake the

@@ -24,25 +24,20 @@ import type { SessionStateResponse } from "@/types/responses/payment/SessionStat
  * complaint, but Stripe.js rejects it at confirm time with "invalid returnUrl". Only the
  * http(s) form survives both.
  *
- * That page is reached in the *system browser*, never in the webview — `CheckoutComponent`
- * cancels the off-origin navigation and hands the bank URL to the OS, so the bank, Stripe
- * and the wrapper all load in Chrome, which unlike a webview does dispatch a custom scheme
- * back to the OS.
+ * The origin is always the page's own, on both platforms. On native the whole redirect runs
+ * *inside* the webview — the bank, Stripe and that return page all load there — and
+ * `catch_deep_link` in `src-tauri/src/lib.rs` turns the `ourdriveway://` hop into an in-app
+ * navigation. The webview can always reach its own origin: the dev machine's LAN address
+ * under `tauri android dev`, `http://tauri.localhost` in a release build.
  *
- * Which makes `VITE_APP_ORIGIN` load-bearing on native and unlike the web case it has no
- * usable fallback: `window.location.origin` inside Tauri is the webview's own origin, which
- * no phone browser can resolve. It must be reachable from the *device* — a LAN address in
- * development, the public domain in production.
+ * It used to be pinned by `VITE_APP_ORIGIN`, set to `http://localhost:1420` for dev. On a
+ * phone that is the phone itself, so the return page never loaded and checkout hung after
+ * the bank step.
  */
 function returnUrl(): string {
-  // `VITE_APP_ORIGIN` when set, so a dev build can pin the origin Stripe returns to —
-  // the vite server on :1420 — rather than whatever host the page happens to be open on.
-  // Falling back to the live origin keeps LAN testing through Caddy working without a
-  // rebuild, which a hardcoded origin would break.
-  const origin = import.meta.env.VITE_APP_ORIGIN || window.location.origin;
   const path = native ? "/checkout/return.html" : "/checkout";
 
-  return `${origin}${path}?session_id={CHECKOUT_SESSION_ID}`;
+  return `${window.location.origin}${path}?session_id={CHECKOUT_SESSION_ID}`;
 }
 
 /**

@@ -35,7 +35,7 @@ const signup = () => {
 </script>
 
 <template>
-    <div class="mx-4 mt-22">
+    <div class="mx-4 mt-22 pb-2">
         <Tabs v-model="tab">
             <TabsList class="w-full">
                 <TabsTrigger value="login">

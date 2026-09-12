@@ -62,7 +62,7 @@ const resend = async () => {
 </script>
 
 <template>
-    <div class="mx-4 mt-22">
+    <div class="mx-4 mt-22 pb-2">
         <Surface size="lg" class="gap-6">
             <div class="grid gap-1">
                 <Title class="font-medium">

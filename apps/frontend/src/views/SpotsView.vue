@@ -11,7 +11,7 @@ import BookedSpotsComponent from '@/components/BookedSpotsComponent.vue';
 </script>
 
 <template>
-    <div class="space-y-2 mt-4 mx-4">
+    <div class="space-y-2 mt-4 mx-4 pb-2">
         <Tabs default-value="my-parking-spots" class="gap-5">
             <TabsList class="w-full group-data-horizontal/tabs:h-10">
                 <TabsTrigger value="my-parking-spots" class="font-bold">

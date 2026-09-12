@@ -170,7 +170,7 @@ const openBooking = () => {
          reachable and a screen reader announces no action. ProfileView's
          `<button class="flex … w-full text-left">` is the shape that fixes it
          without disturbing layout — worth doing to the whole screen at once. -->
-    <div class="pt-2 px-4 pb-2 space-y-4">
+    <div class="py-2 px-4 space-y-4">
         <div class="grid grid-cols-2 gap-2">
             <Surface variant="primary" size="lg" class="gap-8" @click="router.push({ name: 'search' })">
                 <Search />

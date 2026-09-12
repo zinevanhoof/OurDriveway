@@ -178,7 +178,7 @@ const bookingWhen = (booking: any) => {
             </Button>
         </div>
     </header>
-    <div class="space-y-3 px-4 overflow-y-auto no-scrollbar">
+    <div class="space-y-3 px-4 pb-2 overflow-y-auto no-scrollbar">
         <div class="flex h-40 gap-2 overflow-x-auto snap-x snap-mandatory no-scrollbar">
             <img v-for="key in data?.images" :key="key" :src="key"
                 class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
@@ -204,7 +204,7 @@ const bookingWhen = (booking: any) => {
         <FieldError v-if="errors.length" :errors="errors" />
         <div class="grid grid-cols-3 gap-2">
             <Surface variant="elevated" class="text-center">
-                <Money :cents="12800" size="md" />
+                <Money :cents="12800" size="md" class="justify-center" />
                 <Text>Earned</Text>
             </Surface>
             <Surface variant="elevated" class="text-center">
