@@ -19,6 +19,12 @@ pays for it. Once the booking is over and has settled, the host can withdraw the
 A walkthrough of the running app, recorded on the Android build — the same Vue frontend
 the web app uses, wrapped in the Tauri shell, against the real services.
 
+Watch it as a **work in progress**: it shows the core flow working end to end, not a
+finished product — see [Status and known gaps](#status-and-known-gaps). The frontend is
+also a **development build**, `npm run tauri android dev`, which serves the app from the
+Vite dev server over the LAN: unminified, unbundled, with HMR attached. Cold screens and
+first loads are slower in the video than in a release build for that reason alone.
+
 <!-- To replace the video: drag the .mp4 into a comment box on a GitHub issue, wait for
      the upload, and paste the https://github.com/user-attachments/assets/… URL it gives
      back on its own line below — GitHub renders an inline player only for that kind of
