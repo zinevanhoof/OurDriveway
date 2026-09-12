@@ -72,8 +72,8 @@ jobs:
       # exporting a multi-GB layer cache through the Actions cache service can cost
       # more wall clock than it saves at that size.
       #
-      # bake resolves all five targets in one graph, so the shared `builder` stage
-      # compiles the Rust workspace exactly once for all four service images.
+      # bake resolves all nine targets in one graph, so the shared `builder` stage
+      # compiles the Rust workspace exactly once for the seven service images and the migrator.
       - uses: docker/bake-action@v7
         with:
           push: true
@@ -87,13 +87,13 @@ jobs:
       # above leaves the previous release as :latest. Manifest copy, no rebuild.
       - name: Point :latest at this commit
         run: |
-          for p in user-service booking-service spot-service view-service frontend; do
+          for p in user-service booking-service spot-service view-service media-service notification-service payment-service migrator frontend; do
             docker buildx imagetools create \
               -t "$REGISTRY/ourdriveway-$p:latest" \
               "$REGISTRY/ourdriveway-$p:${{ github.sha }}"
           done
 
-  # Every push adds five immutable sha tags. Keep enough for rollback, bin the rest.
+  # Every push adds nine immutable sha tags. Keep enough for rollback, bin the rest.
   cleanup:
     needs: publish
     runs-on: ubuntu-latest
@@ -106,6 +106,10 @@ jobs:
           - ourdriveway-booking-service
           - ourdriveway-spot-service
           - ourdriveway-view-service
+          - ourdriveway-media-service
+          - ourdriveway-notification-service
+          - ourdriveway-payment-service
+          - ourdriveway-migrator
           - ourdriveway-frontend
     steps:
       - uses: actions/delete-package-versions@v5

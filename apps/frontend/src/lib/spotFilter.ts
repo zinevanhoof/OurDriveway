@@ -1,16 +1,6 @@
 import type { SpotFilter } from "@/types/SpotFilter";
 import type { TimeSlot } from "@/types/domain/spot";
-
-// Availability as returned by SPOTS_IN_RADIUS (both are `object` scalars).
-type SpotAvailability = {
-  weekly?: Record<string, TimeSlot[]>;
-  single?: Record<string, TimeSlot[]>;
-};
-
-// "HH:MM" strings compare chronologically, so a spot slot fully covers a request
-// when it starts no later and ends no earlier.
-const covers = (a: TimeSlot, r: TimeSlot) =>
-  a.start <= r.start && a.end >= r.end;
+import { covers, type SpotAvailability } from "./bookingAvailability";
 
 // Every requested slot must be covered by some available slot. An empty request list
 // means "any availability that day", so the spot just needs at least one slot.

@@ -1,4 +1,4 @@
-import { getLocalTimeZone } from "@internationalized/date";
+import { getLocalTimeZone, parseDate } from "@internationalized/date";
 import type { TimeSlot } from "@/types/domain/spot";
 
 // Structural date type — both reka-ui's and @internationalized's DateValue satisfy
@@ -72,12 +72,59 @@ export function resolveOpenWindows(
   return availability?.single?.[iso] ?? availability?.weekly?.[weekday] ?? [];
 }
 
+// "HH:MM" strings compare chronologically, so a window fully covers a slot when it
+// starts no later and ends no earlier.
+export const covers = (window: TimeSlot, slot: TimeSlot) =>
+  window.start <= slot.start && window.end >= slot.end;
+
+/**
+ * Booked slots that `availability` would no longer cover, on or after `from`.
+ *
+ * This is the edit screen's warning: the host is about to remove hours somebody
+ * already paid for. It is a courtesy, not the rule — booking-service re-runs the
+ * same question when the event lands and is the one that actually cancels. Past
+ * dates are skipped for the same reason it skips them: a booking that already
+ * happened can't be withdrawn.
+ */
+export function bookedOutside(
+  availability: SpotAvailability | undefined,
+  occupied: Record<string, TimeSlot[]>,
+  from: string,
+): { date: string; slot: TimeSlot }[] {
+  return Object.entries(occupied)
+    .filter(([date]) => date >= from)
+    .flatMap(([date, slots]) => {
+      const open = resolveOpenWindows(availability, parseDate(date));
+      return slots
+        .filter((slot) => !open.some((window) => covers(window, slot)))
+        .map((slot) => ({ date, slot }));
+    });
+}
+
+/**
+ * Every booking's slots on a spot, unioned into one `"YYYY-MM-DD"` -> slots map.
+ *
+ * The rows come from `bookings(where: { spot_id, ends_at: { gt: now } })`, and no
+ * status filter is applied here on purpose: the view's `booking` select permission
+ * hands a prospective renter only the rows that actually block a slot. Released and
+ * cancelled bookings are visible to their renter and the host, and to nobody else.
+ */
+export function mergeBooked(
+  bookings: { booked?: Record<string, TimeSlot[]> | null }[] | undefined | null,
+): Record<string, TimeSlot[]> {
+  const out: Record<string, TimeSlot[]> = {};
+  for (const b of bookings ?? [])
+    for (const [date, slots] of Object.entries(b.booked ?? {}))
+      (out[date] ??= []).push(...slots);
+  return out;
+}
+
 // What's still bookable on a date: open windows minus what's already taken.
 //
-// `occupied` is the spot's `booked` field verbatim — no reshaping and no
-// filtering. Everything in it is taken, including a slot someone is paying for
-// right now; a hold that lapses is removed server-side by the expiry sweeper, so
-// there is no expiry for this side to reason about.
+// `occupied` is `mergeBooked()`'s output — no further reshaping and no filtering.
+// Everything in it is taken, including a slot someone is paying for right now; a
+// hold that lapses stops blocking when the expiry sweeper releases it server-side,
+// so there is no expiry for this side to reason about.
 export function remainingWindows(
   availability: SpotAvailability | undefined,
   occupied: Record<string, TimeSlot[]>,
@@ -123,5 +170,42 @@ export function demo() {
     ),
     [{ start: "14:00", end: "16:00" }],
   ); // window fully taken drops, other stays
+
+  // bookedOutside: which paid slots an edit would cancel. 2026-08-03 is a Monday.
+  const monday = { weekly: { monday: [{ start: "08:00", end: "18:00" }] }, single: {} };
+  const at = (slots: TimeSlot[]) => ({ "2026-08-03": slots });
+  const outside = (a: SpotAvailability, slots: TimeSlot[]) =>
+    bookedOutside(a, at(slots), "2026-08-01").length;
+
+  if (outside(monday, [{ start: "09:00", end: "10:00" }]) !== 0)
+    throw new Error("a slot inside the hours must survive");
+  if (outside(monday, [{ start: "17:00", end: "19:00" }]) !== 1)
+    throw new Error("a slot running past closing must be flagged");
+  if (outside({ weekly: {}, single: {} }, [{ start: "09:00", end: "10:00" }]) !== 1)
+    throw new Error("closing the day must flag everything on it");
+  // An empty single entry closes that date even though Monday is open — same
+  // precedence the server applies, and the easiest one to get backwards.
+  if (outside({ ...monday, single: at([]) }, [{ start: "09:00", end: "10:00" }]) !== 1)
+    throw new Error("an empty single entry must close the day");
+  // Already happened: nothing to cancel, so it is never flagged.
+  if (bookedOutside({ weekly: {}, single: {} }, at([{ start: "09:00", end: "10:00" }]), "2026-09-01").length)
+    throw new Error("past dates must be skipped");
+
+  // mergeBooked: two bookings on one date must concatenate, not overwrite — the
+  // whole reason this replaced a server-side fold rather than a per-row read.
+  eq(
+    mergeBooked([
+      { booked: at([{ start: "09:00", end: "10:00" }]) },
+      { booked: at([{ start: "14:00", end: "15:00" }]) },
+      { booked: null },
+    ])["2026-08-03"],
+    [
+      { start: "09:00", end: "10:00" },
+      { start: "14:00", end: "15:00" },
+    ],
+  );
+  if (Object.keys(mergeBooked(undefined)).length)
+    throw new Error("no bookings must mean nothing taken");
+
   return "ok";
 }

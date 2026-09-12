@@ -1,0 +1,32 @@
+# Static SPA delivery, nothing else.
+#
+# The reverse_proxy blocks that used to live here moved into the Ingress in
+# k8s/30-frontend.yaml: it routes /api/* to the five services and everything else
+# to this pod, so the browser still sees ONE origin — which is what keeps the
+# SameSite=Strict refresh cookie working and CORS unnecessary. Routing declared in
+# two places is just two places to forget.
+#
+# Nothing load-balances here any more either. A ClusterIP Service does that in
+# front of each service's pods, and `readinessProbe: /readyz` keeps a replica that
+# is still replaying the log out of the endpoint list — the job the old
+# `health_uri /readyz` snippet was doing.
+#
+# ponytail: plain HTTP. TLS terminates at the ingress now, so `tls internal` here
+# would only re-encrypt inside the cluster. Android release builds block cleartext,
+# so the ingress is where a real certificate has to land.
+#
+# Tauri never touches this at all: desktop and mobile ship the SPA as local files
+# and call the ingress origin directly.
+:80 {
+	# Something cheap for the probes to hit that isn't the whole SPA. First
+	# matching `handle` wins, so this has to come before the catch-all.
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	handle {
+		root * /srv/dist
+		try_files {path} /index.html
+		file_server
+	}
+}

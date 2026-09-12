@@ -18,8 +18,9 @@ import {
     ComboboxItem,
     ComboboxEmpty,
 } from '@/components/ui/combobox'
-import { suggestAddress } from '@/api/address'
-import type { Address } from '@/types/domain/spot'
+import { Text, Title } from '@/components/base/text'
+import { suggestAddress } from '@/api/spotApi'
+import type { AddressSuggestResponse } from '@/types/responses/spot/AddressSuggestResponse'
 import { AcceptableValue } from 'reka-ui';
 
 // setValues comes from the parent's useForm; picking a suggestion fills every
@@ -27,7 +28,7 @@ import { AcceptableValue } from 'reka-ui';
 const props = defineProps<{ setValues: (values: Record<string, any>, shouldValidate?: boolean) => void }>()
 
 const term = ref('')
-const items = ref<Address[]>([])
+const items = ref<AddressSuggestResponse[]>([])
 const open = ref(false)
 // Set the input text on select without retriggering a search.
 let suppress = false
@@ -39,7 +40,7 @@ const search = useDebounceFn(async (q: string) => {
         open.value = false
         return
     }
-    items.value = await suggestAddress(query)
+    items.value = await suggestAddress(query).catch(() => [])
     open.value = items.value.length > 0
 }, 300)
 
@@ -52,7 +53,7 @@ watch(term, (q) => {
 })
 
 const onSelect = (value: AcceptableValue) => {
-    const addr = value as Address
+    const addr = value as AddressSuggestResponse
     props.setValues({
         address: {
             line1: addr.line1,
@@ -72,7 +73,7 @@ const onSelect = (value: AcceptableValue) => {
 
 <template>
     <FieldGroup class="gap-4">
-        <div class="font-bold">Address</div>
+        <Title>Address</Title>
         <Field class="gap-1">
             <Combobox v-model:open="open" :ignore-filter="true" :reset-search-term-on-blur="false"
                 @update:model-value="onSelect">
@@ -88,9 +89,9 @@ const onSelect = (value: AcceptableValue) => {
                     </ComboboxViewport>
                 </ComboboxList>
             </Combobox>
-            <p class="text-xs text-muted-foreground">
+            <Text as="p" weight="normal">
                 Search powered by LocationIQ
-            </p>
+            </Text>
         </Field>
 
         <VeeField v-slot="{ componentField, errors }" name="address.line1">

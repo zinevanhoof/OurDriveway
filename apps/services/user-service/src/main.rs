@@ -1,113 +1,152 @@
 use std::sync::{Arc, LazyLock};
 
-use axum::{Router, routing::post};
-
-use crate::{
-    projector::{SessionProjector, UserProjector},
-    repository::{
-        refresh_token_repository::RefreshTokenRepository, user_repository::UserRepository,
-    },
-    service::user_service::UserService,
+use axum::{
+    Router,
+    routing::{patch, post},
 };
+use shared::env;
+
+use crate::service::{refresh_token_service::RefreshTokenService, user_service::UserService};
 
 #[derive(Clone)]
 pub struct AppState {
     pub user_service: Arc<UserService>,
+    pub refresh_token_service: Arc<RefreshTokenService>,
 }
 
+/// Every variable this service reads, in one place.
+///
+/// One-to-one with `apps/services/user-service/.env`: if a variable is not a
+/// field here it is not read, and if it is a field here it is required. Nothing
+/// falls back to a default, because a default is a value you cannot discover by
+/// reading the `.env`.
 pub struct Config {
+    /// Where profile pictures are served from. Read only to VALIDATE: the avatar a
+    /// client sends back must be a URL media-service minted on this origin, or a
+    /// user could point their picture at any host. Same value as media-service's
+    /// MEDIA_BASE and spot-service's — see `shared::media`.
+    pub media_base: String,
+    /// This service's own database in the YugabyteDB cluster, as one URL:
+    /// `postgres://user:pass@host:5433/user`.
+    ///
+    /// Four variables became one. The database NAME in it is what keeps this
+    /// service's tables out of another's, exactly as `SURREALDB_DB` did.
+    ///
+    /// **The port is 5433, not 5432.** YSQL does not listen on the PostgreSQL
+    /// default, and a URL that says 5432 fails with an ordinary "connection refused"
+    /// that reads like the container being down.
+    pub database_url: String,
+    pub nats_url: String,
+    pub port: u16,
     pub jwt_secret: String,
+    /// Verification links only, and deliberately NOT `jwt_secret`. `JwtClaims`
+    /// carries no purpose or audience field, so a link signed with the access
+    /// token key would be accepted by `AuthedJwt` as a full session — see the
+    /// test in `shared::email_token`.
+    pub email_token_secret: String,
+    /// Minutes.
     pub jwt_expiration: i64,
+    /// Days.
     pub refresh_token_expiration: i64,
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
-    jwt_secret: std::env::var("JWT_SECRET").expect("JWT_SECRET must be set"),
-    jwt_expiration: std::env::var("JWT_EXPIRATION")
-        .expect("JWT_EXPIRATION must be set")
-        .parse()
-        .unwrap(),
-    refresh_token_expiration: std::env::var("REFRESH_TOKEN_EXPIRATION")
-        .expect("REFRESH_TOKEN_EXPIRATION must be set")
-        .parse()
-        .unwrap(),
+    media_base: env::require("MEDIA_BASE"),
+    database_url: env::require("DATABASE_URL"),
+    nats_url: env::require("NATS_URL"),
+    port: env::require_parsed("PORT"),
+    jwt_secret: env::require("JWT_SECRET"),
+    email_token_secret: env::require("EMAIL_TOKEN_SECRET"),
+    jwt_expiration: env::require_parsed("JWT_EXPIRATION"),
+    refresh_token_expiration: env::require_parsed("REFRESH_TOKEN_EXPIRATION"),
 });
 
 mod auth;
-mod projector;
 mod repository;
 mod route;
 mod service;
+
+bus::version_reader! {
+    /// The two aggregates this service stores. Anything else a client echoes back is
+    /// `Unavailable` — nothing here to wait for, so the request proceeds rather than
+    /// spending the timeout on a table this database does not have.
+    fn version_of;
+    "user" => shared::schema::user::app_user,
+    "refresh_token" => shared::schema::user::refresh_token,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
     shared::install_default_crypto_provider();
 
-    // Read user-service's own .env explicitly so the key resolves regardless of the
-    // process CWD (the workspace has several services).
+    // Local dev only: in a container the environment comes from the orchestrator
+    // and this file does not exist, so the failure is discarded. Read explicitly by
+    // path so the variables resolve regardless of the process CWD.
     dotenvy::from_filename("apps/services/user-service/.env").ok();
-    shared::check_config();
 
-    let db_addr = std::env::var("SURREALDB_ADDR").unwrap_or_else(|_| "localhost:8000".into());
-    let db = shared::db::connect(&db_addr).await?;
+    // Resolve the whole environment before anything binds a port. Without this a
+    // missing variable would surface as a panic inside the first handler that
+    // needed it, leaving a process that passes its health check and fails requests.
+    LazyLock::force(&CONFIG);
+    // Installs the origin `shared::media` mints and validates against. Beside the
+    // CONFIG force for the same reason: a missing base must stop the process, not
+    // surface as a rejected upload later.
+    shared::media::init_base(&CONFIG.media_base);
+    shared::init_jwt_decoding_key(&CONFIG.jwt_secret);
 
-    let js = bus::connect().await?;
+    let db = shared::db::connect(&CONFIG.database_url).await?;
+
+    // Schema is NOT applied here. `apps/migrator` is the only thing that migrates —
+    // one Compose one-shot in dev, one Helm hook Job in production — because
+    // diesel_migrations takes no lock around a run and `replicas: N` would race.
+    // This process assumes its database exists and is current, and fails at connect
+    // above if it does not.
+
+    // One pool for the whole process — election, relay, handlers and the await layer
+    // all share it. `PgPool` is `Arc` inside, so a clone is a refcount bump; a
+    // connection is borrowed per statement or per transaction and returned.
+    let await_db = db.clone();
+
+    let js = bus::connect(&CONFIG.nats_url).await?;
     bus::ensure_streams(&js).await?;
-    let readiness = bus::Readiness::new(
-        js.client().clone(),
-        &[
-            shared::events::STREAM_USERS,
-            shared::events::STREAM_SESSIONS,
-        ],
-    );
+    // No streams: this service projects nothing now. It writes its own rows
+    // directly, so "am I caught up" has no meaning here and `/readyz` reduces to
+    // "is NATS reachable" — which still matters, because the outbox relay needs it.
+    let readiness = bus::Readiness::new(js.client().clone(), &[]);
 
-    // Cold start only: restore the projection from the newest snapshot before the
-    // projectors begin, so replay resumes from the snapshot's cursor instead of
-    // sequence 1. A warm restart finds a non-empty projection and skips this.
-    let snapshotter = std::sync::Arc::new(
-        bus::snapshot::connect(&js, &db_addr, "user-service", vec![shared::events::STREAM_USERS, shared::events::STREAM_SESSIONS]).await?,
-    );
-    snapshotter.restore_if_empty().await?;
-    bus::snapshot::spawn(snapshotter, bus::snapshot::interval_from_env());
-    let users_applied = readiness
-        .applied_rx(shared::events::STREAM_USERS)
-        .expect("USERS registered above");
-    let sessions_applied = readiness
-        .applied_rx(shared::events::STREAM_SESSIONS)
-        .expect("SESSIONS registered above");
+    // For the outbox relay, which is now the only thing here that must run on
+    // exactly one instance. There are no projectors left to elect for: this
+    // service writes its own rows inside the request's transaction, and the event
+    // goes into `_outbox` in that same transaction.
+    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
 
-    // Two projectors, two streams, two independent consumers.
-    tokio::spawn(bus::projector::run(
-        js.clone(),
-        Arc::new(UserProjector {
-            repository: UserRepository { db: db.clone() },
-        }),
-        readiness.clone(),
-    ));
-    tokio::spawn(bus::projector::run(
-        js.clone(),
-        Arc::new(SessionProjector {
-            repository: RefreshTokenRepository { db: db.clone() },
-        }),
-        readiness.clone(),
-    ));
+    // Carries every USERS and SESSIONS event this service commits. No longer
+    // scaffolding — this is the only path by which those events reach NATS.
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
 
     let state = AppState {
-        user_service: Arc::new(UserService {
-            user_repository: UserRepository { db: db.clone() },
-            refresh_token_repository: RefreshTokenRepository { db },
-            js,
-            users_applied,
-            sessions_applied,
-        }),
+        user_service: Arc::new(UserService { db: db.clone() }),
+        refresh_token_service: Arc::new(RefreshTokenService { db }),
     };
 
     let api_router = Router::new()
         .route("/api/user/login", post(route::login::login))
         .route("/api/user/signup", post(route::signup::signup))
-        .route("/api/user/refresh/logout", post(route::logout::logout))
-        .route("/api/user/refresh", post(route::refresh::refresh));
+        // Both under `auth::cookie::SESSION_PATH`, which is what the refresh-token
+        // cookie is scoped to — that scoping is the reason they share a prefix
+        // rather than sitting beside `login`. See `auth::cookie`.
+        .route("/api/user/session/refresh", post(route::refresh::refresh))
+        .route("/api/user/session/logout", post(route::logout::logout))
+        // Both unauthenticated: the token in the link is the credential, and a
+        // user who cannot log in yet is exactly who needs these.
+        .route("/api/user/email/verify", post(route::email::verify))
+        .route("/api/user/email/resend", post(route::email::resend))
+        // The authenticated user themselves — which one is the JWT's business, so
+        // there is no id in the path and nothing to scope under.
+        // PATCH is also the change-password form: same record, and the service
+        // decides from the body which event that becomes.
+        .route("/api/user", patch(route::user::update_user));
 
     // No GraphQL proxy here any more: every client read is served by
     // view-service from the combined projection. This database is private to
@@ -115,13 +154,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let app = Router::new()
         .merge(api_router)
+        // On the API only, and before health is merged: `/readyz` reporting how far
+        // behind a projector is must never itself wait for that projector.
+        // Waits on the aggregate versions a client echoes back, against this
+        // service's own database — see `bus::await_version`.
+        .layer(axum::middleware::from_fn_with_state(
+            bus::AwaitVersions(await_db, version_of),
+            bus::await_version::await_version,
+        ))
+        // After the layer, deliberately — a backfill is not a client read and has
+        // no version to wait on. Not under `/api` either, which is what keeps it
+        // off the ingress; see `route::user::backfill`.
+        .route("/internal/backfill", post(route::user::backfill))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 
-    // run our app with hyper, listening globally on port 3000
-    // PORT is overridable so several instances can run on one host — needed to
-    // test that independent projections converge on the same log.
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".into());
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
-    Ok(axum::serve(listener, app).await.unwrap())
+    // PORT differs per service in local dev so several can run on one host — which
+    // is also how you test that independent projections converge on the same log.
+    // Containerised, every service listens on 80 and is told apart by its Service.
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", CONFIG.port)).await?;
+    tracing::info!(port = CONFIG.port, "user-service listening");
+    Ok(axum::serve(listener, app).await?)
 }

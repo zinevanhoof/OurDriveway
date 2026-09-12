@@ -1,0 +1,67 @@
+# Single origin for every client: browser, tauri desktop, tauri android.
+# Serving the SPA and the API from one origin is what keeps requests same-origin,
+# so the SameSite=Strict refresh cookie works and no CORS is needed anywhere.
+#
+# ponytail: plain HTTP on the LAN. Upgrade path is `tls internal` (or a real domain
+# + ACME), which also unblocks Android release builds — they block cleartext. Bare
+# `:80` avoids auto-HTTPS and doesn't hardcode the IP.
+#
+# Same /readyz health checks as apps/frontend/Caddyfile — see the note there.
+(api_upstream) {
+	health_uri /readyz
+	health_interval 5s
+	health_timeout 2s
+}
+
+:80 {
+	handle /api/view/* {
+		reverse_proxy localhost:3003 {
+			import api_upstream
+		}
+	}
+	# Glob without the slash, like /api/booking* below: `PATCH /api/user` is a real
+	# route (the authenticated user), and /api/user/* would not match it — the
+	# request would fall through to the SPA and answer HTML.
+	handle /api/user* {
+		reverse_proxy localhost:3000 {
+			import api_upstream
+		}
+	}
+	handle /api/spot/* {
+		reverse_proxy localhost:3002 {
+			import api_upstream
+		}
+	}
+	handle /api/booking* {
+		reverse_proxy localhost:3001 {
+			import api_upstream
+		}
+	}
+	# Glob without the slash, like /api/booking* above: the routes are /api/payment/…
+	# but a bare /api/payment must not fall through to the SPA either.
+	#
+	# Note that Stripe's webhook does NOT arrive through here. The stripe-cli container
+	# forwards straight to localhost:3006, bypassing this proxy on purpose — the
+	# api_upstream health check answers 502 while a service is still replaying the log,
+	# and a webhook bounced for that reason would be retried by Stripe rather than
+	# handled.
+	handle /api/payment* {
+		reverse_proxy localhost:3006 {
+			import api_upstream
+		}
+	}
+	# media-service mints presigned R2 upload URLs. It holds no state, so unlike
+	# the others its /readyz answers immediately — the shared health check still
+	# applies, it just never has a replay to wait through.
+	handle /api/media/* {
+		reverse_proxy localhost:3004 {
+			import api_upstream
+		}
+	}
+
+	handle {
+		root * /srv/dist
+		try_files {path} /index.html
+		file_server
+	}
+}

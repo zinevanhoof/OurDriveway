@@ -1,0 +1,19 @@
+[package]
+name = "media-service"
+version = "0.1.0"
+edition.workspace = true
+
+# No `bus` and no `surrealdb`: this service owns no state and consumes no events.
+# It hands out presigned URLs and nothing else, which is the entire reason it is
+# not part of spot-service.
+[dependencies]
+aws-sdk-s3 = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+dotenvy = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+shared = { path = "../../../shared" }

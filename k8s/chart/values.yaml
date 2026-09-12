@@ -1,0 +1,215 @@
+# The backends differ in some extra env and in which of two dependencies they
+# have. Everything else about them is identical, so they are data here and one
+# template in templates/services.yaml — not five near-copies that drift the first
+# time a probe changes.
+registry: ghcr.io/zinevanhoof
+
+# Every service listens on 80 in a container. Locally they need distinct ports to
+# share one host (3000-3004, in each service's .env); here each one has its own
+# Service and DNS name, so there is nothing left to disambiguate.
+port: 80
+
+# Overridden per-environment by values-local.yaml / values-prod.yaml. Set this to
+# a commit sha to pin a release or a rollback.
+tag: latest
+
+# Kubernetes defaults this to Always whenever the tag is `latest`, which is right
+# for a deployed environment and wrong on a laptop: it would re-pull the last
+# image CI published and quietly discard the one you just built and imported into
+# k3d. values-local.yaml sets IfNotPresent for exactly that reason.
+imagePullPolicy: Always
+
+# Where uploaded images are SERVED from — not S3_ENDPOINT, which is the R2 API.
+#
+# One value, aliased into the three services that need it, because they must agree
+# byte for byte: media mints image URLs on this origin, spot and user validate that a
+# client-submitted image is on it. A mismatch rejects every upload on the way back in.
+# An anchor rather than three copies precisely because "these must be identical" is a
+# correctness requirement, not a convention.
+#
+# Must also be reachable FROM STRIPE, not just from a browser: listing photos go onto a
+# Checkout Session and Stripe may fetch them server-side.
+mediaBase: &mediaBase https://images.ourdriveway.example.com
+
+# SECONDS. How long after a booking ends its money counts as settled — one day.
+#
+# Aliased into two services for the same reason as mediaBase: they must agree. payment
+# decides what `POST /api/payment/payout` actually hands over; view decides what the
+# wallet SHOWS as available rather than pending. Two different numbers means a balance
+# that offers money the withdraw endpoint refuses, or hides money it would have paid.
+#
+# A renter cannot cancel inside an hour of the start and the host-side withdrawal only
+# touches bookings that haven't ended, so a confirmed booking with a past `ends_at` is
+# already safe to pay out today. This is the margin that keeps it safe if those rules
+# are ever relaxed. Both `.env` files set 0 so a payout is testable locally without
+# waiting a day.
+settlementSecs: &settlementSecs "86400"
+
+# Keys are load-bearing three times over: the image is
+# ourdriveway-<name>-service, the database name is <name> (and so is its directory
+# under migrations/, which the migrator embeds), and the ingress path is /api/<name>.
+# Rename one and all three follow.
+services:
+  user:
+    env:
+      # Validates that a submitted avatar is on our origin.
+      MEDIA_BASE: *mediaBase
+      # MINUTES — user_service.rs does Duration::minutes on this.
+      JWT_EXPIRATION: "15"
+      # DAYS — Duration::days.
+      REFRESH_TOKEN_EXPIRATION: "15"
+  booking: {}
+  spot:
+    env:
+      # Validates that a host's submitted listing photos are on our origin — without
+      # it a listing could point its photos at any host. See shared/src/media.rs.
+      MEDIA_BASE: *mediaBase
+  view:
+    env:
+      # The read side of the same rule — see the anchor above. This one decides whether
+      # the wallet calls a host's income available or pending.
+      SETTLEMENT_SECS: *settlementSecs
+  payment:
+    env:
+      # The write side: what a withdrawal actually pays out. Not secret and better off
+      # visible in review; the Stripe keys come from secrets.env instead.
+      SETTLEMENT_SECS: *settlementSecs
+  # The one service that talks to neither a database nor the broker: it mints
+  # presigned R2 upload URLs and holds nothing at all. Both flags off strips the
+  # SurrealDB env, the schema and both init containers — see
+  # templates/services.yaml.
+  media:
+    db: false
+    nats: false
+    env:
+      # Not secret, and visible in review where it belongs. The credentials for
+      # this bucket come from secrets.env instead.
+      # The origin this service stamps onto every URL it mints. Distinct from
+      # S3_ENDPOINT above: that is where bytes are PUT, this is where they are read.
+      MEDIA_BASE: *mediaBase
+      S3_ENDPOINT: https://REPLACE-ME.r2.cloudflarestorage.com
+      S3_BUCKET: ourdriveway
+      # R2 has one region and it is called `auto`. Still signed, so it must match.
+      S3_REGION: auto
+      # Seconds a minted upload URL stays usable.
+      PRESIGN_EXPIRY_SECS: "900"
+      # Per-image ceiling in bytes (20 MiB), signed into the URL so it holds no
+      # matter what is proxying in front of the service.
+      MAX_UPLOAD_BYTES: "20971520"
+  # No database like media, but it does consume the log — its consumer cursor
+  # lives in NATS rather than in a projection, which is why it needs no SurrealDB
+  # and no schema. `api: false` keeps it off the ingress: it exposes only /healthz
+  # and /readyz, so there is nothing outside the cluster should be able to reach.
+  notification:
+    db: false
+    api: false
+    env:
+      # Not secret and better off visible in review. RESEND_API_KEY and
+      # EMAIL_TOKEN_SECRET come from secrets.env instead.
+      #
+      # Master switch. "false" keeps the pod running and consuming — it just sends
+      # nothing. Quoted like VERIFY_TOKEN_TTL_SECS below: the template renders every
+      # value through `| quote`, so a bare YAML bool would work too, but writing the
+      # string makes it obvious this reaches Rust as text that must read exactly
+      # `true` or `false`.
+      NOTIFICATIONS_ENABLED: "true"
+      MAIL_FROM: OurDriveway <noreply@mail.ourdriveway.com>
+      APP_BASE_URL: https://ourdriveway.com
+      COMPANY_NAME: OurDriveway
+      # 24h. Long enough to survive a night's sleep, short enough that a link left
+      # in an old inbox goes stale.
+      VERIFY_TOKEN_TTL_SECS: "86400"
+      # Resend template alias, not the UUID — it survives editing the template.
+      TEMPLATE_EMAIL_VERIFICATION: email-verification
+
+replicas: 1
+
+# The authoritative store — see templates/yugabyte.yaml.
+#
+# This one block replaced three: a `surrealdb` query engine, a `tikv` store under it,
+# and a `pd` placement driver under that. And a `curlImage`, which existed because the
+# distroless SurrealDB image had no shell to run the schema-import loop in, and because
+# PD and TiKV had no app image to borrow for their init containers.
+#
+# `storage` is the one thing in this chart whose loss is data loss rather than a
+# rebuild. Everything else derives from it: every service database, the read model, and
+# the seven days of events in NATS.
+yugabyte:
+  # **>= 2025.2, and started through `yugabyted`.** That pair is what enables Read
+  # Committed, which booking-service's reserve path depends on to not double-book —
+  # see the header of templates/yugabyte.yaml. This is a correctness constraint, not a
+  # preference. Keep it in step with docker/docker-compose-dev.yml.
+  image: yugabytedb/yugabyte:2026.1.1.2-b9
+  storage: 20Gi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+  # Untuned, a tserver sizes itself to the node — right on a node it does not share,
+  # wrong on a k3d cluster sharing a laptop with a cargo build. `values-local.yaml`
+  # overrides these; production leaves them empty and lets it have the machine.
+  tserverFlags: ""
+  masterFlags: ""
+  # No `replicas` key, deliberately. This template is single-node — multi-node needs
+  # `--join` and a replication factor, which is a different template, and a knob here
+  # would make three replicas look like a supported option when it is not.
+
+# Created outside this chart, by deploy.sh, from the gitignored k8s/secrets.env.
+# Deliberately not templated: Helm stores every rendered value in the release
+# secret and prints them back with `helm get values`, so a chart is a poor place
+# to put a signing key — and the database password is now in there too, as
+# YSQL_PASSWORD. Rotating it needs a `kubectl rollout restart`.
+#
+# The NAME still has to be here, though — `secretKeyRef.name` and `secretRef.name`
+# in services.yaml, yugabyte.yaml and migrator-job.yaml all read it, and while this
+# key was missing they rendered an empty name and every pod failed admission. It must
+# match the secret deploy.sh creates.
+secretName: app-secrets
+
+frontend:
+  # Caddy serving the built SPA and nothing else — all routing lives in the
+  # Ingress now. Tauri builds ignore this entirely; they ship the SPA locally.
+  replicas: 1
+
+ingress:
+  # Traefik, because k3s ships it: one less thing to install on the VPS, and the
+  # local cluster can run the same controller as production.
+  #
+  # It is also the surviving option. `kubernetes-sigs/ingress-nginx` was retired
+  # and the GitHub repository now 404s — its Helm index is still served, but that
+  # is not something to build on.
+  className: traefik
+  # Controller-specific annotations, if you ever need any. Deliberately empty:
+  # this app's only such dependency was nginx's proxy-body-size, and nothing
+  # image-sized passes through the ingress at all any more — the browser PUTs
+  # photos straight to R2, capped by a signature media-service mints.
+  annotations: {}
+  # One host for the SPA and the API. Not cosmetic: the refresh cookie is
+  # SameSite=Strict, so the moment /api lives on another origin, login breaks.
+  host: ourdriveway.local
+  tls:
+    enabled: false
+    secretName: ourdriveway-tls
+
+# Subchart values. `helm show values nats/nats` is the authority if these keys
+# ever move.
+nats:
+  # A `nats` CLI in a Deployment that runs `sleep infinity`, plus its own Secret.
+  # Purely a debug shell for poking at streams by hand; nothing in the data path
+  # touches it, and `kubectl run --rm -it --image=natsio/nats-box` gets you the
+  # same thing on the rare occasion you want it.
+  natsBox:
+    enabled: false
+
+  config:
+    jetstream:
+      enabled: true
+      # The one PVC in the whole deployment. Everything else is rebuilt from it.
+      fileStore:
+        enabled: true
+        pvc:
+          size: 5Gi
+    cluster:
+      # One node. Three (odd, for quorum) the day losing this pod means losing
+      # data rather than taking an outage.
+      enabled: false

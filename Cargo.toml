@@ -4,6 +4,10 @@ members = [
     "apps/services/booking-service",
     "apps/services/spot-service",
     "apps/services/view-service",
+    "apps/services/media-service",
+    "apps/services/notification-service",
+    "apps/services/payment-service",
+    "apps/migrator",
     "bus",
     "shared"
 ]
@@ -19,24 +23,71 @@ resolver = "2"
 edition = "2024"
 
 [workspace.dependencies]
-axum = { version = "0.8.9", features = ["macros", "multipart"] }
-tower-http = { version = "0.7.0", features = ["fs"] }
+axum = { version = "0.8.9", features = ["macros"] }
 tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-# protocol-http is on top of the default protocol-ws: the app talks WebSocket,
-# but export/import (snapshots) are HTTP-engine only.
-surrealdb = { version = "3.2.1", features = ["protocol-http"] }
+# sqlx is gone. It was replaced by diesel + diesel-async in one pass; the ledger it
+# owned (`_sqlx_migrations`) went with it, so the databases were wiped once at cutover
+# — see `diesel-migration.md`.
+#
+# `postgres_backend` and NOT `postgres`. The `postgres` feature pulls pq-sys, which links
+# libpq — and under `resolver = "2"` that feature unifies across every package built
+# together, so ONE crate asking for it would put libpq in all seven service binaries and
+# force `libpq5` into all seven images. diesel-async speaks the wire protocol through
+# tokio-postgres, so only the backend's SQL and type layer is needed here.
+#
+# TLS is deliberately absent: k8s/chart/templates/services.yaml connects with no
+# `sslmode`, so tokio-postgres uses NoTls. The aws-lc-rs rustls provider that
+# `shared::install_default_crypto_provider` installs stays for outbound HTTPS (Stripe,
+# Resend, R2) and jsonwebtoken only.
+diesel = { version = "2.3.13", default-features = false, features = [
+    "postgres_backend",
+    "uuid",
+    "chrono",
+    "serde_json",
+    "32-column-tables",
+] }
+# `migrations` pulls diesel_migrations + async-connection-wrapper and, importantly, does
+# NOT enable `diesel/postgres` — which is what lets the migrator run migrations without
+# dragging libpq into the workspace per the note above.
+diesel-async = { version = "0.7", features = [
+    "postgres",
+    "bb8",
+    "async-connection-wrapper",
+    "migrations",
+] }
+diesel_migrations = "2.3"
+# The replacement for `#[sqlx(json)]`. `Json<T>` is `#[serde(transparent)]` with `Deref`,
+# so the wire format is unchanged, and its `from_sql` decodes through `serde_json::Value`
+# and propagates the real serde error — which is what tells a stalled projector WHICH
+# field failed to decode.
+diesel_json = "0.3"
 rustls = "0.23"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 thiserror = "2.0.18"
 axum-extra = { version = "0.12.6", features = ["typed-header", "cookie"] }
 cookie = "0.18.1"
-axum-reverse-proxy = "1.3.0"
+# `axum-reverse-proxy` is gone with the GraphQL endpoint it fronted. view-service used
+# it to forward /api/view/graphql to SurrealDB with the client's own Authorization
+# header, so the browser got a RECORD identity and the schema's PERMISSIONS clauses did
+# the authorizing. Those reads are ordinary handlers now.
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
-chrono = "0.4.45"
-uuid = { version = "1.23.4", features = ["v4", "v5", "v7"] }
+# `serde` is explicit now and must stay so. It used to arrive for free through
+# surrealdb, which depends on chrono-with-serde — so every `#[derive(Serialize)]` on a
+# struct holding a DateTime compiled only because of a dependency that never mentioned
+# it. Removing surrealdb broke 26 derives across `shared` and pointed straight at it.
+chrono = { version = "0.4.45", features = ["serde"] }
+# IANA name -> offset, which is the opposite of what tzf-rs below does (point ->
+# name). `booked` is bare local wall-clock strings, so a cancel deadline computed
+# without this is off by the spot's whole UTC offset — two hours in Brussels in
+# summer. chrono alone ships no tz database, and iana-time-zone only ever answers
+# for the *host*, which must not decide a renter's deadline.
+chrono-tz = "0.10"
+# `serde` for the same reason as chrono above: it rode in on surrealdb, and 130
+# derives across the events and domain models depended on it without saying so.
+uuid = { version = "1.23.4", features = ["v4", "v5", "v7", "serde"] }
 dotenvy = "0.15.7"
 reqwest = { version = "0.13.4", features = ["json", "query"] }
 geo = "=0.32.0"
@@ -49,3 +100,102 @@ sha2 = "0.10.9"
 hex = "0.4.3"
 bytes = "1.12.0"
 tokio-util = { version = "0.7.18", features = ["io"] }
+# media-service only. Presigning is a local computation, but the SDK still wants a
+# client to hang it off, so the default HTTP stack comes along — it shares the
+# aws-lc-rs rustls provider the rest of the workspace already installs.
+aws-sdk-s3 = "1.141.0"
+# notification-service only. Thin wrapper over one POST, but it carries the
+# idempotency-key and template plumbing that would otherwise be hand-rolled
+# against a JSON shape with no compiler checking it.
+#
+# default-features = false is not optional: the crate defaults to `native-tls`,
+# which links OpenSSL. That drags a system library into an image built on
+# distroless and splits the workspace across two TLS stacks — everything else
+# here runs on rustls with the aws-lc-rs provider that
+# `shared::install_default_crypto_provider` installs.
+resend-rs = { version = "0.29.0", default-features = false, features = ["rustls-tls"] }
+
+# payment-service only. Chosen over hand-rolling reqwest for one reason: the webhook
+# signature verifier in async-stripe-webhook. That is a trust boundary — it is what
+# stands between "Stripe says this was paid" and "anyone who can POST to us says so" —
+# and the HMAC, the timestamp tolerance and the typed event dispatch are not worth
+# owning to save four HTTP calls.
+#
+# Pinned with `=`, because 1.0 is still a release candidate and a floating
+# pre-release requirement would move the API underneath us between builds.
+#
+# `default-features = false` is not optional, same as resend-rs above and for the same
+# reason: this crate's `default` is `default-tls`, which pulls hyper-tls -> native-tls
+# -> openssl-sys. Adding a rustls feature does NOT displace it — features are additive,
+# so without this line the build links OpenSSL *and* rustls and the workspace ends up
+# on two TLS stacks. Verified: dropping `default-features = false` adds openssl,
+# openssl-sys, tokio-native-tls, pkg-config and vcpkg to the lock.
+#
+# Two rustls features, because they answer different questions and neither implies the
+# other:
+#   rustls-tls-native  where root certificates come from — the ca-certificates that
+#                      payment-service's Dockerfile installs, as notification-service
+#                      already relies on for Resend.
+#   rustls-aws-lc-rs   which crypto provider backs rustls. Must be aws-lc-rs to match
+#                      `shared::install_default_crypto_provider` and jsonwebtoken's
+#                      `aws_lc_rs`; letting it default to ring would put two providers
+#                      in one process.
+#
+# The 1.0 line splits resources into companion crates, so only payment_intent and
+# refund are compiled here. The 0.41 stable line is one crate carrying the entire
+# Stripe API surface, which on this workspace is the cost CLAUDE.md exists to avoid.
+#
+# `redact-generated-debug` keeps a stray `tracing::debug!("{intent:?}")` in a money
+# path from printing card and customer detail into the log. Set on every crate that
+# offers it — the derives it suppresses are spread across all three.
+async-stripe = { version = "=1.0.0-rc.8", default-features = false, features = [
+    "rustls-tls-native",
+    "rustls-aws-lc-rs",
+] }
+async-stripe-core = { version = "=1.0.0-rc.8", features = [
+    "payment_intent",
+    "refund",
+    "serialize",
+    "deserialize",
+    "redact-generated-debug",
+] }
+# Checkout Sessions with `ui_mode: elements` — the session is what the browser mounts a
+# Payment Element against, and its id is what voids an unpaid checkout. `payment_intent`
+# above is still needed: the session's intent is what a refund is issued against
+# (CreateRefund takes an intent or a charge, never a session), and it is the intent that
+# emits the webhook we confirm bookings on.
+async-stripe-checkout = { version = "=1.0.0-rc.8", features = [
+    "checkout_session",
+    "serialize",
+    "deserialize",
+    "redact-generated-debug",
+] }
+# Connect: the host side of the money. `account` + `account_session` are onboarding —
+# an Express account per host and the short-lived secret its embedded components mount
+# against — and `transfer` is the withdrawal itself, platform balance to connected
+# account. `external_account` is only for the bank's last four digits on the withdraw
+# screen's summary line.
+#
+# `account_link` is deliberately ABSENT. It is the hosted-redirect alternative to the
+# embedded components, and carrying both would be two onboarding flows to keep in step.
+async-stripe-connect = { version = "=1.0.0-rc.8", features = [
+    "account",
+    "account_session",
+    "external_account",
+    "transfer",
+    "serialize",
+    "deserialize",
+    "redact-generated-debug",
+] }
+# `async-stripe-core` here is an optional *dependency* exposed as a feature: without it
+# the crate can parse an event envelope but not the PaymentIntent inside it, which is
+# the only part we actually read.
+async-stripe-webhook = { version = "=1.0.0-rc.8", features = [
+    "async-stripe-core",
+    "deserialize",
+    "redact-generated-debug",
+] }
+# Only for `Currency`, which `CreatePaymentIntent::new` takes and which neither
+# async-stripe nor async-stripe-core re-exports. Already in the tree as a transitive
+# dep of both, so naming it compiles nothing new.
+async-stripe-types = "=1.0.0-rc.8"

@@ -1,342 +1,203 @@
 use chrono::{DateTime, Utc};
-use shared::{
-    error::myerror::MyResult,
-    events::{
-        Envelope,
-        booking::{BookingEvent, BookingReserved, ReleaseReason},
-        spot::{SpotCreated, SpotEvent, SpotUpdated},
-        user::record_key,
-    },
-    general_models::booking::{Booked, BookingRow, fold_booked},
-    general_models::spot::Availability,
-};
-use serde::Deserialize;
-use surrealdb::{
-    Surreal,
-    engine::remote::ws::Client,
-    types::{Datetime, SurrealValue},
-};
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::domain_models::booking::Booking;
+use shared::error::myerror::MyResult;
+use shared::general_models::booking::Booked;
+use shared::schema::booking::booking;
 use uuid::Uuid;
 
-/// The **only** writer to this database. Request handlers publish to NATS and
-/// return; everything that lands here arrives via a projector.
-pub struct BookingRepository {
-    pub db: Surreal<Client>,
-}
-
-/// Everything reserve needs, in one point read.
-#[derive(Debug, Deserialize, SurrealValue)]
-pub struct SpotForBooking {
-    pub owner_id: Option<String>,
-    pub shard: Option<String>,
-    pub price_per_hour: Option<i64>,
-    pub availability: Option<Availability>,
-    pub active: bool,
-    pub booked: Booked,
-    /// Stream sequence of the last BOOKINGS event applied for this spot — the
-    /// value reserve asserts as `Nats-Expected-Last-Subject-Sequence`.
-    pub bookings_seq: u64,
-}
-
-/// A booking as confirm, release, and reserve's lost-ack recovery need it.
-#[derive(Debug, Deserialize, SurrealValue)]
-pub struct BookingForUpdate {
-    pub spot_id: String,
-    pub spot_shard: String,
-    pub renter_id: String,
-    pub status: String,
-    pub booked: Booked,
-    pub amount: i64,
-    pub hold_until: Option<DateTime<Utc>>,
-}
-
-/// A lapsed hold the sweeper is about to release.
-#[derive(Debug, Deserialize, SurrealValue)]
-pub struct LapsedHold {
-    /// Bare uuid, not a `RecordId` — the sweeper parses it straight back into a
-    /// `Uuid` for the event, and the table name would only be in the way.
-    pub id: String,
-    pub spot_id: String,
-    pub spot_shard: String,
-}
+/// The `booking` table.
+///
+/// Six statements: the point read, the write, one conditional transition, and three
+/// range scans — what blocks a spot, what has lapsed, and what is still owed on a
+/// spot.
+pub struct BookingRepository;
 
 impl BookingRepository {
-    pub async fn last_seq(&self, stream: &str) -> MyResult<u64> {
-        let seq: Option<i64> = self
-            .db
-            .query("SELECT VALUE last_seq FROM ONLY type::record('_projection', $s)")
-            .bind(("s", stream.to_string()))
-            .await?
-            .take(0)?;
-        Ok(seq.unwrap_or(0).max(0) as u64)
-    }
-
-    // ─── reads ──────────────────────────────────────────────────────────────
-
-    pub async fn spot_for_booking(&self, spot_id: &str) -> MyResult<Option<SpotForBooking>> {
-        Ok(self
-            .db
-            .query(
-                // `?? {}` / `?? 0` rather than trusting the schema DEFAULTs: a row
-                // created by the BOOKINGS-first ordering, or one written before
-                // these fields existed, has neither, and NONE won't deserialize.
-                "SELECT owner_id, shard, price_per_hour, availability, active,
-                        booked ?? {} AS booked, bookings_seq ?? 0 AS bookings_seq
-                 FROM ONLY type::record('spot', $id)",
-            )
-            .bind(("id", spot_id.to_string()))
-            .await?
-            .take(0)?)
-    }
-
-    pub async fn booking_for_update(&self, booking_id: &str) -> MyResult<Option<BookingForUpdate>> {
-        Ok(self
-            .db
-            .query(
-                "SELECT spot_id, spot_shard, renter_id, status, booked, amount, hold_until
-                 FROM ONLY type::record('booking', $id)",
-            )
-            .bind(("id", booking_id.to_string()))
-            .await?
-            .take(0)?)
-    }
-
-    /// Holds whose expiry has passed. The sweeper's entire query.
-    pub async fn lapsed_holds(&self, limit: usize) -> MyResult<Vec<LapsedHold>> {
-        Ok(self
-            .db
-            .query(
-                "SELECT record::id(id) AS id, spot_id, spot_shard FROM booking
-                 WHERE status = 'reserved' AND hold_until < time::now()
-                 LIMIT $limit",
-            )
-            .bind(("limit", limit as i64))
-            .await?
-            .take(0)?)
-    }
-
-    // ─── SPOTS projection ───────────────────────────────────────────────────
-
-    pub async fn apply_spot(&self, envelope: Envelope<SpotEvent>, seq: u64) -> MyResult<()> {
-        let at = envelope.occurred_at;
-        match envelope.payload {
-            SpotEvent::Created(e) => self.spot_created(e, at, seq).await,
-            SpotEvent::Updated(e) => self.spot_updated(e, at, seq).await,
-            SpotEvent::Deactivated { spot_id } => self.spot_deactivated(spot_id, at, seq).await,
-        }
-    }
-
-    async fn spot_created(
-        &self,
-        e: SpotCreated,
-        at: DateTime<Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        // MERGE, never CONTENT. CONTENT replaces the whole record body with the
-        // listed keys, which would wipe `booked` and `bookings_seq` — the SPOTS and
-        // BOOKINGS projectors advance independently, so on any cold rebuild this
-        // event can land after bookings for the same spot have already applied.
-        self.db
-            .query(
-                "BEGIN;
-                 UPSERT type::record('spot', $id) MERGE {
-                     owner_id: $owner_id, shard: $shard, price_per_hour: $price,
-                     availability: $availability, timezone: $timezone, active: true
-                 };
-                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", record_key(&e.spot_id)))
-            .bind(("owner_id", e.owner_id))
-            .bind(("shard", e.shard))
-            .bind(("price", e.price_per_hour_cents))
-            .bind(("availability", e.availability))
-            .bind(("timezone", e.timezone))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    async fn spot_updated(&self, e: SpotUpdated, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
-        // `??` keeps the existing value when the event field is None: absent means
-        // "unchanged", not "clear".
-        self.db
-            .query(
-                "BEGIN;
-                 UPSERT type::record('spot', $id) SET
-                     price_per_hour = $price        ?? price_per_hour,
-                     availability   = $availability ?? availability;
-                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", record_key(&e.spot_id)))
-            .bind(("price", e.price_per_hour_cents))
-            .bind(("availability", e.availability))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    async fn spot_deactivated(&self, spot_id: Uuid, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPSERT type::record('spot', $id) SET active = false;
-                 UPSERT _projection:SPOTS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", record_key(&spot_id)))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    // ─── BOOKINGS projection ────────────────────────────────────────────────
-
-    pub async fn apply_booking(&self, envelope: Envelope<BookingEvent>, seq: u64) -> MyResult<()> {
-        let at = envelope.occurred_at;
-        match envelope.payload {
-            BookingEvent::Reserved(e) => self.reserved(e, at, seq).await,
-            BookingEvent::Confirmed { booking_id } => self.confirmed(booking_id, at, seq).await,
-            BookingEvent::Released { booking_id, reason } => {
-                self.released(booking_id, reason, at, seq).await
-            }
-        }
-    }
-
-    async fn reserved(&self, e: BookingReserved, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
-        let spot_id = record_key(&e.spot_id);
-        self.db
-            .query(
-                "UPSERT type::record('booking', $id) CONTENT {
-                     spot_id: $spot_id, spot_shard: $spot_shard, owner_id: $owner_id,
-                     renter_id: $renter_id, booked: $booked, amount: $amount,
-                     status: 'reserved', hold_until: $expires_at, created_at: $at
-                 };",
-            )
-            .bind(("id", record_key(&e.booking_id)))
-            .bind(("spot_id", spot_id.clone()))
-            .bind(("spot_shard", e.spot_shard))
-            .bind(("owner_id", e.owner_id))
-            .bind(("renter_id", e.renter_id))
-            .bind(("booked", e.booked))
-            .bind(("amount", e.amount_cents))
-            .bind(("expires_at", Datetime::from(e.expires_at)))
-            .bind(("at", Datetime::from(at)))
-            .await?
-            .check()?;
-        self.refold(&spot_id, at, seq).await
-    }
-
-    async fn confirmed(&self, booking_id: Uuid, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
-        // Scoped to 'reserved' so a duplicate delivery can't resurrect a booking
-        // that was since released.
-        let spot_id = self
-            .status_transition(booking_id, "confirmed", &["reserved"], None)
-            .await?;
-        self.refold_opt(spot_id, at, seq).await
-    }
-
-    async fn released(
-        &self,
+    /// `SELECT *`. `spot_id` stays a plain uuid: the spot table is in another
+    /// service's database and could never be dereferenced from here.
+    pub async fn find_by_id(
+        conn: &mut AsyncPgConnection,
         booking_id: Uuid,
-        reason: ReleaseReason,
-        at: DateTime<Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        // Only a *reserved* booking can be released. A payment landing microseconds
-        // before the hold lapses, with the sweeper's event arriving second, must not
-        // undo the confirmation — this WHERE clause is the whole guard.
-        let spot_id = self
-            .status_transition(booking_id, "released", &["reserved"], Some(reason.as_str()))
-            .await?;
-        self.refold_opt(spot_id, at, seq).await
+    ) -> MyResult<Option<Booking>> {
+        Ok(booking::table
+            .find(booking_id)
+            .select(Booking::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
-    /// Moves a booking to `to` only if it is currently in one of `from`, returning
-    /// its spot id when the transition applied.
-    async fn status_transition(
-        &self,
+    /// Every booking, for `BookingService::backfill`.
+    ///
+    /// ponytail: reads the whole table into memory in one pass, and this is the table
+    /// most likely to be the one that outgrows it. Page on `id` — `WHERE id > $after
+    /// ORDER BY id LIMIT $n` — when it does.
+    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<Booking>> {
+        Ok(booking::table
+            .select(Booking::as_select())
+            .load(conn)
+            .await?)
+    }
+
+    /// Insert-or-replace the whole row, keyed by its own id.
+    ///
+    /// Idempotent by construction, which is what lets a projector replay the same
+    /// event. Every column of this table is owned by the BOOKINGS stream, so there is
+    /// nothing for a whole-row write to erase.
+    pub async fn upsert(conn: &mut AsyncPgConnection, row: Booking) -> MyResult<()> {
+        diesel::insert_into(booking::table)
+            .values(row.clone())
+            .on_conflict(booking::id)
+            .do_update()
+            .set(row)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Moves a booking to `to` only if it is currently in one of `from`.
+    ///
+    /// The whole value here is the `WHERE` — a payment landing microseconds before a
+    /// hold lapses, with the sweeper's event arriving second, must not undo the
+    /// confirmation. Matching nothing is a legitimate no-op, not an error.
+    ///
+    /// **Returns nothing, and used to return the spot id.** That was a second
+    /// statement, deliberately run whether or not the guard applied, because the
+    /// caller needed the spot to advance its compare-and-swap cursor — and skipping
+    /// the advance on a refused transition would leave the subject head permanently
+    /// ahead of the cursor, refusing every later reserve on that spot. The cursor is
+    /// gone (see `SpotMirrorRepository`), no caller ever read the value, and the
+    /// second statement went with it.
+    ///
+    /// The two reasons are separate columns, not one: `release_reason` says why a
+    /// *hold* ended, `cancel_reason` says who withdrew a *paid* booking. Only ever one
+    /// is `Some`, but collapsing them would leave a renter's history unable to tell
+    /// "your hold ran out" from "the host pulled the listing".
+    pub async fn transition(
+        conn: &mut AsyncPgConnection,
         booking_id: Uuid,
         to: &str,
         from: &[&str],
-        reason: Option<&str>,
-    ) -> MyResult<Option<String>> {
-        let spot_id: Option<String> = self
-            .db
-            .query(
-                "UPDATE type::record('booking', $id) SET
-                     status = $to,
-                     hold_until = NONE,
-                     release_reason = $reason ?? release_reason
-                 WHERE status IN $from
-                 RETURN VALUE spot_id;",
-            )
-            .bind(("id", record_key(&booking_id)))
-            .bind(("to", to.to_string()))
-            .bind(("from", from.iter().map(|s| s.to_string()).collect::<Vec<_>>()))
-            .bind(("reason", reason.map(str::to_string)))
-            .await?
-            .take(0)?;
-        Ok(spot_id)
+        release: Option<&str>,
+        cancel: Option<&str>,
+    ) -> MyResult<()> {
+        // `.eq_any` rather than an `IN` list built by hand: the set is a parameter, so
+        // there is no string to assemble and no arity to get wrong.
+        //
+        // `hold_until` is assigned NULL unconditionally — a clear, which an
+        // absent-is-unchanged patch cannot express — so this is written as explicit
+        // column assignments rather than through an `AsChangeset` struct.
+        diesel::update(booking::table.find(booking_id).filter(
+            booking::status.eq_any(from.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+        ))
+        .set((
+            booking::status.eq(to),
+            booking::hold_until.eq(None::<DateTime<Utc>>),
+            // `None` here means "leave the existing reason alone" rather than "clear
+            // it" — only one of the two is ever set. Diesel skips a `None` element of a
+            // `set` tuple, so an absent reason is a column the statement never mentions.
+            //
+            // That is what `COALESCE($n, release_reason)` used to spell out, as a
+            // `sql::<Nullable<Text>>` fragment with the column name spliced in as
+            // unchecked text. The column reference is a real one now, and the shorter
+            // statement is the same rule.
+            release.map(|r| booking::release_reason.eq(r)),
+            cancel.map(|c| booking::cancel_reason.eq(c)),
+        ))
+        .execute(conn)
+        .await?;
+        Ok(())
     }
 
-    async fn refold_opt(&self, spot_id: Option<String>, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
-        match spot_id {
-            Some(id) => self.refold(&id, at, seq).await,
-            // The transition didn't apply (already released, already confirmed).
-            // `booked` is unchanged, but the cursor still has to advance or this
-            // event replays forever.
-            None => self.advance(seq, at).await,
-        }
-    }
-
-    /// Recomputes `spot.booked` from this spot's booking rows and advances both
-    /// cursors in one transaction.
+    /// The slots that block a new booking on one spot, as of `now`.
     ///
-    /// A full recompute, not an incremental merge: re-delivering the same event
-    /// then produces the same map, where appending slots would double them up.
-    async fn refold(&self, spot_id: &str, at: DateTime<Utc>, seq: u64) -> MyResult<()> {
-        let rows: Vec<BookingRow> = self
-            .db
-            .query("SELECT status, booked FROM booking WHERE spot_id = $spot_id")
-            .bind(("spot_id", spot_id.to_string()))
-            .await?
-            .take(0)?;
-
-        self.db
-            .query(
-                "BEGIN;
-                 UPSERT type::record('spot', $id) SET
-                     booked = $booked,
-                     -- math::max so a redelivered older message can't rewind the
-                     -- CAS cursor, which would make every reserve assert too low.
-                     bookings_seq = math::max([bookings_seq ?? 0, $seq]);
-                 UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
+    /// This is the whole of what `spot.booked` used to be, asked directly. It is also
+    /// why there is no denormalized copy any more: the rows *are* the answer, so there
+    /// is nothing to keep in step with them.
+    ///
+    /// `ends_at > $2` is what bounds the scan, and `booking_spot (spot_id, ends_at)`
+    /// is what serves it. The old fold had no such floor and read every booking a spot
+    /// had ever taken, on every event.
+    ///
+    /// `status <> ALL` rather than a positive list: a status this build has never
+    /// heard of has to block, because the safe direction for availability is keeping a
+    /// slot unavailable rather than selling it twice. Carrying no `hold_until` filter
+    /// is the same deliberate choice `spot.booked` made — a lapsed hold stops blocking
+    /// when the sweeper publishes `Released`, not because this learned to skip it.
+    pub async fn taken_for_spot(
+        conn: &mut AsyncPgConnection,
+        spot_id: &Uuid,
+        now: DateTime<Utc>,
+    ) -> MyResult<Booked> {
+        let maps: Vec<Booked> = booking::table
+            .filter(
+                booking::spot_id
+                    .eq(spot_id)
+                    .and(booking::ends_at.gt(now))
+                    .and(
+                        booking::status
+                            .ne_all(vec!["released".to_string(), "cancelled".to_string()]),
+                    ),
             )
-            .bind(("id", spot_id.to_string()))
-            .bind(("booked", fold_booked(&rows, at)))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
+            .select(booking::booked)
+            .load(conn)
+            .await?;
+
+        // A union, not the old fold: the rows are already filtered to the ones that
+        // block, and nothing downstream depends on the order — unlike `spot.booked`,
+        // which had to be byte-identical across replicas because it was stored.
+        let mut booked = Booked::new();
+        for map in maps {
+            for (date, slots) in map {
+                booked.entry(date).or_default().extend(slots);
+            }
+        }
+        Ok(booked)
     }
 
-    async fn advance(&self, seq: u64, at: DateTime<Utc>) -> MyResult<()> {
-        self.db
-            .query("UPSERT _projection:BOOKINGS SET last_seq = $seq, updated_at = $at;")
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
-        Ok(())
+    /// Holds whose expiry has passed. The sweeper's entire query, served by
+    /// `booking_hold (status, hold_until)`.
+    ///
+    /// The one clock read in this service that is allowed to be a clock read: the
+    /// sweeper is a wall-clock job, not a projection, and its output is an event that
+    /// everything downstream derives deterministically.
+    pub async fn lapsed_holds(
+        conn: &mut AsyncPgConnection,
+        limit: usize,
+    ) -> MyResult<Vec<Booking>> {
+        Ok(booking::table
+            .filter(
+                booking::status
+                    .eq("reserved")
+                    .and(booking::hold_until.lt(diesel::dsl::now)),
+            )
+            .limit(limit as i64)
+            .select(Booking::as_select())
+            .load(conn)
+            .await?)
+    }
+
+    /// Paid bookings on one spot that are still to come, as of `at`.
+    ///
+    /// `at` is the event's `occurred_at`, not a clock read: a replayed SpotDeleted then
+    /// selects the same set it selected the first time, which is what keeps the cancel
+    /// reactor's output a function of the log.
+    pub async fn upcoming_confirmed(
+        conn: &mut AsyncPgConnection,
+        spot_id: &Uuid,
+        at: DateTime<Utc>,
+    ) -> MyResult<Vec<Booking>> {
+        Ok(booking::table
+            .filter(
+                booking::spot_id
+                    .eq(spot_id)
+                    .and(booking::status.eq("confirmed"))
+                    .and(booking::ends_at.gt(at)),
+            )
+            .select(Booking::as_select())
+            .load(conn)
+            .await?)
     }
 }

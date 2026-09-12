@@ -10,6 +10,11 @@ edition.workspace = true
 async-nats = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
+# `Tx` hands each event's `occurred_at` to the projector it wraps, which is the
+# only clock an apply may read.
+chrono = { workspace = true }
+# `publish_event` stamps the actor onto each envelope.
+uuid = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,6 +22,20 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 
-surrealdb = { workspace = true }
+# sqlx is gone from this crate: `bus` was ported first because `Projector::apply` and
+# `outbox::enqueue` are what every service's write path threads a connection through.
+diesel = { workspace = true }
+diesel-async = { workspace = true }
 
 shared = { path = "../shared" }
+
+# `examples/seed.rs` only. A dev-dependency, so no service build pays for it —
+# and it is already in the workspace graph, so nothing new compiles.
+[dev-dependencies]
+argon2 = { workspace = true }
+# `examples/demo_seed.rs` only: a booking's `ends_at` is its last slot in the spot's
+# own zone, MEDIA_BASE is read from spot-service's .env, and the seed triggers each
+# service's `/internal/backfill` over HTTP. All three are already in the workspace graph.
+chrono-tz = { workspace = true }
+dotenvy = { workspace = true }
+reqwest = { workspace = true }

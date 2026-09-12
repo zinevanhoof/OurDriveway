@@ -1,14 +1,23 @@
-use std::sync::Arc;
-
 use bus::Projector;
+use chrono::{DateTime, Utc};
+use diesel_async::AsyncPgConnection;
 use shared::{
-    error::myerror::{MyError, MyResult},
+    domain_models::booking::{Booking, SpotMirrorPatch, status},
+    error::myerror::MyResult,
     events::{
-        Envelope, STREAM_BOOKINGS, STREAM_SPOTS, booking::BookingEvent, spot::SpotEvent,
+        Envelope, STREAM_SPOTS, aggregate_id,
+        booking::{BookingEvent, CancelReason},
+        booking_subject,
+        spot::SpotEvent,
     },
+    general_models::{booking::Booked, spot::Availability},
 };
+use uuid::Uuid;
 
-use crate::repository::booking_repository::BookingRepository;
+use crate::policy::availability;
+use crate::repository::{
+    booking_repository::BookingRepository, spot_mirror_repository::SpotMirrorRepository,
+};
 
 /// booking-service consumes SPOTS as well as its own stream: it needs price,
 /// availability and active-ness to authorize and price a booking server-side, and
@@ -16,39 +25,286 @@ use crate::repository::booking_repository::BookingRepository;
 ///
 /// The two advance independently, which is exactly why a BOOKINGS event can arrive
 /// for a spot this projector hasn't created yet — see the `option<>` fields in
-/// booking-schema.surql.
-pub struct SpotProjector {
-    pub repository: Arc<BookingRepository>,
-}
+/// booking-schema.surql, and `Repository::merge`, which is what lets either
+/// projector create the row.
+///
+/// Holds nothing at all: `bus::Tx` hands it a `&Transaction` per event, and the
+/// cancellations it raises go into `_outbox` on that same transaction rather than
+/// to NATS directly.
+pub struct SpotProjector;
 
 impl Projector for SpotProjector {
     const STREAM: &'static str = STREAM_SPOTS;
+    const DURABLE: &'static str = "booking-spots";
+    type Event = SpotEvent;
 
-    async fn last_seq(&self) -> MyResult<u64> {
-        self.repository.last_seq(STREAM_SPOTS).await
-    }
+    async fn apply(
+        &self,
+        conn: &mut AsyncPgConnection,
+        event: SpotEvent,
+        at: DateTime<Utc>,
+        version: i64,
+    ) -> MyResult<()> {
+        let spot_id = event.spot_id();
 
-    async fn apply(&self, payload: &[u8], seq: u64) -> MyResult<()> {
-        let envelope: Envelope<SpotEvent> = serde_json::from_slice(payload)
-            .map_err(|e| MyError::Bus(format!("decode SpotEvent at seq {seq}: {e}")))?;
-        self.repository.apply_spot(envelope, seq).await
+        // React before projecting. Both sit inside one transaction, so on any failure
+        // nothing is acked and the whole thing runs again — the cancels are deduped by
+        // their deterministic event ids and the mirror write is an idempotent merge.
+        //
+        // Nothing is read from the projection that the event doesn't already carry,
+        // so running first costs nothing in accuracy.
+        Self::react(conn, &event, at).await?;
+
+        // `merge`, never a whole-row write: this stream does not own every column, and
+        // the row may already exist. It used to also be about not erasing
+        // `bookings_seq`; that column is gone with the compare-and-swap it served.
+        match event {
+            SpotEvent::Created(e) => {
+                SpotMirrorRepository::merge(&mut *conn, e.spot_id, SpotMirrorPatch::created(e))
+                    .await
+            }
+            SpotEvent::Updated(e) => {
+                let spot_id = e.spot_id;
+                SpotMirrorRepository::merge(&mut *conn, spot_id, SpotMirrorPatch::updated(e)).await
+            }
+            SpotEvent::Deleted { spot_id } => {
+                SpotMirrorRepository::merge(&mut *conn, spot_id, SpotMirrorPatch::deleted()).await
+            }
+        }?;
+
+        // spot-service's version of this aggregate, as last applied here. The only
+        // counter on this row now — `bookings_seq` used to sit beside it doing an
+        // entirely different job.
+        shared::set_version!(conn, "spot", shared::schema::booking::spot, &spot_id, version)
     }
 }
 
-pub struct BookingProjector {
-    pub repository: Arc<BookingRepository>,
-}
+impl SpotProjector {
+    /// Withdraws bookings the spot can no longer honour.
+    ///
+    /// This is where a host's edit meets the bookings it invalidates, and it lives
+    /// here — not in spot-service — because *this* stream is the one with a per-spot
+    /// total order over bookings. spot-service publishes its edit without ever
+    /// knowing a booking exists.
+    ///
+    /// Only *confirmed* bookings are touched. A live hold lapses within `HOLD` on its
+    /// own, so releasing it here would buy fifteen minutes at the cost of racing a
+    /// payment — and losing that race means cancelling a booking that was paid for a
+    /// moment later. A hold that *is* paid after this runs is the gap named below.
+    async fn react(
+        conn: &mut AsyncPgConnection,
+        event: &SpotEvent,
+        at: DateTime<Utc>,
+    ) -> MyResult<()> {
+        let (spot_id, availability) = match event {
+            // A narrowed availability may leave paid bookings outside it. An edit
+            // that carries no availability cannot — and the live switch is exactly
+            // that edit, which is how flipping a listing off still honours the
+            // bookings already made.
+            SpotEvent::Updated(e) => match &e.availability {
+                Some(a) => (e.spot_id, Some(a)),
+                None => return Ok(()),
+            },
+            // The host says they cannot provide the space at all: everything still
+            // owed goes, no check needed.
+            SpotEvent::Deleted { spot_id } => (*spot_id, None),
+            // Created has no bookings yet.
+            _ => return Ok(()),
+        };
 
-impl Projector for BookingProjector {
-    const STREAM: &'static str = STREAM_BOOKINGS;
-
-    async fn last_seq(&self) -> MyResult<u64> {
-        self.repository.last_seq(STREAM_BOOKINGS).await
+        // ponytail: reads the booking table, which the *other* projector writes on
+        // its own cursor, and this event is never redelivered — so a booking that
+        // becomes confirmed after this point keeps hours the host has withdrawn.
+        // Two windows: milliseconds, for a payment confirmed just before the edit but
+        // not yet projected; and up to `HOLD`, for a live hold paid after it, since
+        // `confirm_paid` publishes unconditionally and re-checks nothing.
+        // Close both with a reconciliation sweep over confirmed future bookings,
+        // shaped like sweeper.rs, if it ever shows up in practice.
+        // Collected before the loop: the cancels below write through the same
+        // connection, and a streaming read would still be borrowing it.
+        let upcoming = BookingRepository::upcoming_confirmed(&mut *conn, &spot_id, at).await?;
+        for booking in upcoming {
+            if let Some(availability) = availability
+                && fits(availability, &booking)
+            {
+                continue;
+            }
+            Self::cancel(&mut *conn, &booking, at).await?;
+        }
+        Ok(())
     }
 
-    async fn apply(&self, payload: &[u8], seq: u64) -> MyResult<()> {
-        let envelope: Envelope<BookingEvent> = serde_json::from_slice(payload)
-            .map_err(|e| MyError::Bus(format!("decode BookingEvent at seq {seq}: {e}")))?;
-        self.repository.apply_booking(envelope, seq).await
+    /// Writes the cancellation **and** enqueues its event, in the caller's
+    /// transaction.
+    ///
+    /// It used to only publish, and booking-service's own projector applied the row
+    /// a moment later. That projector is gone — this service writes its own rows
+    /// now — so publishing alone left the authoritative booking `confirmed` while
+    /// view-service and payment-service both showed it cancelled. Exactly the wrong
+    /// way round.
+    async fn cancel(
+        conn: &mut AsyncPgConnection,
+        booking: &Booking,
+        at: DateTime<Utc>,
+    ) -> MyResult<()> {
+        let version = shared::next_version!(conn, shared::schema::booking::booking, &booking.id)?;
+
+        // Scoped to `confirmed`, so a redelivered SpotUpdated is a no-op — the same
+        // guard the projector arm used to carry.
+        BookingRepository::transition(
+            &mut *conn,
+            booking.id,
+            status::CANCELLED,
+            &[status::CONFIRMED],
+            None,
+            Some(CancelReason::SpotUnavailable.as_str()),
+        )
+        .await?;
+        shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking.id, version)?;
+
+        let event = BookingEvent::Cancelled {
+            booking_id: booking.id,
+            reason: CancelReason::SpotUnavailable,
+        };
+        // `actor_id: None` — the host acted on the spot, not on this booking.
+        let mut envelope =
+            Envelope::new(event, None, aggregate_id("booking", &booking.id), version);
+        // Deterministic, like the sweeper's: a redelivered SpotUpdated must
+        // not publish a second cancel for the same booking. Keyed on the event's own
+        // timestamp too, so a *later* edit that invalidates the same booking again
+        // is still its own event rather than being swallowed as a duplicate.
+        envelope.event_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("spot-cancel:{}:{}", booking.id, at.timestamp_millis()).as_bytes(),
+        );
+
+        tracing::info!(
+            booking = %booking.id,
+            spot = %booking.spot_id,
+            "cancelling: spot can no longer honour it"
+        );
+
+        // In the projector's own transaction, so the row and the event commit
+        // together. This was the last NATS publish inside a database transaction —
+        // the one genuine dual write left from before the rewrite.
+        bus::outbox::enqueue(conn, &booking_subject(&booking.spot_id), &envelope).await?;
+        Ok(())
+    }
+}
+
+/// Whether a paid booking still sits inside the spot's hours.
+///
+/// Nothing is passed as busy: the question is only whether the host is still *open*
+/// at these times, and a booking measured against its own slots would collide with
+/// itself.
+fn fits(availability: &Availability, booking: &Booking) -> bool {
+    availability::check(availability, &Booked::new(), &booking.booked).is_ok()
+}
+
+// `BookingProjector` is gone. This service's own BOOKINGS events are no longer
+// projected back in: `booking_service`, `sweeper` and `payment_worker_service`
+// write the `booking` rows directly, inside the transaction that enqueues the
+// event. It also advanced `spot.bookings_seq` — a column that no longer exists at
+// all. What serialises reserve now is a row lock on the spot mirror, taken by
+// `create_booking` itself; see `SpotMirrorRepository::find_for_update`.
+//
+// What remains above is the SPOTS mirror — a *foreign* stream, which is what a
+// projector is still for.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::domain_models::booking::status;
+    use shared::general_models::spot::{TimeSlot, WeeklyAvailability};
+    use std::collections::HashMap;
+
+    fn slot(start: &str, end: &str) -> TimeSlot {
+        TimeSlot {
+            start: start.into(),
+            end: end.into(),
+        }
+    }
+
+    fn booking(date: &str, slots: Vec<TimeSlot>) -> Booking {
+        Booking {
+            id: Uuid::now_v7(),
+            version: 1,
+            spot_id: Uuid::now_v7(),
+            host_id: Uuid::now_v7(),
+            renter_id: Uuid::now_v7(),
+            booked: HashMap::from([(date.to_string(), slots)]).into(),
+            amount: 500,
+            status: status::CONFIRMED.into(),
+            hold_until: None,
+            release_reason: None,
+            cancel_reason: None,
+            ends_at: Utc::now().into(),
+            rating: None,
+            created_at: Utc::now().into(),
+        }
+    }
+
+    /// Monday hours only, so a booking's fate depends on the weekday of its date.
+    fn availability(monday: Vec<TimeSlot>) -> Availability {
+        Availability {
+            weekly: WeeklyAvailability {
+                monday,
+                tuesday: vec![],
+                wednesday: vec![],
+                thursday: vec![],
+                friday: vec![],
+                saturday: vec![],
+                sunday: vec![],
+            },
+            single: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn only_bookings_outside_the_new_hours_are_cancelled() {
+        // 2026-08-03 is a Monday.
+        let hours = availability(vec![slot("08:00", "18:00")]);
+
+        // Inside — survives. This is the case that matters: measure a booking against
+        // slots that include its own and every edit cancels every booking.
+        assert!(fits(
+            &hours,
+            &booking("2026-08-03", vec![slot("09:00", "10:00")])
+        ));
+        // Starts inside, runs past the close.
+        assert!(!fits(
+            &hours,
+            &booking("2026-08-03", vec![slot("17:00", "19:00")])
+        ));
+        // Entirely outside.
+        assert!(!fits(
+            &hours,
+            &booking("2026-08-03", vec![slot("06:00", "07:00")])
+        ));
+        // Right day, but the host closed Mondays altogether.
+        assert!(!fits(
+            &availability(vec![]),
+            &booking("2026-08-03", vec![slot("09:00", "10:00")])
+        ));
+        // Two slots, one of them now outside: the whole booking goes.
+        assert!(!fits(
+            &hours,
+            &booking(
+                "2026-08-03",
+                vec![slot("09:00", "10:00"), slot("19:00", "20:00")]
+            )
+        ));
+    }
+
+    #[test]
+    fn a_single_date_entry_overrides_that_weekdays_hours() {
+        // Same precedence the reserve path uses, and the reason an edit that only
+        // touches one date still has to be checked against every booking on it.
+        let mut hours = availability(vec![slot("08:00", "18:00")]);
+        hours.single.insert("2026-08-03".into(), vec![]);
+        assert!(!fits(
+            &hours,
+            &booking("2026-08-03", vec![slot("09:00", "10:00")])
+        ));
     }
 }

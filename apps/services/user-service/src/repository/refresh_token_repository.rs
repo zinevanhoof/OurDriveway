@@ -1,162 +1,83 @@
-use shared::{
-    error::myerror::MyResult,
-    events::{
-        Envelope,
-        session::{RefreshTokenIssued, RefreshTokenRevoked, RefreshTokenRotated, SessionEvent},
-        user::record_key,
-    },
-};
-use surrealdb::{
-    Surreal,
-    engine::remote::ws::Client,
-    types::{Datetime, SurrealValue},
-};
+use chrono::{DateTime, Utc};
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::domain_models::user::{RefreshToken, RefreshTokenPatch};
+use shared::error::myerror::MyResult;
+use shared::schema::user::refresh_token;
 
-pub struct RefreshTokenRepository {
-    pub db: Surreal<Client>,
-}
-
-/// What the refresh and logout paths need: the owner's record key as a plain
-/// uuid (so the new JWT's `id` claim is built the same way login builds it), the
-/// user's shard (so the event goes to the same subject as the rest of that
-/// user's sessions), and enough to decide whether the token is still valid.
-#[derive(SurrealValue)]
-pub struct RefreshTokenAuth {
-    pub user_uid: String,
-    pub shard: String,
-    pub revoked: bool,
-    pub expires_at: Datetime,
-}
+/// The `refresh_token` table.
+///
+/// This used to be the one table in the codebase with a **linked** column: `user_id`
+/// was `record<user>` in the schema and a bare `Uuid` on the struct, so every
+/// statement here had to bridge that — the read unwrapped with `record::id(user_id)`,
+/// the write re-wrapped with `type::record('user', $user_id)`, and the upsert could
+/// not use `CONTENT $row` because binding the struct whole would send a uuid where a
+/// record was required.
+///
+/// It is a plain uuid with a real foreign key now. All three statements are ordinary,
+/// and the asymmetry that had to be got right in each of them is gone.
+pub struct RefreshTokenRepository;
 
 impl RefreshTokenRepository {
-    /// Looked up by hash — the plaintext token is never stored.
-    pub async fn find_by_hash(&self, token_hash: &str) -> MyResult<Option<RefreshTokenAuth>> {
-        let found: Option<RefreshTokenAuth> = self
-            .db
-            .query(
-                "SELECT record::id(user_id) AS user_uid, shard, revoked, expires_at
-                 FROM ONLY refresh_token
-                 WHERE token_hash = $token_hash
-                 LIMIT 1;",
-            )
-            .bind(("token_hash", token_hash.to_string()))
-            .await?
-            .take(0)?;
-
-        Ok(found)
+    /// `refresh_token_hash_idx … UNIQUE`, so at most one row can match. The only way
+    /// a token is ever looked up: refresh and logout both arrive holding a plaintext
+    /// token and nothing else.
+    pub async fn find_by_token_hash(
+        conn: &mut AsyncPgConnection,
+        token_hash: String,
+    ) -> MyResult<Option<RefreshToken>> {
+        Ok(refresh_token::table
+            .filter(refresh_token::token_hash.eq(token_hash))
+            .select(RefreshToken::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
-    // ─── projector side ─────────────────────────────────────────────────────
-
-    pub async fn last_seq(&self) -> MyResult<u64> {
-        let seq: Option<i64> = self
-            .db
-            .query("SELECT VALUE last_seq FROM ONLY _projection:SESSIONS")
-            .await?
-            .take(0)?;
-        Ok(seq.unwrap_or(0).max(0) as u64)
-    }
-
-    pub async fn apply(&self, envelope: Envelope<SessionEvent>, seq: u64) -> MyResult<()> {
-        let at = envelope.occurred_at;
-        match envelope.payload {
-            SessionEvent::Issued(e) => self.issued(e, at, seq).await,
-            SessionEvent::Rotated(e) => self.rotated(e, at, seq).await,
-            SessionEvent::Revoked(e) => self.revoked(e, at, seq).await,
-        }
-    }
-
-    async fn issued(
-        &self,
-        e: RefreshTokenIssued,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
-    ) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPSERT type::record('refresh_token', $id) CONTENT {
-                     user_id: type::record('user', $user_id), shard: $shard,
-                     token_hash: $token_hash, jti: $jti,
-                     created_at: $at, expires_at: $expires_at,
-                     revoked: false, revoked_reason: NONE
-                 };
-                 UPSERT _projection:SESSIONS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("id", record_key(&e.token_id)))
-            .bind(("user_id", record_key(&e.user_id)))
-            .bind(("shard", e.shard))
-            .bind(("token_hash", e.token_hash))
-            .bind(("jti", surrealdb::types::Uuid::from(e.jti)))
-            .bind(("expires_at", Datetime::from(e.expires_at)))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
+    /// Insert-or-replace the whole row, keyed by its own id.
+    ///
+    /// `#[derive(Insertable)]` binds the struct whole, so there is no column list here
+    /// at all — which is what this table's write looked like before sqlx, and could not
+    /// have while `user_id` was a record link.
+    pub async fn upsert(conn: &mut AsyncPgConnection, token: RefreshToken) -> MyResult<()> {
+        diesel::insert_into(refresh_token::table)
+            .values(token.clone())
+            .on_conflict(refresh_token::id)
+            .do_update()
+            .set(token)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
-    /// Revoke-and-issue in one transaction, mirroring the single event.
-    async fn rotated(
-        &self,
-        e: RefreshTokenRotated,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
+    /// Revoke, addressed by the hash rather than the id — callers hold a token, never
+    /// a row id.
+    ///
+    /// The two columns here are every column [`RefreshTokenPatch`] carries. It cannot
+    /// repoint `user_id`, so a partial update can never move a token to another
+    /// account.
+    pub async fn patch_by_token_hash(
+        conn: &mut AsyncPgConnection,
+        token_hash: String,
+        patch: RefreshTokenPatch,
     ) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPDATE refresh_token SET revoked = true, revoked_reason = 'Rotation'
-                     WHERE token_hash = $old_hash;
-                 UPSERT type::record('refresh_token', $id) CONTENT {
-                     user_id: type::record('user', $user_id), shard: $shard,
-                     token_hash: $token_hash, jti: $jti,
-                     created_at: $at, expires_at: $expires_at,
-                     revoked: false, revoked_reason: NONE
-                 };
-                 UPSERT _projection:SESSIONS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("old_hash", e.old_token_hash))
-            .bind(("id", record_key(&e.token_id)))
-            .bind(("user_id", record_key(&e.user_id)))
-            .bind(("shard", e.shard))
-            .bind(("token_hash", e.token_hash))
-            .bind(("jti", surrealdb::types::Uuid::from(e.jti)))
-            .bind(("expires_at", Datetime::from(e.expires_at)))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
+        diesel::update(refresh_token::table.filter(refresh_token::token_hash.eq(token_hash)))
+            .set(&patch)
+            .execute(conn)
+            .await?;
         Ok(())
     }
 
-    async fn revoked(
-        &self,
-        e: RefreshTokenRevoked,
-        at: chrono::DateTime<chrono::Utc>,
-        seq: u64,
+    /// Expired rows can never be revoked or renewed again, so they are dead weight;
+    /// dropped whenever this user's sessions are touched. `before` is the event's own
+    /// clock, so every replica deletes exactly the same rows.
+    pub async fn delete_expired(
+        conn: &mut AsyncPgConnection,
+        before: DateTime<Utc>,
     ) -> MyResult<()> {
-        self.db
-            .query(
-                "BEGIN;
-                 UPDATE refresh_token SET revoked = true, revoked_reason = $reason
-                     WHERE token_hash = $token_hash;
-                 -- Expired rows can never be revoked or renewed again, so they are
-                 -- dead weight; drop them whenever this user's sessions are touched.
-                 -- `$at` is the event's own clock, so every replica deletes exactly
-                 -- the same rows.
-                 DELETE refresh_token WHERE expires_at < $at;
-                 UPSERT _projection:SESSIONS SET last_seq = $seq, updated_at = $at;
-                 COMMIT;",
-            )
-            .bind(("token_hash", e.token_hash))
-            .bind(("reason", e.reason))
-            .bind(("at", Datetime::from(at)))
-            .bind(("seq", seq as i64))
-            .await?
-            .check()?;
+        diesel::delete(refresh_token::table.filter(refresh_token::expires_at.lt(before)))
+            .execute(conn)
+            .await?;
         Ok(())
     }
 }

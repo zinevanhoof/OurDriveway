@@ -4,14 +4,8 @@ import { useForm, Field as VeeField } from 'vee-validate'
 import { z } from 'zod'
 import { ref } from 'vue'
 
-import {
-    Card,
-    CardContent,
-    CardDescription,
-    CardHeader,
-    CardFooter,
-    CardTitle,
-} from '@/components/ui/card'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
 import {
     Field,
     FieldError,
@@ -20,8 +14,9 @@ import {
 } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { signupUser } from '@/api/userApi'
-import { applyValidationErrors, readErrorDetail } from '@/lib/serverErrors'
+import { useSignup } from '@/api/userApi'
+import type { ApiError } from '@/api/client'
+import { passwordRules } from '@/lib/passwordSchema'
 
 const emit = defineEmits<{
     success: []
@@ -32,15 +27,7 @@ const formSchema = toTypedSchema(
         firstName: z.string(),
         lastName: z.string(),
         email: z.string().email(),
-        password: z
-            .string()
-            .min(8, "Password must be at least 8 characters")
-            .max(32, "Password must be at most 32 characters")
-            .regex(/[A-Z]/, "Must contain at least one uppercase letter")
-            .regex(/[a-z]/, "Must contain at least one lowercase letter")
-            .regex(/[0-9]/, "Must contain at least one number")
-            .regex(/[^A-Za-z0-9]/, "Must contain at least one special character"),
-
+        password: passwordRules,
         confirmPassword: z.string(),
     }).refine((data) => data.password === data.confirmPassword, {
         message: "Passwords do not match",
@@ -61,29 +48,30 @@ const { handleSubmit, setErrors, isSubmitting } = useForm({
 
 const serverErrors = ref<string[]>([])
 
+const { mutateAsync: signup } = useSignup()
+
 const onSubmit = handleSubmit(async ({ confirmPassword, ...form }) => {
     serverErrors.value = []
-    const response = await signupUser(form)
 
-    if (response.ok) {
+    try {
+        await signup(form)
         emit('success')
-        return
+    } catch (e) {
+        const err = e as ApiError
+        if (!err.applyTo(setErrors)) serverErrors.value = err.detail
     }
-
-    if (await applyValidationErrors(response, setErrors)) return
-    serverErrors.value = await readErrorDetail(response)
 })
 </script>
 
 <template>
-    <Card>
-        <CardHeader>
-            <CardTitle>Signup</CardTitle>
-            <CardDescription>
+    <Surface size="lg" class="gap-6">
+        <div class="grid gap-1">
+            <Title class="font-medium">Signup</Title>
+            <Text size="sm" weight="normal">
                 Create an account here
-            </CardDescription>
-        </CardHeader>
-        <CardContent>
+            </Text>
+        </div>
+        <div>
             <form id="form-register" @submit="onSubmit">
                 <FieldGroup>
                     <div class="flex justify-center gap-2 items-center">
@@ -144,11 +132,9 @@ const onSubmit = handleSubmit(async ({ confirmPassword, ...form }) => {
                     <FieldError v-if="serverErrors.length" :errors="serverErrors" />
                 </FieldGroup>
             </form>
-        </CardContent>
-        <CardFooter>
-            <Button class="flex-1" type="submit" form="form-register" :disabled="isSubmitting">
-                Signup
-            </Button>
-        </CardFooter>
-    </Card>
+        </div>
+        <Button class="w-full" type="submit" form="form-register" :disabled="isSubmitting">
+            Signup
+        </Button>
+    </Surface>
 </template>

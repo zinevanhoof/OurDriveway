@@ -1,0 +1,21 @@
+[package]
+name = "notification-service"
+version = "0.1.0"
+edition.workspace = true
+
+# No `surrealdb`: this service owns no state and builds no projection. Unlike
+# media-service it does take `bus` — it consumes events — but only through
+# `bus::worker`, whose cursor lives in NATS rather than in a database. That is
+# the whole reason there is no schema file and no SurrealDB sidecar for it.
+[dependencies]
+axum = { workspace = true }
+dotenvy = { workspace = true }
+resend-rs = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+bus = { path = "../../../bus" }
+shared = { path = "../../../shared" }

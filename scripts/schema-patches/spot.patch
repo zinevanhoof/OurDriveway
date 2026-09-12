@@ -1,0 +1,11 @@
+--- a/spot.rs
++++ b/spot.rs
+@@ -8,7 +8,7 @@
+         title -> Text,
+         description -> Nullable<Text>,
+         price_per_hour -> Int8,
+-        images -> Array<Nullable<Text>>,
++        images -> Array<Text>,
+         lng -> Float8,
+         lat -> Float8,
+         active -> Bool,

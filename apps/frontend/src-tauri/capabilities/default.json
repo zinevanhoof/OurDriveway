@@ -7,6 +7,11 @@
     "core:default",
     "opener:default",
     {
+      "identifier": "opener:allow-open-url",
+      "comment": "opener:default covers only mailto:/tel:/http:/https:, so Directions would silently no-op without these. geo: is what gives Android a chooser across every installed navigation app instead of forcing Google Maps; maps: is the iOS equivalent, dormant until there is an iOS target.",
+      "allow": [{ "url": "geo:*" }, { "url": "maps:*" }]
+    },
+    {
       "identifier": "http:default",
       "allow": [
         {
@@ -19,6 +24,10 @@
     },
     "geolocation:allow-check-permissions",
     "geolocation:allow-request-permissions",
-    "geolocation:allow-get-current-position"
+    "geolocation:allow-get-current-position",
+    {
+      "identifier": "deep-link:default",
+      "comment": "Only `onOpenUrl` is used, so the app can be brought back after a redirect payment. The scheme is declared in tauri.conf.json under plugins.deep-link.mobile — desktop registers nothing, since a redirect there returns to the web origin instead."
+    }
   ]
 }

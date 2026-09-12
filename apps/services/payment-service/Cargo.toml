@@ -1,0 +1,40 @@
+[package]
+name = "payment-service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+garde = { workspace = true }
+
+async-stripe = { workspace = true }
+async-stripe-checkout = { workspace = true }
+async-stripe-connect = { workspace = true }
+async-stripe-core = { workspace = true }
+async-stripe-webhook = { workspace = true }
+async-stripe-types = { workspace = true }
+
+# The Accounts v2 API only. `async-stripe` is generated from the v1 OpenAPI spec and
+# has no `/v2/core/accounts` in it — see the note over `Stripe::create_account`.
+reqwest = { workspace = true }
+
+async-nats = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+dotenvy = { workspace = true }
+
+bus = { path = "../../../bus" }
+shared = { path = "../../../shared" }
+
+[dev-dependencies]
+# The test `db()` helper migrates through the same crate production does.
+migrator = { path = "../../migrator" }

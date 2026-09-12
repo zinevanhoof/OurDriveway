@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Returning to OurDriveway</title>
+
+    <!--
+      Bounces a redirect payment back into the native app.
+
+      Normally reached inside the webview itself: the whole redirect chain — bank, Stripe,
+      this page — loads there, and `catch_deep_link` in src-tauri/src/lib.rs catches the
+      `ourdriveway://` hop below and navigates the app back to /checkout. A webview would
+      otherwise answer that scheme with ERR_UNKNOWN_URL_SCHEME. If a payment ever finishes
+      in the system browser instead, the OS routes the same link to the app as an intent.
+
+      And it has to be this page rather than the scheme directly, because Stripe.js refuses
+      a non-http(s) `return_url` at confirm time even though the REST API stores one happily.
+
+      Deliberately a static file rather than a route: the browser that lands here has no
+      session — installNativeFetch keeps the refresh cookie in reqwest's jar inside the
+      Tauri process — so anything that booted the SPA would hit the auth guard and land on
+      the login screen instead of going home.
+
+      Nothing here is load-bearing for correctness. The app never unloaded, and it re-reads
+      the session on `visibilitychange`, so a renter who ignores this page and switches back
+      by hand gets the same result.
+    -->
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-content: center;
+        gap: 1.5rem;
+        justify-items: center;
+        font: 1rem/1.5 system-ui, sans-serif;
+        text-align: center;
+        padding: 2rem;
+        color: #1f2937;
+        background: #f9fafb;
+      }
+      a {
+        padding: 0.75rem 1.5rem;
+        border-radius: 0.5rem;
+        background: #1f2937;
+        color: #fff;
+        text-decoration: none;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { color: #f9fafb; background: #111827; }
+        a { background: #f9fafb; color: #111827; }
+      }
+    </style>
+  </head>
+
+  <body>
+    <p>Taking you back to OurDriveway…</p>
+    <!-- The automatic hop needs no gesture on iOS but Chrome may refuse it, so the
+         button is the guaranteed path, not decoration. -->
+    <a id="open" href="ourdriveway://checkout">Open the app</a>
+
+    <script>
+      // The query is passed through untouched: Stripe appends ?session_id=cs_… and that
+      // is the only handle /checkout needs.
+      var link = "ourdriveway://checkout" + window.location.search;
+      document.getElementById("open").href = link;
+      window.location.replace(link);
+    </script>
+  </body>
+</html>

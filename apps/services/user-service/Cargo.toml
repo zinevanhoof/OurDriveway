@@ -8,7 +8,8 @@ axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-surrealdb = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
@@ -26,3 +27,8 @@ async-nats = { workspace = true }
 
 bus = { path = "../../../bus" }
 shared = { path = "../../../shared" }
+
+[dev-dependencies]
+# The test `db()` helper migrates through the same crate production does, so a test
+# cannot drift from what actually gets applied.
+migrator = { path = "../../migrator" }

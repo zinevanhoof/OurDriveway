@@ -6,6 +6,16 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 // SameSite, so the refresh cookie rides along cross-origin — that's the whole point
 // of keeping the frontend bundled locally (offline shell + atomic app updates).
 // Safe in a web-only build: isTauri() is a plain boolean check that returns false.
+//
+// **Never hardcode this.** It is a capability check, not a design preference, and
+// `installNativeFetch` below replaces `window.fetch` on the strength of it — forcing it
+// true in a browser would route every request through a plugin that isn't there and break
+// the whole app. If you want the phone *layout* everywhere, that is `MOBILE_SHELL` in
+// App.vue, which is a separate question deliberately kept separate.
+//
+// Its other callers are capability decisions too: the platform geolocation prompt
+// (lib/geo.ts), opening a maps app (BookedSpotRow), and choosing an `ourdriveway://`
+// return URL over an http one for a redirect payment.
 export const native = isTauri();
 
 // reqwest can't resolve a relative URL and rejects the `tauri://` scheme a bundled
@@ -47,22 +57,7 @@ export function installNativeFetch() {
       return browserFetch(input, init);
     }
 
-    const url = parsed.toString();
-
-    // plugin-http breaks urql two ways ("resource id is invalid"): urql probes
-    // response.body (frees the read-once native body) and aborts on teardown
-    // (fetch_cancel on a consumed rid rejects uncaught). Drain the body once into a
-    // plain Response and drop the signal. Harmless for the REST path, required for
-    // urql — and doing it here covers both without either caller knowing.
-    if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    const { signal: _signal, ...rest } = init ?? {};
-
-    const res = await tauriFetch(url, rest);
-    const body = await res.arrayBuffer();
-    return new Response(body, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: res.headers,
-    });
+    // The resolved absolute URL, not `input` — reqwest cannot resolve a relative one.
+    return tauriFetch(parsed, init);
   };
 }

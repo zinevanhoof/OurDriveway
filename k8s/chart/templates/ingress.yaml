@@ -1,0 +1,56 @@
+# The single origin, and the only place routing is declared.
+#
+# One host serves the SPA at / and the API under /api/*, so the browser never
+# leaves the origin. That is a hard requirement, not tidiness: the refresh cookie
+# is SameSite=Strict, so splitting the API onto another host silently breaks
+# login and nothing else.
+#
+# Note these are `Prefix`, not the glob Caddy used. `/api/spot` therefore matches
+# both `POST /api/spot` and `/api/spot/address/suggest` — the old
+# `handle /api/spot/*` matched only the latter and quietly served the SPA's
+# index.html in response to spot creation.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ourdriveway
+  {{- with .Values.ingress.annotations }}
+  # Empty by default. Nothing this app needs depends on a specific controller any
+  # more — the upload ceiling moved into spot-service, where it holds regardless
+  # of what is proxying. Put controller-specific tuning here if you ever need it.
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  # TLS terminates here, not in Caddy. Android release builds block cleartext, so
+  # this is what unblocks the Tauri mobile target against a real deployment.
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          {{- range $name, $svc := .Values.services }}
+          {{- if ne $svc.api false }}
+          - path: /api/{{ $name }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}-service
+                port:
+                  number: {{ $.Values.port }}
+          {{- end }}
+          {{- end }}
+          # Last, and shortest: the controller matches longest prefix first, so
+          # every /api/* rule above wins before the SPA catch-all.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

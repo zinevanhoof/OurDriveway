@@ -1,1 +1,0 @@
-Image files are put here in replacement for actual S3 storage, only for dev purposes

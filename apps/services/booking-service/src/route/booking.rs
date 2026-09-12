@@ -1,84 +1,83 @@
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::{Json, response::IntoResponse};
-use chrono::{DateTime, Utc};
-use serde::Serialize;
+use axum::http::{HeaderName, StatusCode};
 use shared::error::myerror::MyResult;
-use shared::events::{STREAM_BOOKINGS, user::record_key};
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::booking::CreateBookingRequest;
+use shared::responses::booking::CreateBookingResponse;
+use shared::responses::common::{BackfilledResponse, X_VERSION};
+use uuid::Uuid;
 
 use crate::AppState;
 
-#[derive(Serialize)]
-pub struct ReservedResponse {
-    pub id: String,
-    /// `"BOOKINGS:812"` — where this write landed in the log. The client echoes it
-    /// back on its next read so a load balancer can't route it to an instance that
-    /// hasn't projected this event yet.
-    pub seq: String,
-    /// When the hold lapses. Returned here so the checkout countdown needs no
-    /// follow-up query.
-    pub expires_at: DateTime<Utc>,
-    /// EUR cents, recomputed server-side from the authorised minutes.
-    pub amount_cents: i64,
-}
-
-#[derive(Serialize)]
-pub struct AcceptedResponse {
-    pub seq: String,
-}
-
 /// 202, not 201: the event is committed to the log, but the projections that
-/// answer reads are still catching up. `seq` is how a caller waits for its own
-/// write.
-pub async fn reserve(
+/// answer reads are still catching up. The `X-Version` header is how a caller waits
+/// for its own write.
+///
+/// The one write in the system that answers with more than a version, and `id` is now
+/// all of it. The hold's `expires_at` and the priced `amount_cents` used to ride
+/// along for the checkout drawer's countdown and total; checkout is its own route
+/// now and reads both from the Stripe session, so nothing consumed them.
+pub async fn create_booking(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
     Valid(request): Valid<CreateBookingRequest>,
-) -> MyResult<impl IntoResponse> {
+) -> MyResult<(StatusCode, [(HeaderName, String); 1], Json<CreateBookingResponse>)> {
     // Renter identity comes from the verified token, never from the request body.
-    let reserved = state.booking_service.reserve(request, user_id).await?;
+    let (version, id) = state
+        .booking_service
+        .create_booking(&user_id, request)
+        .await?;
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(ReservedResponse {
-            id: record_key(&reserved.booking_id),
-            seq: format!("{STREAM_BOOKINGS}:{}", reserved.seq),
-            expires_at: reserved.expires_at,
-            amount_cents: reserved.amount_cents,
-        }),
+        [(X_VERSION, version)],
+        Json(CreateBookingResponse { id }),
     ))
 }
 
-/// Payment succeeded. Stands in for the provider's callback until one exists —
-/// swapping in a webhook later changes only how the caller is authenticated.
-pub async fn confirm(
-    AuthedJwt { user_id, .. }: AuthedJwt,
-    State(state): State<AppState>,
-    Path(booking_id): Path<String>,
-) -> MyResult<impl IntoResponse> {
-    let seq = state.booking_service.confirm(&booking_id, &user_id).await?;
-    Ok(accepted(seq))
-}
+// There is no confirm endpoint. Confirmation is not something a client can ask for:
+// it happens when payment-service publishes `PaymentEvent::Succeeded` off a
+// signature-verified Stripe webhook, and `worker::PaymentWorker` picks it up. A renter
+// able to confirm their own booking would not have to pay for it.
 
 /// The renter backed out of checkout. Frees the slots now rather than making the
 /// next renter wait out the hold.
 pub async fn release(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-    Path(booking_id): Path<String>,
-) -> MyResult<impl IntoResponse> {
-    let seq = state.booking_service.release(&booking_id, &user_id).await?;
-    Ok(accepted(seq))
+    Path(booking_id): Path<Uuid>,
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state.booking_service.release(&user_id, &booking_id).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 
-fn accepted(seq: u64) -> impl IntoResponse {
-    (
-        StatusCode::ACCEPTED,
-        Json(AcceptedResponse {
-            seq: format!("{STREAM_BOOKINGS}:{seq}"),
-        }),
-    )
+/// The renter withdraws a booking they already paid for, up to an hour before it
+/// starts.
+///
+/// Its own endpoint rather than letting DELETE dispatch on status: a client that
+/// means "abandon my hold" must never cancel a paid booking because the payment
+/// landed between rendering the button and pressing it.
+pub async fn cancel(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(booking_id): Path<Uuid>,
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state.booking_service.cancel(&user_id, &booking_id).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
+}
+
+/// `POST /internal/backfill` — re-emit every booking, for rebuilding a consumer.
+///
+/// Off the ingress and unauthenticated by construction; see the same handler in
+/// user-service for why that is the whole of the access control.
+///
+/// The one of the four that wakes a side-effect consumer — payment-service settles
+/// on the terminal booking events. `BookingService::backfill` says why that is safe
+/// and what would make it stop being.
+pub async fn backfill(State(state): State<AppState>) -> MyResult<Json<BackfilledResponse>> {
+    Ok(Json(BackfilledResponse {
+        events: state.booking_service.backfill().await?,
+    }))
 }

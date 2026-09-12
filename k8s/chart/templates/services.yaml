@@ -1,0 +1,183 @@
+{{/*
+One template for every backend, and every one of them is now a plain stateless
+pod: an app container, and nothing else.
+
+What used to be here was a SurrealDB sidecar per pod on an `emptyDir`. That was
+not decoration — bus/src/projector.rs gave every instance an *ephemeral* consumer
+that replayed the whole stream into its own database and kept its cursor there, so
+two replicas sharing one database meant two projectors racing over one cursor.
+Sidecar-per-pod made "a database per replica" fall out of `replicas: N`.
+
+None of that is true any more. The databases are authoritative and live in YugabyteDB,
+projectors share a durable consumer per partition, and a service writes its own rows
+inside the request's transaction. So the sidecar, the `fsGroup` that let it write a fresh
+emptyDir, the data volume, the schema mount and the startup probe are all gone, and
+"stateless" stopped being a property that told two services apart — everything here
+is stateless.
+
+The schema mount went for a second reason worth knowing: schemas are no longer files
+at all. Each service embeds its own migrations with `sqlx::migrate!` and applies them at
+boot, which is what deleted the ConfigMap, the `--set-file` plumbing in deploy.sh, and
+the import Job that used to POST them.
+
+What is left are two facts about a service, spelled the same way and defaulting to
+the common case, so an ordinary service still declares nothing:
+
+  db: false      no DATABASE_URL, no database created for it, no wait-for-yugabyte
+                 (media and notification — one holds nothing at all, the other's
+                 only cursor lives in NATS)
+  nats: false    no NATS_URL and no wait-for-nats  (media only)
+  api: false     no ingress path  (notification only — it exposes only health)
+
+`stateless: true` was the old spelling of the first one, back when having a
+database and having local state were the same question.
+*/}}
+{{- range $name, $svc := .Values.services }}
+{{- $needsNats := true }}
+{{- if hasKey $svc "nats" }}{{- $needsNats = $svc.nats }}{{- end }}
+{{- $needsDb := true }}
+{{- if hasKey $svc "db" }}{{- $needsDb = $svc.db }}{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-service
+  labels:
+    app.kubernetes.io/name: {{ $name }}-service
+spec:
+  replicas: {{ $svc.replicas | default $.Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}-service
+    spec:
+      {{- if or $needsNats $needsDb }}
+      initContainers:
+        {{/*
+        Kubernetes has no `depends_on`, so the compose file's
+        `condition: service_healthy` becomes these: plain init containers that
+        block until the dependency answers. Both matter because the app dials each
+        once at boot and exits if it cannot — bus/src/connect.rs and
+        shared/src/db.rs — so without them a pod that starts first just
+        CrashLoopBackOffs until it happens to win the race.
+
+        Both reuse the app image, already pulled for this pod, and bash's /dev/tcp
+        builtin: no netcat, no CLI, no second image to keep pinned.
+
+        A bare TCP check is enough for NATS, whose Service only routes to endpoints
+        that passed their own readiness probe. It is weaker for YugabyteDB, whose
+        Service is HEADLESS — kube-proxy does no readiness filtering there, so this
+        only proves something is listening on 5433. That is deliberate rather than
+        overlooked: the databases are created and migrated by the migrator Job, which
+        on a FIRST install runs alongside these pods rather than before them, so a
+        service that starts too early fails loudly at `connect` with 3D000 and is fine
+        on the CrashLoopBackOff retry. The init container turns the common case into a
+        wait instead of a restart; it is not a guarantee.
+        */}}
+        {{- if $needsNats }}
+        - name: wait-for-nats
+          image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          command:
+            - bash
+            - -c
+            # Quoted: unquoted, `until : <…` is a YAML mapping key, not a string.
+            - 'until : </dev/tcp/{{ $.Release.Name }}-nats/4222; do echo "waiting for nats"; sleep 2; done'
+        {{- end }}
+        {{- if $needsDb }}
+        - name: wait-for-yugabyte
+          image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          command:
+            - bash
+            - -c
+            # 5433, not 5432 — YSQL does not listen on the PostgreSQL default.
+            - 'until : </dev/tcp/yugabyte/5433; do echo "waiting for yugabyte"; sleep 2; done'
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: app
+          image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $.Values.port }}
+          # Every variable the service's Config struct requires. There are no
+          # defaults left in the code, so an omission here crashes the pod at
+          # startup rather than surfacing as a 500 later — which is the point.
+          env:
+            - name: PORT
+              value: {{ $.Values.port | quote }}
+            {{- if $needsDb }}
+            # One URL where there used to be four variables. The database NAME in it is
+            # what keeps this service's tables out of another's — the job SURREALDB_DB
+            # did — and it is the service name, which is also the ingress path.
+            #
+            # The password is interpolated from the same secret entry YugabyteDB itself
+            # reads (YSQL_PASSWORD in templates/yugabyte.yaml), so the two cannot drift.
+            # It lands in the pod spec as a `$(VAR)` reference rather than a literal:
+            # Kubernetes expands it from the env var below at container start, so
+            # `kubectl get pod -o yaml` shows the reference, not the password.
+            - name: YSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: YSQL_PASSWORD
+            - name: DATABASE_URL
+              value: "postgres://yugabyte:$(YSQL_PASSWORD)@yugabyte:5433/{{ $name }}"
+            {{- end }}
+            {{- if $needsNats }}
+            - name: NATS_URL
+              value: "nats://{{ $.Release.Name }}-nats:4222"
+            {{- end }}
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          # JWT_SECRET for every service, plus LOCATIONIQ_API_KEY, the R2 credentials
+          # and the Stripe keys. See secrets.env.example. YSQL_PASSWORD is also in
+          # here, but is named explicitly above because DATABASE_URL interpolates it.
+          envFrom:
+            - secretRef:
+                name: {{ $.Values.secretName }}
+          # /readyz means "my projections have caught up", so this is what keeps a
+          # pod that is still catching up out of the Service's endpoint list.
+          #
+          # It answers much sooner than it used to. A pod no longer rebuilds a
+          # database from sequence 1 — its rows are already in the cluster — so what is
+          # left to wait for is a foreign projection, and for user-, spot- and
+          # payment-service not even that: they register no streams at all, and
+          # /readyz there reduces to "is NATS reachable" for the outbox relay.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          # /healthz deliberately ignores NATS (see bus/src/health.rs). Pointing
+          # liveness at /readyz instead would restart every pod in the cluster
+          # during a broker blip and fix nothing.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-service
+spec:
+  # This IS the load balancer. kube-proxy spreads connections across every ready
+  # pod behind it, so scaling is `replicas: N` and nothing else.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ $name }}-service
+  ports:
+    - name: http
+      port: {{ $.Values.port }}
+      targetPort: http
+{{- end }}

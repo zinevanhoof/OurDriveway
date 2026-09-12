@@ -11,17 +11,18 @@ import {
     ComboboxItem,
     ComboboxEmpty,
 } from '@/components/ui/combobox';
-import { suggestAddress } from '@/api/address';
-import type { Address } from '@/types/domain/spot';
+import { suggestAddress } from '@/api/spotApi';
+import type { AddressSuggestResponse } from '@/types/responses/spot/AddressSuggestResponse';
 import type { SpotFilter } from '@/types/SpotFilter';
 import MapSearchFilterComponent from './MapSearchFilterComponent.vue';
 import Input from '../ui/input/Input.vue';
 import Button from '../ui/button/Button.vue';
+import { IconBox } from '@/components/base/icon-box';
 
 const emit = defineEmits<{ select: [coords: [number, number]]; filter: [filter: SpotFilter] }>();
 
 const term = ref('');
-const items = ref<Address[]>([]);
+const items = ref<AddressSuggestResponse[]>([]);
 const open = ref(false);
 const filterOpen = ref(false);
 const filterSummary = ref('');
@@ -35,7 +36,11 @@ const search = useDebounceFn(async (q: string) => {
         open.value = false;
         return;
     }
-    items.value = await suggestAddress(query);
+    // `suggestAddress` used to swallow its own failures with `return []`. It
+    // throws like the rest of the api layer now, and a typeahead's answer to a
+    // failed lookup is still "no suggestions" — just written down here, where it
+    // can be seen, instead of hidden in the transport.
+    items.value = await suggestAddress(query).catch(() => []);
     open.value = items.value.length > 0;
 }, 300);
 
@@ -49,7 +54,7 @@ watch(term, (q) => {
 
 const onSelect = (value: AcceptableValue) => {
     if (!value || typeof value !== 'object') return;
-    const addr = value as Address;
+    const addr = value as AddressSuggestResponse;
     if (addr.lng == null || addr.lat == null) return;
     emit('select', [addr.lng, addr.lat]);
     suppress = true;
@@ -84,10 +89,9 @@ const onSelect = (value: AcceptableValue) => {
         </Combobox>
         <MapSearchFilterComponent v-model:open="filterOpen" @update="filterSummary = $event"
             @apply="emit('filter', $event)">
-            <div
-                class="flex items-center justify-center w-10 h-10 bg-accent text-accent-foreground rounded-md cursor-pointer">
+            <IconBox size="lg" class="cursor-pointer">
                 <SlidersHorizontal />
-            </div>
+            </IconBox>
         </MapSearchFilterComponent>
         <Button v-if="filterSummary" size="xs" @click="filterOpen = true"
             class="absolute -bottom-4 left-2 rounded-full font-bold shadow-md">

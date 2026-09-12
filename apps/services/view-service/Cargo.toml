@@ -6,12 +6,12 @@ edition.workspace = true
 [dependencies]
 async-nats = { workspace = true }
 axum = { workspace = true }
-axum-reverse-proxy = { workspace = true }
 chrono = { workspace = true }
 dotenvy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-surrealdb = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -19,3 +19,10 @@ tracing-subscriber = { workspace = true }
 
 bus = { path = "../../../bus" }
 shared = { path = "../../../shared" }
+
+[dev-dependencies]
+# The test `db()` helper migrates through the same crate production does.
+migrator = { path = "../../migrator" }
+# `ServiceExt::oneshot`, for driving the router in `tests/routes.rs` without a listener.
+# Already in the tree under axum; this only names it.
+tower = { version = "0.5", features = ["util"] }

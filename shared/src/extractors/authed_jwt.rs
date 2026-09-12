@@ -3,12 +3,13 @@ use axum_extra::{
     TypedHeader,
     headers::{Authorization, authorization::Bearer},
 };
-use jsonwebtoken::{DecodingKey, TokenData, Validation, decode};
+use jsonwebtoken::{TokenData, Validation, decode};
+use uuid::Uuid;
 
 use crate::{
-    SHARED_CONFIG,
     claims::jwt_claims::{ISSUER, JwtClaims},
     error::myerror::{ContextExt, MyError},
+    jwt_decoding_key,
 };
 
 /// The only authentication extractor. Verifies the token's signature in Rust and
@@ -19,10 +20,10 @@ use crate::{
 /// mutated in turn. Services now connect once with their own database-level user
 /// and authorize in Rust, so nothing about a request can change the connection.
 pub struct AuthedJwt {
-    /// SurrealDB record id in SQL form (`"user:abc123"`), i.e. the `$token.ID`
-    /// that row-level permissions compare against. Same string, so values stored
-    /// under either scheme stay comparable.
-    pub user_id: String,
+    /// The caller's uuid, parsed once here from the claim's `user:u'…'` record-id
+    /// form. Every handler and service below this point takes a `Uuid` and never
+    /// sees that spelling.
+    pub user_id: Uuid,
     pub claims: JwtClaims,
 }
 
@@ -45,20 +46,21 @@ where
         validation.set_issuer(&[ISSUER]);
         validation.validate_nbf = true;
 
-        let token_data: TokenData<JwtClaims> = decode(
-            auth.token(),
-            &DecodingKey::from_secret(SHARED_CONFIG.jwt_secret.as_bytes()),
-            &validation,
-        )
-        // The detail string must keep containing "JWT": the frontend's apiFetch
-        // (api/king.ts) only attempts a token refresh on a 401 whose `detail`
-        // mentions it. Change this wording and silent logouts start happening.
-        .context_unauthorized(("Unauthorized", "JWT"))?;
+        let token_data: TokenData<JwtClaims> =
+            decode(auth.token(), jwt_decoding_key(), &validation)
+                // The detail string must keep containing "JWT": the frontend's apiFetch
+                // (api/king.ts) only attempts a token refresh on a 401 whose `detail`
+                // mentions it. Change this wording and silent logouts start happening.
+                .context_unauthorized(("Unauthorized", "JWT"))?;
 
         let claims = token_data.claims;
-        Ok(AuthedJwt {
-            user_id: claims.id.clone(),
-            claims,
-        })
+        // `sub` is already the uuid. It used to be a SurrealDB record id spelled
+        // `user:u'<uuid>'` — the form that made `$auth` resolve for the GraphQL
+        // permission clauses — which had to be parsed apart here, with a
+        // `parse_claim_id` and a unit test covering the shapes an attacker might send.
+        // Both are gone with the claim.
+        let user_id = claims.sub;
+
+        Ok(AuthedJwt { user_id, claims })
     }
 }

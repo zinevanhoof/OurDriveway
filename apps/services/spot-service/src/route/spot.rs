@@ -1,100 +1,70 @@
 use axum::Json;
-use axum::extract::{Multipart, State};
-use axum::http::StatusCode;
-use garde::Validate;
-use serde::Serialize;
-use shared::error::myerror::{ContextExt, MyError, MyResult};
-use shared::events::STREAM_SPOTS;
+use axum::extract::{Path, State};
+use axum::http::{HeaderName, StatusCode};
+use shared::error::myerror::MyResult;
+use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
-use shared::requests::spot::CreateSpotRequest;
-use tokio::{fs::File, io::AsyncWriteExt};
+use shared::requests::spot::{CreateSpotRequest, UpdateSpotRequest};
+use shared::responses::common::{BackfilledResponse, X_VERSION};
+use uuid::Uuid;
 
 use crate::AppState;
 
-#[derive(Serialize)]
-pub struct CreatedResponse {
-    pub id: String,
-    /// `"SPOTS:4712"` — where this write landed in the log. The client echoes it
-    /// back on its next read so a load balancer can't route it to an instance
-    /// that hasn't projected this event yet.
-    pub seq: String,
-}
-
 /// 202, not 201: the event is committed to the log, but the projections that
-/// answer reads are still catching up. `seq` is how a caller waits for its own
-/// write.
+/// answer reads are still catching up. The `X-Version` header is how a caller waits
+/// for its own write.
 ///
-/// `Multipart` consumes the body, so it must stay the last extractor.
+/// Answers with the version and nothing else — the minted id is not returned; see
+/// `SpotService::create_spot`.
+///
+/// Plain JSON. Photos are already in R2 by the time this is called — the browser
+/// uploaded them against a presigned URL from media-service — so `images` carries
+/// keys, not bytes, and garde can vet the whole request in one place.
 pub async fn create_spot(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-    multipart: Multipart,
-) -> MyResult<(StatusCode, Json<CreatedResponse>)> {
-    let (request, images) = parse_spot_form(multipart).await?;
+    Valid(request): Valid<CreateSpotRequest>,
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
     // Ownership comes from the verified token, never from the request body.
-    let created = state
-        .spot_service
-        .create_spot(request, user_id, images)
-        .await?;
+    let version = state.spot_service.create_spot(&user_id, request).await?;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(CreatedResponse {
-            id: shared::events::user::record_key(&created.spot_id),
-            seq: format!("{STREAM_SPOTS}:{}", created.seq),
-        }),
-    ))
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 
-async fn parse_spot_form(mut multipart: Multipart) -> MyResult<(CreateSpotRequest, Vec<String>)> {
-    let mut data = None;
-    let mut images = vec![];
+/// 202 for the same reason as create: the log has it, the projections haven't.
+///
+/// Also the live switch — there is no separate endpoint for it. Every field of
+/// [`UpdateSpotRequest`] is optional, so the manage screen's toggle is this route
+/// with a body of `{ "active": false }` and nothing else.
+pub async fn update_spot(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Valid(request): Valid<UpdateSpotRequest>,
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state
+        .spot_service
+        .update_spot(&user_id, &id, request)
+        .await?;
 
-    while let Some(field) = multipart.next_field().await? {
-        let name = field
-            .name()
-            .context_bad_request(("Bad Request", "unnamed field"))?
-            .to_owned();
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
+}
 
-        match name.as_str() {
-            "data" => {
-                let json = field.text().await?;
-                let request: CreateSpotRequest = serde_json::from_str(&json)
-                    .context_bad_request(("Bad Request", "invalid data JSON"))?;
-                request.validate()?; // garde -> MyError::Validation (422 { errors })
-                data = Some(request);
-            }
-            "images" => {
-                let file_name = field
-                    .file_name()
-                    .context_bad_request(("Bad Request", "image without filename"))?
-                    .to_owned();
+pub async fn delete_spot(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state.spot_service.delete_spot(&user_id, &id).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
+}
 
-                let bytes = field.bytes().await?;
-
-                images.push(format!(
-                    "http://192.168.50.29:3002/api/spot/uploads/{file_name}"
-                ));
-                File::create(format!("uploads/{file_name}"))
-                    .await?
-                    .write_all(&bytes)
-                    .await?;
-            }
-            other => tracing::warn!("unknown multipart field: {other}"),
-        }
-    }
-
-    // Images live outside CreateSpotRequest, so garde can't reach them.
-    if images.is_empty() {
-        return Err(MyError::api(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Validation failed",
-            "Add at least one photo.",
-        ));
-    }
-
-    Ok((
-        data.context_bad_request(("Bad Request", "missing data field"))?, // was silently ignored
-        images,
-    ))
+/// `POST /internal/backfill` — re-emit every spot, for rebuilding a consumer.
+///
+/// Off the ingress and unauthenticated by construction; see the same handler in
+/// user-service for why that is the whole of the access control.
+pub async fn backfill(State(state): State<AppState>) -> MyResult<Json<BackfilledResponse>> {
+    Ok(Json(BackfilledResponse {
+        events: state.spot_service.backfill().await?,
+    }))
 }

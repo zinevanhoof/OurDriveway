@@ -22,11 +22,20 @@ variable "REGISTRY" {
 // `builder` is deliberately absent: it carries no tags and is never pushed, it
 // only exists to be consumed by the service targets.
 group "default" {
-  targets = ["user-service", "booking-service", "spot-service", "view-service", "frontend"]
+  targets = ["user-service", "booking-service", "spot-service", "view-service", "media-service", "notification-service", "payment-service", "migrator", "frontend"]
 }
 
 target "builder" {
   dockerfile = "Dockerfile.builder"
+}
+
+// Not a service, and deliberately not named like one: it runs to completion and exits.
+// It is the only thing that migrates — no service does, because diesel_migrations takes
+// no lock around a run and `replicas: N` would race. See diesel-migration.md.
+target "migrator" {
+  dockerfile = "apps/migrator/Dockerfile"
+  contexts   = { builder = "target:builder" }
+  tags       = ["${REGISTRY}/ourdriveway-migrator:${TAG}"]
 }
 
 target "user-service" {
@@ -53,8 +62,26 @@ target "view-service" {
   tags       = ["${REGISTRY}/ourdriveway-view-service:${TAG}"]
 }
 
-// Context is still the repo root, even though the Dockerfile sits in apps/frontend:
-// the SPA lives there but the Caddyfile it ships with is in docker/.
+target "media-service" {
+  dockerfile = "apps/services/media-service/Dockerfile"
+  contexts   = { builder = "target:builder" }
+  tags       = ["${REGISTRY}/ourdriveway-media-service:${TAG}"]
+}
+
+target "notification-service" {
+  dockerfile = "apps/services/notification-service/Dockerfile"
+  contexts   = { builder = "target:builder" }
+  tags       = ["${REGISTRY}/ourdriveway-notification-service:${TAG}"]
+}
+
+target "payment-service" {
+  dockerfile = "apps/services/payment-service/Dockerfile"
+  contexts   = { builder = "target:builder" }
+  tags       = ["${REGISTRY}/ourdriveway-payment-service:${TAG}"]
+}
+
+// Context is still the repo root, even though everything this target needs now
+// sits under apps/frontend/ — it is bake's default and the COPY paths assume it.
 target "frontend" {
   dockerfile = "apps/frontend/Dockerfile"
   tags       = ["${REGISTRY}/ourdriveway-frontend:${TAG}"]

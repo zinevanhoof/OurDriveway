@@ -1,0 +1,27 @@
+# Everything not listed here is the chart default. Set `tag` to a commit sha to
+# pin a release or a rollback — the CI workflow pushes one per merge to main.
+tag: latest
+
+replicas: 2
+
+ingress:
+  host: ourdriveway.example.com
+  tls:
+    enabled: true
+
+services:
+  # spot is no longer pinned to `replicas: 1`. It used to be, because uploaded
+  # images sat on the pod's emptyDir and a second replica would serve 404s for
+  # every image the first one received. The images are in R2 now, so it scales
+  # with everything else.
+  media:
+    env:
+      S3_ENDPOINT: https://REPLACE-ME.r2.cloudflarestorage.com
+      S3_BUCKET: ourdriveway
+
+nats:
+  config:
+    jetstream:
+      fileStore:
+        pvc:
+          size: 20Gi

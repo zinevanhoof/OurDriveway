@@ -16,6 +16,8 @@ import {
     PopoverTrigger,
 } from '@/components/ui/popover'
 import { ArrowRight, CalendarIcon, Plus, X } from '@lucide/vue'
+import { Surface } from '@/components/base/surface'
+import { Text, Title } from '@/components/base/text'
 import {
     DateFormatter,
     getLocalTimeZone,
@@ -100,10 +102,10 @@ const groups = computed(() => [
 <template>
     <div class="space-y-2">
         <div>
-            <div class="font-bold">Availability</div>
-            <div class="text-xs text-muted-foreground font-medium">Add the times your spot is free —
+            <Title>Availability</Title>
+            <Text>Add the times your spot is free —
                 repeating
-                every week, or on specific one-off dates.</div>
+                every week, or on specific one-off dates.</Text>
         </div>
         <Tabs v-model="mode">
             <TabsList class="w-full group-data-horizontal/tabs:h-10">
@@ -115,9 +117,9 @@ const groups = computed(() => [
                 </TabsTrigger>
             </TabsList>
             <TabsContent value="recurring">
-                <div class="flex gap-1">
+                <div class="grid grid-cols-7 gap-1">
                     <Button v-for="day in WEEKDAYS" :key="day" type="button"
-                        :variant="weekday === day ? 'default' : 'outline'" class="flex-1 capitalize"
+                        :variant="weekday === day ? 'default' : 'outline'" class="capitalize"
                         @click="weekday = day">
                         {{ day.slice(0, 3) }}
                     </Button>
@@ -153,20 +155,19 @@ const groups = computed(() => [
 
         <div class="space-y-2" v-auto-animate>
             <div v-for="group in groups" :key="group.title" class="space-y-2">
-                <div class="text-xs font-bold uppercase text-muted-foreground">{{ group.title }}</div>
-                <div v-for="row in group.rows" :key="row.label"
-                    class="space-y-2 px-3 py-3.25 bg-card border border-border rounded-md">
-                    <div class="text-sm font-bold">{{ row.label }}</div>
+                <Text size="eyebrow" weight="bold">{{ group.title }}</Text>
+                <Surface v-for="row in group.rows" :key="row.label" class="gap-2">
+                    <Title size="sm">{{ row.label }}</Title>
                     <div class="flex flex-wrap gap-1">
-                        <div v-for="(slot, i) in row.slots" :key="slot.start"
-                            class="flex items-center text-xs gap-1 rounded-md bg-muted px-2 py-0.5 font-semibold">
+                        <Text v-for="(slot, i) in row.slots" :key="slot.start" weight="semibold" tone="default"
+                            class="flex items-center gap-1 rounded-md bg-muted px-2 py-0.5">
                             {{ slot.start }} - {{ slot.end }}
                             <button type="button" @click="row.slots.splice(i, 1)">
                                 <X class="size-3" />
                             </button>
-                        </div>
+                        </Text>
                     </div>
-                </div>
+                </Surface>
             </div>
         </div>
     </div>

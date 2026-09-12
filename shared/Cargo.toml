@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 axum = { workspace = true }
-surrealdb = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+diesel_json = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -16,3 +18,8 @@ uuid = { workspace = true }
 geo = { workspace = true }
 garde = { workspace = true }
 axum-extra = { workspace = true }
+# A facade, not a runtime — no tokio, no executor, and a no-op unless the binary
+# installs a subscriber. So this does not break the rule at the top of this file:
+# `db::set_version` needs to report a version gap it can only see here, and returning
+# it instead would put the decision in twelve projector call sites.
+tracing = { workspace = true }

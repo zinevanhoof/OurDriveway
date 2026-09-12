@@ -1,27 +1,28 @@
-import { apiFetch } from "@/api/king";
+import { fetchAccount } from "@/api/viewApi";
 import { User } from "@/types/User";
 
-// Why REST and not a GraphQL query: the view's `user` table must be readable by
-// everyone so spot-owner profiles resolve, which means `users { id }` would
-// return every user rather than you. Here the server picks the row from the
-// signature-verified JWT claim, so no permission clause has to be both
-// "only me" and "public" at once.
-//
-// `profile` is null for the moment between registering and the projection
-// catching up; `id` always resolves because it comes from the claim itself.
+/**
+ * The signed-in user, for the auth store.
+ *
+ * A thin adaptor over `viewApi.fetchAccount` rather than a second fetch: the store wants a
+ * flat `User` and the endpoint answers `{ id, profile }`, where `profile` is null for
+ * the moment between registering and the projection catching up. `id` always resolves,
+ * because it comes from the claim itself rather than from a row.
+ *
+ * Why the server picks the row at all, rather than the client asking by id: the read
+ * model's `app_user` is readable by everyone so spot-host profiles resolve, so a
+ * query by id would need a permission clause that is somehow both "only me" and
+ * "public". Choosing the row from a signature-verified claim sidesteps that. The
+ * `email` and `licensePlates` this endpoint alone returns are the fields that used to
+ * need the field-level clause.
+ */
 export async function fetchMe(): Promise<User> {
-  const response = await apiFetch("/api/view/me");
-  if (!response.ok) throw new Error(`fetchMe failed: ${response.status}`);
-
-  const me = (await response.json()) as {
-    id: string;
-    profile: { first_name: string; last_name: string; profile_picture?: string | null } | null;
-  };
+  const me = await fetchAccount();
 
   return {
     id: me.id,
-    firstName: me.profile?.first_name ?? "",
-    lastName: me.profile?.last_name ?? "",
-    profilePicture: me.profile?.profile_picture ?? null,
+    firstName: me.profile?.firstName ?? "",
+    lastName: me.profile?.lastName ?? "",
+    profilePicture: me.profile?.profilePicture ?? null,
   };
 }

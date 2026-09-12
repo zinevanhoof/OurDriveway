@@ -1,0 +1,175 @@
+# The storage layer plus Caddy on the host network, so a phone on the LAN reaches
+# one origin. The Rust services run natively on the host (the "run-all-services"
+# VS Code task), which is why none of them appear below — including media-service,
+# which is reached on :3004 through the Caddy route in Caddyfile-dev.
+#
+# Storage is ONE container now. It was four — pd, tikv, surrealdb and a schema-import
+# job — because SurrealDB needed a separate distributed store underneath it and a
+# separate pass to apply the schemas. YugabyteDB is both halves in one process.
+#
+# The separate pass came back, but it is NOT in this file: `scripts/migrate.sh` runs it
+# on the host, for the reasons in the schema section at the bottom.
+#
+# The one container here that is neither a database nor a proxy is stripe-cli, which
+# forwards webhooks *inward* to payment-service on :3006 — see the note on it below.
+#
+# Production is Kubernetes, not compose. See k8s/.
+
+services:
+  # The event log. Published on the host port because in this topology the Rust
+  # services run natively, outside compose.
+  nats:
+    image: nats:2.14.4-alpine
+    restart: unless-stopped
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # ─── storage ──────────────────────────────────────────────────────────────
+  #
+  # The authoritative store, and the only thing in this file holding a volume that
+  # matters. `docker compose down -v` is data loss, not a replay.
+  #
+  # The per-service databases are created and migrated by `scripts/migrate.sh`, run by
+  # hand after this is healthy — the ONLY thing that touches schema in dev. Services no
+  # longer create their own on first connect: `diesel_migrations` takes no lock around a
+  # run, so `replicas: N` all migrating at boot would race. See `diesel-migration.md`.
+  yugabyte:
+    # >= 2025.2 (LTS), and started through `yugabyted`. That PAIR is what sets the
+    # tserver gflag `yb_enable_read_committed_isolation=true`, and the whole reserve
+    # path depends on it: booking-service locks the spot row with SELECT … FOR UPDATE
+    # and relies on Read Committed giving the NEXT statement a fresh snapshot, so the
+    # loser of a race sees the winner's booking and answers a clean 409.
+    #
+    # Measured on this exact image before any of it was written, two ysqlsh sessions
+    # racing one lock row:
+    #
+    #   FOR UPDATE + read committed    B blocks, then SEES A's insert    correct
+    #   no FOR UPDATE                  B sees 0, both insert             DOUBLE BOOKS
+    #   FOR UPDATE + repeatable read   B locks, still sees 0             DOUBLE BOOKS
+    #
+    # That last row is the pre-2025.2 fallback: Read Committed silently degrades to
+    # Snapshot and reserve double-books with no error anywhere. So this tag is a
+    # correctness constraint, not a preference. Verify after any bump with:
+    #
+    #   docker compose -f docker/docker-compose-dev.yml exec yugabyte \
+    #     bash -lc 'curl -s http://$(hostname -i):9000/varz?raw | grep read_committed'
+    #
+    # `SHOW yb_enable_read_committed_isolation` does NOT answer this — it is a tserver
+    # gflag, not a session GUC, and ysqlsh replies "unrecognized configuration
+    # parameter". `BEGIN; SHOW transaction_isolation;` is the session-level check and
+    # must say "read committed".
+    image: yugabytedb/yugabyte:2026.1.1.2-b9
+    restart: unless-stopped
+    # `--advertise_address` is not optional: without it every process binds the
+    # container's own IP and nothing resolves it by name. Same class of mistake the
+    # old PD `--advertise-client-urls=0.0.0.0` note warned about.
+    #
+    # The memory caps are not tuning-for-later. Untuned, a tserver sizes itself to the
+    # host — this is the same 16 GB box CLAUDE.md pins `jobs = 4` for, and a build and
+    # an unbounded tserver do not fit on it together. `yb_num_shards_per_tserver=1`
+    # keeps a single node from splitting every table into eight tablets it cannot use.
+    # `--base_dir` is NOT optional, and its absence was silent data loss.
+    #
+    # `yugabyted` defaults its base dir to `$HOME/var`, and this image runs as root — so
+    # every tablet, WAL and catalogue went to `/root/var`, in the container's writable
+    # layer, while the named volume sat mounted at `/home/yugabyte/var` holding 4 KB of
+    # nothing. `docker compose down` then destroyed the layer and the databases with it,
+    # which looked like the volume "not persisting" when in fact it was never written to.
+    #
+    # So the flag and the mount below must name the SAME path. Changing one without the
+    # other puts it straight back.
+    command: >
+      bin/yugabyted start --background=false --advertise_address=yugabyte
+      --base_dir=/home/yugabyte/yb_data
+      --tserver_flags=memory_limit_hard_bytes=1500000000,yb_num_shards_per_tserver=1
+      --master_flags=memory_limit_hard_bytes=500000000
+    ports:
+      # YSQL is 5433, NOT 5432 — every DATABASE_URL in the .env files says so.
+      - "5433:5433"
+      # The yugabyted web UI, worth having when a query plan is a surprise.
+      - "15433:15433"
+    volumes:
+      # Same path as `--base_dir` above. See the note there.
+      - yb-data:/home/yugabyte/yb_data
+    healthcheck:
+      # Exits non-zero until every process is actually serving, which is the same
+      # question each service's boot asks a moment later.
+      test: ["CMD", "bin/yugabyted", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      # Deliberately generous. A cold first boot initialises the cluster before it
+      # listens at all, and a tight window here just turns that into a restart loop.
+      start_period: 30s
+
+  # Delivers Stripe webhooks to payment-service without a public URL.
+  #
+  # This is NOT offline: the CLI opens an outbound WebSocket to Stripe, authenticated
+  # as the sandbox below, and Stripe pushes that sandbox's events down it. What it
+  # removes is the need for a public *inbound* URL — an ngrok or a tunnel — not the
+  # dependency on Stripe itself.
+  #
+  # `network_mode: host` for the same reason caddy uses it: the Rust services run
+  # natively on the host, so a bridged container could not reach :3006 at all.
+  #
+  # `--api-key` instead of `stripe login`: no browser pairing, and it makes the sandbox
+  # explicit rather than whatever the stored config happens to point at. It must be the
+  # SAME sandbox as STRIPE_SECRET_KEY in apps/services/payment-service/.env — mismatched
+  # sandboxes is the usual cause of "the payment succeeded but no webhook arrived".
+  #
+  # `--events` because a sandbox is shared: without it every event type on the account
+  # arrives, including other projects' payments.
+  #
+  # The signing secret this session verifies against is NOT the one in the dashboard.
+  # `listen` prints it on startup, so read it from this container's own logs:
+  #
+  #   docker compose -f docker/docker-compose-dev.yml logs stripe-cli | grep -i whsec
+  #
+  # then put it in STRIPE_WEBHOOK_SECRET in apps/services/payment-service/.env. That is
+  # read once at boot, so it has to be set before payment-service starts — not before
+  # compose does.
+  stripe-cli:
+    image: stripe/stripe-cli:latest
+    restart: unless-stopped
+    network_mode: "host"
+    # From docker/.env, which the repo's `*.env` gitignore rule already covers.
+    #
+    # `required: false` so that a checkout without Stripe configured still brings the
+    # databases and Caddy up — only this container fails, loudly, instead of blocking
+    # the whole stack on an unconfigured payment provider. Copy .env.example to .env to
+    # make it work.
+    env_file:
+      - path: .env
+        required: false
+    command:
+      - listen
+      - --api-key=${STRIPE_SECRET_KEY}
+      - --forward-to=localhost:3006/api/payment/webhook
+      - --events=payment_intent.succeeded,payment_intent.payment_failed
+
+  # Single origin for every client (browser + tauri): serves the built SPA and
+  # reverse-proxies /api/* to the Rust services running on the host. Same-origin
+  # is what keeps the SameSite=Strict refresh cookie working and CORS unnecessary
+  # — the one deliberate exception is the PUT straight to R2, which carries a
+  # signature instead of a cookie.
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: "host"
+    volumes:
+      - ./Caddyfile-dev:/etc/caddy/Caddyfile:ro
+      - ../apps/frontend/dist:/srv/dist:ro
+
+# The authoritative data. A named volume rather than the container's own layer,
+# because this does NOT rebuild from the log — `docker compose down -v` is data
+# loss, not a replay.
+volumes:
+  yb-data:
