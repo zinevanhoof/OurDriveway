@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
-import { computed, inject, onScopeDispose, ref, watch } from 'vue'
+import { computed, onScopeDispose, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useForm, useFieldArray, Field as VeeField } from 'vee-validate'
 import { z } from 'zod'
@@ -40,10 +40,6 @@ const me = computed(() => data.value?.profile)
 
 // Built once: the list is fixed and the names only depend on the browser's locale.
 const countries = countryOptions()
-
-// Provided in `main.ts` off `--safe-bottom`. Same injection the availability popover
-// uses, so every floating layer on a phone stops at the same line.
-const safeBottom = inject<number>('safeBottom')
 
 // The address the form was loaded with. Changing away from it is what makes the
 // password field appear — and what the server independently demands a password
@@ -262,7 +258,7 @@ const submit = handleSubmit(async (form) => {
                                     class="bg-card">
                                     <SelectValue placeholder="Not set" />
                                 </SelectTrigger>
-                                <SelectContent position="popper" :collision-padding="{ top: 60, bottom: safeBottom }">
+                                <SelectContent position="popper">
                                     <SelectGroup>
                                         <SelectItem v-for="country in countries" :key="country.code"
                                             :value="country.code">

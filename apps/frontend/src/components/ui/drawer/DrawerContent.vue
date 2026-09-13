@@ -2,6 +2,7 @@
 import type { DialogContentEmits, DialogContentProps } from 'reka-ui'
 import type { HTMLAttributes } from 'vue'
 import { useForwardPropsEmits } from 'reka-ui'
+import { reactiveOmit } from '@vueuse/core'
 import { DrawerContent, DrawerPortal } from 'vaul-vue'
 import { cn } from '@/lib/utils'
 import DrawerOverlay from './DrawerOverlay.vue'
@@ -10,15 +11,28 @@ defineOptions({
   inheritAttrs: false,
 })
 
-const props = defineProps<DialogContentProps & { class?: HTMLAttributes['class'] }>()
+const props = withDefaults(
+  defineProps<DialogContentProps & {
+    class?: HTMLAttributes['class']
+    /**
+     * The dimming layer behind the sheet. Off for a non-modal drawer: it is
+     * `fixed inset-0`, so it swallows every tap on whatever is behind it and stays
+     * mounted for the full close animation, which defeats the point of going
+     * non-modal in the first place.
+     */
+    overlay?: boolean
+  }>(),
+  { overlay: true },
+)
 const emits = defineEmits<DialogContentEmits>()
 
-const forwarded = useForwardPropsEmits(props, emits)
+// `overlay` is ours, not vaul's — forwarding it would land it on the DOM node.
+const forwarded = useForwardPropsEmits(reactiveOmit(props, 'overlay'), emits)
 </script>
 
 <template>
   <DrawerPortal>
-    <DrawerOverlay />
+    <DrawerOverlay v-if="overlay" />
     <DrawerContent
       data-slot="drawer-content"
       v-bind="{ ...$attrs, ...forwarded }"

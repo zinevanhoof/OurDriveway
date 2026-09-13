@@ -56,7 +56,7 @@ const onSelectImages = (event: Event) => {
                 Add photo
                 <input type="file" accept="image/*" multiple class="sr-only" @change="onSelectImages" />
             </label>
-            <div v-auto-animate class="flex gap-2 overflow-x-auto snap-x snap-mandatory no-scrollbar">
+            <div v-auto-animate class="flex gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
                 <div v-for="(image, index) in images" :key="index" class="relative shrink-0 snap-center">
                     <Dialog>
                         <DialogTrigger as-child>

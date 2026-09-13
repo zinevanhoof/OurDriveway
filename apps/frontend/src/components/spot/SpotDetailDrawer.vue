@@ -19,7 +19,7 @@ import AvatarImage from "../ui/avatar/AvatarImage.vue";
 import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
 import Button from "../ui/button/Button.vue";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   spotId: string | null;
   /** Show the book button. Off for a booking the renter already holds. */
   bookable?: boolean;
@@ -28,7 +28,18 @@ const props = defineProps<{
    * schedule is listed — the card only had room for the first day.
    */
   booking?: any;
-}>();
+  /**
+   * Whether the sheet takes the screen while it is open.
+   *
+   * Modal is right for the two list callers, where nothing behind the sheet is worth
+   * touching. The map is the exception: a modal layer sets `pointer-events: none` on
+   * the whole body (reka-ui's DismissableLayer) and only restores it when the layer
+   * unmounts — which vaul delays by the full 500ms close animation. So every dismiss
+   * left the pins dead for half a second. Non-modal keeps the map live throughout, and
+   * tapping a second pin swaps this sheet's contents instead of closing it first.
+   */
+  modal?: boolean;
+}>(), { modal: true });
 
 const open = defineModel<boolean>("open", { default: false });
 const emit = defineEmits<{ book: [] }>();
@@ -56,9 +67,13 @@ const days = computed(() => sortedDays(props.booking));
 </script>
 
 <template>
-  <Drawer v-model:open="open">
-    <DrawerContent @close-auto-focus.prevent
-      class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
+  <Drawer v-model:open="open" :modal="modal">
+    <!-- Non-modal still dismisses on an outside pointer*down*, which fires before the
+         marker's click — the sheet would close and reopen on every pin-to-pin tap. The
+         map closes it on a canvas click instead, so a tap on empty map still works. -->
+    <DrawerContent @close-auto-focus.prevent :overlay="modal"
+      @pointer-down-outside="(e) => { if (!modal) e.preventDefault() }"
+      class="data-[vaul-drawer-direction=bottom]:mb-15">
       <!-- A failed read used to render this sheet with every field blank, which looks
            like a spot with no title, no price and no address rather than a failure. -->
       <div v-if="isError" class="m-4 space-y-2 text-center">
@@ -66,7 +81,11 @@ const days = computed(() => sortedDays(props.booking));
         <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
       </div>
       <div v-else class="m-4 space-y-4">
-        <div class="flex h-40 gap-4 overflow-x-auto snap-x snap-mandatory no-scrollbar">
+        <!-- `touch-pan-x`: without it the browser claims a vertical swipe here for
+             scrolling and cancels the pointer stream, so vaul never sees the drag and
+             the sheet won't close when the gesture starts on a photo. Declaring the
+             strip horizontal-only leaves the vertical axis to the drawer. -->
+        <div class="flex h-40 gap-4 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
           <!-- `only:` = the sole image, so it fills the row instead of leaving a gap. -->
           <img v-for="key in spot?.images" :key="key" :src="key"
             class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md border-border" />

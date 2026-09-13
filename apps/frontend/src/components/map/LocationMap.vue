@@ -135,10 +135,13 @@ watch(bookingOpen, (isOpen) => {
 // raised state while the drawer is up, exactly like a selected single spot.
 const openCluster = ref<{ key: string; spots: MapSpot[] } | null>(null);
 
-const clusterOpen = computed({
-  get: () => openCluster.value !== null,
-  set: (v) => { if (!v) openCluster.value = null; },
-});
+// Open state is its own ref rather than derived from `openCluster`, because the list is
+// rendered *from* `openCluster`: clearing it the moment the drawer started closing emptied
+// the sheet and collapsed its height mid-animation. vaul translates the sheet by its own
+// height, so the close visibly jumped forward the instant the rows vanished. The members
+// are held until vaul reports the animation finished — which also keeps the pin raised
+// until the sheet is actually gone, rather than dropping it on the first frame.
+const clusterOpen = ref(false);
 
 // Two columns, not a geometry: PostGIS is unavailable on YSQL, so lng/lat come back
 // separately.
@@ -152,12 +155,23 @@ const mapSpots = computed<MapSpot[]>(() =>
   })),
 );
 
-type Pin = PinData & { div: HTMLDivElement; marker: maplibregl.Marker };
+// `div` is MapLibre's to position; `inner` is ours to animate. They have to be two
+// elements: the individual `scale` property is applied *after* the element's own
+// `transform`, so scaling the marker element multiplies the positioning translate with
+// it and the pin slides off toward the transform origin as it shrinks.
+type Pin = PinData & {
+  div: HTMLDivElement;
+  inner: HTMLDivElement;
+  marker: maplibregl.Marker;
+};
 const pins = new Map<string, Pin>();
 
 function renderPin(p: Pin) {
+  // `clusterOpen`, not just `openCluster`: the members are deliberately held past the
+  // start of the close so the sheet keeps its height (see the note on `clusterOpen`),
+  // but the pin should start dropping the moment the drawer does.
   const selected = p.spots.length > 1
-    ? p.key === openCluster.value?.key
+    ? p.key === openCluster.value?.key && clusterOpen.value
     : p.spots[0].id === selectedId.value;
   // Raise the marker element itself — MapLibre sets an inline z-index per marker
   // by latitude, so a z-class on the inner button can't lift it above siblings.
@@ -169,23 +183,41 @@ function renderPin(p: Pin) {
       selected,
       onSelect: () => selectPin(p),
     }),
-    p.div,
+    p.inner,
   );
 }
 
 // A cluster opens a list, it never zooms to expand. Spots at identical coordinates
 // stay clustered at every zoom level, so zoom-to-expand would loop forever without
 // ever reaching them — and that is exactly the case this whole feature exists for.
+// Both sheets are non-modal, so either can be open when a pin is tapped — each one
+// closes the other rather than stacking.
 function selectPin(p: Pin) {
   if (p.spots.length === 1) {
+    clusterOpen.value = false;
     selectedId.value = p.spots[0].id;
     return;
   }
+  selectedId.value = null;
   openCluster.value = { key: p.key, spots: p.spots };
+  clusterOpen.value = true;
+}
+
+/**
+ * Drops a closed cluster's members, once it is safe to.
+ *
+ * vaul's `animationEnd` is not an animation event: it is a 500ms `setTimeout` started
+ * when `open` changed, carrying the value `open` had at that moment, and it is never
+ * cancelled. Closing one cluster and opening another inside that window delivers a
+ * stale `false` after the new sheet is already up — which emptied it to its title.
+ * So the live state decides, not the argument.
+ */
+function releaseCluster(open: boolean) {
+  if (!open && !clusterOpen.value) openCluster.value = null;
 }
 
 function openSpot(id: string) {
-  openCluster.value = null;
+  clusterOpen.value = false; // members stay until the close animation ends
   selectedId.value = id;
 }
 
@@ -198,6 +230,19 @@ function openSpot(id: string) {
 // mid-gesture included.
 let zoomLevel: number | null = null;
 
+// Pins grow in and shrink out rather than blinking, so a refetch or a zoom step reads
+// as the set changing instead of the map flickering.
+const PIN_FADE_MS = 180;
+
+// Applied to the wrapper inside the marker, never to the marker itself — see the note
+// on `Pin`. The pin's own selection `scale-125` lives one level further in, on the
+// button, so that transition and this one stay independent.
+function fadePin(inner: HTMLDivElement, visible: boolean) {
+  inner.style.transition = `opacity ${PIN_FADE_MS}ms ease, scale ${PIN_FADE_MS}ms ease`;
+  inner.style.opacity = visible ? "1" : "0";
+  inner.style.scale = visible ? "1" : "0.6";
+}
+
 function syncMarkers() {
   if (!map) return;
   zoomLevel = Math.floor(map.getZoom());
@@ -206,9 +251,14 @@ function syncMarkers() {
 
   for (const [key, pin] of pins) {
     if (next.has(key)) continue;
-    pin.marker.remove();
-    render(null, pin.div); // unmount before discarding the div (frees instances/effects)
+    // Dropped from the index first, so a key that comes back inside the fade gets a
+    // fresh marker rather than adopting one that is on its way out.
     pins.delete(key);
+    fadePin(pin.inner, false);
+    setTimeout(() => {
+      pin.marker.remove();
+      render(null, pin.inner); // unmount before discarding it (frees instances/effects)
+    }, PIN_FADE_MS);
   }
   for (const [key, d] of next) {
     const existing = pins.get(key);
@@ -218,22 +268,32 @@ function syncMarkers() {
       continue;
     }
     const div = document.createElement("div");
+    const inner = document.createElement("div");
+    div.appendChild(inner);
+    fadePin(inner, false);
     const pin: Pin = {
       ...d,
       div,
+      inner,
       marker: new maplibregl.Marker({ element: div }).setLngLat(d.coords).addTo(map),
     };
     pins.set(key, pin);
     renderPin(pin);
+    // The marker is in the DOM by now; reading a layout property commits the hidden
+    // state so the flip below has something to transition *from*. Without it both
+    // styles land in the same frame and the pin just appears.
+    void inner.offsetWidth;
+    fadePin(inner, true);
   }
 }
 
 watch(mapSpots, syncMarkers);
 
 // Selection change: re-render each pin into its existing div → class flips,
-// CSS transition animates the jump up and the shrink back. Closing either drawer
-// clears its ref, which is what shrinks the pin again.
-watch([selectedId, openCluster], () => {
+// CSS transition animates the jump up and the shrink back. A single spot shrinks when
+// `selectedId` clears; a cluster when `clusterOpen` flips, which is the first frame of
+// the close rather than the last — `openCluster` outlives both by design.
+watch([selectedId, openCluster, clusterOpen], () => {
   for (const p of pins.values()) renderPin(p);
 });
 
@@ -257,6 +317,15 @@ onMounted(async () => {
   map.on("load", () => {
     refreshBounds(); // initial fetch at the fallback center
   });
+  // Clears the selection, which closes the detail sheet. That sheet is non-modal, so
+  // nothing dismisses it for us any more. Bound on the canvas rather than via
+  // `map.on("click")` because markers are sibling DOM elements of the canvas, not
+  // children — a tap on a pin can never reach this, so selecting one cannot also
+  // cancel it.
+  map.getCanvas().addEventListener("click", () => {
+    selectedId.value = null;
+    clusterOpen.value = false;
+  });
   map.on("moveend", refreshBounds);
   // Regroup the moment a zoom gesture crosses a whole level, not when it ends. `zoom`
   // fires every frame of a zoom, so this compares levels and only regroups on a change.
@@ -279,7 +348,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
-  for (const p of pins.values()) render(null, p.div);
+  for (const p of pins.values()) render(null, p.inner);
   map?.remove();
 });
 </script>
@@ -288,12 +357,20 @@ onBeforeUnmount(() => {
   <div ref="el" class="relative h-full w-full">
     <MapSearchComponent @select="map?.jumpTo({ center: $event, zoom: 15 })" @filter="filter = $event" />
     <!-- Cluster tap: pick one of the spots sharing this location. -->
-    <Drawer v-model:open="clusterOpen">
-      <DrawerContent @close-auto-focus.prevent
-        class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
+    <Drawer v-model:open="clusterOpen" :modal="false"
+      @animation-end="releaseCluster">
+      <!-- The list scrolls by scrolling the sheet itself, not an inner box. vaul only
+           lets a downward drag close the drawer when the scroll container it finds is
+           the dialog (it checks `role="dialog"` explicitly); from a nested scroller the
+           gesture goes to that scroller and the sheet stays put. -->
+      <!-- No overlay, and outside pointer-downs are left alone: that event beats the
+           marker's click, so letting it dismiss would close and reopen the sheet on
+           every pin-to-pin tap. The canvas click handler closes it instead. -->
+      <DrawerContent @close-auto-focus.prevent :overlay="false" @pointer-down-outside.prevent
+        class="overflow-y-auto data-[vaul-drawer-direction=bottom]:mb-15">
         <div class="m-4 space-y-3">
           <Title size="lg">{{ openCluster?.spots.length }} spots here</Title>
-          <div class="max-h-80 space-y-2 overflow-y-auto">
+          <div class="space-y-2">
             <Surface v-for="s in openCluster?.spots" :key="s.id" @click="openSpot(s.id)" as="button" variant="none"
               orientation="horizontal" class="w-full justify-between gap-4 border border-border text-left">
               <Title as="span" weight="semibold" class="truncate">{{ s.title }}</Title>
@@ -303,7 +380,7 @@ onBeforeUnmount(() => {
         </div>
       </DrawerContent>
     </Drawer>
-    <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable
+    <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable :modal="false"
       @book="bookingOpen = true" />
     <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot"
       :booked="mergeBooked(selectedSpot?.bookings)"

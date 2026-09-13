@@ -336,7 +336,7 @@ async function giveUp() {
             centre, `no-scrollbar` because the snap points are the affordance.
           -->
           <div v-if="item.images?.length"
-            class="flex h-40 gap-2 overflow-x-auto snap-x snap-mandatory no-scrollbar">
+            class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
             <img v-for="key in item.images" :key="key" :src="key" alt=""
               class="snap-center shrink-0 h-full w-full object-cover rounded-md bg-accent" />
           </div>

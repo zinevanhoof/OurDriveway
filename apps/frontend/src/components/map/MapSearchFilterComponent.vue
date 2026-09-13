@@ -141,7 +141,7 @@ function reset() {
         <DrawerTrigger as-child>
             <slot></slot>
         </DrawerTrigger>
-        <DrawerContent class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
+        <DrawerContent class="data-[vaul-drawer-direction=bottom]:mb-15">
             <div class="m-4 space-y-4">
                 <SectionHeader>
                     <Title size="xl" weight="extrabold">Filters</Title>

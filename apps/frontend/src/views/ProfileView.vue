@@ -126,7 +126,7 @@ const logout = async () => {
 
         <Drawer v-model:open="confirmOpen">
             <DrawerContent @close-auto-focus.prevent
-                class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
+                class="data-[vaul-drawer-direction=bottom]:mb-15">
                 <div class="m-4 space-y-4">
                     <div>
                         <Title size="lg">Log out?</Title>

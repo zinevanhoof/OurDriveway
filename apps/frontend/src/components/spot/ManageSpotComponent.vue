@@ -179,7 +179,7 @@ const bookingWhen = (booking: any) => {
         </div>
     </header>
     <div class="space-y-3 px-4 pb-2 overflow-y-auto no-scrollbar">
-        <div class="flex h-40 gap-2 overflow-x-auto snap-x snap-mandatory no-scrollbar">
+        <div class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
             <img v-for="key in data?.images" :key="key" :src="key"
                 class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
         </div>
@@ -285,7 +285,7 @@ const bookingWhen = (booking: any) => {
 
     <Drawer v-model:open="confirmOpen">
         <DrawerContent @close-auto-focus.prevent
-            class="data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))]">
+            class="data-[vaul-drawer-direction=bottom]:mb-15">
             <div class="m-4 space-y-4">
                 <div>
                     <Title size="lg">Delete this listing?</Title>

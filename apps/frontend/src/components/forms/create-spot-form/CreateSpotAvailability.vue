@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { FieldError } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import Button from '@/components/ui/button/Button.vue';
@@ -31,7 +31,6 @@ import type { Availability, TimeSlot, WeeklyAvailability } from '@/types/domain/
 const availability = defineModel<Availability>('availability', { required: true })
 const slotErrors = defineModel<string[]>('slotErrors', { required: true })
 
-const safeBottom = inject<number>('safeBottom')
 const df = new DateFormatter('en-US', { dateStyle: 'medium' })
 const minDate = today(getLocalTimeZone())
 
@@ -134,7 +133,7 @@ const groups = computed(() => [
                             {{ date ? df.format(date.toDate(getLocalTimeZone())) : 'Pick a date' }}
                         </Button>
                     </PopoverTrigger>
-                    <PopoverContent class="w-auto p-0" align="start" :collision-padding="{ bottom: safeBottom }">
+                    <PopoverContent class="w-auto p-0" align="start">
                         <Calendar v-model="date" :min-value="minDate" layout="month-and-year" initial-focus
                             @update:model-value="close" />
                     </PopoverContent>

@@ -12,17 +12,6 @@ import { installNativeFetch, native } from "./api/http.ts";
 import { refreshAccessToken } from "./api/refresh.ts";
 import { fetchMe } from "./api/me.ts";
 
-const safeTop = parseFloat(
-  getComputedStyle(document.documentElement).getPropertyValue("--safe-top") ||
-    "0",
-);
-
-const safeBottom = parseFloat(
-  getComputedStyle(document.documentElement).getPropertyValue(
-    "--safe-bottom",
-  ) || "0",
-);
-
 async function bootstrap() {
   // Route all fetches through plugin-http on native, before the first request
   // (refreshAccessToken below) fires. No-op on web.
@@ -63,10 +52,7 @@ async function bootstrap() {
   });
 
   app.use(MotionPlugin);
-  app
-    .use(autoAnimatePlugin)
-    .provide("safeTop", safeTop)
-    .provide("safeBottom", safeBottom);
+  app.use(autoAnimatePlugin);
 
   const auth = useAuthStore();
 

@@ -9,9 +9,6 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --spacing-safe-top: env(safe-area-inset-top, 0px);
-  --spacing-safe-bottom: env(safe-area-inset-bottom, 0px);
-
   --font-sans: "Inter Variable", sans-serif;
   --font-heading: var(--font-sans);
   --color-sidebar-ring: var(--sidebar-ring);
@@ -55,9 +52,6 @@
 }
 
 :root {
-  --safe-top: env(safe-area-inset-top);
-  --safe-bottom: env(safe-area-inset-bottom);
-
   --background: oklch(0.976 0.005 265);
   --foreground: oklch(0.21 0.03 265);
   --card: oklch(1 0 0);

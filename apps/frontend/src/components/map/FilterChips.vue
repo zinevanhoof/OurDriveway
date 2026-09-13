@@ -9,7 +9,7 @@ defineEmits<{ select: [key: string]; remove: [key: string] }>()
 </script>
 
 <template>
-    <div v-if="items.length" class="no-scrollbar flex gap-2 overflow-x-auto">
+    <div v-if="items.length" class="no-scrollbar flex gap-2 overflow-x-auto touch-pan-x">
         <Text v-for="it in items" :key="it.key" size="sm" weight="semibold"
             :class="cn('flex shrink-0 items-center gap-1 rounded-md py-1 pl-2.5 pr-1', it.key === active ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground')">
             <button type="button" @click="$emit('select', it.key)" class="cursor-pointer">

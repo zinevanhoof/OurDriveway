@@ -228,7 +228,7 @@ watch(open, (o) => {
 <template>
     <Drawer :open="open" :dismissible="false">
         <DrawerContent @close-auto-focus.prevent
-            class="h-[calc(100dvh-var(--safe-top)-3.75rem-var(--safe-bottom))] [&>div:first-child]:hidden data-[vaul-drawer-direction=bottom]:mt-0 data-[vaul-drawer-direction=bottom]:mb-[calc(3.75rem+var(--safe-bottom))] data-[vaul-drawer-direction=bottom]:max-h-[calc(100dvh-var(--safe-top)-3.75rem-var(--safe-bottom))] data-[vaul-drawer-direction=bottom]:rounded-none z-50">
+            class="h-[calc(100dvh-3.75rem)] [&>div:first-child]:hidden data-[vaul-drawer-direction=bottom]:mt-0 data-[vaul-drawer-direction=bottom]:mb-15 data-[vaul-drawer-direction=bottom]:max-h-[calc(100dvh-3.75rem)] data-[vaul-drawer-direction=bottom]:rounded-none z-50">
             <FullScreenLayoutComponent @close="open = false" :title="spot?.title ?? 'Book this spot'"
                 :description="description">
                 <template #main>
