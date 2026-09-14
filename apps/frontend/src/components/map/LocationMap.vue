@@ -28,8 +28,17 @@ const props = withDefaults(
     lng: number;
     lat: number;
     zoom?: number;
+    /**
+     * Whether the map is the screen the user is looking at.
+     *
+     * It is mounted for the whole session and hidden the rest of the time (see
+     * MobileLayout), so it has to know: both sheets portal to the body and would
+     * otherwise hang over another screen, and an error about locating the user is
+     * only worth saying on the map itself.
+     */
+    active?: boolean;
   }>(),
-  { zoom: 14 },
+  { zoom: 14, active: true },
 );
 
 const STYLE_URL = "https://tiles.openfreemap.org/styles/bright";
@@ -339,11 +348,34 @@ onMounted(async () => {
     const dot = document.createElement("div");
     dot.className = "size-4 rounded-full bg-blue-500 border-2 border-white shadow-md";
     new maplibregl.Marker({ element: dot }).setLngLat(here).addTo(map);
+  } else if (props.active) {
+    reportLocateFailure();
   } else {
-    toast.error("Couldn't find your location", {
-      description: "Check that location/GPS is on and permission is granted.",
-      duration: 10000,
-    });
+    locateFailed = true;
+  }
+});
+
+// The locate runs at boot, on a screen that is not the map. Toasting there is an error
+// message about a map the user has not opened — so it waits for them to open it.
+let locateFailed = false;
+
+function reportLocateFailure() {
+  locateFailed = false;
+  toast.error("Couldn't find your location", {
+    description: "Check that location/GPS is on and permission is granted.",
+    duration: 10000,
+  });
+}
+
+// Both sheets are portalled to the body and neither is modal, so leaving the map with
+// one open would leave it floating over the next screen.
+watch(() => props.active, (active) => {
+  if (!active) {
+    selectedId.value = null;
+    clusterOpen.value = false;
+    bookingOpen.value = false;
+  } else if (locateFailed) {
+    reportLocateFailure();
   }
 });
 
@@ -366,8 +398,13 @@ onBeforeUnmount(() => {
       <!-- No overlay, and outside pointer-downs are left alone: that event beats the
            marker's click, so letting it dismiss would close and reopen the sheet on
            every pin-to-pin tap. The canvas click handler closes it instead. -->
+      <!-- `after:hidden`: vaul paints a `height: 200%` `::after` below the sheet to cover
+           an overscroll rubber-band. Once the sheet is the scroll container that pseudo
+           becomes scrollable content — two screens of empty popover under a three-row
+           list. Nothing is lost: the navbar is z-60 over the drawer's z-50, so that
+           strip was never visible here. -->
       <DrawerContent @close-auto-focus.prevent :overlay="false" @pointer-down-outside.prevent
-        class="overflow-y-auto data-[vaul-drawer-direction=bottom]:mb-15">
+        class="overflow-y-auto after:hidden data-[vaul-drawer-direction=bottom]:mb-15">
         <div class="m-4 space-y-3">
           <Title size="lg">{{ openCluster?.spots.length }} spots here</Title>
           <div class="space-y-2">

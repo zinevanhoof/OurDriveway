@@ -17,7 +17,17 @@ export type Position = [number, number];
  * (the map has a fallback center) shouldn't have to catch, and one that can't
  * decides for itself what to say.
  */
-export async function locateUser(): Promise<Position | null> {
+export function locateUser(): Promise<Position | null> {
+  // The home screen and the map both locate at boot now that the map is mounted for
+  // the session, and on native that is two overlapping `requestPermissions` calls into
+  // the same platform prompt. One flight at a time; a later call still re-locates.
+  inFlight ??= locate().finally(() => { inFlight = null; });
+  return inFlight;
+}
+
+let inFlight: Promise<Position | null> | null = null;
+
+async function locate(): Promise<Position | null> {
   try {
     if (native) {
       const geo = await import("@tauri-apps/plugin-geolocation");
