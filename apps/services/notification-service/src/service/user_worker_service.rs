@@ -76,9 +76,11 @@ impl UserWorkerService {
 
             // `Updated`, `PasswordChanged` and `EmailVerified` are nobody's
             // business here yet, and `PasswordResetRequested` was answered above.
-            // Note that `Registered` also carries an Argon2 `password_hash` — it
-            // must never be logged, which is why nothing in this file prints the
-            // event.
+            //
+            // Nothing in this file prints an event, and that rule is worth keeping
+            // even now that `Registered` no longer carries a password hash: every
+            // variant still names a real address, and `reset_url` below is a live
+            // credential.
             _ => return Ok(None),
         };
 

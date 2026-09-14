@@ -4,10 +4,14 @@ use argon2::{
 };
 use shared::error::myerror::{ContextExt, MyResult};
 
-/// Hashing happens here rather than in SurrealQL (`crypto::argon2::generate`)
-/// because a projection must be deterministic: Argon2 generates a random salt,
-/// so every replica applying the same `UserRegistered` event would store a
-/// different hash. Hash once, on the write side, and put the result in the event.
+/// Hashing happens in Rust, on the write side, once — and the result goes into
+/// this service's own row and nowhere else. It is never put in an event: nothing
+/// downstream has any business knowing it, which is why `UserRegistered` and
+/// `UserPasswordChanged` carry no password at all.
+///
+/// The original reason for hashing here was determinism — Argon2 salts randomly,
+/// so a projection computing it would give a different answer on every replica.
+/// That still holds; it just no longer implies the hash has to travel.
 pub fn hash(password: &str) -> MyResult<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()

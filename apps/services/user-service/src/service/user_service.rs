@@ -100,14 +100,15 @@ impl UserService {
         );
 
         let user_id = Uuid::now_v7();
+        // Beside the event rather than in it. Argon2 salts randomly, so this still
+        // has to happen exactly once and on the write side — but the result belongs
+        // in the row and nowhere else, least of all in a stream four services read.
+        let password_hash = password::hash(req.password.as_str())?;
         let registered = UserRegistered {
             user_id,
             first_name: req.first_name,
             last_name: req.last_name,
             email: req.email.into(),
-            // Hashed here rather than anywhere downstream: Argon2 salts randomly,
-            // so hashing twice from the same event gives two different answers.
-            password_hash: password::hash(req.password.as_str())?,
         };
 
         // The row and its event, in one transaction. This is the whole shape of
@@ -123,8 +124,11 @@ impl UserService {
                     // No `set_version` after this: the row carries its own version and this is
                     // a whole-row write. The separate statement is still needed wherever a
                     // *patch* moves a row, since a patch does not touch the column.
-                    UserRepository::upsert(conn, User::registered(registered.clone(), version))
-                        .await?;
+                    UserRepository::upsert(
+                        conn,
+                        User::registered(registered.clone(), version, password_hash),
+                    )
+                    .await?;
 
                     let mut envelope = Envelope::new(
                         UserEvent::Registered(registered),
@@ -450,7 +454,7 @@ impl UserService {
                         conn,
                         user_id,
                         UserPatch {
-                            password: Some(password_hash.clone()),
+                            password: Some(password_hash),
                             // The link proved the mailbox, which is the same claim
                             // `EmailVerified` makes. Without this an account that never
                             // verified resets successfully and still cannot log in.
@@ -473,12 +477,10 @@ impl UserService {
 
                     // `PasswordChanged`, not a variant of its own: view-service and
                     // payment-service already ignore it, and a consumer that reacts to a
-                    // password changing does not care why it changed.
+                    // password changing does not care why it changed — nor, now, what it
+                    // changed to.
                     let envelope = Envelope::new(
-                        UserEvent::PasswordChanged(UserPasswordChanged {
-                            user_id,
-                            password_hash,
-                        }),
+                        UserEvent::PasswordChanged(UserPasswordChanged { user_id }),
                         Some(user_id),
                         aggregate_id("user", &user_id),
                         next,
@@ -531,7 +533,11 @@ impl UserService {
             profile_picture,
         } = req;
 
-        let event = match new_password {
+        // The hash travels *beside* the event now rather than inside it — see
+        // `UserRegistered`. Destructured as a pair so the invariant holds by
+        // construction: a `PasswordChanged` always carries one, an `Updated` never
+        // does, and neither arm can be written to disagree.
+        let (event, new_password_hash) = match new_password {
             Some(new_password) => {
                 // Only one event goes out, so a profile field here would be accepted
                 // and then silently dropped. 422 instead.
@@ -556,10 +562,12 @@ impl UserService {
                 password::verify(&existing.password, current)
                     .context_unauthorized(("Unauthorized", "Incorrect password"))?;
 
-                UserEvent::PasswordChanged(UserPasswordChanged {
-                    user_id: user_uuid,
-                    password_hash: password::hash(new_password.as_str())?,
-                })
+                (
+                    UserEvent::PasswordChanged(UserPasswordChanged {
+                        user_id: user_uuid,
+                    }),
+                    Some(password::hash(new_password.as_str())?),
+                )
             }
 
             None => {
@@ -602,18 +610,21 @@ impl UserService {
                 // Straight through, all of them: `None` already means "unchanged"
                 // both in the event and in the projection's `?? column` coalescing,
                 // which is the same thing it means in the request.
-                UserEvent::Updated(UserUpdated {
-                    user_id: user_uuid,
-                    first_name,
-                    last_name,
-                    email: email.map(Into::into),
-                    license_plates,
-                    profile_picture,
-                    // Uppercased on the way out — `Country::into_inner` is the only
-                    // way to read one, so the database and every consumer of this
-                    // event see a single spelling.
-                    country: country.map(Country::into_inner),
-                })
+                (
+                    UserEvent::Updated(UserUpdated {
+                        user_id: user_uuid,
+                        first_name,
+                        last_name,
+                        email: email.map(Into::into),
+                        license_plates,
+                        profile_picture,
+                        // Uppercased on the way out — `Country::into_inner` is the only
+                        // way to read one, so the database and every consumer of this
+                        // event see a single spelling.
+                        country: country.map(Country::into_inner),
+                    }),
+                    None,
+                )
             }
         };
 
@@ -625,12 +636,17 @@ impl UserService {
                     let version = shared::next_version!(conn, shared::schema::user::app_user, &user_uuid)?;
 
                     match &event {
-                        UserEvent::PasswordChanged(e) => {
+                        // The hash comes from the pair above, not from the event —
+                        // which no longer carries one. `PasswordChanged` implies
+                        // `Some`, so an unreachable `None` writes nothing rather than
+                        // panicking: this is inside a transaction, and the version
+                        // bump and the event below are still correct on their own.
+                        UserEvent::PasswordChanged(_) => {
                             UserRepository::patch(
                                 conn,
                                 user_uuid,
                                 UserPatch {
-                                    password: Some(e.password_hash.clone()),
+                                    password: new_password_hash.clone(),
                                     ..Default::default()
                                 },
                             )
@@ -698,6 +714,11 @@ impl UserService {
     /// `Envelope::backfill` is the real backstop, checked in
     /// notification-service's `notify`; this list is what stops anyone reaching
     /// for it in the first place.
+    ///
+    /// `PasswordChanged` is likewise absent, and now trivially so: it carries no
+    /// password, so there is nothing about it to reproduce. This used to publish
+    /// every account's Argon2 hash onto STREAM_USERS in one burst — the single worst
+    /// consequence of a field nothing downstream ever read.
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
 
@@ -710,7 +731,6 @@ impl UserService {
                 first_name: user.first_name,
                 last_name: user.last_name,
                 email: user.email,
-                password_hash: user.password,
             };
             let updated = UserUpdated {
                 user_id,

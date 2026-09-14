@@ -334,7 +334,6 @@ mod live_tests {
                 first_name: "Ada".to_string(),
                 last_name: "Lovelace".to_string(),
                 email: email.clone(),
-                password_hash: "$argon2id$vTEST".to_string(),
             }),
             1,
         )
@@ -386,7 +385,6 @@ mod live_tests {
                 first_name: "Ada".to_string(),
                 last_name: "Lovelace".to_string(),
                 email: email.clone(),
-                password_hash: "$argon2id$vTEST".to_string(),
             }),
             1,
         )

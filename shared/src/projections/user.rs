@@ -30,7 +30,8 @@ pub struct UserPublicProjection {
 ///
 /// No `email_verified` and no password hash: neither is a column on the read model's
 /// `app_user` at all, which is the first thing deciding what can leak from a table every
-/// caller can read.
+/// caller can read. The hash could not arrive here even by accident now — no USERS
+/// event carries one.
 #[derive(Debug, Clone, Queryable, Selectable)]
 #[diesel(table_name = crate::schema::view::app_user)]
 #[diesel(check_for_backend(diesel::pg::Pg))]

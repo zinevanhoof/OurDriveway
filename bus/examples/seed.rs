@@ -159,16 +159,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             first_name: first.into(),
             last_name: last.into(),
             email: email.into(),
-            // Hashed here for the same reason the real signup path does it: Argon2
-            // salts randomly, so it has to happen once on the write side.
-            password_hash: hash(PASSWORD),
         };
 
         let mut conn = user_db.get().await?;
 
         // Verified on the way in. The real path needs a mailed token, and a seeded
         // account that cannot log in is not a seeded account.
-        let mut row = User::registered(registered.clone(), 1);
+        //
+        // The hash goes into the row and not into the event, exactly as signup does
+        // it — see `UserRegistered`. Argon2 salts randomly, so it still happens once,
+        // here, on the write side.
+        let mut row = User::registered(registered.clone(), 1, hash(PASSWORD));
         row.email_verified = true;
         // The struct is the write. `User` derives `Insertable + AsChangeset`, so
         // `.values(row)` names `app_user`'s columns once — in the model — and this seed

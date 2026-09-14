@@ -96,8 +96,9 @@ impl Projector for BookingProjector {
 /// being here — a value onboarding cannot proceed without must not depend on another
 /// service answering a request. See `migrations/payment/0004_host_mirror/up.sql`.
 ///
-/// Only two of the five USERS variants matter. A password change, an email
-/// verification and a resend request change nothing Stripe is ever told.
+/// Only two of the six USERS variants matter. A password change, an email
+/// verification and the two "send them a link" requests change nothing Stripe is
+/// ever told.
 pub struct UserProjector;
 
 impl Projector for UserProjector {
@@ -126,9 +127,10 @@ impl Projector for UserProjector {
                 HostMirrorRepository::patch(&mut *conn, &user_id, e.email, e.country).await
             }
 
-            // Deliberately ignored, and each for its own reason: a password hash must
-            // never reach this database, `EmailVerified` gates login rather than
-            // payouts, and `VerificationRequested` is notification-service's alone.
+            // Deliberately ignored, and each for its own reason: a password change
+            // is nothing a payout account can act on, `EmailVerified` gates login
+            // rather than payouts, and the two `*Requested` variants are
+            // notification-service's alone.
             _ => Ok(()),
         }?;
 

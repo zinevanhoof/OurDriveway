@@ -66,18 +66,24 @@ impl UserEvent {
     }
 }
 
+/// **No password, in any form.** It used to carry the Argon2 hash, and nothing
+/// downstream ever read it: view-service's row has no such column, payment-service
+/// mirrors an id and an address, and notification-service wants a name. The only
+/// reads were user-service building its own row out of a struct it was about to
+/// publish — a local convenience, never a contract — so the hash was travelling
+/// through a stream four services consume purely because of where the writer
+/// happened to keep it. `User::registered` takes it as an argument now.
+///
+/// The event-sourcing case for carrying it is gone too: STREAM_USERS expires after
+/// a week (see [`crate::events::STREAMS`]), so nothing older is rebuildable from
+/// the log, and user-service's row is read rather than re-derived — see
+/// `UserService::backfill`, which no longer re-emits every account's hash.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserRegistered {
     pub user_id: Uuid,
     pub first_name: String,
     pub last_name: String,
     pub email: String,
-    /// Argon2 PHC string, hashed in Rust before publishing.
-    ///
-    /// Never the plaintext, and never hashed in a projection: Argon2 salts
-    /// randomly, so every replica would compute a different hash for the same
-    /// event and logins would work on one instance but not another.
-    pub password_hash: String,
 }
 
 /// Partial update — `None` means "unchanged", not "clear".
@@ -100,13 +106,18 @@ pub struct UserUpdated {
     pub country: Option<String>,
 }
 
-/// Its own event rather than a field on [`UserUpdated`]: that one is consumed by
-/// the view projection, and a password hash must never reach a database a
-/// browser identity can read.
+/// A marker: this account's password is not what it was. Carries no password, for
+/// the reasons on [`UserRegistered`].
+///
+/// Still its own event rather than a field on [`UserUpdated`], and now for the only
+/// reason that was ever load-bearing: a consumer that wants to react to a password
+/// changing — revoke sessions, mail the account, raise an alert — has to be able to
+/// match on it rather than sniff a field. What it must *not* do is learn the new
+/// password, which was true before and is now true by construction.
+///
+/// Deliberately the same bare shape as [`UserEvent::EmailVerified`]. Both say only
+/// that something happened to an account the reader can look up if it is entitled to.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserPasswordChanged {
     pub user_id: Uuid,
-    /// Argon2 PHC string. Hashed on the write side for the same reason as
-    /// [`UserRegistered::password_hash`].
-    pub password_hash: String,
 }

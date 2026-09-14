@@ -65,7 +65,8 @@ impl Projector for UserProjector {
                 ViewUserRepository::patch(&mut *conn, user_id, ViewUserPatch::from(e)).await
             }
 
-            // Nothing to project — the hash never comes near this database.
+            // Nothing to project: the event is a bare marker, and there is no
+            // password anywhere near this database to update even if it weren't.
             UserEvent::PasswordChanged(_) => Ok(()),
 
             // Verification state is an authentication concern and stays in
