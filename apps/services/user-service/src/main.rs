@@ -142,6 +142,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // user who cannot log in yet is exactly who needs these.
         .route("/api/user/email/verify", post(route::email::verify))
         .route("/api/user/email/resend", post(route::email::resend))
+        // The same bargain, for the other link this system mails. Deliberately not
+        // under `session/`: these two have no cookie and must not be scoped to the
+        // path one is sent on. `PATCH /api/user` remains the *authenticated*
+        // change-password form — these are for someone who cannot log in.
+        .route("/api/user/password/forgot", post(route::password::forgot))
+        .route("/api/user/password/reset", post(route::password::reset))
         // The authenticated user themselves — which one is the JWT's business, so
         // there is no id in the path and nothing to scope under.
         // PATCH is also the change-password form: same record, and the service

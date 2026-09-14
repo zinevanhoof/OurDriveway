@@ -23,6 +23,14 @@ pub enum Mail {
         first_name: Option<String>,
         company_name: Option<String>,
     },
+    ResetPassword {
+        to: String,
+        /// Single-use, and short-lived. See `shared::email_token` for what makes
+        /// it so — the URL is the whole credential either way.
+        reset_url: String,
+        first_name: Option<String>,
+        company_name: Option<String>,
+    },
 }
 
 impl Mail {
@@ -30,7 +38,7 @@ impl Mail {
     /// differs.
     pub fn to(&self) -> &str {
         match self {
-            Mail::VerifyEmail { to, .. } => to,
+            Mail::VerifyEmail { to, .. } | Mail::ResetPassword { to, .. } => to,
         }
     }
 
@@ -39,6 +47,7 @@ impl Mail {
     pub fn kind(&self) -> &'static str {
         match self {
             Mail::VerifyEmail { .. } => "verify_email",
+            Mail::ResetPassword { .. } => "reset_password",
         }
     }
 }

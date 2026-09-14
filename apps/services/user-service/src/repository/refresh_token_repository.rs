@@ -4,6 +4,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::user::{RefreshToken, RefreshTokenPatch};
 use shared::error::myerror::MyResult;
 use shared::schema::user::refresh_token;
+use uuid::Uuid;
 
 /// The `refresh_token` table.
 ///
@@ -66,6 +67,38 @@ impl RefreshTokenRepository {
             .execute(conn)
             .await?;
         Ok(())
+    }
+
+    /// Ends every live session this user has, in one statement. Returns how many.
+    ///
+    /// Filtered on `revoked = false` so a second call is a real no-op rather than a
+    /// rewrite of reasons already recorded — which is also what makes the count mean
+    /// "sessions actually ended".
+    ///
+    /// No `version` bump on these rows, unlike every single-token write above. That
+    /// column feeds the await-version layer and numbers the per-token events, and a
+    /// bulk revoke has neither a client waiting on one row nor an event to number.
+    ///
+    // ponytail: no `SessionEvent::Revoked` per row. Nothing in the repo consumes
+    // SESSIONS, and N events would be N `FOR UPDATE` reads and N outbox rows inside
+    // a transaction the caller is waiting on. The day something projects that stream,
+    // add one `AllRevoked { user_id, reason }` — not N.
+    pub async fn revoke_all_for_user(
+        conn: &mut AsyncPgConnection,
+        user_id: Uuid,
+        reason: &str,
+    ) -> MyResult<usize> {
+        Ok(diesel::update(
+            refresh_token::table
+                .filter(refresh_token::user_id.eq(user_id))
+                .filter(refresh_token::revoked.eq(false)),
+        )
+        .set(&RefreshTokenPatch {
+            revoked: Some(true),
+            revoked_reason: Some(reason.to_string()),
+        })
+        .execute(conn)
+        .await?)
     }
 
     /// Expired rows can never be revoked or renewed again, so they are dead weight;

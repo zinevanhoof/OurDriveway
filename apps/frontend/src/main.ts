@@ -5,6 +5,7 @@ import { createPinia } from "pinia";
 import { MotionPlugin } from "motion-v";
 import { autoAnimatePlugin } from "@formkit/auto-animate/vue";
 import { VueQueryPlugin, QueryClient } from "@tanstack/vue-query";
+import { configure as configureVeeValidate } from "vee-validate";
 import { useAuthStore } from "@/stores/auth";
 
 import "@/main.css";
@@ -16,6 +17,18 @@ async function bootstrap() {
   // Route all fetches through plugin-http on native, before the first request
   // (refreshAccessToken below) fires. No-op on web.
   installNativeFetch();
+
+  // vee-validate validates on change and blur but NOT on input by default, so a
+  // field only turned red once you left it. The two login/signup forms bind
+  // `v-slot="{ field }"`, which is the raw HTML binding — `field.onInput` updates
+  // the value and validates nothing without this. (The forms binding
+  // `componentField` were already live: `validateOnModelUpdate` defaults on, and
+  // `ui/input` emits `update:modelValue` per keystroke. Set here so both spellings
+  // behave the same rather than depending on which one a form happened to use.)
+  //
+  // The cost is that a half-typed email reads as invalid from the first character.
+  // That is the trade the library's default avoids and we are choosing against.
+  configureVeeValidate({ validateOnInput: true });
 
   const app = createApp(App);
 

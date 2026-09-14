@@ -18,12 +18,31 @@ pub enum UserEvent {
     ///
     /// Carries the address and name rather than just an id so notification-service
     /// never has to look a user up, which is what lets it own no database at all.
-    /// `PasswordResetRequested` will be this same shape.
     VerificationRequested(VerificationRequested),
+    /// "I've forgotten it." Same shape and same reason as
+    /// [`Self::VerificationRequested`], and likewise projected by nothing.
+    ///
+    /// **The envelope's `version` is load-bearing for this one.**
+    /// notification-service mints the reset token carrying it, and user-service
+    /// refuses that token unless the row is still at that version — which is the
+    /// whole of what makes a reset link single-use with nothing stored anywhere.
+    /// A consumer that re-raises this event under a different version silently
+    /// breaks that.
+    PasswordResetRequested(PasswordResetRequested),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerificationRequested {
+    pub user_id: Uuid,
+    pub email: String,
+    pub first_name: String,
+}
+
+/// Deliberately its own struct rather than a second variant over
+/// [`VerificationRequested`]: the two are the same three fields today, and the
+/// name is what a reader of notification-service's `mail_for` match sees.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PasswordResetRequested {
     pub user_id: Uuid,
     pub email: String,
     pub first_name: String,
@@ -42,6 +61,7 @@ impl UserEvent {
             Self::PasswordChanged(e) => e.user_id,
             Self::EmailVerified { user_id } => *user_id,
             Self::VerificationRequested(e) => e.user_id,
+            Self::PasswordResetRequested(e) => e.user_id,
         }
     }
 }

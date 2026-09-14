@@ -12,11 +12,13 @@
 mod email;
 mod fields;
 mod login;
+mod password;
 mod signup;
 mod update_user;
 
 pub use email::{ResendVerificationRequest, VerifyEmailRequest};
 pub use fields::{Country, Email, Password};
 pub use login::LoginRequest;
+pub use password::{ForgotPasswordRequest, ResetPasswordRequest};
 pub use signup::SignupRequest;
 pub use update_user::UpdateUserRequest;

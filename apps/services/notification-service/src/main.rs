@@ -33,19 +33,25 @@ pub struct Config {
     /// `Name <address@domain>` or a bare address. The domain must be the one
     /// verified with Resend — mail from anything else is refused outright.
     pub mail_from: String,
-    /// Origin the verification link points at, with no trailing slash. In dev
-    /// this must be the LAN IP: the link is opened on a phone, where `localhost`
-    /// is the phone.
+    /// Origin every mailed link points at, with no trailing slash. In dev this
+    /// must be the LAN IP: the link is opened on a phone, where `localhost` is
+    /// the phone.
     pub app_base_url: String,
     /// Fills the template's `company_name`. Configured so a dev deployment can
     /// say so and its mail doesn't read as production.
     pub company_name: String,
-    /// Signs verification links. **Not** `JWT_SECRET` — see
-    /// `shared::email_token`, where the reason is a test.
+    /// Signs both mailed links. **Not** `JWT_SECRET` — see
+    /// `shared::email_token`, where the reason is a test. One secret for both is
+    /// safe because `Purpose` separates them, which is also a test.
     pub email_token_secret: String,
     pub verify_token_ttl_secs: i64,
+    /// How long a reset link lives. Deliberately far shorter than
+    /// `verify_token_ttl_secs`: this one sets a credential on an account that
+    /// already exists, and the person who asked for it is at their keyboard now.
+    pub reset_token_ttl_secs: i64,
     /// Resend template id or alias.
     pub template_email_verification: String,
+    pub template_password_reset: String,
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
@@ -60,7 +66,9 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     company_name: env::require("COMPANY_NAME"),
     email_token_secret: env::require("EMAIL_TOKEN_SECRET"),
     verify_token_ttl_secs: env::require_parsed("VERIFY_TOKEN_TTL_SECS"),
+    reset_token_ttl_secs: env::require_parsed("RESET_TOKEN_TTL_SECS"),
     template_email_verification: env::require("TEMPLATE_EMAIL_VERIFICATION"),
+    template_password_reset: env::require("TEMPLATE_PASSWORD_RESET"),
 });
 
 #[tokio::main]

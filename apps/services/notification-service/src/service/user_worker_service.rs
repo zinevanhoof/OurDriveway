@@ -47,22 +47,38 @@ impl UserWorkerService {
             return Ok(());
         }
 
-        let Some(mail) = self.mail_for(&envelope.payload)? else {
+        // The version travels with the event rather than being read from anywhere:
+        // this service owns no database, and the reset token has to bind to the
+        // version the *request* assigned, not to whatever the row says by the time
+        // the mail goes out.
+        let Some(mail) = self.mail_for(&envelope.payload, envelope.version)? else {
             return Ok(());
         };
 
         self.mailer.send(&mail, &envelope.event_id).await
     }
 
-    fn mail_for(&self, event: &UserEvent) -> MyResult<Option<Mail>> {
+    fn mail_for(&self, event: &UserEvent, version: i64) -> MyResult<Option<Mail>> {
+        // Handled ahead of the shared destructure below because it is the only mail
+        // whose link is bound to a version rather than to a user alone.
+        if let UserEvent::PasswordResetRequested(e) = event {
+            return Ok(Some(Mail::ResetPassword {
+                to: e.email.clone(),
+                reset_url: reset_url(&e.user_id, version)?,
+                first_name: Some(e.first_name.clone()),
+                company_name: Some(CONFIG.company_name.clone()),
+            }));
+        }
+
         let (user_id, email, first_name) = match event {
             UserEvent::Registered(e) => (&e.user_id, &e.email, &e.first_name),
             UserEvent::VerificationRequested(e) => (&e.user_id, &e.email, &e.first_name),
 
             // `Updated`, `PasswordChanged` and `EmailVerified` are nobody's
-            // business here yet. Note that `Registered` also carries an Argon2
-            // `password_hash` — it must never be logged, which is why nothing in
-            // this file prints the event.
+            // business here yet, and `PasswordResetRequested` was answered above.
+            // Note that `Registered` also carries an Argon2 `password_hash` — it
+            // must never be logged, which is why nothing in this file prints the
+            // event.
             _ => return Ok(None),
         };
 
@@ -92,6 +108,32 @@ fn verification_url(user_id: &Uuid) -> MyResult<String> {
         user_id,
         Purpose::VerifyEmail,
         CONFIG.verify_token_ttl_secs,
+        // No version claim: verification is deliberately replayable, so the token
+        // binds to nothing but the account.
+        None,
     )?;
     Ok(format!("{}/verify?token={token}", CONFIG.app_base_url))
+}
+
+/// Minted here for the same reasons as [`verification_url`], plus one.
+///
+/// `version` is the aggregate version the reset request itself bumped the account
+/// to, and it rides inside the signature. user-service bumps past it when the
+/// password is set, so the link works exactly once — with no table of issued
+/// tokens anywhere. The corollary is that a second request kills the first link:
+/// see `UserService::forgot_password`, and say so in the template copy.
+///
+/// The path has to match the frontend route exactly — `/reset-password`.
+fn reset_url(user_id: &Uuid, version: i64) -> MyResult<String> {
+    let token = email_token::mint(
+        &CONFIG.email_token_secret,
+        user_id,
+        Purpose::ResetPassword,
+        CONFIG.reset_token_ttl_secs,
+        Some(version),
+    )?;
+    Ok(format!(
+        "{}/reset-password?token={token}",
+        CONFIG.app_base_url
+    ))
 }

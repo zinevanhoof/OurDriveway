@@ -28,6 +28,19 @@ pub fn variables(mail: &Mail) -> HashMap<String, Value> {
             insert_opt(&mut vars, "company_name", company_name.as_deref());
             vars
         }
+
+        Mail::ResetPassword {
+            reset_url,
+            first_name,
+            company_name,
+            ..
+        } => {
+            let mut vars = HashMap::new();
+            vars.insert("reset_url".to_string(), json(reset_url));
+            insert_opt(&mut vars, "first_name", first_name.as_deref());
+            insert_opt(&mut vars, "company_name", company_name.as_deref());
+            vars
+        }
     }
 }
 
@@ -38,6 +51,7 @@ pub fn variables(mail: &Mail) -> HashMap<String, Value> {
 pub fn subject(mail: &Mail) -> &'static str {
     match mail {
         Mail::VerifyEmail { .. } => "Verify your email address",
+        Mail::ResetPassword { .. } => "Reset your password",
     }
 }
 
@@ -91,5 +105,39 @@ mod tests {
             vars.get("company_name").and_then(Value::as_str),
             Some("OurDriveway")
         );
+    }
+
+    fn reset_mail(first_name: Option<&str>, company_name: Option<&str>) -> Mail {
+        Mail::ResetPassword {
+            to: "renter@example.com".to_string(),
+            reset_url: "https://ourdriveway.com/reset-password?token=abc".to_string(),
+            first_name: first_name.map(str::to_string),
+            company_name: company_name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_reset_mail_carries_its_url() {
+        let vars = variables(&reset_mail(None, None));
+        assert_eq!(
+            vars.get("reset_url").and_then(Value::as_str),
+            Some("https://ourdriveway.com/reset-password?token=abc")
+        );
+        // Not the other variant's key, which a copy-pasted arm would leave behind.
+        assert!(!vars.contains_key("verification_url"), "{vars:?}");
+    }
+
+    /// Per variant, because the omit-rather-than-blank rule is written out per
+    /// variant — the arm that forgets `insert_opt` compiles perfectly.
+    #[test]
+    fn an_absent_optional_is_omitted_on_a_reset_too() {
+        let vars = variables(&reset_mail(None, None));
+        assert!(!vars.contains_key("first_name"), "{vars:?}");
+        assert!(!vars.contains_key("company_name"), "{vars:?}");
+    }
+
+    #[test]
+    fn each_mail_has_its_own_subject() {
+        assert_ne!(subject(&mail(None, None)), subject(&reset_mail(None, None)));
     }
 }

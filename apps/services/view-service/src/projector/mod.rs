@@ -72,7 +72,13 @@ impl Projector for UserProjector {
             // user-service's private projection. This table is world-readable, so
             // `email_verified` here would publish which addresses are unconfirmed to
             // every client that can read a spot host's profile.
-            UserEvent::EmailVerified { .. } | UserEvent::VerificationRequested(_) => Ok(()),
+            //
+            // `PasswordResetRequested` is the same again, twice over: it is a
+            // message to notification-service, and it names an address that is
+            // about to receive a credential.
+            UserEvent::EmailVerified { .. }
+            | UserEvent::VerificationRequested(_)
+            | UserEvent::PasswordResetRequested(_) => Ok(()),
         }?;
 
         // After the match, so it runs for the arms that store nothing too. "Applied"

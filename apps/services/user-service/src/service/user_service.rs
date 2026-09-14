@@ -6,16 +6,23 @@ use shared::db;
 use shared::domain_models::user::{User, UserPatch};
 use shared::error::myerror::{ContextExt, MyError, MyResult};
 use shared::events::user::{
-    UserEvent, UserPasswordChanged, UserRegistered, UserUpdated, VerificationRequested,
+    PasswordResetRequested, UserEvent, UserPasswordChanged, UserRegistered, UserUpdated,
+    VerificationRequested,
 };
 use shared::events::{Envelope, aggregate_id, format_version, user_subject};
 use shared::requests::user::{
-    Country, Email, LoginRequest, ResendVerificationRequest, SignupRequest, UpdateUserRequest,
-    VerifyEmailRequest,
+    Country, Email, ForgotPasswordRequest, LoginRequest, ResendVerificationRequest,
+    ResetPasswordRequest, SignupRequest, UpdateUserRequest, VerifyEmailRequest,
 };
 use uuid::Uuid;
 
-use crate::{CONFIG, auth::password, repository::user_repository::UserRepository};
+use crate::{
+    CONFIG,
+    auth::password,
+    repository::{
+        refresh_token_repository::RefreshTokenRepository, user_repository::UserRepository,
+    },
+};
 
 /// Write side for the user itself: who they are, and proving it.
 ///
@@ -199,11 +206,14 @@ impl UserService {
     /// — `authenticate` reads `email_verified`, so a login racing this projection
     /// would answer "verify your email" to someone who just did.
     pub async fn verify_email(&self, req: VerifyEmailRequest) -> MyResult<String> {
+        // `.user_id` and nothing else: a verification token carries no version claim
+        // and binds to no state — this endpoint is replayable by design.
         let user_id = shared::email_token::verify(
             &CONFIG.email_token_secret,
             &req.token,
             shared::email_token::Purpose::VerifyEmail,
-        )?;
+        )?
+        .user_id;
 
         let mut conn = db::conn(&self.db).await?;
 
@@ -308,6 +318,180 @@ impl UserService {
         .await?;
 
         Ok(())
+    }
+
+    /// Asks notification-service to mail a password-reset link.
+    ///
+    /// Returns `Ok(())` whether or not the address exists — the same enumeration
+    /// rule as `resend_verification`, and for the same reason: this needs no
+    /// credentials at all, so any answer that varies is an oracle telling an
+    /// anonymous caller which addresses are registered.
+    ///
+    /// Unverified accounts are included deliberately. A reset link proves the
+    /// mailbox received it, which is the very claim verification makes, so
+    /// `reset_password` marks the address verified rather than leaving someone
+    /// who reset successfully still unable to log in and no way to find out why.
+    ///
+    /// **The version this bumps to is the mechanism, not bookkeeping.**
+    /// notification-service mints the token carrying it and `reset_password`
+    /// refuses that token unless the row is still there, which is what makes the
+    /// link single-use with nothing stored anywhere. `set_version!` is therefore
+    /// mandatory here even though no row changes: without it the row never
+    /// reaches the version the token names and every link is born dead.
+    ///
+    // ponytail: no rate limit, same as `resend_verification` — but this is the
+    // endpoint that actually gets pointed at, and each request is a mail to a real
+    // inbox that reads as phishing when it wasn't asked for. Add a per-user
+    // cooldown (last-sent timestamp on the row, checked here) before this is
+    // public. Note the frontend hides its own button after one send, which covers
+    // the double-click but nothing deliberate.
+    pub async fn forgot_password(&self, req: ForgotPasswordRequest) -> MyResult<()> {
+        let mut read = db::conn(&self.db).await?;
+        let Some(user) = UserRepository::find_by_email(&mut read, req.email.to_string()).await?
+        else {
+            return Ok(());
+        };
+
+        // No version answered and none needed, exactly as `resend_verification`:
+        // `PasswordResetRequested` is projected by nothing — it is a message to
+        // notification-service — so there is no state for a follow-up read to wait
+        // on. The transaction is still required: the enqueue *is* the write, and it
+        // has to be atomic with the version it claims.
+        let mut conn = db::conn(&self.db).await?;
+
+        conn.transaction::<_, MyError, _>(|conn| {
+            async move {
+                let version = shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
+                shared::set_version!(conn, "user", shared::schema::user::app_user, &user.id, version)?;
+
+                let envelope = Envelope::new(
+                    UserEvent::PasswordResetRequested(PasswordResetRequested {
+                        user_id: user.id,
+                        email: user.email,
+                        first_name: user.first_name,
+                    }),
+                    Some(user.id),
+                    aggregate_id("user", &user.id),
+                    version,
+                );
+
+                outbox::enqueue(conn, &user_subject(&user.id), &envelope).await?;
+                Ok(())
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sets a new password from a mailed link, and ends every session on the
+    /// account.
+    ///
+    /// Unauthenticated on purpose: the token *is* the credential, verified under
+    /// `EMAIL_TOKEN_SECRET` and `Purpose::ResetPassword` so it can be neither a
+    /// repurposed access token nor a verification link.
+    ///
+    /// **Single use, with nothing stored to make it so.** The token carries the
+    /// aggregate version the account stood at when `forgot_password` raised its
+    /// event; this bumps the row past it. A second click reads a version one
+    /// higher than the token names and gets the identical 400 a forged link does —
+    /// which is why every rejection below is `email_token::invalid()` rather than
+    /// a message of its own. This is the opposite of `verify_email`, which is
+    /// deliberately replayable; setting `true` twice is harmless, setting a
+    /// password twice is a replay hole.
+    ///
+    /// The refresh tokens die inside the same transaction as the password: whoever
+    /// forced the reset must not keep a session across it. That does **not** reach
+    /// an access token already issued — a JWT is stateless and stays good until it
+    /// expires. Short `JWT_EXPIRATION` is the whole mitigation for that window.
+    ///
+    /// Returns the log position, which the client echoes on the login that follows
+    /// — `authenticate` reads the password and `email_verified` from this
+    /// service's own rows.
+    pub async fn reset_password(&self, req: ResetPasswordRequest) -> MyResult<String> {
+        let verified = shared::email_token::verify(
+            &CONFIG.email_token_secret,
+            &req.token,
+            shared::email_token::Purpose::ResetPassword,
+        )?;
+        let user_id = verified.user_id;
+        // A `Result`, not an `Option`: a token carrying no version claim is refused
+        // here rather than reaching the comparison below as an unchecked `None`.
+        let minted_at = verified.version()?;
+
+        // Hashed before the transaction opens. Argon2 is ~100ms of CPU by design and
+        // `next_version!` holds `FOR UPDATE` on the row for the whole block —
+        // hashing inside would serialise every other write to this user behind it.
+        let password_hash = password::hash(req.password.as_str())?;
+
+        let mut conn = db::conn(&self.db).await?;
+
+        let version = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    // Takes `FOR UPDATE`, which is what serialises two clicks of the same
+                    // link against each other: the second reads the version the first wrote.
+                    let next = shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
+
+                    // The single-use check. `next_version!` returns stored + 1, so this
+                    // reads "the row is still exactly where it was when the link was minted".
+                    //
+                    // No `find_by_id` above it, unlike `verify_email`: a row that is gone
+                    // makes `next` 1, which would need `minted_at == 0`, and versions start
+                    // at 1. A deleted user therefore falls out here as an invalid link —
+                    // which is the better answer anyway, since a 404 would confirm to an
+                    // anonymous caller that the id once existed.
+                    if next - 1 != minted_at {
+                        return Err(shared::email_token::invalid());
+                    }
+
+                    UserRepository::patch(
+                        conn,
+                        user_id,
+                        UserPatch {
+                            password: Some(password_hash.clone()),
+                            // The link proved the mailbox, which is the same claim
+                            // `EmailVerified` makes. Without this an account that never
+                            // verified resets successfully and still cannot log in.
+                            email_verified: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    shared::set_version!(conn, "user", shared::schema::user::app_user, &user_id, next)?;
+
+                    // In this transaction rather than after it: the password and the
+                    // sessions it protected die together, or neither does.
+                    let ended = RefreshTokenRepository::revoke_all_for_user(
+                        conn,
+                        user_id,
+                        "password reset",
+                    )
+                    .await?;
+                    tracing::info!(%user_id, sessions_ended = ended, "password reset");
+
+                    // `PasswordChanged`, not a variant of its own: view-service and
+                    // payment-service already ignore it, and a consumer that reacts to a
+                    // password changing does not care why it changed.
+                    let envelope = Envelope::new(
+                        UserEvent::PasswordChanged(UserPasswordChanged {
+                            user_id,
+                            password_hash,
+                        }),
+                        Some(user_id),
+                        aggregate_id("user", &user_id),
+                        next,
+                    );
+
+                    outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
+                    Ok(format_version(&envelope.aggregate, envelope.version))
+                }
+                .scope_boxed()
+            })
+            .await?;
+
+        Ok(version)
     }
 
     /// Writes the caller's own record — both forms that do so: the profile screen
@@ -507,9 +691,13 @@ impl UserService {
     ///
     /// `EmailVerified` is not among them and is not an omission: nothing downstream
     /// projects it. Verification stays in this service's own row, which is the thing
-    /// being read here rather than rebuilt. `VerificationRequested` is left out for
-    /// a much louder reason — it is a mail, and re-emitting it would send one to
-    /// every account on the system.
+    /// being read here rather than rebuilt. `VerificationRequested` and
+    /// `PasswordResetRequested` are left out for a much louder reason — both are a
+    /// mail, and re-emitting either would send one to every account on the system.
+    /// A reset mail would additionally hand every one of them a live credential.
+    /// `Envelope::backfill` is the real backstop, checked in
+    /// notification-service's `notify`; this list is what stops anyone reaching
+    /// for it in the first place.
     pub async fn backfill(&self) -> MyResult<usize> {
         let mut sent = 0;
 

@@ -110,6 +110,14 @@ const resend = async () => {
                     </Field>
                 </VeeField>
 
+                <!-- An anchor, not a `Button`: it navigates, so it should be
+                     right-clickable and openable in a new tab. `RouterLink` is
+                     registered globally, so there is nothing to import. -->
+                <RouterLink to="/forgot-password"
+                    class="self-end -mt-2 text-sm text-muted-foreground hover:underline">
+                    Forgot password?
+                </RouterLink>
+
                 <FieldError v-if="serverErrors.length" :errors="serverErrors" />
 
                 <Button class="w-full" type="submit" :disabled="isSubmitting">

@@ -87,5 +87,6 @@ impl Mailer {
 fn template_id(mail: &Mail) -> &'static str {
     match mail {
         Mail::VerifyEmail { .. } => CONFIG.template_email_verification.as_str(),
+        Mail::ResetPassword { .. } => CONFIG.template_password_reset.as_str(),
     }
 }

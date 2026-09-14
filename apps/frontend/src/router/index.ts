@@ -15,6 +15,8 @@ import EditSpotView from "@/views/EditSpotView.vue";
 import EditProfileView from "@/views/EditProfileView.vue";
 import ChangePasswordView from "@/views/ChangePasswordView.vue";
 import VerifyEmailView from "@/views/VerifyEmailView.vue";
+import ForgotPasswordView from "@/views/ForgotPasswordView.vue";
+import ResetPasswordView from "@/views/ResetPasswordView.vue";
 import CheckoutView from "@/views/CheckoutView.vue";
 import WalletView from "@/views/wallet/WalletView.vue";
 import WalletWithdrawView from "@/views/wallet/WalletWithdrawView.vue";
@@ -136,6 +138,29 @@ const routes = [
     path: "/verify",
     name: "verify-email",
     component: VerifyEmailView,
+    meta: {
+      header: null,
+      requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    // The same bargain as `/verify`, only more so: not being able to log in is the
+    // entire premise of both of these.
+    path: "/forgot-password",
+    name: "forgot-password",
+    component: ForgotPasswordView,
+    meta: {
+      header: null,
+      requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    // This path is also built into the mailed link by notification-service
+    // (`reset_url`). The two spellings have to match exactly or every reset email
+    // in the wild lands on a 404.
+    path: "/reset-password",
+    name: "reset-password",
+    component: ResetPasswordView,
     meta: {
       header: null,
       requiresAuth: false,

@@ -8,6 +8,7 @@ import type {
   ChangePasswordRequest,
   UpdateProfileRequest,
 } from "@/types/requests/user/UpdateUserRequest";
+import type { ResetPasswordRequest } from "@/types/requests/user/ResetPasswordRequest";
 import type { LoginResponse } from "@/types/responses/user/LoginResponse";
 import type { RefreshResponse } from "@/types/responses/user/RefreshResponse";
 
@@ -58,6 +59,25 @@ export const verifyEmail = (token: string) =>
 export const resendVerification = (email: string) =>
   post<void>("/api/user/email/resend", { email });
 
+/**
+ * Asks for a password-reset link.
+ *
+ * Always 204, on the same terms as `resendVerification` — an unknown address and a
+ * known one are indistinguishable from here, deliberately.
+ */
+export const forgotPassword = (email: string) =>
+  post<void>("/api/user/password/forgot", { email });
+
+/**
+ * Sets a new password from the token in a reset link.
+ *
+ * Unauthenticated: the token is the credential, and someone who has forgotten their
+ * password has no session. Single-use — see `ResetPasswordRequest`, and treat the 400
+ * as "that link is spent" rather than as a retryable failure.
+ */
+export const resetPassword = (body: ResetPasswordRequest) =>
+  post<void>("/api/user/password/reset", body);
+
 export const logout = () => post<void>("/api/user/session/logout");
 
 /**
@@ -98,6 +118,13 @@ export const useVerifyEmail = () => useMutation({ mutationFn: verifyEmail });
 
 export const useResendVerification = () =>
   useMutation({ mutationFn: resendVerification });
+
+// Neither of these invalidates anything: the caller is anonymous, so there is no
+// cached read of theirs to be stale.
+export const useForgotPassword = () =>
+  useMutation({ mutationFn: forgotPassword });
+
+export const useResetPassword = () => useMutation({ mutationFn: resetPassword });
 
 export function useLogout() {
   const queryClient = useQueryClient();
