@@ -1,12 +1,12 @@
-import type { AccountProfileResponse } from "./AccountProfileResponse";
+import type { AccountUserResponse } from "./AccountUserResponse";
 
 /**
  * `GET /api/view/account`.
  *
- * `profile` is null only between signup and its projection. `id` comes from the verified
+ * `user` is null only between signup and its projection. `id` comes from the verified
  * claim rather than a row, so it always resolves.
  */
 export type AccountResponse = {
   id: string;
-  profile: AccountProfileResponse | null;
+  user: AccountUserResponse | null;
 };

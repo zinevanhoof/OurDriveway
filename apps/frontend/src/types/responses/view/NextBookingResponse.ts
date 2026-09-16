@@ -13,6 +13,8 @@ import type { SpotCardResponse } from "./SpotCardResponse";
 export type NextBookingResponse = {
   id: string;
   booked: Booked;
+  /** Which car to bring — the one thing here the renter may have forgotten. */
+  licensePlate: string;
   /** EUR cents. Read by the detail sheet the card opens, not by the card. */
   amount: number;
   spot: SpotCardResponse | null;

@@ -25,18 +25,18 @@ pub struct AccountService {
 }
 
 impl AccountService {
-    /// The caller's own profile, `email` included.
+    /// The caller's own user record, `email` included.
     ///
-    /// `profile` is `None` while the caller's own `UserRegistered` is still in flight. The
+    /// `user` is `None` while the caller's own `UserRegistered` is still in flight. The
     /// id comes from the claim regardless, so this never has to 404.
     pub async fn account(&self, user_id: Uuid) -> MyResult<AccountResponse> {
         let mut conn = shared::db::conn(&self.db).await?;
 
-        let profile = ViewUserRepository::find_for_account(&mut conn, user_id).await?;
+        let user = ViewUserRepository::find_for_account(&mut conn, user_id).await?;
 
         Ok(AccountResponse {
             id: user_id,
-            profile: profile.map(Into::into),
+            user: user.map(Into::into),
         })
     }
 
@@ -64,11 +64,7 @@ impl AccountService {
     ///   different rules.
     /// - `pending` compares the booking's end against the settlement cutoff, which the
     ///   statement has no other use for.
-    pub async fn wallet(
-        &self,
-        user_id: Uuid,
-        month: Option<String>,
-    ) -> MyResult<WalletResponse> {
+    pub async fn wallet(&self, user_id: Uuid, month: Option<String>) -> MyResult<WalletResponse> {
         let now = Utc::now();
         let month = month.unwrap_or_else(|| policy::wallet::label(now));
 

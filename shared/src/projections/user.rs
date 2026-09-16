@@ -45,12 +45,12 @@ pub struct AccountProjection {
     pub email: String,
     /// Here rather than on [`UserPublicProjection`] only because no screen shows another
     /// person's plates. A host recognising the car on their driveway reads it off the
-    /// booking, not off a profile.
+    /// booking, not off the renter.
     pub license_plates: Vec<String>,
-    /// ISO 3166-1 alpha-2, `None` until the profile screen sets it.
+    /// ISO 3166-1 alpha-2, `None` until the edit screen sets it.
     ///
     /// Scoped like `email` and unlike `license_plates`: where somebody banks is nobody
-    /// else's business. It is projected at all because the profile form renders its
+    /// else's business. It is projected at all because the edit form renders its
     /// current value, and because the withdraw screen needs to know whether there is one
     /// before Stripe refuses to open an account without it.
     pub country: Option<String>,

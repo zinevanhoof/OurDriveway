@@ -120,7 +120,8 @@ impl SettlementWorkerService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
 
                 // The row moves in the same transaction as the event. Guarded, so a
                 // redelivery that already applied is a no-op rather than a second refund.
@@ -150,7 +151,13 @@ impl SettlementWorkerService {
                     // `decide` yields only the two above.
                     _ => {}
                 }
-                shared::set_version!(conn, "payment", shared::schema::payment::payment, &payment_id, version)?;
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::payment::payment,
+                    &payment_id,
+                    version
+                )?;
 
                 // Deterministic event id: a redelivery that gets this far — because the Stripe
                 // call succeeded but the commit did not — is discarded by the stream's

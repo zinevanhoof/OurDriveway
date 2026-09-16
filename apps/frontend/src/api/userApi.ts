@@ -6,7 +6,7 @@ import type { LoginRequest } from "@/types/requests/user/LoginRequest";
 import type { SignupRequest } from "@/types/requests/user/SignupRequest";
 import type {
   ChangePasswordRequest,
-  UpdateProfileRequest,
+  UpdateUserRequest,
 } from "@/types/requests/user/UpdateUserRequest";
 import type { ResetPasswordRequest } from "@/types/requests/user/ResetPasswordRequest";
 import type { LoginResponse } from "@/types/responses/user/LoginResponse";
@@ -91,13 +91,13 @@ export const refreshSession = () =>
   post<RefreshResponse>("/api/user/session/refresh");
 
 /**
- * The two halves of `PATCH /api/user`. Every field is optional server-side, where
- * omitted means "unchanged" — which is what lets one endpoint serve both screens,
- * each sending only its own half. The server refuses a body carrying both, with a
- * 409: it publishes one event per request, and a password change is a different
- * event from a profile edit.
+ * `PATCH /api/user`. Every field is optional, where omitted means "unchanged" —
+ * which is what lets one endpoint serve the edit screen, the password screen and
+ * the booking form, each sending only what it changed. The server refuses a body
+ * carrying a password change *and* anything else, with a 409: it publishes one
+ * event per request, and those are two different events.
  */
-export const updateProfile = (body: UpdateProfileRequest) =>
+export const updateUser = (body: UpdateUserRequest) =>
   patch<void>("/api/user", body);
 
 /** Same endpoint, the other half. */
@@ -138,11 +138,11 @@ export function useLogout() {
   });
 }
 
-export function useUpdateProfile() {
+export function useUpdateUser() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: updateProfile,
+    mutationFn: updateUser,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: viewKeys.account }),
   });
 }

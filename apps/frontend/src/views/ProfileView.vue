@@ -30,9 +30,9 @@ const { data } = useQuery({
 })
 
 // No `!` here: the query has not resolved on first render, so this really is
-// undefined for a tick and the template has to say so. `profile` is additionally null
+// undefined for a tick and the template has to say so. `user` is additionally null
 // for the moment between registering and that projection landing.
-const me = computed(() => data.value?.profile)
+const me = computed(() => data.value?.user)
 
 // Server first — revoking the refresh token needs the cookie, and clearing the
 // store synchronously trips the `isAuthenticated` watcher in main.ts, which is

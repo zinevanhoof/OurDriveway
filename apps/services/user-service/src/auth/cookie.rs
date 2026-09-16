@@ -10,7 +10,7 @@ const NAME: &str = "refresh-token";
 ///
 /// A browser sends a cookie only to this path and its `/`-delimited descendants
 /// (RFC 6265 §5.1.4), so scoping it here keeps a 30-day credential off signup,
-/// verification, profile edits and password changes — every request that has no
+/// verification, user edits and password changes — every request that has no
 /// use for it. Widening this to `/api/user` would put it on all of them; that is
 /// the trade this prefix exists to avoid.
 ///

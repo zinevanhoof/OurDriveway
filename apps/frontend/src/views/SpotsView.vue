@@ -17,14 +17,14 @@ import BookedSpotsComponent from '@/components/BookedSpotsComponent.vue';
                 <TabsTrigger value="my-parking-spots" class="font-bold">
                     My parking spots
                 </TabsTrigger>
-                <TabsTrigger value="bookings" class="font-bold">
-                    Bookings
+                <TabsTrigger value="my-bookings" class="font-bold">
+                    My bookings
                 </TabsTrigger>
             </TabsList>
             <TabsContent value="my-parking-spots">
                 <MySpotsComponent />
             </TabsContent>
-            <TabsContent value="bookings">
+            <TabsContent value="my-bookings">
                 <BookedSpotsComponent />
             </TabsContent>
         </Tabs>

@@ -47,7 +47,7 @@ mod tests {
         assert!(signup("nope", "Str0ng!pw").validate().is_err()); // bad email
     }
 
-    /// Names are held to the same rule the profile form applies. They used to be
+    /// Names are held to the same rule the edit form applies. They used to be
     /// `#[garde(skip)]` here, so signup accepted an empty name that the edit screen
     /// would then refuse.
     #[test]

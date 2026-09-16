@@ -256,7 +256,6 @@ macro_rules! set_version {
     }};
 }
 
-
 /// How many events are missing between `stored` and `incoming`, if any.
 ///
 /// Pure, so the rule can be read and tested without a database — which matters,

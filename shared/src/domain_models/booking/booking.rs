@@ -52,6 +52,10 @@ pub struct Booking {
     /// `booked.*.*.start`, which bought nothing: no query has ever reached into it,
     /// and the shape is enforced by garde on the request that creates it.
     pub booked: Booked,
+    /// The car that will park. Denormalised at reserve time for the same reason
+    /// `host_id` is: the renter's plate list lives in another service's database,
+    /// and it changes while this booking does not.
+    pub license_plate: String,
     /// EUR cents, recomputed server-side from the minutes actually authorised —
     /// never a figure the client sent.
     pub amount: i64,
@@ -95,6 +99,7 @@ impl Booking {
             host_id: e.host_id,
             renter_id: e.renter_id,
             booked: e.booked,
+            license_plate: e.license_plate,
             amount: e.amount_cents,
             status: status::RESERVED.to_string(),
             hold_until: Some(e.expires_at),
@@ -123,6 +128,7 @@ mod tests {
             host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: Default::default(),
+            license_plate: "1-ABC-123".into(),
             amount_cents: 500,
             expires_at: "2026-08-03T12:00:00Z".parse().unwrap(),
             ends_at: "2026-08-03T18:00:00Z".parse().unwrap(),

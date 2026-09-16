@@ -20,7 +20,7 @@ import { Text, Title } from '@/components/base/text'
 
 import { fetchAccount } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
-import { useUpdateProfile } from '@/api/userApi'
+import { useUpdateUser } from '@/api/userApi'
 import { uploadImage } from '@/api/mediaApi'
 import { fetchMe } from '@/api/me'
 import { useAuthStore } from '@/stores/auth'
@@ -36,7 +36,7 @@ const { data } = useQuery({
     queryFn: fetchAccount,
 })
 
-const me = computed(() => data.value?.profile)
+const me = computed(() => data.value?.user)
 
 // Built once: the list is fixed and the names only depend on the browser's locale.
 const countries = countryOptions()
@@ -74,7 +74,7 @@ const formSchema = toTypedSchema(
     })
 )
 
-const { handleSubmit, setValues, setErrors, values } = useForm({
+const { handleSubmit, resetForm, setErrors, values, meta } = useForm({
     validationSchema: formSchema,
     initialValues: { firstName: '', lastName: '', email: '', licensePlates: [], country: '', currentPassword: '' },
 })
@@ -83,25 +83,35 @@ const { fields: plates, push: addPlate, remove: removePlate } = useFieldArray<st
 
 const emailChanged = computed(() => !!loadedEmail.value && values.email !== loadedEmail.value)
 
-const { mutateAsync: save, isPending: loading } = useUpdateProfile()
+const { mutateAsync: save, isPending: loading } = useUpdateUser()
 const formErrors = ref<string[]>([])
 
-// Prefills once the query lands, and again if it refetches while untouched —
+// Prefills once the query lands, and again if it refetches while the form is untouched —
 // same pattern as the edit-listing screen.
+//
+// `resetForm`, not `setValues`: what came back from the server is this form's *baseline*,
+// not an edit of it. `setValues` leaves the initial values as they were, so the form reads
+// as dirty from the moment it is filled in — and the save button, which appears on dirty,
+// would be offered before anyone had changed anything.
+//
+// The dirty check is also what makes the refetch case safe rather than merely rare: a
+// background refetch landing mid-edit used to overwrite what the user was typing.
 watch(me, (user) => {
-    if (!user) return
+    if (!user || meta.value.dirty) return
 
     // No `?? ''` on the email: `HostViewUser.email` is not nullable. The column is
     // NOT NULL and every projected row comes from a registration that carried one.
     loadedEmail.value = user.email
-    setValues({
-        firstName: user.firstName,
-        lastName: user.lastName,
-        email: user.email,
-        licensePlates: [...(user.licensePlates ?? [])],
-        // Null until a host sets it, and the select's empty option is `''`.
-        country: user.country ?? '',
-        currentPassword: '',
+    resetForm({
+        values: {
+            firstName: user.firstName,
+            lastName: user.lastName,
+            email: user.email,
+            licensePlates: [...(user.licensePlates ?? [])],
+            // Null until a host sets it, and the select's empty option is `''`.
+            country: user.country ?? '',
+            currentPassword: '',
+        },
     })
 }, { immediate: true })
 
@@ -111,6 +121,14 @@ watch(me, (user) => {
 const pickedFile = ref<File | null>(null)
 const picked = ref<string | null>(null)
 const revoke = () => picked.value && URL.revokeObjectURL(picked.value)
+
+/**
+ * Whether there is anything to save — what puts the save button on screen.
+ *
+ * The picked avatar is its own half: it never enters the form's values, because it is
+ * uploaded on submit rather than on pick, so `meta.dirty` cannot see it.
+ */
+const dirty = computed(() => meta.value.dirty || !!pickedFile.value)
 
 const onSelectPicture = (event: Event) => {
     const file = (event.target as HTMLInputElement).files?.[0]
@@ -143,8 +161,8 @@ const submit = handleSubmit(async (form) => {
                 : undefined,
         })
 
-        // `useUpdateProfile` invalidates `account` itself. These two are extra
-        // because a profile is embedded elsewhere: `spots` carries a host and
+        // `useUpdateUser` invalidates `account` itself. These two are extra
+        // because a person is embedded elsewhere: `spots` carries a host and
         // `bookings` carries a renter. graphcache used to normalize by entity id, so
         // writing a user updated every reference to that person at once; vue-query
         // caches per key, so the keys that could hold a stale copy have to be named.
@@ -167,7 +185,7 @@ const submit = handleSubmit(async (form) => {
 
 <template>
     <FullScreenLayoutComponent @close="router.back()" title="Edit profile"
-        description="Your details and the cars you park">
+        description="Your details and the cars you park" :show-action="dirty">
         <template #main>
             <form id="edit-profile-form" @submit="submit" class="space-y-4">
                 <div class="flex justify-center py-2">
@@ -311,7 +329,9 @@ const submit = handleSubmit(async (form) => {
                 <FieldError v-if="formErrors.length" :errors="formErrors" />
             </form>
         </template>
-        <template #footer>
+        <!-- Arrives once there is something to save. `form="edit-profile-form"` is what
+             keeps it a submit button from outside the form. -->
+        <template #action>
             <Button type="submit" form="edit-profile-form" :disabled="loading" class="w-full h-11 font-bold">
                 <Spinner v-if="loading" />
                 Save changes

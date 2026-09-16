@@ -13,5 +13,10 @@
 //! nobody would notice — an off-by-one on a month boundary or a withdrawal counted as
 //! spending. Both are arithmetic, so both are testable with nothing running.
 
+//! `bookings` is the third, and the smallest: which tab, which offset, and whether
+//! there is a page after this one. Three lines of arithmetic that decide which rows a
+//! host sees, which is the same argument as the other two.
+
+pub mod bookings;
 pub mod geo;
 pub mod wallet;

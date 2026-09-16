@@ -24,7 +24,7 @@ import { viewKeys } from '@/api/keys';
 import { useDeleteSpot, useUpdateSpot } from '@/api/spotApi';
 import type { ApiError } from '@/api/client';
 import { uploadNewImages } from '@/api/mediaApi';
-import { bookedOutside, mergeBooked } from '@/lib/bookingAvailability';
+import { bookedOutside } from '@/lib/bookingAvailability';
 import { formatDay, formatSlots, todayIn } from '@/lib/bookingDates';
 import { centsToEuros, eurosToCents } from '@/lib/money';
 import type { Availability } from '@/types/domain/spot'
@@ -58,7 +58,7 @@ const formSchema = toTypedSchema(
     })
 )
 
-const { handleSubmit, setValues, setErrors } = useForm({ validationSchema: formSchema })
+const { handleSubmit, resetForm, setErrors, meta } = useForm({ validationSchema: formSchema })
 
 // Declared before the watcher below, not after it: with `immediate: true` that
 // watcher runs during setup, so anything it calls has to already be initialized.
@@ -80,16 +80,46 @@ const formErrors = ref<string[]>([])
 const timezone = computed(() => data.value?.timezone)
 const today = computed(() => todayIn(timezone.value))
 
-// Prefills once the query lands, and again if it refetches while untouched. The
-// spot itself is the source of truth for the initial state; everything after is
-// the host's edit.
-watch(() => data.value, (spot) => {
-    if (!spot) return
+/**
+ * The availability and images as they were loaded, as one string.
+ *
+ * They live in plain refs rather than in the form, so `meta.dirty` says nothing about
+ * them — and a host who only added an opening hour would get no save button.
+ *
+ * ponytail: a string compare, not a structural diff. A `File` serializes to `{}`, so it
+ * is keyed by name and size instead. It decides whether to *offer* a button, and the
+ * worst it can be is briefly wrong about a file swapped for another of identical name and
+ * size; compare structurally if that ever matters.
+ */
+const snapshot = () => JSON.stringify({
+    availability: availability.value,
+    images: images.value.map((i) => typeof i === 'string' ? i : `${i.name}:${i.size}`),
+})
+// Seeded with the empty form's own snapshot, not `''`. The prefill watcher below skips a
+// dirty form, and a baseline of `''` would never match anything — so the screen would
+// call itself edited before it had loaded, and never fill itself in.
+const loaded = ref(snapshot())
 
-    setValues({
-        title: spot.title,
-        description: spot.description ?? '',
-        pricePerHour: centsToEuros(spot.pricePerHour),
+/** Whether there is anything to save — what puts the save button on screen. */
+const dirty = computed(() => meta.value.dirty || snapshot() !== loaded.value)
+
+// Prefills once the query lands, and again if it refetches while the form is untouched.
+// The spot itself is the source of truth for the initial state; everything after is the
+// host's edit.
+//
+// `resetForm`, not `setValues`: what came back from the server is this form's *baseline*.
+// `setValues` leaves the initial values as they were, so the form would read as dirty the
+// moment it was filled in and offer to save an edit nobody had made. The `dirty` guard
+// then also stops a background refetch overwriting an edit in progress.
+watch(() => data.value, (spot) => {
+    if (!spot || dirty.value) return
+
+    resetForm({
+        values: {
+            title: spot.title,
+            description: spot.description ?? '',
+            pricePerHour: centsToEuros(spot.pricePerHour),
+        },
     })
 
     availability.value = {
@@ -104,6 +134,9 @@ watch(() => data.value, (spot) => {
     }
 
     images.value = [...(spot.images ?? [])]
+
+    // After both assignments: this is the baseline `dirty` compares against.
+    loaded.value = snapshot()
 }, { immediate: true })
 
 const hasSlots = () =>
@@ -118,7 +151,7 @@ const hasSlots = () =>
  * only the warning that it is about to happen.
  */
 const casualties = computed(() =>
-    bookedOutside(availability.value, mergeBooked(data.value?.bookings), today.value))
+    bookedOutside(availability.value, data.value?.booked ?? {}, today.value))
 
 const submit = handleSubmit(async (values) => {
     formErrors.value = []
@@ -201,7 +234,8 @@ const showServerErrors = (err: ApiError) => {
 </script>
 
 <template>
-    <FullScreenLayoutComponent @close="router.back()" title="Edit listing" :description="data?.title">
+    <FullScreenLayoutComponent @close="router.back()" title="Edit listing" :description="data?.title"
+        :show-action="dirty">
         <template #main>
             <form id="edit-spot-form" @submit="submit" class="space-y-4">
                 <CreateSpotBasicInfo />
@@ -238,7 +272,9 @@ const showServerErrors = (err: ApiError) => {
                 </Button>
             </form>
         </template>
-        <template #footer>
+        <!-- Arrives once the listing differs from what was loaded — a changed field, an
+             opening hour, a photo. `form="edit-spot-form"` submits it from out here. -->
+        <template #action>
             <Button type="submit" form="edit-spot-form" :disabled="loading" class="w-full h-11 font-bold">
                 <Spinner v-if="loading" />
                 Save changes

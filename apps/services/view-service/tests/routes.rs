@@ -2,7 +2,7 @@
 //!
 //! `nest("/api/view/account", route("/", …))` reads as if it answers `/api/view/account`,
 //! and whether it actually does is an axum detail rather than something the code says.
-//! Getting it wrong 404s the whole profile screen and nothing else notices, so it is worth
+//! Getting it wrong 404s the whole account screen and nothing else notices, so it is worth
 //! one assertion per path.
 //!
 //! Not `#[ignore]`d and needs no database: the handlers are stubs, because what is under

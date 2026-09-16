@@ -98,7 +98,8 @@ impl SpotService {
         let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
-                    let version = shared::next_version!(conn, shared::schema::spot::spot, &spot_id)?;
+                    let version =
+                        shared::next_version!(conn, shared::schema::spot::spot, &spot_id)?;
 
                     // No `set_version` after this: the row carries its own version and this is
                     // a whole-row write. `update_spot` and `delete_spot` still need it — they
@@ -156,11 +157,18 @@ impl SpotService {
                     // now that a contended write no longer conflicts on its own — see
                     // `shared::db::next_version`. Without it both would read version 3, both
                     // write 4, and the projector would silently drop one of the two events.
-                    let version = shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
+                    let version =
+                        shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
 
                     SpotRepository::patch(conn, spot.id, SpotPatch::updated(updated.clone(), now))
                         .await?;
-                    shared::set_version!(conn, "spot", shared::schema::spot::spot, &spot.id, version)?;
+                    shared::set_version!(
+                        conn,
+                        "spot",
+                        shared::schema::spot::spot,
+                        &spot.id,
+                        version
+                    )?;
 
                     let envelope = Envelope::new(
                         SpotEvent::Updated(updated),
@@ -190,12 +198,19 @@ impl SpotService {
         let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
-                    let version = shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
+                    let version =
+                        shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
 
                     // A soft delete: the row survives so a renter's past bookings still resolve
                     // a title and an address. Every list filters `deleted`.
                     SpotRepository::patch(conn, spot.id, SpotPatch::deleted(now)).await?;
-                    shared::set_version!(conn, "spot", shared::schema::spot::spot, &spot.id, version)?;
+                    shared::set_version!(
+                        conn,
+                        "spot",
+                        shared::schema::spot::spot,
+                        &spot.id,
+                        version
+                    )?;
 
                     let envelope = Envelope::new(
                         SpotEvent::Deleted { spot_id: spot.id },

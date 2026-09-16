@@ -35,24 +35,28 @@ pub struct PublicBookingProjection {
     pub ends_at: DateTime<Utc>,
 }
 
-/// `GET /api/view/host/spots/{id}` — the child half. Statement 2 of 2.
+/// `GET /api/view/host/spots/{id}/bookings` — one row of the host's list.
 ///
 /// The same rows as [`PublicBookingProjection`] with the scoped columns added: reaching
-/// this type means statement 1 already matched `host_id = caller`, so there is no
-/// second check and nothing cut afterwards.
+/// this type means the parent statement already matched `host_id = caller`, so there is
+/// no second check and nothing cut afterwards. `license_plate` is selected here and in
+/// [`RenterBookingProjection`] — the two parties to the booking — and in neither of the
+/// public reads.
 ///
-/// No status filter either. A host is entitled to their own released and cancelled rows
-/// — that is the history the manage screen shows.
+/// **No `ends_at`.** It orders the statement and bounds it to one tab, and nothing
+/// renders it — a projection selects what a row reads, not what its `WHERE` mentions.
+/// `booked` stays, because the row's date line *and* its slot count are both folds
+/// over it, and it is also what lets the detail drawer open without a second request.
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable, Associations)]
 #[diesel(table_name = booking)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 #[diesel(belongs_to(HostSpotProjection, foreign_key = spot_id))]
-pub struct HostBookingProjection {
+pub struct HostBookingListProjection {
     pub id: Uuid,
     pub spot_id: Uuid,
     pub booked: Booked,
+    pub license_plate: String,
     pub status: String,
-    pub ends_at: DateTime<Utc>,
     /// EUR cents.
     pub amount: i64,
     /// `None` while the renter has not been projected here yet.
@@ -80,6 +84,8 @@ pub struct RenterBookingProjection {
     /// EUR cents. Unscoped: every row this is built from matched `renter_id = caller`.
     pub amount: i64,
     pub booked: Booked,
+    /// The car the renter said they would bring, so the app can tell them again.
+    pub license_plate: String,
     pub ends_at: DateTime<Utc>,
     /// `'spot_unavailable'` is how a renter's row says the *host* withdrew, rather than
     /// showing the same bare "cancelled" they would see for their own doing.

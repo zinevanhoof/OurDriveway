@@ -2,7 +2,7 @@
 //!
 //! Split by what writes them, not by type: the two email-verification bodies share
 //! a file because they are two buttons on the same flow, and [`update_user`] holds
-//! both halves of the user's own record — the profile form and the password form —
+//! both halves of the user's own record — the edit form and the password form —
 //! because one request serves both. [`fields`] holds the values more than one of
 //! them needs, each as a newtype that owns its own rules.
 //!
@@ -10,7 +10,9 @@
 //! `shared::requests::user::SignupRequest` and the split is invisible outside.
 
 mod email;
-mod fields;
+// `pub(crate)` for one function: `plate_length` is also the booking form's rule, and
+// the booking request imports it rather than restating the bounds.
+pub(crate) mod fields;
 mod login;
 mod password;
 mod signup;

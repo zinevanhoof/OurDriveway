@@ -29,6 +29,7 @@ pub fn events(booking: &Booking) -> Vec<BookingEvent> {
         host_id: booking.host_id,
         renter_id: booking.renter_id,
         booked: booking.booked.clone(),
+        license_plate: booking.license_plate.clone(),
         amount_cents: booking.amount,
         // Cleared when a booking settles, so a settled one has none to recover.
         // Harmless: the settlement that follows clears it again, and until then it
@@ -83,6 +84,7 @@ mod tests {
             host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: Default::default(),
+            license_plate: "1-ABC-123".into(),
             amount: 500,
             status: status.to_string(),
             hold_until: None,

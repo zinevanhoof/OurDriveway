@@ -145,6 +145,12 @@ pub struct BookingCreated {
     /// event assign it straight across. `Booked` is `#[serde(transparent)]`, so the JSON
     /// on the wire and in the log is unchanged by that.
     pub booked: Booked,
+    /// The car that will park, as the renter picked it on the booking form.
+    ///
+    /// Carried on the event rather than dereferenced from the renter when a reader
+    /// needs it: their plate list changes, and the car that took a slot on a given
+    /// day does not.
+    pub license_plate: String,
     /// EUR cents, computed server-side from the spot's price and the *authorised*
     /// minutes. The client's figure is display-only and never reaches this.
     pub amount_cents: i64,

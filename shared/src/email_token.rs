@@ -165,14 +165,23 @@ mod tests {
         let user_id = Uuid::now_v7();
         let token = mint(SECRET, &user_id, Purpose::VerifyEmail, DAY, None).unwrap();
         assert_eq!(
-            verify(SECRET, &token, Purpose::VerifyEmail).unwrap().user_id,
+            verify(SECRET, &token, Purpose::VerifyEmail)
+                .unwrap()
+                .user_id,
             user_id
         );
     }
 
     #[test]
     fn carries_the_version_it_was_minted_with() {
-        let token = mint(SECRET, &Uuid::now_v7(), Purpose::ResetPassword, DAY, Some(7)).unwrap();
+        let token = mint(
+            SECRET,
+            &Uuid::now_v7(),
+            Purpose::ResetPassword,
+            DAY,
+            Some(7),
+        )
+        .unwrap();
         let verified = verify(SECRET, &token, Purpose::ResetPassword).unwrap();
         assert_eq!(verified.version().unwrap(), 7);
     }
@@ -219,7 +228,14 @@ mod tests {
     /// account takeover.
     #[test]
     fn a_token_is_useless_for_a_purpose_it_was_not_minted_for() {
-        let token = mint(SECRET, &Uuid::now_v7(), Purpose::ResetPassword, DAY, Some(1)).unwrap();
+        let token = mint(
+            SECRET,
+            &Uuid::now_v7(),
+            Purpose::ResetPassword,
+            DAY,
+            Some(1),
+        )
+        .unwrap();
         assert!(verify(SECRET, &token, Purpose::VerifyEmail).is_err());
     }
 

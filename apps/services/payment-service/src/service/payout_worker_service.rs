@@ -136,12 +136,19 @@ impl PayoutWorkerService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::payment::payout, payout_id)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::payment::payout, payout_id)?;
 
                 // The row moves in the same transaction as the event, guarded on the status the
                 // decision was made from.
                 PayoutRepository::transition(conn, *payout_id, &[status::REQUESTED], patch).await?;
-                shared::set_version!(conn, "payout", shared::schema::payment::payout, payout_id, version)?;
+                shared::set_version!(
+                    conn,
+                    "payout",
+                    shared::schema::payment::payout,
+                    payout_id,
+                    version
+                )?;
 
                 // Deterministic event id: a redelivery that gets this far — because Stripe
                 // answered but the commit did not — is discarded by the stream's duplicate

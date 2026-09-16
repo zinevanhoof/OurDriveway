@@ -11,6 +11,7 @@ import MobileHomeHeader from "@/components/header/MobileHomeHeader.vue";
 import MobileProfileHeader from "@/components/header/MobileProfileHeader.vue";
 import AddSpotView from "@/views/AddSpotView.vue";
 import ManageSpotView from "@/views/ManageSpotView.vue";
+import SpotBookingsView from "@/views/SpotBookingsView.vue";
 import EditSpotView from "@/views/EditSpotView.vue";
 import EditProfileView from "@/views/EditProfileView.vue";
 import ChangePasswordView from "@/views/ChangePasswordView.vue";
@@ -67,6 +68,18 @@ const routes = [
     path: "/spot/:id",
     name: "spot",
     component: ManageSpotView,
+    props: true,
+    meta: {
+      header: null,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    // Every booking on one spot, paged, under an upcoming/past tab. The manage screen
+    // shows two of them and links here.
+    path: "/spot/:id/bookings",
+    name: "spot-bookings",
+    component: SpotBookingsView,
     props: true,
     meta: {
       header: null,

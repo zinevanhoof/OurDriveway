@@ -109,6 +109,10 @@ CREATE TABLE booking (
     host_id       uuid        NOT NULL,
     renter_id      uuid        NOT NULL,
     booked         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    -- The car that will park. Read by both parties: the host has to recognise what
+    -- turns up on the driveway, the renter has to know what they said they would bring.
+    -- Never by a stranger — the public projection does not select it.
+    license_plate  text        NOT NULL,
     amount         bigint      NOT NULL,          -- EUR cents
     status         text        NOT NULL
                    CHECK (status IN ('reserved','confirmed','released','completed','cancelled')),

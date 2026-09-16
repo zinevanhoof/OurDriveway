@@ -346,7 +346,7 @@ mod live_tests {
         assert_eq!(host.email, email);
         assert_eq!(host.country, None, "signup never carries a country");
 
-        // The country arrives on a later profile edit and nothing else changes. This is
+        // The country arrives on a later user edit and nothing else changes. This is
         // the path a host actually takes before onboarding.
         apply(
             shared::events::user::UserEvent::Updated(UserUpdated {

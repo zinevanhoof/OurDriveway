@@ -61,7 +61,7 @@ pub struct PayoutResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectStatusResponse {
-    /// `needs_country` — no account, and no country on the profile to open one with.
+    /// `needs_country` — no account, and no country on the user to open one with.
     /// Accounts v2 fixes `identity.country` permanently at creation, so it is asked for
     /// before anything is created rather than defaulted.
     /// `none` — ready to onboard, nothing created at Stripe yet.

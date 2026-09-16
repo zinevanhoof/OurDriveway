@@ -179,7 +179,8 @@ impl PaymentService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
 
                 PaymentRepository::upsert(conn, Payment::created(created.clone(), version)).await?;
 
@@ -294,7 +295,8 @@ impl PaymentService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
 
                 // `status = ANY(UNPAID)` is the guard that makes a redelivered webhook a
                 // no-op, and it runs in the same transaction as the event rather than a
@@ -321,7 +323,13 @@ impl PaymentService {
                     // `handle_webhook` builds only the two above.
                     _ => {}
                 }
-                shared::set_version!(conn, "payment", shared::schema::payment::payment, &payment_id, version)?;
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::payment::payment,
+                    &payment_id,
+                    version
+                )?;
 
                 // Same as above: the id is what makes a redelivered webhook a no-op.
                 let mut envelope =
@@ -431,7 +439,8 @@ impl PaymentService {
                         requested_at: Utc::now(),
                     };
 
-                    let payout_version = shared::next_version!(conn, shared::schema::payment::payout, &payout_id)?;
+                    let payout_version =
+                        shared::next_version!(conn, shared::schema::payment::payout, &payout_id)?;
                     PayoutRepository::upsert(
                         conn,
                         Payout::requested(&requested, payout_version).ok_or_else(|| {

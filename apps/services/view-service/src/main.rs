@@ -203,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Router::new()
                 .route("/spots", get(route::host::spots))
                 .route("/spots/{id}", get(route::host::spot))
+                .route("/spots/{id}/bookings", get(route::host::bookings))
                 .route("/balance", get(route::host::balance)),
         )
         .nest(

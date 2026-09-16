@@ -10,8 +10,9 @@ use shared::{error::myerror::MyResult, extract::Valid, requests::user::UpdateUse
 use crate::AppState;
 
 /// `PATCH /api/user` — the caller's own record, whichever half of it they are
-/// writing. The client calls one screen the profile form and the other the
-/// change-password form; nothing back here does. It edits the user row, there is
+/// writing. The client calls one of its screens the profile form; nothing back
+/// here does, and neither does anything else in this workspace — that word is the
+/// name of a screen, not of an entity. It edits the user row, there is
 /// no other entity involved, and which event that becomes is
 /// [`UserService::update_user`]'s call.
 pub async fn update_user(

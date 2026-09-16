@@ -4,13 +4,14 @@ use serde::Deserialize;
 use super::fields::{Country, Email, Password, name_length, plate_length};
 use crate::validation::require;
 
-/// The caller's own record — both forms that write it: the profile screen and the
+/// The caller's own record — both forms that write it: the edit screen and the
 /// change-password screen.
 ///
 /// Every field is optional and `None` means "unchanged", never "clear". That is
-/// what lets one request serve two screens: the profile form submits its whole
+/// what lets one request serve two screens: the edit form submits its whole
 /// half, the password form submits nothing but `current_password` and
-/// `new_password`.
+/// `new_password`. The booking form is a third caller and submits one field — the
+/// plate a renter typed on it — which the same rule already allows.
 ///
 /// **One half per request.** `UserService::update_user` publishes exactly one
 /// event, and a password change is still its own event — so a body carrying both
@@ -18,7 +19,7 @@ use crate::validation::require;
 ///
 /// `current_password` is the field they share: it is what proves the caller is the
 /// account's owner and not a stolen access token. Required for a password change,
-/// and for an email change; nothing else on the profile form is worth that much.
+/// and for an email change; nothing else on the edit form is worth that much.
 /// Which rule applies is the service's call, because only it knows the stored
 /// address.
 #[derive(Deserialize, Validate)]
@@ -34,7 +35,7 @@ pub struct UpdateUserRequest {
     pub license_plates: Option<Vec<String>>,
     /// Where this person banks, ISO 3166-1 alpha-2.
     ///
-    /// On the profile rather than at signup because most people never need it: it
+    /// Asked for here rather than at signup because most people never need it: it
     /// exists for hosts, and it is asked for once, before Stripe will open a
     /// connected account for them. See [`Country`].
     #[garde(dive)]
@@ -62,7 +63,7 @@ pub struct UpdateUserRequest {
 ///
 /// Same trust boundary as a spot's photos: it comes straight back from the client
 /// and is rendered as an `<img src>` anywhere this user appears — on their own
-/// profile, in a spot's host card, on a booking row.
+/// own screen, in a spot's host card, on a booking row.
 fn is_avatar(url: &String, _: &()) -> garde::Result {
     require(
         crate::media::is_media_url(url, crate::media::PREFIX_AVATARS),
@@ -117,8 +118,8 @@ mod tests {
     }
 
     #[test]
-    fn profile_rejects_blank_names_and_plates() {
-        let profile = |plates: Vec<&str>| {
+    fn the_user_form_rejects_blank_names_and_plates() {
+        let edit = |plates: Vec<&str>| {
             UpdateUserRequest {
                 first_name: Some("Zine".into()),
                 last_name: Some("Van Hoof".into()),
@@ -129,11 +130,11 @@ mod tests {
             .validate()
         };
 
-        assert!(profile(vec![]).is_ok(), "no plates is a valid profile");
-        assert!(profile(vec!["1-ABC-123"]).is_ok());
+        assert!(edit(vec![]).is_ok(), "owning no car is allowed");
+        assert!(edit(vec!["1-ABC-123"]).is_ok());
         // An empty row is the "Add" button pressed and never filled in.
-        assert!(profile(vec![""]).is_err());
-        assert!(profile(vec!["THIS-PLATE-IS-FAR-TOO-LONG"]).is_err());
+        assert!(edit(vec![""]).is_err());
+        assert!(edit(vec!["THIS-PLATE-IS-FAR-TOO-LONG"]).is_err());
 
         assert!(
             UpdateUserRequest {
@@ -145,7 +146,7 @@ mod tests {
         );
     }
 
-    /// The password screen's whole body. If any profile field ever goes back to
+    /// The password screen's whole body. If any of the other fields ever goes back to
     /// being required, this 422s and the screen cannot save at all.
     #[test]
     fn the_password_form_is_a_valid_body_on_its_own() {

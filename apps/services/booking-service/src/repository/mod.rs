@@ -125,6 +125,7 @@ mod live_tests {
             host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: slots(),
+            license_plate: "1-ABC-123".into(),
             amount: 500,
             status: status::RESERVED.to_string(),
             hold_until: Some(Utc::now() + TimeDelta::minutes(10)),

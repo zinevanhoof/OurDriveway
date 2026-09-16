@@ -19,7 +19,7 @@ pub struct HostMirrorRepository;
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Host {
     pub email: String,
-    /// ISO 3166-1 alpha-2, or `None` until the host sets it on their profile.
+    /// ISO 3166-1 alpha-2, or `None` until the host sets it on their user record.
     pub country: Option<String>,
 }
 
@@ -37,7 +37,7 @@ impl HostMirrorRepository {
     ///
     /// **`country` is deliberately absent from the conflict clause.** A `Registered`
     /// carries no country — Stripe fixes it permanently at account creation and the host
-    /// sets it on their profile — so a whole-row `.set()` here would clear it every time
+    /// sets it themselves later — so a whole-row `.set()` here would clear it every time
     /// USERS replayed. The columns are listed rather than derived for that one reason.
     ///
     /// **`version` is not written here**, and that is what every other projection in this

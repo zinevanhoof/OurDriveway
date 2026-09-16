@@ -253,9 +253,12 @@ mod live_tests {
 
         let sessions_for = async |db: &mut diesel_async::AsyncPgConnection| {
             let user_id = Uuid::now_v7();
-            UserRepository::upsert(db, a_user(user_id, &format!("reset-{user_id}@example.test")))
-                .await
-                .unwrap();
+            UserRepository::upsert(
+                db,
+                a_user(user_id, &format!("reset-{user_id}@example.test")),
+            )
+            .await
+            .unwrap();
 
             let mut hashes = Vec::new();
             for _ in 0..2 {

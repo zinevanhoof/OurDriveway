@@ -3,8 +3,9 @@ use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::view::booking::{ViewBooking, ViewBookingPatch};
 use shared::error::myerror::MyResult;
+use shared::general_models::booking::Booked;
 use shared::projections::booking::{
-    HostBookingProjection, PublicBookingProjection, RenterBookingProjection,
+    HostBookingListProjection, PublicBookingProjection, RenterBookingProjection,
 };
 use shared::projections::spot::{HostSpotProjection, PublicSpotProjection};
 use shared::schema::view::{app_user, booking};
@@ -28,7 +29,9 @@ use uuid::Uuid;
 /// | function | namespace | scope |
 /// |---|---|---|
 /// | [`find_for_public_spot`] | `public` | none — reserved/confirmed rows block a slot for everyone |
-/// | [`find_for_host_spot`] | `host` | the parent read already matched `host_id = caller` |
+/// | [`find_booked_for_host_spot`] | `host` | the parent read already matched `host_id = caller` |
+/// | [`count_for_host_spot`] | `host` | same — the paged list's count |
+/// | [`find_page_for_host_spot`] | `host` | same — one page of the paged list |
 /// | [`find_list_for_renter`] | `renter` | `renter_id = caller` |
 /// | [`find_next_for_renter`] | `renter` | `renter_id = caller` |
 /// | [`find_for_renter`] | `renter` | `renter_id = caller` |
@@ -50,7 +53,9 @@ use uuid::Uuid;
 /// each of these separately.
 ///
 /// [`find_for_public_spot`]: ViewBookingRepository::find_for_public_spot
-/// [`find_for_host_spot`]: ViewBookingRepository::find_for_host_spot
+/// [`find_booked_for_host_spot`]: ViewBookingRepository::find_booked_for_host_spot
+/// [`count_for_host_spot`]: ViewBookingRepository::count_for_host_spot
+/// [`find_page_for_host_spot`]: ViewBookingRepository::find_page_for_host_spot
 /// [`find_list_for_renter`]: ViewBookingRepository::find_list_for_renter
 /// [`find_next_for_renter`]: ViewBookingRepository::find_next_for_renter
 /// [`find_for_renter`]: ViewBookingRepository::find_for_renter
@@ -85,27 +90,104 @@ impl ViewBookingRepository {
             .await?)
     }
 
-    /// Every booking still to come on one spot, in full, for its host.
+    /// The slots still taken on one spot, for its host's edit form. One `booked` per row.
     ///
-    /// **No caller and no status filter.** Both would be redundant: the `spot` this
-    /// belongs to came back from `ViewSpotRepository::find_for_host`, whose
-    /// `host_id = $2` already matched, and a host is entitled to their own released and
-    /// cancelled rows — which is exactly the history the manage screen shows.
+    /// **One column.** The edit form asks a single question of these — would this edit
+    /// remove hours someone holds — and the rows, renters and amounts are
+    /// [`Self::find_page_for_host_spot`]'s job. The status filter is the public read's:
+    /// only what blocks a slot can be cancelled by an edit.
     ///
-    /// The renter join resolves to `None` for a renter this service has not projected
-    /// yet.
-    pub async fn find_for_host_spot(
+    /// No caller: the `spot` came back from `ViewSpotRepository::find_for_host`, whose
+    /// `host_id = $2` already matched.
+    pub async fn find_booked_for_host_spot(
         conn: &mut AsyncPgConnection,
         spot: &HostSpotProjection,
         now: DateTime<Utc>,
-    ) -> MyResult<Vec<HostBookingProjection>> {
-        Ok(HostBookingProjection::belonging_to(spot)
-            .left_join(app_user::table.on(app_user::id.eq(booking::renter_id)))
-            .filter(booking::ends_at.gt(now))
-            .order(booking::ends_at.asc())
-            .select(HostBookingProjection::as_select())
+    ) -> MyResult<Vec<Booked>> {
+        Ok(booking::table
+            .filter(
+                booking::spot_id
+                    .eq(spot.id)
+                    .and(booking::ends_at.gt(now))
+                    .and(booking::status.eq_any(["reserved", "confirmed"])),
+            )
+            .select(booking::booked)
             .load(conn)
             .await?)
+    }
+
+    /// How many bookings one tab of the host's list holds. Statement 2 of 3.
+    ///
+    /// Its own statement rather than a window function beside the page: the count is
+    /// what `nextOffset` is derived from, and it is answered from the same
+    /// `booking_spot (spot_id, ends_at)` index the page uses.
+    pub async fn count_for_host_spot(
+        conn: &mut AsyncPgConnection,
+        spot: &HostSpotProjection,
+        now: DateTime<Utc>,
+        past: bool,
+        statuses: &[&str],
+    ) -> MyResult<i64> {
+        // Two statements rather than one boxed query: `.count()` after boxing loses
+        // the select, and the halves differ by a single operator.
+        Ok(if past {
+            HostBookingListProjection::belonging_to(spot)
+                .filter(booking::ends_at.le(now))
+                .filter(booking::status.eq_any(statuses))
+                .count()
+                .get_result(conn)
+                .await?
+        } else {
+            HostBookingListProjection::belonging_to(spot)
+                .filter(booking::ends_at.gt(now))
+                .filter(booking::status.eq_any(statuses))
+                .count()
+                .get_result(conn)
+                .await?
+        })
+    }
+
+    /// One window of one tab of the host's list. Statement 3 of 3.
+    ///
+    /// `past` picks the tab and with it the order: what is still to come reads soonest
+    /// first, what is over reads most recent first. Both are a range scan on
+    /// `booking_spot (spot_id, ends_at)` — the same index, from either end.
+    ///
+    /// `statuses` is whatever the caller asked for, already checked against the four
+    /// that exist. No caller: ownership was proved by the statement that fetched `spot`,
+    /// and a host is entitled to their own cancelled rows.
+    ///
+    // ponytail: OFFSET paging. A booking created or cancelled between two page
+    // requests shifts the window, so a row can repeat or be skipped across a page
+    // boundary. Keyset on (ends_at, id) if that ever shows up on screen.
+    pub async fn find_page_for_host_spot(
+        conn: &mut AsyncPgConnection,
+        spot: &HostSpotProjection,
+        now: DateTime<Utc>,
+        past: bool,
+        statuses: &[&str],
+        limit: i64,
+        offset: i64,
+    ) -> MyResult<Vec<HostBookingListProjection>> {
+        // Boxed, unlike every other read here, because `.asc()` and `.desc()` are
+        // different types and this one statement has to be able to be either.
+        let page = HostBookingListProjection::belonging_to(spot)
+            .left_join(app_user::table.on(app_user::id.eq(booking::renter_id)))
+            .filter(booking::status.eq_any(statuses))
+            .select(HostBookingListProjection::as_select())
+            .limit(limit)
+            .offset(offset)
+            .into_boxed();
+
+        let page = if past {
+            page.filter(booking::ends_at.le(now))
+                .order(booking::ends_at.desc())
+        } else {
+            page.filter(booking::ends_at.gt(now))
+                .order(booking::ends_at.asc())
+        };
+
+        Ok(page.load(conn).await?)
     }
 
     /// The caller's own bookings as a renter, newest first.

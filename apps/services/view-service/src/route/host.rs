@@ -10,12 +10,15 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
+use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     extractors::authed_jwt::AuthedJwt,
-    responses::view::{BalanceResponse, HostSpotListItemResponse, HostSpotResponse},
+    responses::view::{
+        BalanceResponse, HostBookingsPageResponse, HostSpotListItemResponse, HostSpotResponse,
+    },
 };
 use uuid::Uuid;
 
@@ -35,9 +38,9 @@ pub async fn spots(
 /// `GET /api/view/host/spots/{id}` — one spot as its host sees it.
 ///
 /// Serves both the manage screen and the edit form. They differ in which fields they
-/// render, not in which they may read, so they are one route: the edit form needs the
-/// bookings to stop a host removing a slot someone has taken, and the manage screen needs
-/// the same rows with their renters attached.
+/// render, not in which they may read, so they are one route. It carries the taken slots
+/// as one `booked` map — the edit form needs them to stop a host removing a slot someone
+/// has taken — but not the booking rows, which are [`bookings`].
 ///
 /// A non-host gets 404, not 403 — a 403 would confirm the existence of a listing the
 /// caller is not allowed to see.
@@ -47,6 +50,51 @@ pub async fn spot(
     Path(spot_id): Path<Uuid>,
 ) -> MyResult<Json<HostSpotResponse>> {
     Ok(Json(state.host_service.spot(spot_id, user_id).await?))
+}
+
+/// Query for [`bookings`]. All absent means the first twenty of every booking still to
+/// come.
+///
+/// Plain options for the same reason as [`WalletQuery`]: each is a rule stated once next
+/// to the read, and a 422 for any of them comes from the service rather than from an
+/// extractor that would answer before the caller's ownership of the spot had been
+/// established.
+///
+/// [`WalletQuery`]: crate::route::account::WalletQuery
+#[derive(Deserialize)]
+pub struct BookingsQuery {
+    /// `upcoming` (the default) or `past`.
+    pub scope: Option<String>,
+    /// Comma-separated, e.g. `confirmed` or `cancelled,released`. Absent is every status.
+    pub status: Option<String>,
+    /// 1 to 50, 20 when absent.
+    pub limit: Option<i64>,
+    /// 0 when absent. The client never computes one — it asks for what `nextOffset` said.
+    pub offset: Option<i64>,
+}
+
+/// `GET /api/view/host/spots/{id}/bookings?scope=&status=&limit=&offset=` — one window
+/// of one spot's bookings.
+///
+/// Both the manage screen's preview (`status=confirmed&limit=2`) and the paged screen
+/// behind it. It is a separate route from [`spot`] rather than a parameter on it because
+/// it is a separate read with a separate cache lifetime: a spot is edited rarely and its
+/// bookings change under it constantly.
+///
+/// Same 404-not-403 as [`spot`], and from the same statement — the ownership check is
+/// the first thing `spot_bookings` does.
+pub async fn bookings(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+    Query(q): Query<BookingsQuery>,
+) -> MyResult<Json<HostBookingsPageResponse>> {
+    Ok(Json(
+        state
+            .host_service
+            .spot_bookings(spot_id, user_id, q.scope, q.status, q.limit, q.offset)
+            .await?,
+    ))
 }
 
 /// `GET /api/view/host/balance` — what the caller has earned, withdrawn and is waiting on.

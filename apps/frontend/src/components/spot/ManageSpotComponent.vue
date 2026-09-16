@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { useQuery } from '@tanstack/vue-query';
 import Button from '../ui/button/Button.vue';
-import { fetchHostSpot } from '@/api/viewApi';
+import { fetchHostSpot, fetchHostSpotBookings } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
-import type { HostBookingResponse } from '@/types/responses/view/HostBookingResponse';
+import type { HostBookingListItemResponse } from '@/types/responses/view/HostBookingListItemResponse';
 import { computed, ref } from 'vue';
 import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
@@ -41,6 +41,7 @@ const { data } = useQuery({
 })
 
 const routeToSpotEdit = () => router.push({ name: 'spot-edit', params: { id } })
+const routeToSpotBookings = () => router.push({ name: 'spot-bookings', params: { id } })
 
 const timezone = computed(() => data.value?.timezone)
 
@@ -133,24 +134,16 @@ const sections = computed(() => [
 
 // ─── bookings ───────────────────────────────────────────────────────────────
 
-const PREVIEW = 2
-const showAllBookings = ref(false)
-
-// Already filtered to the future by the query's ends_at comparison; sorted here
-// because "soonest first" is a presentation choice, and the list is two rows long
-// until someone asks for all of it.
-// The host is a party to every booking on their own spot, so `renter` and `amount`
-// come back populated here — the same rows read by a stranger would have both null.
-const upcoming = computed<HostBookingResponse[]>(() =>
-    [...(data.value?.bookings ?? [])]
-        .filter((b) => b.status === 'confirmed' || b.status === 'reserved')
-        .sort((a, b) => a.endsAt.localeCompare(b.endsAt)))
-
-const visibleBookings = computed(() =>
-    showAllBookings.value ? upcoming.value : upcoming.value.slice(0, PREVIEW))
+// The two soonest confirmed bookings still to come — filtered, ordered and cut to two
+// server-side. The rest of the list is its own screen, paged, behind "See all".
+const { data: preview } = useQuery({
+    queryKey: viewKeys.hostSpotBookingsPreview(id),
+    queryFn: () => fetchHostSpotBookings(id, { status: ['confirmed'], limit: 2 }),
+})
+const visibleBookings = computed(() => preview.value?.bookings ?? [])
 
 /** "Mon, Aug 3 · 09:00–10:00", plus a count when the booking spans more days. */
-const bookingWhen = (booking: any) => {
+const bookingWhen = (booking: HostBookingListItemResponse) => {
     const days = sortedDays(booking)
     if (!days.length) return ''
     const [date, slots] = days[0]
@@ -252,13 +245,12 @@ const bookingWhen = (booking: any) => {
             <SectionHeader>
                 <Title>Upcoming bookings</Title>
                 <template #action>
-                    <Text v-if="upcoming.length > PREVIEW" @click="showAllBookings = !showAllBookings" tone="primary"
-                        weight="semibold">
-                        {{ showAllBookings ? 'Show less' : 'View all' }}
+                    <Text @click="routeToSpotBookings" tone="primary" weight="semibold">
+                        See all
                     </Text>
                 </template>
             </SectionHeader>
-            <div v-auto-animate class="space-y-2 max-h-96 overflow-y-auto no-scrollbar">
+            <div v-auto-animate class="space-y-2">
                 <Surface v-for="booking in visibleBookings" :key="booking.id" orientation="horizontal" class="gap-2">
                     <Avatar size="lg">
                         <AvatarImage v-if="booking?.renter?.profilePicture" :src="booking?.renter?.profilePicture" />
@@ -276,7 +268,7 @@ const bookingWhen = (booking: any) => {
                          query resolves. -->
                     <Money :cents="booking?.amount ?? 0" signed size="md" />
                 </Surface>
-                <Text v-if="!upcoming.length">
+                <Text v-if="preview && !visibleBookings.length">
                     Nothing booked yet.
                 </Text>
             </div>

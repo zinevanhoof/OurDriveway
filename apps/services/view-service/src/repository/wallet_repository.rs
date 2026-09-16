@@ -404,11 +404,7 @@ impl WalletRepository {
         // over two databases: change one and change the other, or the figure beside the
         // withdraw button stops matching what the button will pay.
         let paid_out: Option<i64> = payout::table
-            .filter(
-                payout::host_id
-                    .eq(host_id)
-                    .and(payout::status.ne("failed")),
-            )
+            .filter(payout::host_id.eq(host_id).and(payout::status.ne("failed")))
             .select(to_bigint(sum(payout::amount)))
             .first(&mut *conn)
             .await?;

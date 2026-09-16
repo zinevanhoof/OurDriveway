@@ -38,7 +38,8 @@
 //! | | `find_for_host` | `host` | `id = $1 AND host_id = $2` |
 //! | | `find_list_for_host` | `host` | `host_id = $1 AND NOT deleted` |
 //! | `booking` | `find_for_public_spot` | `public` | `spot_id = parent AND status IN ('reserved','confirmed')` |
-//! | | `find_for_host_spot` | `host` | `spot_id = parent` — ownership already proved |
+//! | | `find_booked_for_host_spot` | `host` | `spot_id = parent AND status IN ('reserved','confirmed')` — ownership already proved |
+//! | | `find_page_for_host_spot` | `host` | `spot_id = parent AND status IN ($statuses)` — same |
 //! | | `find_list_for_renter` | `renter` | `renter_id = $1` |
 //! | | `find_next_for_renter` | `renter` | `renter_id = $1 AND status = 'confirmed' AND ends_at > $2` |
 //! | | `find_for_renter` | `renter` | `id = $1 AND renter_id = $2` |
@@ -403,6 +404,7 @@ mod live_tests {
                 host_id,
                 renter_id,
                 booked: Booked::new(),
+                license_plate: "1-ABC-123".into(),
                 amount: 500,
                 status: status::RESERVED.to_string(),
                 hold_until: Some(at),
@@ -491,6 +493,7 @@ mod live_tests {
                 host_id,
                 renter_id,
                 booked: Booked::new(),
+                license_plate: "1-ABC-123".into(),
                 amount: 500,
                 status: status::RESERVED.to_string(),
                 hold_until: None,
@@ -554,10 +557,17 @@ mod live_tests {
         // `at - 1s`, because this booking's `ends_at` **is** `at` and the host read is
         // `ends_at > now`. Passing `at` would return nothing and the assertion below would
         // fail on an index rather than on the join it is about.
-        let host_rows =
-            ViewBookingRepository::find_for_host_spot(db, &spot, at - chrono::Duration::seconds(1))
-                .await
-                .unwrap();
+        let host_rows = ViewBookingRepository::find_page_for_host_spot(
+            db,
+            &spot,
+            at - chrono::Duration::seconds(1),
+            false,
+            &crate::policy::bookings::STATUSES,
+            20,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             host_rows[0]
                 .renter
@@ -584,7 +594,7 @@ mod live_tests {
     // `a_missing_alias_fails_loudly` is deleted rather than ported.
     //
     // It guarded `MaybeJoined`'s one dangerous edge: it turned a `ColumnDecode` into
-    // `None`, so a statement that forgot its `AS user_*` would have hidden every profile
+    // `None`, so a statement that forgot its `AS user_*` would have hidden every person
     // on every page with nothing in the logs. There is no aliasing left to forget —
     // diesel matches the select clause by position and checks it against the FROM at
     // compile time — so the failure this proved was loud cannot be written.
@@ -727,6 +737,7 @@ mod live_tests {
                 host_id: host,
                 renter_id: renter,
                 booked: Booked::new(),
+                license_plate: "1-ABC-123".into(),
                 amount: 4200,
                 status: status::RESERVED.to_string(),
                 hold_until: Some(at),
@@ -782,12 +793,37 @@ mod live_tests {
             .await
             .unwrap()
             .expect("its host may read it");
-        let owned = ViewBookingRepository::find_for_host_spot(db, &host_spot, at)
-            .await
-            .unwrap();
+        let all = &crate::policy::bookings::STATUSES;
+        let owned =
+            ViewBookingRepository::find_page_for_host_spot(db, &host_spot, at, false, all, 20, 0)
+                .await
+                .unwrap();
         assert_eq!(owned.len(), 1);
         assert_eq!(owned[0].amount, 4200, "the host sees the amount");
         assert!(owned[0].renter.is_some(), "the host sees the renter");
+        assert_eq!(
+            ViewBookingRepository::find_booked_for_host_spot(db, &host_spot, at)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a held slot is on the edit form's map"
+        );
+        assert!(
+            ViewBookingRepository::find_page_for_host_spot(
+                db,
+                &host_spot,
+                at,
+                false,
+                &["cancelled"],
+                20,
+                0
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "a status filter leaves out the rows it did not name"
+        );
 
         // A released booking stops blocking, so it leaves the availability answer.
         ViewBookingRepository::settle(
@@ -805,13 +841,35 @@ mod live_tests {
                 .is_empty(),
             "a released booking must not block a slot"
         );
-        assert_eq!(
-            ViewBookingRepository::find_for_host_spot(db, &host_spot, at)
+        assert!(
+            ViewBookingRepository::find_booked_for_host_spot(db, &host_spot, at)
                 .await
                 .unwrap()
-                .len(),
+                .is_empty(),
+            "…nor the edit form's map"
+        );
+
+        // The paged list takes a `HostSpotProjection`, and the only way to hold one is
+        // `find_for_host`, which a stranger is refused further down.
+        let page =
+            ViewBookingRepository::find_page_for_host_spot(db, &host_spot, at, false, all, 20, 0)
+                .await
+                .unwrap();
+        assert_eq!(
+            page.len(),
             1,
-            "…but the host keeps it, which is the history the manage screen shows"
+            "…but the host keeps it, which is the history the bookings screen shows"
+        );
+        assert_eq!(
+            page[0].license_plate, "1-ABC-123",
+            "the host is told which car to expect"
+        );
+        assert_eq!(
+            ViewBookingRepository::count_for_host_spot(db, &host_spot, at, false, all)
+                .await
+                .unwrap(),
+            1,
+            "and the count agrees with the page under it"
         );
 
         // ── renter: by id, the renter and nobody else ────────────────────────
@@ -913,6 +971,129 @@ mod live_tests {
             .unwrap();
     }
 
+    /// The host's paged list, walked: every booking once, in the tab's order, with no
+    /// row appearing on two pages and none missing between them.
+    ///
+    /// Offset paging is right until an off-by-one makes it wrong, and the failure is
+    /// quiet — a list that silently skips its 21st booking looks like a list of twenty.
+    /// So the walk is the assertion, with a limit of 2 standing in for the real page
+    /// size: what matters is that `offset` advances by exactly what came back.
+    ///
+    /// The tabs are the other half. `upcoming` and `past` split on the same instant and
+    /// order in opposite directions, so a booking belongs to exactly one of them and the
+    /// two together are the whole history.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn the_hosts_paged_list_walks_every_booking_once() {
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+
+        let (host, renter) = (Uuid::now_v7(), Uuid::now_v7());
+        let spot_id = Uuid::now_v7();
+        let at = Utc::now();
+
+        ViewSpotRepository::merge(
+            db,
+            spot_id,
+            ViewSpotPatch::created(spot_created(spot_id, host), at),
+        )
+        .await
+        .unwrap();
+
+        // Three still to come and two over, each an hour apart so the order is a fact
+        // about the data rather than about insertion.
+        let hours = [3, 2, 1, -1, -2];
+        let ids: Vec<Uuid> = hours.iter().map(|_| Uuid::now_v7()).collect();
+        for (id, h) in ids.iter().zip(hours) {
+            ViewBookingRepository::upsert(
+                db,
+                ViewBooking {
+                    id: *id,
+                    version: 1,
+                    spot_id,
+                    host_id: host,
+                    renter_id: renter,
+                    booked: Booked::new(),
+                    license_plate: "1-ABC-123".into(),
+                    amount: 500,
+                    status: status::CONFIRMED.to_string(),
+                    hold_until: None,
+                    release_reason: None,
+                    cancel_reason: None,
+                    rating: None,
+                    ends_at: at + chrono::TimeDelta::hours(h),
+                    created_at: at,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let spot = ViewSpotRepository::find_for_host(db, spot_id, host)
+            .await
+            .unwrap()
+            .expect("its host may read it");
+
+        let all = &crate::policy::bookings::STATUSES;
+        assert_eq!(
+            ViewBookingRepository::count_for_host_spot(db, &spot, at, false, all)
+                .await
+                .unwrap(),
+            3,
+            "three are still to come"
+        );
+        assert_eq!(
+            ViewBookingRepository::count_for_host_spot(db, &spot, at, true, all)
+                .await
+                .unwrap(),
+            2,
+            "and the two that are over are the other tab, not nowhere"
+        );
+
+        // Walk `upcoming` two at a time: pages of 2, 2 and then nothing.
+        let mut walked = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = ViewBookingRepository::find_page_for_host_spot(
+                db, &spot, at, false, all, 2, offset,
+            )
+            .await
+            .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            offset += page.len() as i64;
+            walked.extend(page.into_iter().map(|b| b.id));
+        }
+
+        // ids[2] ends soonest (+1h), then ids[1] (+2h), then ids[0] (+3h).
+        assert_eq!(
+            walked,
+            vec![ids[2], ids[1], ids[0]],
+            "soonest first, each booking exactly once across the pages"
+        );
+
+        let past = ViewBookingRepository::find_page_for_host_spot(db, &spot, at, true, all, 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            past.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![ids[3], ids[4]],
+            "what is over reads most recent first, and holds nothing from the other tab"
+        );
+
+        for id in &ids {
+            diesel::delete(booking::table.find(id))
+                .execute(db)
+                .await
+                .unwrap();
+        }
+        diesel::delete(spot::table.find(spot_id))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
     /// The wallet, end to end against a real database: four sources in one ordered
     /// list, the right sign on each, and nothing of anyone else's.
     ///
@@ -965,6 +1146,7 @@ mod live_tests {
                 host_id: host,
                 renter_id: renter,
                 booked: Booked::new(),
+                license_plate: "1-ABC-123".into(),
                 amount: 2_000,
                 status: status::CONFIRMED.to_string(),
                 hold_until: None,

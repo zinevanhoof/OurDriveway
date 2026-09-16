@@ -1,6 +1,11 @@
 import { get, query } from "@/api/client";
 import type { AccountResponse } from "@/types/responses/view/AccountResponse";
 import type { BalanceResponse } from "@/types/responses/view/BalanceResponse";
+import type {
+  BookingScope,
+  BookingStatus,
+  HostBookingsPageResponse,
+} from "@/types/responses/view/HostBookingsPageResponse";
 import type { HostSpotListItemResponse } from "@/types/responses/view/HostSpotListItemResponse";
 import type { HostSpotResponse } from "@/types/responses/view/HostSpotResponse";
 import type { NearbyResponse } from "@/types/responses/view/NearbyResponse";
@@ -69,16 +74,38 @@ export const fetchHostSpots = () =>
   get<HostSpotListItemResponse[]>("/api/view/host/spots");
 
 /**
- * One spot as its host sees it, with every booking on it in full.
+ * One spot as its host sees it, with the slots still taken on it merged into `booked`.
  *
  * Serves the manage screen and the edit form: they render different fields but may read
- * the same ones, and both need the bookings — the form to stop a host removing a slot
- * someone has taken, the screen to show who is coming.
+ * the same ones. The booking rows — who is coming — are {@link fetchHostSpotBookings}.
  *
  * This was `/spots/:id/manage`, a path segment shared with nothing.
  */
 export const fetchHostSpot = (id: string) =>
   get<HostSpotResponse>(`/api/view/host/spots/${id}`);
+
+/**
+ * One window of one spot's bookings: the manage screen's preview and the paged screen.
+ *
+ * Separate from the spot because a listing is edited rarely and the bookings on it change
+ * under it constantly, so they are worth separate cache entries.
+ *
+ * Everything is optional: `scope` defaults to upcoming, `status` to every status, `limit`
+ * to 20 (at most 50), `offset` to 0. Pass back whatever `nextOffset` said — `null` there
+ * is the end of the list.
+ */
+export const fetchHostSpotBookings = (
+  spotId: string,
+  params: {
+    scope?: BookingScope;
+    status?: BookingStatus[];
+    limit?: number;
+    offset?: number;
+  } = {},
+) =>
+  get<HostBookingsPageResponse>(
+    `/api/view/host/spots/${spotId}/bookings${query({ ...params, status: params.status?.join(",") })}`,
+  );
 
 /**
  * What the caller has to withdraw, and what is still ripening.

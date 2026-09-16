@@ -85,7 +85,13 @@ impl Projector for BookingProjector {
             }
         }?;
 
-        shared::set_version!(conn, "booking", shared::schema::payment::booking, &booking_id, version)
+        shared::set_version!(
+            conn,
+            "booking",
+            shared::schema::payment::booking,
+            &booking_id,
+            version
+        )
     }
 }
 
@@ -121,7 +127,7 @@ impl Projector for UserProjector {
             }
 
             // `None` is unchanged in the event and unchanged in the write — the same
-            // rule the profile form sends. A country arrives only this way: it is not
+            // rule the edit form sends. A country arrives only this way: it is not
             // asked for at signup.
             UserEvent::Updated(e) => {
                 HostMirrorRepository::patch(&mut *conn, &user_id, e.email, e.country).await
@@ -144,7 +150,13 @@ impl Projector for UserProjector {
         // line and a client's `user:<id>@N` version spell — while `host` is where this
         // service happens to keep it. They differ here exactly as `user`/`app_user` do
         // everywhere else.
-        shared::set_version!(conn, "user", shared::schema::payment::host, &user_id, version)
+        shared::set_version!(
+            conn,
+            "user",
+            shared::schema::payment::host,
+            &user_id,
+            version
+        )
     }
 }
 

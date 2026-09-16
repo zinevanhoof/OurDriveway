@@ -63,7 +63,7 @@ pub struct User {
     /// Gates login. On the same row as the password hash deliberately — one
     /// lookup, and no way to check the credential without also holding the flag.
     pub email_verified: bool,
-    /// ISO 3166-1 alpha-2, uppercase. `None` until the profile is filled in, which
+    /// ISO 3166-1 alpha-2, uppercase. `None` until the user fills it in, which
     /// is most accounts: it is only needed to open a Stripe connected account, and
     /// only hosts ever do that.
     pub country: Option<String>,

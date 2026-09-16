@@ -72,7 +72,7 @@ impl Projector for UserProjector {
             // Verification state is an authentication concern and stays in
             // user-service's private projection. This table is world-readable, so
             // `email_verified` here would publish which addresses are unconfirmed to
-            // every client that can read a spot host's profile.
+            // every client that can read a spot's host.
             //
             // `PasswordResetRequested` is the same again, twice over: it is a
             // message to notification-service, and it names an address that is
@@ -86,7 +86,13 @@ impl Projector for UserProjector {
         // means *seen and decided about*, not *changed a column* — a version that
         // only advanced on writes would strand a client waiting on `user:<id>@2`
         // after an `EmailVerified` this table deliberately ignores.
-        shared::set_version!(conn, "user", shared::schema::view::app_user, &user_id, version)
+        shared::set_version!(
+            conn,
+            "user",
+            shared::schema::view::app_user,
+            &user_id,
+            version
+        )
     }
 }
 
@@ -160,7 +166,13 @@ impl Projector for BookingProjector {
                 // no links for a second statement to restore.
                 ViewBookingRepository::upsert(&mut *conn, ViewBooking::created(e, at, version))
                     .await?;
-                shared::set_version!(conn, "booking", shared::schema::view::booking, &booking_id, version)
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
             }
 
             BookingEvent::Confirmed { booking_id } => {
@@ -171,7 +183,13 @@ impl Projector for BookingProjector {
                     ViewBookingPatch::confirmed(),
                 )
                 .await?;
-                shared::set_version!(conn, "booking", shared::schema::view::booking, &booking_id, version)
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
             }
 
             BookingEvent::Released { booking_id, reason } => {
@@ -182,7 +200,13 @@ impl Projector for BookingProjector {
                     ViewBookingPatch::released(reason),
                 )
                 .await?;
-                shared::set_version!(conn, "booking", shared::schema::view::booking, &booking_id, version)
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
             }
 
             BookingEvent::Cancelled { booking_id, reason } => {
@@ -193,7 +217,13 @@ impl Projector for BookingProjector {
                     ViewBookingPatch::cancelled(reason),
                 )
                 .await?;
-                shared::set_version!(conn, "booking", shared::schema::view::booking, &booking_id, version)
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
             }
         }
     }
@@ -251,7 +281,13 @@ impl Projector for PaymentProjector {
                     },
                 )
                 .await?;
-                shared::set_version!(conn, "payout", shared::schema::view::payout, &payout_id, version)
+                shared::set_version!(
+                    conn,
+                    "payout",
+                    shared::schema::view::payout,
+                    &payout_id,
+                    version
+                )
             }
 
             // The worker's outcome. One column, and the row is certainly here: these
@@ -264,7 +300,13 @@ impl Projector for PaymentProjector {
             PaymentEvent::PayoutPaid { payout_id, .. } => {
                 ViewPayoutRepository::set_status(&mut *conn, payout_id, payout_status::PAID)
                     .await?;
-                shared::set_version!(conn, "payout", shared::schema::view::payout, &payout_id, version)
+                shared::set_version!(
+                    conn,
+                    "payout",
+                    shared::schema::view::payout,
+                    &payout_id,
+                    version
+                )
             }
 
             // A failed withdrawal leaves the row here, marked — the wallet's queries
@@ -274,13 +316,25 @@ impl Projector for PaymentProjector {
             PaymentEvent::PayoutFailed { payout_id, .. } => {
                 ViewPayoutRepository::set_status(&mut *conn, payout_id, payout_status::FAILED)
                     .await?;
-                shared::set_version!(conn, "payout", shared::schema::view::payout, &payout_id, version)
+                shared::set_version!(
+                    conn,
+                    "payout",
+                    shared::schema::view::payout,
+                    &payout_id,
+                    version
+                )
             }
 
             PaymentEvent::Created(e) => {
                 let payment_id = e.payment_id;
                 ViewPaymentRepository::upsert(&mut *conn, ViewPayment::created(e, version)).await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
 
             // The four transitions. Each is one patch and the version write, and the
@@ -297,7 +351,13 @@ impl Projector for PaymentProjector {
                     ViewPaymentPatch::succeeded(),
                 )
                 .await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
 
             PaymentEvent::Failed { payment_id, .. } => {
@@ -307,7 +367,13 @@ impl Projector for PaymentProjector {
                     ViewPaymentPatch::failed(),
                 )
                 .await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
 
             PaymentEvent::Refunded {
@@ -323,7 +389,13 @@ impl Projector for PaymentProjector {
                     ViewPaymentPatch::refunded(refunded_at),
                 )
                 .await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
 
             PaymentEvent::SessionExpired { payment_id, .. } => {
@@ -333,7 +405,13 @@ impl Projector for PaymentProjector {
                     ViewPaymentPatch::expired(),
                 )
                 .await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
         }
     }

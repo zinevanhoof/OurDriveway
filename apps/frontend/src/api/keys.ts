@@ -25,6 +25,18 @@ export const viewKeys = {
     ["spots", "near", lng, lat, meters] as const,
   spot: (id: string) => ["spots", id] as const,
   hostSpot: (id: string) => ["spots", id, "host"] as const,
+  /**
+   * One tab of one spot's paged bookings. Under `hostSpot`'s key on purpose: a booking
+   * landing invalidates `["spots"]`, and this has to go with it.
+   */
+  hostSpotBookings: (id: string, scope: string, status: string) =>
+    ["spots", id, "host", "bookings", scope, status] as const,
+  /**
+   * The manage screen's two-row preview. Its own key rather than a `hostSpotBookings`
+   * one: that is an infinite query, which caches `{ pages }` rather than one response.
+   */
+  hostSpotBookingsPreview: (id: string) =>
+    ["spots", id, "host", "bookings", "preview"] as const,
   bookings: ["bookings"] as const,
   renterBookings: ["bookings", "renter"] as const,
   nextBooking: ["bookings", "next"] as const,

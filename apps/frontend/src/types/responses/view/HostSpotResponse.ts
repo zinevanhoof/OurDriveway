@@ -1,5 +1,4 @@
-import type { Address, Availability } from "@/types/domain/spot";
-import type { HostBookingResponse } from "./HostBookingResponse";
+import type { Address, Availability, Booked } from "@/types/domain/spot";
 
 /** `GET /api/view/host/spots/{id}` — one spot as its host sees it. */
 export type HostSpotResponse = {
@@ -14,5 +13,10 @@ export type HostSpotResponse = {
   address: Address;
   availability: Availability;
   timezone: string;
-  bookings: HostBookingResponse[];
+  /**
+   * Every slot a reserved or confirmed booking still holds, merged. What the edit form
+   * checks before a host removes hours someone has taken. The rows themselves are
+   * `GET /host/spots/{id}/bookings`.
+   */
+  booked: Booked;
 };

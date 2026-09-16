@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::validation::require;
 
 use crate::general_models::spot::{TimeSlot, validate_single};
+use crate::requests::user::fields::plate_length;
 
 /// What the booking form posts to reserve slots.
 ///
@@ -26,6 +27,15 @@ pub struct CreateBookingRequest {
     /// availability is expressed on can never match a window.
     #[garde(custom(validate_single), custom(not_empty), custom(not_in_the_past))]
     pub booked: HashMap<String, Vec<TimeSlot>>,
+    /// The car that will park. Required — the host has to recognise what turns up
+    /// on their driveway, and the renter has to be able to read back what they
+    /// said they would bring.
+    ///
+    /// The same rule as a plate on the user form, imported rather than restated:
+    /// one of these is the booking form's copy of the other, and two spellings of
+    /// "between 1 and 16 characters" would be two things to keep in step.
+    #[garde(custom(plate_length))]
+    pub license_plate: String,
 }
 
 /// A booking with no slots would authorise a free reservation that blocks nothing.
@@ -65,9 +75,14 @@ mod tests {
     }
 
     fn req(date: &str, slots: Vec<TimeSlot>) -> CreateBookingRequest {
+        plated(date, slots, "1-ABC-123")
+    }
+
+    fn plated(date: &str, slots: Vec<TimeSlot>, plate: &str) -> CreateBookingRequest {
         CreateBookingRequest {
             spot_id: Uuid::now_v7(),
             booked: HashMap::from([(date.to_string(), slots)]),
+            license_plate: plate.into(),
         }
     }
 
@@ -96,6 +111,19 @@ mod tests {
         );
         assert!(
             req(&future(), vec![slot("09:15", "11:00")])
+                .validate()
+                .is_err()
+        );
+    }
+
+    /// The plate is required and bounded, the same as on the user form. A booking
+    /// with a blank one would reach the host's list as a car with no name.
+    #[test]
+    fn rejects_a_blank_or_over_long_plate() {
+        let slots = vec![slot("09:00", "11:00")];
+        assert!(plated(&future(), slots.clone(), "").validate().is_err());
+        assert!(
+            plated(&future(), slots, &"A".repeat(17))
                 .validate()
                 .is_err()
         );

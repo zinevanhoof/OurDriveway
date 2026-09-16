@@ -95,6 +95,10 @@ impl BookingService {
         // The request spells the bare map — its garde rules are written against that —
         // so this is where it becomes the domain type.
         let requested = Booked::from(request.booked);
+        // Taken as the renter sent it. Nothing here checks it against their user
+        // record: this service has no mirror of one, and the plate is a statement
+        // about which car is coming rather than a claim to authorize.
+        let license_plate = request.license_plate;
 
         // The idempotency key. If an ack is lost after the transaction committed, a
         // client resubmitting the same form gets its booking back rather than a
@@ -147,10 +151,8 @@ impl BookingService {
                         "Unavailable",
                         "This spot is no longer accepting bookings.",
                     ))?;
-                    (host_id != *renter_id).context_conflict((
-                        "Not allowed",
-                        "You can't book your own spot.",
-                    ))?;
+                    (host_id != *renter_id)
+                        .context_conflict(("Not allowed", "You can't book your own spot."))?;
 
                     // Reads on a snapshot taken AFTER the lock was granted — which is what makes
                     // the loser of a race see the winner's booking here rather than a stale empty
@@ -180,6 +182,7 @@ impl BookingService {
                         host_id,
                         renter_id: *renter_id,
                         booked: requested.clone(),
+                        license_plate: license_plate.clone(),
                         amount_cents,
                         expires_at: Utc::now() + HOLD,
                         ends_at,
@@ -325,11 +328,18 @@ impl BookingService {
         let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
-                    let version = shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
+                    let version =
+                        shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
 
                     BookingRepository::transition(conn, booking_id, to, from, release, cancel)
                         .await?;
-                    shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking_id, version)?;
+                    shared::set_version!(
+                        conn,
+                        "booking",
+                        shared::schema::booking::booking,
+                        &booking_id,
+                        version
+                    )?;
 
                     let envelope = Envelope::new(
                         event,

@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub struct ViewUserRepository;
 
 impl ViewUserRepository {
-    /// `GET /api/view/account` — the caller's own profile, `email` included.
+    /// `GET /api/view/account` — the caller's own user record, `email` included.
     ///
     /// No `WHERE` beyond the key, and that *is* the `account` namespace's predicate: the
     /// row is chosen by a signature-verified claim, so there is no comparison here to get

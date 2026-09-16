@@ -8,6 +8,8 @@ export type RenterBookingResponse = {
   /** EUR cents. Unscoped: this endpoint only ever returns your own. */
   amount: number;
   booked: Booked;
+  /** The car you said you would bring. */
+  licensePlate: string;
   endsAt: string;
   /** `'spot_unavailable'` means the host withdrew, not that you cancelled. */
   cancelReason: string | null;

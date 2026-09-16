@@ -119,7 +119,8 @@ impl UserService {
         let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
-                    let version = shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
+                    let version =
+                        shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
 
                     // No `set_version` after this: the row carries its own version and this is
                     // a whole-row write. The separate statement is still needed wherever a
@@ -234,7 +235,8 @@ impl UserService {
                     // Takes `FOR UPDATE` on the row, which is what serialises two of these
                     // against each other now that a contended write no longer conflicts on its
                     // own. See `shared::db::next_version`.
-                    let version = shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
+                    let version =
+                        shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
                     // Idempotent by construction — setting `true` twice is setting `true`.
                     // That matters because mail scanners prefetch links, so this endpoint is
                     // deliberately re-runnable.
@@ -247,7 +249,13 @@ impl UserService {
                         },
                     )
                     .await?;
-                    shared::set_version!(conn, "user", shared::schema::user::app_user, &user_id, version)?;
+                    shared::set_version!(
+                        conn,
+                        "user",
+                        shared::schema::user::app_user,
+                        &user_id,
+                        version
+                    )?;
 
                     let envelope = Envelope::new(
                         UserEvent::EmailVerified { user_id },
@@ -297,8 +305,15 @@ impl UserService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
-                shared::set_version!(conn, "user", shared::schema::user::app_user, &user.id, version)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
+                shared::set_version!(
+                    conn,
+                    "user",
+                    shared::schema::user::app_user,
+                    &user.id,
+                    version
+                )?;
 
                 let envelope = Envelope::new(
                     UserEvent::VerificationRequested(VerificationRequested {
@@ -365,8 +380,15 @@ impl UserService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
-                shared::set_version!(conn, "user", shared::schema::user::app_user, &user.id, version)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
+                shared::set_version!(
+                    conn,
+                    "user",
+                    shared::schema::user::app_user,
+                    &user.id,
+                    version
+                )?;
 
                 let envelope = Envelope::new(
                     UserEvent::PasswordResetRequested(PasswordResetRequested {
@@ -436,7 +458,8 @@ impl UserService {
                 async move {
                     // Takes `FOR UPDATE`, which is what serialises two clicks of the same
                     // link against each other: the second reads the version the first wrote.
-                    let next = shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
+                    let next =
+                        shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
 
                     // The single-use check. `next_version!` returns stored + 1, so this
                     // reads "the row is still exactly where it was when the link was minted".
@@ -463,7 +486,13 @@ impl UserService {
                         },
                     )
                     .await?;
-                    shared::set_version!(conn, "user", shared::schema::user::app_user, &user_id, next)?;
+                    shared::set_version!(
+                        conn,
+                        "user",
+                        shared::schema::user::app_user,
+                        &user_id,
+                        next
+                    )?;
 
                     // In this transaction rather than after it: the password and the
                     // sessions it protected die together, or neither does.
@@ -496,10 +525,10 @@ impl UserService {
         Ok(version)
     }
 
-    /// Writes the caller's own record — both forms that do so: the profile screen
+    /// Writes the caller's own record — both forms that do so: the edit screen
     /// and the change-password screen. Returns the log position, which the caller
     /// answers with so the client can wait for the projection that serves its next
-    /// read — view-service's for the profile, this service's own for a login.
+    /// read — view-service's for the user row, this service's own for a login.
     ///
     /// One request, one event, and **which** event is decided here: a
     /// `new_password` makes it `PasswordChanged`, anything else makes it `Updated`.
@@ -539,15 +568,15 @@ impl UserService {
         // does, and neither arm can be written to disagree.
         let (event, new_password_hash) = match new_password {
             Some(new_password) => {
-                // Only one event goes out, so a profile field here would be accepted
+                // Only one event goes out, so any other field here would be accepted
                 // and then silently dropped. 422 instead.
-                let profile_too = first_name.is_some()
+                let user_fields_too = first_name.is_some()
                     || last_name.is_some()
                     || email.is_some()
                     || license_plates.is_some()
                     || country.is_some()
                     || profile_picture.is_some();
-                (!profile_too).context_conflict((
+                (!user_fields_too).context_conflict((
                     "One change at a time",
                     "Send a password change on its own.",
                 ))?;
@@ -563,9 +592,7 @@ impl UserService {
                     .context_unauthorized(("Unauthorized", "Incorrect password"))?;
 
                 (
-                    UserEvent::PasswordChanged(UserPasswordChanged {
-                        user_id: user_uuid,
-                    }),
+                    UserEvent::PasswordChanged(UserPasswordChanged { user_id: user_uuid }),
                     Some(password::hash(new_password.as_str())?),
                 )
             }
@@ -633,7 +660,8 @@ impl UserService {
         let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
-                    let version = shared::next_version!(conn, shared::schema::user::app_user, &user_uuid)?;
+                    let version =
+                        shared::next_version!(conn, shared::schema::user::app_user, &user_uuid)?;
 
                     match &event {
                         // The hash comes from the pair above, not from the event —
@@ -677,7 +705,13 @@ impl UserService {
                         _ => {}
                     }
 
-                    shared::set_version!(conn, "user", shared::schema::user::app_user, &user_uuid, version)?;
+                    shared::set_version!(
+                        conn,
+                        "user",
+                        shared::schema::user::app_user,
+                        &user_uuid,
+                        version
+                    )?;
 
                     let envelope = Envelope::new(
                         event,

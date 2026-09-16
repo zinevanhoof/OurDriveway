@@ -23,7 +23,7 @@ use shared::{
 
 use crate::AppState;
 
-/// `GET /api/view/account` — the caller's own profile, `email` included.
+/// `GET /api/view/account` — the caller's own user record, `email` included.
 ///
 /// This endpoint predates the rest of the REST read API and existed because one
 /// `FOR select` clause could not be both "only me" and "public": scoping `app_user` to

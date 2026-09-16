@@ -662,6 +662,20 @@ fn person(key: &str) -> Uuid {
     stable(&format!("user:{key}"))
 }
 
+/// The car a renter turns up in: their first plate, the one the booking form offers
+/// first. Everyone in [`PEOPLE`] has at least one, and a demo renter without a plate
+/// could not have made this booking on the real path either.
+fn plate(key: &str) -> String {
+    // `.iter().next()` rather than `.first()`: diesel's `FirstDsl` is in scope here and
+    // wins the method lookup on a slice.
+    PEOPLE
+        .iter()
+        .find(|(k, ..)| *k == key)
+        .and_then(|(.., plates)| plates.iter().next())
+        .unwrap_or_else(|| panic!("no person named {key}"))
+        .to_string()
+}
+
 fn spot_seed(key: &str) -> &'static SpotSeed {
     SPOTS
         .iter()
@@ -957,6 +971,7 @@ async fn main() -> Result<(), Error> {
                 host_id,
                 renter_id,
                 booked,
+                license_plate: plate(b.renter),
                 amount,
                 status: status.into(),
                 // Cleared by every transition out of `reserved`, as on the live path.

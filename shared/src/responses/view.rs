@@ -14,7 +14,7 @@
 //! change: a projection changes when a statement needs another column, a response changes
 //! when a client needs another field, and those are not the same event. Without the
 //! split, adding a column to a read silently widens the wire contract — which is how
-//! `email` ends up on a public profile.
+//! `email` ends up on a public user row.
 //!
 //! It is also what replaces `#[sqlx(skip)]`, which has no diesel equivalent: a second
 //! statement's `Vec` is a response field, never a projection field.
@@ -29,7 +29,9 @@ use uuid::Uuid;
 use crate::general_models::booking::Booked;
 use crate::general_models::spot::{Address, Availability};
 use crate::projections::{
-    booking::{HostBookingProjection, PublicBookingProjection, RenterBookingProjection},
+    booking::{
+        HostBookingListProjection, PublicBookingProjection, RenterBookingProjection,
+    },
     spot::{
         HostSpotListProjection, HostSpotProjection, PublicSpotPinProjection, PublicSpotProjection,
         SpotCardProjection,
@@ -61,33 +63,33 @@ impl From<UserPublicProjection> for UserPublicResponse {
     }
 }
 
-/// `GET /api/view/account` — the caller's own profile.
+/// `GET /api/view/account` — the caller's own user record.
 ///
 /// `id` comes from the verified claim rather than from a row, so it always resolves;
-/// `profile` is `None` only in the moment between registering and the projection catching
+/// `user` is `None` only in the moment between registering and the projection catching
 /// up. Nullable by design: a 404 there would turn a millisecond of lag into a broken
 /// sign-up flow.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountResponse {
     pub id: Uuid,
-    pub profile: Option<AccountProfileResponse>,
+    pub user: Option<AccountUserResponse>,
 }
 
-/// The profile half of [`AccountResponse`].
+/// The row half of [`AccountResponse`] — the caller as only the caller may see them.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AccountProfileResponse {
+pub struct AccountUserResponse {
     pub first_name: String,
     pub last_name: String,
     pub profile_picture: Option<String>,
     pub email: String,
     pub license_plates: Vec<String>,
-    /// ISO 3166-1 alpha-2, or `null` until the profile screen sets it.
+    /// ISO 3166-1 alpha-2, or `null` until the edit screen sets it.
     pub country: Option<String>,
 }
 
-impl From<AccountProjection> for AccountProfileResponse {
+impl From<AccountProjection> for AccountUserResponse {
     fn from(a: AccountProjection) -> Self {
         Self {
             first_name: a.public.first_name,
@@ -197,9 +199,8 @@ impl From<PublicSpotPinProjection> for NearbyResponse {
 /// `GET /api/view/host/spots/{id}` — one spot as its host sees it.
 ///
 /// Serves the manage screen and the edit form. They render different fields, not
-/// different permissions, so they are one route: the form needs the bookings to stop a
-/// host removing a slot someone has taken, the screen needs the same rows with their
-/// renters attached.
+/// different permissions, so they are one route. The booking rows are not here — they
+/// are `GET /host/spots/{id}/bookings`, which changes far more often than a listing.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSpotResponse {
@@ -214,11 +215,18 @@ pub struct HostSpotResponse {
     pub address: Address,
     pub availability: Availability,
     pub timezone: String,
-    pub bookings: Vec<HostBookingResponse>,
+    /// Every slot a reserved or confirmed booking still holds, merged into one map. What
+    /// the edit form checks before a host removes hours someone has taken.
+    pub booked: Booked,
 }
 
 impl HostSpotResponse {
-    pub fn new(spot: HostSpotProjection, bookings: Vec<HostBookingProjection>) -> Self {
+    pub fn new(spot: HostSpotProjection, booked: Vec<Booked>) -> Self {
+        let mut merged = Booked::new();
+        for (date, slots) in booked.into_iter().flatten() {
+            merged.entry(date).or_default().extend(slots);
+        }
+
         Self {
             id: spot.id,
             title: spot.title,
@@ -229,37 +237,62 @@ impl HostSpotResponse {
             address: spot.address,
             availability: spot.availability,
             timezone: spot.timezone,
-            bookings: bookings.into_iter().map(Into::into).collect(),
+            booked: merged,
         }
     }
 }
 
-/// One booking on a host's own spot. Carries the renter and the amount, because reaching
-/// it already proved ownership.
+/// `GET /api/view/host/spots/{id}/bookings` — one booking on a host's own spot.
+///
+/// Carries the renter and the amount, because reaching it already proved ownership.
+/// `ends_at` is absent: it decides which tab a booking falls in and in what order, both
+/// server-side, and no row renders it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HostBookingResponse {
+pub struct HostBookingListItemResponse {
     pub id: Uuid,
+    /// The date line and the slot count are both folds over this.
     pub booked: Booked,
+    pub license_plate: String,
     pub status: String,
-    pub ends_at: DateTime<Utc>,
     /// EUR cents.
     pub amount: i64,
     /// `null` while the renter has not been projected here yet.
     pub renter: Option<UserPublicResponse>,
 }
 
-impl From<HostBookingProjection> for HostBookingResponse {
-    fn from(b: HostBookingProjection) -> Self {
+impl From<HostBookingListProjection> for HostBookingListItemResponse {
+    fn from(b: HostBookingListProjection) -> Self {
         Self {
             id: b.id,
             booked: b.booked,
+            license_plate: b.license_plate,
             status: b.status,
-            ends_at: b.ends_at,
             amount: b.amount,
             renter: b.renter.map(Into::into),
         }
     }
+}
+
+/// `GET /api/view/host/spots/{id}/bookings?scope=&status=&limit=&offset=` — one window of
+/// them.
+///
+/// **Limit and offset, not a cursor**, unlike [`WalletResponse`]: the same route serves a
+/// two-row preview and a paged list, and a host may want either sorted differently later —
+/// an offset survives a change of sort order where a keyset cursor does not. What it does
+/// not survive is the list moving underneath it — see the note on
+/// `ViewBookingRepository::find_page_for_host_spot`.
+///
+/// `next_offset` rather than a computed one, for the same reason `next_month` exists: the
+/// client asks for what the server said was next and never does the arithmetic itself.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostBookingsPageResponse {
+    pub bookings: Vec<HostBookingListItemResponse>,
+    /// The offset to ask for next, or `null` at the end of the list.
+    pub next_offset: Option<i64>,
+    /// Every booking in this scope and status, not just this window.
+    pub total: i64,
 }
 
 /// `GET /api/view/host/spots` — one row of the host's own list.
@@ -327,6 +360,8 @@ pub struct RenterBookingResponse {
     /// EUR cents.
     pub amount: i64,
     pub booked: Booked,
+    /// The car the renter said they would bring.
+    pub license_plate: String,
     pub ends_at: DateTime<Utc>,
     /// `'spot_unavailable'` means the host withdrew, not that you cancelled.
     pub cancel_reason: Option<String>,
@@ -342,6 +377,7 @@ impl From<RenterBookingProjection> for RenterBookingResponse {
             status: b.status,
             amount: b.amount,
             booked: b.booked,
+            license_plate: b.license_plate,
             ends_at: b.ends_at,
             cancel_reason: b.cancel_reason,
             spot: b.spot.map(Into::into),
@@ -361,6 +397,8 @@ pub struct NextBookingResponse {
     pub id: Uuid,
     /// The slots, in `spot_timezone`'s wall clock. What the card's day and time read off.
     pub booked: Booked,
+    /// Which car to bring — the one thing on this card the renter may have forgotten.
+    pub license_plate: String,
     /// EUR cents. Read by the detail sheet the card opens, not by the card.
     pub amount: i64,
     /// `null` while the spot has not been projected here yet.
@@ -372,6 +410,7 @@ impl From<RenterBookingProjection> for NextBookingResponse {
         Self {
             id: b.id,
             booked: b.booked,
+            license_plate: b.license_plate,
             amount: b.amount,
             spot: b.spot.map(Into::into),
         }

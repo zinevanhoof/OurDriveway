@@ -3,7 +3,7 @@ import { formatCents } from '@/lib/money';
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import FullScreenLayoutComponent from "./FullScreenLayoutComponent.vue";
 import Calendar from "./ui/calendar/Calendar.vue";
-import { ArrowRight, CalendarDays, Clock, Plus, X } from "@lucide/vue";
+import { ArrowRight, CalendarDays, Car, Clock, Plus, X } from "@lucide/vue";
 import Button from "./ui/button/Button.vue";
 import Input from "./ui/input/Input.vue";
 import Separator from "./ui/separator/Separator.vue";
@@ -15,12 +15,26 @@ import { Money } from "@/components/base/money";
 import { SectionHeader } from "@/components/base/section-header";
 import { toast } from "vue-sonner";
 
+import {
+    Combobox,
+    ComboboxAnchor,
+    ComboboxInput,
+    ComboboxItem,
+    ComboboxList,
+    ComboboxViewport,
+} from "@/components/ui/combobox";
+
 import { DateFormatter, DateValue, getLocalTimeZone, today } from "@internationalized/date";
 import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
+import { useQuery } from "@tanstack/vue-query";
+import type { AcceptableValue } from "reka-ui";
 
 import * as bookingApi from "@/api/bookingApi";
 import * as paymentApi from "@/api/paymentApi";
+import { fetchAccount } from "@/api/viewApi";
+import { useUpdateUser } from "@/api/userApi";
+import { viewKeys } from "@/api/keys";
 import type { TimeSlot } from "@/types/domain/spot";
 import {
     type SpotAvailability,
@@ -142,6 +156,47 @@ function removeSlot(i: number) {
     activePicked.value.splice(i, 1);
 }
 
+// ─── Which car ───
+//
+// The plates come from the renter's own user record, the same `["account"]` query the
+// edit screen reads, so opening this form after adding a plate there needs no refetch.
+// One is required: a host has to know what to expect on their driveway, and the server
+// refuses a booking without one.
+const { data: account } = useQuery({ queryKey: viewKeys.account, queryFn: fetchAccount });
+const plates = computed(() => account.value?.user?.licensePlates ?? []);
+
+const plateTerm = ref("");
+const plateOpen = ref(false);
+
+const typedPlate = computed(() => plateTerm.value.trim());
+// **The box is the answer.** Picking from the list fills the input, so there is no second
+// piece of state that can disagree with what the renter can see — and editing a plate
+// back to nothing disables the button without anything having to notice.
+const plate = computed(() =>
+    typedPlate.value.length >= 1 && typedPlate.value.length <= 16 ? typedPlate.value : "",
+);
+// Filtered here rather than by the combobox (`:ignore-filter`), because the list also
+// holds an item that is not a plate yet — the one that creates one.
+const plateMatches = computed(() =>
+    plates.value.filter((p) => p.toLowerCase().includes(typedPlate.value.toLowerCase())),
+);
+const sameAs = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+// Offer to create only what could be saved: the server holds a plate to 1–16 characters,
+// and a plate they already own is a pick, not a create.
+const newPlate = computed(
+    () =>
+        typedPlate.value.length > 0 &&
+        typedPlate.value.length <= 16 &&
+        !plates.value.some((p) => sameAs(p, typedPlate.value)),
+);
+
+function pickPlate(value: AcceptableValue) {
+    plateTerm.value = String(value);
+    plateOpen.value = false;
+}
+
+const { mutateAsync: saveUser } = useUpdateUser();
+
 // ─── Pricing + totals ───
 // pricePerHour is EUR cents (integer) — see lib/money.ts. No `Number()`: it arrives as
 // a number now rather than as auto GraphQL's stringified int.
@@ -177,17 +232,26 @@ const description = computed(() => {
 const busy = ref(false);
 
 async function submit() {
-    if (!totals.value.slots || !props.spot || busy.value) return;
+    if (!totals.value.slots || !plate.value || !props.spot || busy.value) return;
     const booked: Record<string, TimeSlot[]> = {};
     for (const [k, arr] of Object.entries(pickedSlots.value)) if (arr.length) booked[k] = arr;
 
     busy.value = true;
     try {
+        // A plate typed here rather than picked is theirs from now on, so it goes on the
+        // user record first — before the booking, so a save that fails cannot leave a
+        // booking whose plate was never kept. The booking carries its own copy either
+        // way: this list changes, and the car that took a slot does not.
+        if (newPlate.value) {
+            await saveUser({ licensePlates: [...plates.value, plate.value] });
+        }
+
         // `amountCents` is not sent. The server recomputes the price from the spot
         // and the minutes it authorises; the figure on screen is display only.
         const booking = await bookingApi.createBooking({
             spotId: props.spot.id,
             booked,
+            licensePlate: plate.value,
         });
 
         // The session is created here rather than by the checkout screen, so that screen
@@ -221,6 +285,8 @@ watch(open, (o) => {
         activeKey.value = "";
         pickedSlots.value = {};
         drafts.value = {};
+        plateTerm.value = "";
+        plateOpen.value = false;
     }
 });
 </script>
@@ -230,7 +296,7 @@ watch(open, (o) => {
         <DrawerContent @close-auto-focus.prevent
             class="h-[calc(100dvh-3.75rem)] [&>div:first-child]:hidden data-[vaul-drawer-direction=bottom]:mt-0 data-[vaul-drawer-direction=bottom]:mb-15 data-[vaul-drawer-direction=bottom]:max-h-[calc(100dvh-3.75rem)] data-[vaul-drawer-direction=bottom]:rounded-none z-50">
             <FullScreenLayoutComponent @close="open = false" :title="spot?.title ?? 'Book this spot'"
-                :description="description">
+                :description="description" :show-action="totals.slots > 0">
                 <template #main>
                     <!-- Only the picker lives here now. Paying is `/checkout`, a route of
                          its own, because a redirect payment method destroys this page. -->
@@ -315,10 +381,50 @@ watch(open, (o) => {
                                 </Text>
                             </Surface>
                         </div>
+
+                        <!-- Which car. Required: the host has to know what is turning up,
+                             and a plate typed here is saved to the renter's account on
+                             submit, so the next booking form offers it. -->
+                        <div class="space-y-2">
+                            <div class="space-y-1">
+                                <Title weight="extrabold" class="text-[15px]">Which car?</Title>
+                                <Text>Pick one of your plates, or type a new one — we'll remember it.</Text>
+                            </div>
+                            <Combobox v-model:open="plateOpen" :ignore-filter="true"
+                                :reset-search-term-on-blur="false" @update:model-value="pickPlate">
+                                <ComboboxAnchor class="bg-card rounded-md">
+                                    <ComboboxInput v-model="plateTerm" placeholder="1-ABC-123" maxlength="16"
+                                        autocapitalize="characters" @input="plateOpen = true" />
+                                </ComboboxAnchor>
+                                <ComboboxList>
+                                    <ComboboxViewport>
+                                        <ComboboxItem v-for="p in plateMatches" :key="p" :value="p">
+                                            <Car class="size-4" />
+                                            {{ p }}
+                                        </ComboboxItem>
+                                        <ComboboxItem v-if="newPlate" :value="typedPlate">
+                                            <Plus class="size-4" />
+                                            Use "{{ typedPlate }}"
+                                        </ComboboxItem>
+                                        <Text v-if="!plateMatches.length && !newPlate" class="px-2 py-1.5">
+                                            {{ plates.length ? 'No plate like that.' : 'Type your plate.' }}
+                                        </Text>
+                                    </ComboboxViewport>
+                                </ComboboxList>
+                            </Combobox>
+                            <Text v-if="newPlate && plate">
+                                {{ plate }} will be saved to your account.
+                            </Text>
+                        </div>
                 </template>
 
-                <template #footer>
-                    <div v-if="totals.slots" class="flex items-center justify-between pb-2.5 text-sm font-bold">
+                <!-- Summary and button together: they are one strip, and it rises off the
+                     bottom the moment there is a slot to pay for. Showing the bar and
+                     enabling the button stay two questions — the plate is still required,
+                     so a renter who has picked a time but no car sees the price and a
+                     disabled button rather than nothing at all. -->
+                <template #action>
+                    <div class="flex items-center justify-between pb-2.5 text-sm font-bold">
                         <Text as="span" size="sm" weight="bold">
                             {{ totals.dates }} date{{ totals.dates > 1 ? 's' : '' }} ·
                             {{ totals.slots }} slot{{ totals.slots > 1 ? 's' : '' }} ·
@@ -329,7 +435,8 @@ watch(open, (o) => {
                     <!-- Holds the slots and hands off to /checkout. The figure here is the
                          picker's estimate; the server reprices from the minutes it actually
                          authorises, and that is what the checkout screen shows. -->
-                    <Button class="w-full h-11 font-bold" :disabled="!totals.slots || busy" @click="submit">
+                    <Button class="w-full h-11 font-bold" :disabled="!totals.slots || !plate || busy"
+                        @click="submit">
                         Continue to payment
                         <ArrowRight />
                     </Button>

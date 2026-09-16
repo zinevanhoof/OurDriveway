@@ -118,6 +118,14 @@ const days = computed(() => sortedDays(props.booking));
               {{ formatSlots(slots) }}
             </Text>
           </div>
+          <!-- Which car they said they would bring. On the schedule rather than
+               somewhere else on the sheet, because "when and in what" is one thought —
+               and this is the half a renter is most likely to have forgotten. -->
+          <div v-if="booking?.licensePlate"
+            class="flex items-baseline justify-between border-t border-border px-3 py-2">
+            <Text as="span" size="sm" weight="semibold">Car</Text>
+            <Text as="span" size="sm" class="tabular-nums">{{ booking.licensePlate }}</Text>
+          </div>
           <div v-if="booking?.amount != null"
             class="flex items-baseline justify-between border-t border-border bg-muted/50 px-3 py-2">
             <Text as="span" weight="semibold">Total</Text>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { eurosToCents } from '@/lib/money';
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useForm } from 'vee-validate'
 import { z } from 'zod'
 import { toTypedSchema } from '@vee-validate/zod';
@@ -50,7 +50,7 @@ const formSchema = toTypedSchema(
     })
 )
 
-const { handleSubmit, setValues, setErrors } = useForm({ validationSchema: formSchema })
+const { handleSubmit, setValues, setErrors, meta } = useForm({ validationSchema: formSchema })
 
 const availability = ref<Availability>({
     weekly: { monday: [], tuesday: [], wednesday: [], thursday: [], friday: [], saturday: [], sunday: [] },
@@ -70,6 +70,16 @@ const { mutateAsync: create } = useCreateSpot()
 const hasSlots = () =>
     Object.values(availability.value.weekly).some(slots => slots.length)
     || Object.values(availability.value.single).some(slots => slots.length)
+
+/**
+ * Whether the host has started — what puts "Publish listing" on screen.
+ *
+ * There is no baseline to diff against on a new listing, so touching anything counts.
+ * The two `||` arms are the halves `meta.dirty` cannot see: availability and images are
+ * plain refs rather than form fields, and someone who opens the photo picker first should
+ * still be shown the button.
+ */
+const started = computed(() => meta.value.dirty || images.value.length > 0 || hasSlots())
 
 const submit = handleSubmit(async (values) => {
     formErrors.value = []
@@ -165,7 +175,7 @@ const showServerErrors = (err: ApiError) => {
 
 <template>
     <FullScreenLayoutComponent title="New listing" description="List your driveway to start earning"
-        @close="router.back()">
+        @close="router.back()" :show-action="started">
         <template #main>
             <form id="create-spot-form" @submit="submit" class="space-y-4">
                 <CreateSpotBasicInfo />
@@ -175,7 +185,9 @@ const showServerErrors = (err: ApiError) => {
                 <FieldError v-if="formErrors.length" :errors="formErrors" />
             </form>
         </template>
-        <template #footer>
+        <!-- Arrives once the form has been started. `form="create-spot-form"` is what
+             keeps it a submit button from outside the form. -->
+        <template #action>
             <Button type="submit" form="create-spot-form" :disabled="loading" class="w-full h-11 font-bold">
                 <Spinner v-if="loading" />
                 Publish listing

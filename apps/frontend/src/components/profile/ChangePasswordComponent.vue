@@ -33,7 +33,7 @@ const formSchema = toTypedSchema(
     })
 )
 
-const { handleSubmit, setErrors } = useForm({
+const { handleSubmit, setErrors, meta } = useForm({
     validationSchema: formSchema,
     initialValues: { currentPassword: '', newPassword: '', confirmPassword: '' },
 })
@@ -60,7 +60,7 @@ const submit = handleSubmit(async ({ confirmPassword, ...form }) => {
 
 <template>
     <FullScreenLayoutComponent @close="router.back()" title="Change password"
-        description="Confirm your current one to set a new one">
+        description="Confirm your current one to set a new one" :show-action="meta.dirty">
         <template #main>
             <form id="change-password-form" @submit="submit" class="space-y-4">
                 <FieldGroup class="gap-4">
@@ -102,7 +102,9 @@ const submit = handleSubmit(async ({ confirmPassword, ...form }) => {
                 </FieldGroup>
             </form>
         </template>
-        <template #footer>
+        <!-- Outside the `<form>`, which is why it carries `form="change-password-form"` —
+             the same arrangement the footer had, moved. -->
+        <template #action>
             <Button type="submit" form="change-password-form" :disabled="loading" class="w-full h-11 font-bold">
                 <Spinner v-if="loading" />
                 Change password

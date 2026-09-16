@@ -152,7 +152,8 @@ watch(managementEl, (el) => {
 
 <template>
     <FullScreenLayoutComponent title="Withdraw" :description="`${formatCents(maxWithdraw)} available`"
-        @close="router.replace({ name: 'wallet' })">
+        @close="router.replace({ name: 'wallet' })"
+        :show-action="connectStatus?.state === 'enabled' && !belowMinimumBalance">
         <template #main>
             <!-- Asking Stripe, which is a round trip on every visit — see
                  `ConnectService::status` for why it is not a cached column. -->
@@ -278,9 +279,13 @@ watch(managementEl, (el) => {
             </template>
         </template>
 
-        <template #footer>
-            <Button v-if="connectStatus?.state === 'enabled' && !belowMinimumBalance"
-                class="h-11 w-full font-bold" :disabled="!!problem || busy" @click="withdraw">
+        <!-- The `v-if` this used to carry is `showAction` now: whether the form can be
+             used at all is the question of whether to offer the button, and the layout
+             is what animates that. Whether the *amount* is withdrawable stays a
+             `disabled` — the field explains itself underneath, and a button that
+             vanished as you typed past your balance would take the explanation with it. -->
+        <template #action>
+            <Button class="h-11 w-full font-bold" :disabled="!!problem || busy" @click="withdraw">
                 <Spinner v-if="busy" class="size-4" />
                 {{ busy ? 'Withdrawing…' : `Withdraw ${formatCents(Math.max(cents, 0))}` }}
             </Button>

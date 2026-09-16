@@ -319,7 +319,10 @@ mod tests {
         // a `dive`d field. Serde never sees either.
         assert_eq!(camel("license_plates[0]"), "licensePlates[0]");
         assert_eq!(camel("availability.single"), "availability.single");
-        assert_eq!(camel("availability.price_per_hour"), "availability.pricePerHour");
+        assert_eq!(
+            camel("availability.price_per_hour"),
+            "availability.pricePerHour"
+        );
 
         // A digit after the underscore: `to_uppercase` is a no-op on it and the
         // underscore still goes, which is exactly what serde does with `line_1`.

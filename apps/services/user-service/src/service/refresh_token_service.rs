@@ -53,7 +53,7 @@ impl RefreshTokenService {
         // The session is its own aggregate, keyed by the token rather than by the
         // user: two logins from two devices are two independent rows, and pinning
         // them to a shared user version would make either one conflict with an
-        // unrelated profile edit.
+        // unrelated edit to the user.
         let issued = RefreshTokenIssued {
             token_id,
             user_id: user.id,
@@ -74,14 +74,24 @@ impl RefreshTokenService {
         let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
-                    let version = shared::next_version!(conn, shared::schema::user::refresh_token, &token_id)?;
+                    let version = shared::next_version!(
+                        conn,
+                        shared::schema::user::refresh_token,
+                        &token_id
+                    )?;
 
                     RefreshTokenRepository::upsert(
                         conn,
                         RefreshToken::issued(issued.clone(), Utc::now()),
                     )
                     .await?;
-                    shared::set_version!(conn, "refresh_token", shared::schema::user::refresh_token, &token_id, version)?;
+                    shared::set_version!(
+                        conn,
+                        "refresh_token",
+                        shared::schema::user::refresh_token,
+                        &token_id,
+                        version
+                    )?;
 
                     let envelope = Envelope::new(
                         SessionEvent::Issued(issued),
@@ -144,7 +154,11 @@ impl RefreshTokenService {
         let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
-                    let version = shared::next_version!(conn, shared::schema::user::refresh_token, &token_id)?;
+                    let version = shared::next_version!(
+                        conn,
+                        shared::schema::user::refresh_token,
+                        &token_id
+                    )?;
 
                     // Revoke-and-issue in one transaction, mirroring the single event:
                     // there is no instant at which the old token is dead and the new one
@@ -164,7 +178,13 @@ impl RefreshTokenService {
                         RefreshToken::rotated(rotated.clone(), Utc::now()),
                     )
                     .await?;
-                    shared::set_version!(conn, "refresh_token", shared::schema::user::refresh_token, &token_id, version)?;
+                    shared::set_version!(
+                        conn,
+                        "refresh_token",
+                        shared::schema::user::refresh_token,
+                        &token_id,
+                        version
+                    )?;
 
                     let envelope = Envelope::new(
                         SessionEvent::Rotated(rotated),
@@ -206,7 +226,8 @@ impl RefreshTokenService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::user::refresh_token, &existing.id)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::user::refresh_token, &existing.id)?;
 
                 RefreshTokenRepository::patch_by_token_hash(
                     conn,
@@ -222,7 +243,13 @@ impl RefreshTokenService {
                 // the only writer — it used to have to be the envelope's, because every
                 // replica replayed the same event and had to drop exactly the same rows.
                 RefreshTokenRepository::delete_expired(conn, Utc::now()).await?;
-                shared::set_version!(conn, "refresh_token", shared::schema::user::refresh_token, &existing.id, version)?;
+                shared::set_version!(
+                    conn,
+                    "refresh_token",
+                    shared::schema::user::refresh_token,
+                    &existing.id,
+                    version
+                )?;
 
                 let envelope = Envelope::new(
                     SessionEvent::Revoked(revoked),

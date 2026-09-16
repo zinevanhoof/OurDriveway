@@ -14,7 +14,7 @@ use crate::{
 /// whole-row `CONTENT` — a `CONTENT` would erase a link the USERS stream owned, and
 /// the projectors advance independently so a `SpotCreated` routinely lands before its
 /// host. The link is gone: `host_id` is a plain uuid and a read LEFT JOINs to
-/// resolve the profile, so there is nothing a write here can clear.
+/// resolve the host, so there is nothing a write here can clear.
 #[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
 #[diesel(table_name = crate::schema::view::spot)]
 #[diesel(check_for_backend(diesel::pg::Pg))]

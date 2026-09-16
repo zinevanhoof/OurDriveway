@@ -12,4 +12,12 @@ export type CreateBookingRequest = {
   spotId: string;
   /** Mirrors the spot's single-availability shape: `"YYYY-MM-DD"` -> slots. */
   booked: SingleAvailability;
+  /**
+   * The car that will park. Required, 1–16 characters — the same rule the user form
+   * holds a plate to, because this is the booking form's copy of it.
+   *
+   * Sent rather than dereferenced from the renter server-side: booking-service has no
+   * mirror of a user, and which car is coming is a choice made per booking anyway.
+   */
+  licensePlate: string;
 };

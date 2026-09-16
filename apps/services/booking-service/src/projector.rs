@@ -75,7 +75,13 @@ impl Projector for SpotProjector {
         // spot-service's version of this aggregate, as last applied here. The only
         // counter on this row now — `bookings_seq` used to sit beside it doing an
         // entirely different job.
-        shared::set_version!(conn, "spot", shared::schema::booking::spot, &spot_id, version)
+        shared::set_version!(
+            conn,
+            "spot",
+            shared::schema::booking::spot,
+            &spot_id,
+            version
+        )
     }
 }
 
@@ -160,7 +166,13 @@ impl SpotProjector {
             Some(CancelReason::SpotUnavailable.as_str()),
         )
         .await?;
-        shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking.id, version)?;
+        shared::set_version!(
+            conn,
+            "booking",
+            shared::schema::booking::booking,
+            &booking.id,
+            version
+        )?;
 
         let event = BookingEvent::Cancelled {
             booking_id: booking.id,
@@ -233,6 +245,7 @@ mod tests {
             host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: HashMap::from([(date.to_string(), slots)]).into(),
+            license_plate: "1-ABC-123".into(),
             amount: 500,
             status: status::CONFIRMED.into(),
             hold_until: None,

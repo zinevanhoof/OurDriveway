@@ -118,9 +118,9 @@ async function load() {
 async function mount(clientSecret: string) {
   const sdk = (await stripe()).initCheckoutElementsSdk({
     clientSecret,
-    // `profile` is still optional — null between signup and its projection — but the
+    // `user` is still optional — null between signup and its projection — but the
     // email on it is not.
-    defaultValues: { email: me.value?.profile?.email },
+    defaultValues: { email: me.value?.user?.email },
   });
 
   // Themed off the app's own tokens so the Element doesn't read as a third-party panel.

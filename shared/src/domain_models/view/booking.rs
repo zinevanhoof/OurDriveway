@@ -27,6 +27,9 @@ pub struct ViewBooking {
     pub host_id: Uuid,
     pub renter_id: Uuid,
     pub booked: Booked,
+    /// The car that will park. Read by both parties to the booking and by no one
+    /// else — the public projection does not select it.
+    pub license_plate: String,
     /// EUR cents.
     pub amount: i64,
     pub status: String,
@@ -49,6 +52,7 @@ impl ViewBooking {
             host_id: e.host_id,
             renter_id: e.renter_id,
             booked: e.booked,
+            license_plate: e.license_plate,
             amount: e.amount_cents,
             status: status::RESERVED.to_string(),
             hold_until: Some(e.expires_at),

@@ -33,7 +33,7 @@ bus::version_reader! {
     ///
     /// `"user"` maps to `host` — this database has no `app_user`, only the two columns
     /// Stripe demands. It is a real wait now and it earns its place: a host sets their
-    /// country on their profile and then goes to onboard, and `ConnectService` reads that
+    /// country on their user record and then goes to onboard, and `ConnectService` reads that
     /// country from this mirror. Without the wait, onboarding can read the row before the
     /// USERS event lands and see no country — which is the one value Stripe fixes
     /// permanently at account creation.
