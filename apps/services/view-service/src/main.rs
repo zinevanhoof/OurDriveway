@@ -132,13 +132,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &[STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
     );
 
-    // For the outbox relay only. The projectors need no election: each partition is
-    // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
-    // event at a time *per partition* across every replica, in order — and different
-    // partitions are different aggregates, which have no order between them. The
-    // relay has no such backstop, so exactly one instance may run it.
-    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
-
+    // No leader election and no outbox relay: this service publishes nothing, and the
+    // projectors need no election — each partition is one durable consumer with
+    // `max_ack_pending: 1`, so JetStream hands out one event at a time *per partition*
+    // across every replica, in order.
+    //
     // Four projectors, `PARTITIONS` lanes each, all on the one connection above.
     // A transaction per event, on a session that lives only as long as it does.
     tokio::spawn(bus::projector::run(
@@ -165,11 +163,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         db.clone(),
         readiness.clone(),
     ));
-
-    // view-service publishes nothing today, so this relay has nothing to carry.
-    // Spawned anyway so every service has the same shape and a future event from
-    // the read model has somewhere to go.
-    tokio::spawn(bus::outbox::run(db.clone(), js, leader.clone()));
 
     // The GraphQL proxy is gone, and with it the security model it carried.
     //

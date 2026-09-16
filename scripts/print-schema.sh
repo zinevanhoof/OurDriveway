@@ -82,14 +82,15 @@ done
 # crate that owns it. `--only-tables` REPLACES the config's `except_tables` rather than
 # combining with it, which is what lets one section serve both passes.
 #
-# Every database has an identical copy of both, because every service runs its own outbox
-# relay and leader election — the tables are created five times over by
-# `migrations/<svc>/0001_init/up.sql`. So all five are read and compared: they must agree,
-# and if a migration ever drifts from its siblings this is the one place that notices.
-# That check is why this reads five databases to write one file.
+# Every write-side database has an identical copy of both, because each of those services
+# runs its own outbox relay and leader election — the tables are created four times over
+# by `migrations/<svc>/0001_init/up.sql`. `view` has neither: it publishes nothing. So all
+# four are read and compared: they must agree, and if a migration ever drifts from its
+# siblings this is the one place that notices. That check is why this reads four
+# databases to write one file.
 echo "print-schema: bus (_lease, _outbox)"
 prev=""
-for db in user spot booking payment view; do
+for db in user spot booking payment; do
   tmp="$(mktemp)"
   diesel print-schema \
     --database-url "postgres://${USER_NAME}@${HOST}:${PORT}/${db}" \

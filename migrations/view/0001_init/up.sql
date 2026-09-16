@@ -155,19 +155,5 @@ CREATE TABLE payout (
 -- The history list: a host's own withdrawals, newest first.
 CREATE INDEX payout_host ON payout (host_id, created_at);
 
--- ─── leader election ────────────────────────────────────────────────────────
-CREATE TABLE _lease (
-    name       text PRIMARY KEY,
-    holder     text        NOT NULL,
-    expires_at timestamptz NOT NULL
-);
-
--- ─── transactional outbox ───────────────────────────────────────────────────
-CREATE TABLE _outbox (
-    id         uuid PRIMARY KEY,
-    subject    text        NOT NULL,
-    payload    text        NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX _outbox_order ON _outbox (created_at ASC, id ASC);
+-- No `_lease` or `_outbox`, unlike the four write-side databases: view-service publishes
+-- nothing, so it runs no outbox relay and no leader election.

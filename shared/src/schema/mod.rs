@@ -18,8 +18,9 @@
 //! module would make those collide, and the type-level separation is what stops a query
 //! written against one database from compiling against another.
 //!
-//! `_lease` and `_outbox` are **absent** from all five, though every database has them —
-//! each service runs its own outbox relay and its own leader election. They are filtered
+//! `_lease` and `_outbox` are **absent** from all five, though every write-side database
+//! has them — each of those services runs its own outbox relay and its own leader
+//! election (`view` publishes nothing and has neither). They are filtered
 //! out here (`diesel.toml`) and generated into `bus::schema` instead, by their own pass in
 //! `scripts/print-schema.sh`. Every table is still generated exactly once; the pass that
 //! writes it just belongs to the crate that owns it.
