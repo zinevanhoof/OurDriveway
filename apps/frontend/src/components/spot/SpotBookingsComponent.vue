@@ -8,26 +8,19 @@ import { computed, ref, useTemplateRef, watch } from 'vue'
 import { useInfiniteQuery, useQuery } from '@tanstack/vue-query'
 import { useIntersectionObserver } from '@vueuse/core'
 import { useRouter } from 'vue-router'
-import { Car } from '@lucide/vue'
 
 import FullScreenLayoutComponent from '@/components/FullScreenLayoutComponent.vue'
 import HostBookingDrawer from '@/components/spot/HostBookingDrawer.vue'
-import Avatar from '@/components/ui/avatar/Avatar.vue'
-import AvatarImage from '@/components/ui/avatar/AvatarImage.vue'
-import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue'
+import HostBookingRow from '@/components/spot/HostBookingRow.vue'
 import Button from '@/components/ui/button/Button.vue'
-import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Surface } from '@/components/base/surface'
 import { Text } from '@/components/base/text'
-import { Money } from '@/components/base/money'
 
 import { fetchHostSpot, fetchHostSpotBookings } from '@/api/viewApi'
 import { viewKeys } from '@/api/keys'
 import type { ApiError } from '@/api/client'
 import type { BookingScope } from '@/types/responses/view/HostBookingsPageResponse'
 import type { HostBookingListItemResponse } from '@/types/responses/view/HostBookingListItemResponse'
-import { formatDay, formatSlots, sortedDays } from '@/lib/bookingDates'
 
 const { id } = defineProps<{ id: string }>()
 
@@ -72,26 +65,6 @@ const openBooking = (booking: HostBookingListItemResponse) => {
     detailOpen.value = true
 }
 
-/** "Mon, Aug 3 · 09:00–10:00", plus a count when the booking spans more days. */
-const when = (booking: HostBookingListItemResponse) => {
-    const days = sortedDays(booking)
-    if (!days.length) return ''
-    const [date, slots] = days[0]
-    const rest = days.length - 1
-    return `${formatDay(date, timezone.value)} · ${formatSlots(slots)}`
-        + (rest ? ` +${rest} more ${rest === 1 ? 'day' : 'days'}` : '')
-}
-
-/** Only the rows that are not a plain paid booking say anything. */
-const badge = (status: string) => {
-    switch (status) {
-        case 'reserved': return { label: 'Awaiting payment', variant: 'secondary' } as const
-        case 'cancelled': return { label: 'Cancelled', variant: 'destructive' } as const
-        case 'released': return { label: 'Expired', variant: 'outline' } as const
-        default: return null
-    }
-}
-
 // ─── infinite scroll ────────────────────────────────────────────────────────
 //
 // The observer records whether the sentinel is on screen; the watcher decides whether to
@@ -128,30 +101,8 @@ watch([sentinelVisible, hasNextPage, isFetchingNextPage], () => {
             </Tabs>
 
             <div v-auto-animate class="space-y-2">
-                <Surface v-for="booking in bookings" :key="booking.id" orientation="horizontal" class="gap-2"
-                    interactive @click="openBooking(booking)">
-                    <Avatar size="lg">
-                        <AvatarImage v-if="booking.renter?.profilePicture" :src="booking.renter.profilePicture" />
-                        <AvatarFallback :name="{
-                            firstName: booking.renter?.firstName ?? '',
-                            lastName: booking.renter?.lastName ?? '',
-                        }" />
-                    </Avatar>
-                    <div class="flex-1 min-w-0">
-                        <Text size="sm" tone="default" class="flex items-center gap-1.5">
-                            {{ booking.renter ? `${booking.renter.firstName} ${booking.renter.lastName}` : 'A renter' }}
-                            <Badge v-if="badge(booking.status)" :variant="badge(booking.status)!.variant">
-                                {{ badge(booking.status)!.label }}
-                            </Badge>
-                        </Text>
-                        <Text class="truncate">{{ when(booking) }}</Text>
-                        <Text class="flex items-center gap-1">
-                            <Car :size="14" />
-                            {{ booking.licensePlate }}
-                        </Text>
-                    </div>
-                    <Money :cents="booking.amount" signed size="md" />
-                </Surface>
+                <HostBookingRow v-for="booking in bookings" :key="booking.id" :booking="booking"
+                    :timezone="timezone" interactive @click="openBooking(booking)" />
             </div>
 
             <Text v-if="isPending" size="sm" class="py-6 text-center">Loading…</Text>

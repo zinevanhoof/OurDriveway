@@ -3,18 +3,17 @@ import { useQuery } from '@tanstack/vue-query';
 import Button from '../ui/button/Button.vue';
 import { fetchHostSpot, fetchHostSpotBookings } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
-import type { HostBookingListItemResponse } from '@/types/responses/view/HostBookingListItemResponse';
 import { computed, ref } from 'vue';
 import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
-import { formatDay, formatSlots, sortedDays, todayIn } from '@/lib/bookingDates.ts';
+import { formatDay, formatSlots, todayIn } from '@/lib/bookingDates.ts';
 import { useDeleteSpot, useUpdateSpot } from '@/api/spotApi';
 import type { ApiError } from '@/api/client';
 import type { TimeSlot, WeeklyAvailability } from '@/types/domain/spot';
 
-import Avatar from "../ui/avatar/Avatar.vue";
-import AvatarImage from "../ui/avatar/AvatarImage.vue";
-import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
+import HostBookingRow from './HostBookingRow.vue';
+import HostBookingDrawer from './HostBookingDrawer.vue';
+import type { HostBookingListItemResponse } from '@/types/responses/view/HostBookingListItemResponse';
 import Switch from '../ui/switch/Switch.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer'
 import { FieldError } from '@/components/ui/field'
@@ -142,14 +141,13 @@ const { data: preview } = useQuery({
 })
 const visibleBookings = computed(() => preview.value?.bookings ?? [])
 
-/** "Mon, Aug 3 · 09:00–10:00", plus a count when the booking spans more days. */
-const bookingWhen = (booking: HostBookingListItemResponse) => {
-    const days = sortedDays(booking)
-    if (!days.length) return ''
-    const [date, slots] = days[0]
-    const rest = days.length - 1
-    return `${formatDay(date, timezone.value)} · ${formatSlots(slots)}`
-        + (rest ? ` +${rest} more ${rest === 1 ? 'day' : 'days'}` : '')
+// Same drawer as the bookings screen: the row already carries everything it shows.
+const selected = ref<HostBookingListItemResponse | null>(null)
+const detailOpen = ref(false)
+
+const openBooking = (booking: HostBookingListItemResponse) => {
+    selected.value = booking
+    detailOpen.value = true
 }
 </script>
 
@@ -251,23 +249,8 @@ const bookingWhen = (booking: HostBookingListItemResponse) => {
                 </template>
             </SectionHeader>
             <div v-auto-animate class="space-y-2">
-                <Surface v-for="booking in visibleBookings" :key="booking.id" orientation="horizontal" class="gap-2">
-                    <Avatar size="lg">
-                        <AvatarImage v-if="booking?.renter?.profilePicture" :src="booking?.renter?.profilePicture" />
-                        <AvatarFallback
-                            :name="{ firstName: booking?.renter?.firstName ?? '', lastName: booking?.renter?.lastName ?? '' }" />
-                    </Avatar>
-                    <div class="flex-1">
-                        <Text size="sm" tone="default">{{ booking?.renter?.firstName }} {{ booking?.renter?.lastName
-                            }}
-                        </Text>
-                        <Text>{{ bookingWhen(booking) }}</Text>
-                    </div>
-                    <!-- Non-null for the host, who is a party to every booking on
-                         their own listing. `?? 0` only covers the tick before the
-                         query resolves. -->
-                    <Money :cents="booking?.amount ?? 0" signed size="md" />
-                </Surface>
+                <HostBookingRow v-for="booking in visibleBookings" :key="booking.id" :booking="booking"
+                    :timezone="timezone" interactive @click="openBooking(booking)" />
                 <Text v-if="preview && !visibleBookings.length">
                     Nothing booked yet.
                 </Text>
@@ -298,4 +281,6 @@ const bookingWhen = (booking: HostBookingListItemResponse) => {
             </div>
         </DrawerContent>
     </Drawer>
+
+    <HostBookingDrawer v-model:open="detailOpen" :booking="selected" :timezone="timezone" />
 </template>
