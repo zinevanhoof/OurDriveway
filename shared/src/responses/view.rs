@@ -16,8 +16,10 @@
 //! split, adding a column to a read silently widens the wire contract — which is how
 //! `email` ends up on a public user row.
 //!
-//! It is also what replaces `#[sqlx(skip)]`, which has no diesel equivalent: a second
-//! statement's `Vec` is a response field, never a projection field.
+//! **A spot never carries its bookings, and a booking never carries its spot.** Each is
+//! its own route, and a screen that needs both fetches both. **One exception:** a
+//! renter's own bookings embed a small card of their spot — see
+//! `projections::booking::RenterBookingProjection` for why.
 //!
 //! `#[serde(rename_all = "camelCase")]` on every struct. `apps/frontend/src/types/view.ts`
 //! mirrors these names; projection names never cross the wire.
@@ -30,11 +32,11 @@ use crate::general_models::booking::Booked;
 use crate::general_models::spot::{Address, Availability};
 use crate::projections::{
     booking::{
-        HostBookingListProjection, PublicBookingProjection, RenterBookingProjection,
+        HostBookingProjection, PublicBookingProjection, RenterBookingProjection,
+        RenterBookingSpotProjection,
     },
     spot::{
-        HostSpotListProjection, HostSpotProjection, PublicSpotPinProjection, PublicSpotProjection,
-        SpotCardProjection,
+        HostSpotProjection, PublicSpotPinProjection, PublicSpotProjection, RenterSpotProjection,
     },
     user::{AccountProjection, UserPublicProjection},
     wallet::{BalanceProjection, WalletTransactionProjection},
@@ -106,8 +108,8 @@ impl From<AccountProjection> for AccountUserResponse {
 
 /// `GET /api/view/public/spots/{id}` — one active spot as a prospective renter sees it.
 ///
-/// `bookings` is the second statement's rows and is a response field by construction:
-/// there is no column on `spot` for it to be a projection field of.
+/// No bookings: the taken slots are `GET /public/spots/{id}/bookings`, fetched by the
+/// booking form when it opens and by nothing else.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicSpotResponse {
@@ -118,17 +120,14 @@ pub struct PublicSpotResponse {
     pub images: Vec<String>,
     pub address: Address,
     pub availability: Availability,
-    /// The zone `bookings[].booked` is expressed in.
+    /// The zone every `booked` map on this spot is expressed in.
     pub timezone: String,
     /// `null` while the host has not been projected here yet — an absent join.
     pub host: Option<UserPublicResponse>,
-    /// **The availability answer**: which slots are taken and until when. No renter, no
-    /// amount, no hold expiry — not nulled, not selected.
-    pub bookings: Vec<PublicBookingResponse>,
 }
 
-impl PublicSpotResponse {
-    pub fn new(spot: PublicSpotProjection, bookings: Vec<PublicBookingProjection>) -> Self {
+impl From<PublicSpotProjection> for PublicSpotResponse {
+    fn from(spot: PublicSpotProjection) -> Self {
         Self {
             id: spot.id,
             title: spot.title,
@@ -138,12 +137,14 @@ impl PublicSpotResponse {
             availability: spot.availability,
             timezone: spot.timezone,
             host: spot.host.map(Into::into),
-            bookings: bookings.into_iter().map(Into::into).collect(),
         }
     }
 }
 
-/// One booking on a public spot page.
+/// `GET /api/view/public/spots/{id}/bookings` — one slot-taking booking on a spot.
+///
+/// **The availability answer**: which slots are taken and until when. No renter, no
+/// amount, no hold expiry — not nulled, not selected.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicBookingResponse {
@@ -196,11 +197,11 @@ impl From<PublicSpotPinProjection> for NearbyResponse {
 
 // ─── host ───────────────────────────────────────────────────────────────────
 
-/// `GET /api/view/host/spots/{id}` — one spot as its host sees it.
+/// `GET /api/view/host/spots` and `/host/spots/{id}` — a spot as its host sees it.
 ///
-/// Serves the manage screen and the edit form. They render different fields, not
-/// different permissions, so they are one route. The booking rows are not here — they
-/// are `GET /host/spots/{id}/bookings`, which changes far more often than a listing.
+/// Serves the list, the manage screen and the edit form. They render different fields,
+/// not different permissions, so they are one type. No bookings: the rows are
+/// `GET /host/spots/{id}/bookings` and the taken slots `GET /host/spots/{id}/booked`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSpotResponse {
@@ -210,23 +211,16 @@ pub struct HostSpotResponse {
     /// EUR cents.
     pub price_per_hour: i64,
     pub images: Vec<String>,
-    /// The live switch. An inactive spot resolves here and nowhere else.
+    /// The live switch. `false` is a paused listing, which looks identical to a live one
+    /// otherwise. An inactive spot resolves here and nowhere public.
     pub active: bool,
     pub address: Address,
     pub availability: Availability,
     pub timezone: String,
-    /// Every slot a reserved or confirmed booking still holds, merged into one map. What
-    /// the edit form checks before a host removes hours someone has taken.
-    pub booked: Booked,
 }
 
-impl HostSpotResponse {
-    pub fn new(spot: HostSpotProjection, booked: Vec<Booked>) -> Self {
-        let mut merged = Booked::new();
-        for (date, slots) in booked.into_iter().flatten() {
-            merged.entry(date).or_default().extend(slots);
-        }
-
+impl From<HostSpotProjection> for HostSpotResponse {
+    fn from(spot: HostSpotProjection) -> Self {
         Self {
             id: spot.id,
             title: spot.title,
@@ -237,37 +231,47 @@ impl HostSpotResponse {
             address: spot.address,
             availability: spot.availability,
             timezone: spot.timezone,
-            booked: merged,
         }
     }
+}
+
+/// `GET /api/view/host/spots?limit=&offset=` — one window of the host's own listings.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSpotsPageResponse {
+    pub spots: Vec<HostSpotResponse>,
+    /// The offset to ask for next, or `null` at the end of the list.
+    pub next_offset: Option<i64>,
+    /// Every listing the host has that is not deleted.
+    pub total: i64,
 }
 
 /// `GET /api/view/host/spots/{id}/bookings` — one booking on a host's own spot.
 ///
 /// Carries the renter and the amount, because reaching it already proved ownership.
-/// `ends_at` is absent: it decides which tab a booking falls in and in what order, both
-/// server-side, and no row renders it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HostBookingListItemResponse {
+pub struct HostBookingResponse {
     pub id: Uuid,
     /// The date line and the slot count are both folds over this.
     pub booked: Booked,
     pub license_plate: String,
     pub status: String,
+    pub ends_at: DateTime<Utc>,
     /// EUR cents.
     pub amount: i64,
     /// `null` while the renter has not been projected here yet.
     pub renter: Option<UserPublicResponse>,
 }
 
-impl From<HostBookingListProjection> for HostBookingListItemResponse {
-    fn from(b: HostBookingListProjection) -> Self {
+impl From<HostBookingProjection> for HostBookingResponse {
+    fn from(b: HostBookingProjection) -> Self {
         Self {
             id: b.id,
             booked: b.booked,
             license_plate: b.license_plate,
             status: b.status,
+            ends_at: b.ends_at,
             amount: b.amount,
             renter: b.renter.map(Into::into),
         }
@@ -288,38 +292,11 @@ impl From<HostBookingListProjection> for HostBookingListItemResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostBookingsPageResponse {
-    pub bookings: Vec<HostBookingListItemResponse>,
+    pub bookings: Vec<HostBookingResponse>,
     /// The offset to ask for next, or `null` at the end of the list.
     pub next_offset: Option<i64>,
     /// Every booking in this scope and status, not just this window.
     pub total: i64,
-}
-
-/// `GET /api/view/host/spots` — one row of the host's own list.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostSpotListItemResponse {
-    pub id: Uuid,
-    pub title: String,
-    /// EUR cents.
-    pub price_per_hour: i64,
-    pub images: Vec<String>,
-    /// `false` is a paused listing, which looks identical to a live one otherwise.
-    pub active: bool,
-    pub address: Address,
-}
-
-impl From<HostSpotListProjection> for HostSpotListItemResponse {
-    fn from(s: HostSpotListProjection) -> Self {
-        Self {
-            id: s.id,
-            title: s.title,
-            price_per_hour: s.price_per_hour,
-            images: s.images,
-            active: s.active,
-            address: s.address,
-        }
-    }
 }
 
 /// `GET /api/view/host/balance` — what the host has to withdraw, and what is ripening.
@@ -347,15 +324,52 @@ impl From<BalanceProjection> for BalanceResponse {
 
 // ─── renter ─────────────────────────────────────────────────────────────────
 
+/// `GET /api/view/renter/spots/{id}` — a spot the caller has booked, whole, with its host.
+///
+/// Resolves for a paused or deleted listing too: a renter's past booking keeps its spot.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenterSpotResponse {
+    pub id: Uuid,
+    pub title: String,
+    /// EUR cents.
+    pub price_per_hour: i64,
+    pub images: Vec<String>,
+    pub address: Address,
+    /// `booked` on this spot's bookings is wall-clock in this zone.
+    pub timezone: String,
+    /// `null` while the host has not been projected here yet.
+    pub host: Option<UserPublicResponse>,
+}
+
+impl From<RenterSpotProjection> for RenterSpotResponse {
+    fn from(s: RenterSpotProjection) -> Self {
+        Self {
+            id: s.id,
+            title: s.title,
+            price_per_hour: s.price_per_hour,
+            images: s.images,
+            address: s.address,
+            timezone: s.timezone,
+            host: s.host.map(Into::into),
+        }
+    }
+}
+
 /// `GET /api/view/renter/bookings` and `/renter/bookings/{id}` — one of the caller's own
 /// bookings, whole.
 ///
 /// Unscoped: every row it is built from matched `renter_id = caller`, so there is nothing
 /// here the caller may not see.
+///
+/// **EXCEPTION: carries its spot.** The one booking response that does — see
+/// `RenterBookingProjection`. `spot_id` is kept beside it because `spot` is `null` until
+/// the spot is projected, and the detail sheet needs the id either way.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenterBookingResponse {
     pub id: Uuid,
+    pub spot_id: Uuid,
     pub status: String,
     /// EUR cents.
     pub amount: i64,
@@ -365,15 +379,15 @@ pub struct RenterBookingResponse {
     pub ends_at: DateTime<Utc>,
     /// `'spot_unavailable'` means the host withdrew, not that you cancelled.
     pub cancel_reason: Option<String>,
-    /// `null` while the spot has not been projected here yet. A *deleted* spot still
-    /// resolves — the row survives so a past booking keeps a title.
-    pub spot: Option<SpotCardResponse>,
+    /// The exception. `null` while the spot has not been projected here yet.
+    pub spot: Option<RenterBookingSpotResponse>,
 }
 
 impl From<RenterBookingProjection> for RenterBookingResponse {
     fn from(b: RenterBookingProjection) -> Self {
         Self {
             id: b.id,
+            spot_id: b.spot_id,
             status: b.status,
             amount: b.amount,
             booked: b.booked,
@@ -385,58 +399,74 @@ impl From<RenterBookingProjection> for RenterBookingResponse {
     }
 }
 
+/// The spot card on a renter's booking — the exception's wire half.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenterBookingSpotResponse {
+    pub id: Uuid,
+    pub title: String,
+    pub images: Vec<String>,
+    pub address: Address,
+    /// `booked` is wall-clock in this zone; without it "upcoming" is answered wrong.
+    pub timezone: String,
+}
+
+impl From<RenterBookingSpotProjection> for RenterBookingSpotResponse {
+    fn from(s: RenterBookingSpotProjection) -> Self {
+        Self {
+            id: s.id,
+            title: s.title,
+            images: s.images,
+            address: s.address,
+            timezone: s.timezone,
+        }
+    }
+}
+
+/// `GET /api/view/renter/bookings?scope=&status=&limit=&offset=` — one window of the
+/// caller's own bookings.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenterBookingsPageResponse {
+    pub bookings: Vec<RenterBookingResponse>,
+    /// The offset to ask for next, or `null` at the end of the list.
+    pub next_offset: Option<i64>,
+    /// Every booking in this scope and status, not just this window.
+    pub total: i64,
+}
+
 /// `GET /api/view/renter/bookings/next` — the home screen's next-up card.
 ///
 /// **The same projection as [`RenterBookingResponse`], a different response**, which is
 /// the clearest case for why every route has one. The card renders a title, a zone, the
-/// slots and — once opened into the detail sheet — the amount. It does not render a
-/// status, an end instant or a cancel reason, so it is not sent them.
+/// slots and — once opened into the detail sheet — the plate and the amount. It does not
+/// render a status, an end instant or a cancel reason, so it is not sent them.
+///
+/// Carries its spot under the same **exception** as [`RenterBookingResponse`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NextBookingResponse {
     pub id: Uuid,
-    /// The slots, in `spot_timezone`'s wall clock. What the card's day and time read off.
+    pub spot_id: Uuid,
+    /// The slots, in the spot's wall clock. What the card's day and time read off.
     pub booked: Booked,
     /// Which car to bring — the one thing on this card the renter may have forgotten.
     pub license_plate: String,
     /// EUR cents. Read by the detail sheet the card opens, not by the card.
     pub amount: i64,
-    /// `null` while the spot has not been projected here yet.
-    pub spot: Option<SpotCardResponse>,
+    /// The exception. `null` while the spot has not been projected here yet.
+    pub spot: Option<RenterBookingSpotResponse>,
 }
 
 impl From<RenterBookingProjection> for NextBookingResponse {
     fn from(b: RenterBookingProjection) -> Self {
         Self {
             id: b.id,
+            spot_id: b.spot_id,
             booked: b.booked,
             license_plate: b.license_plate,
             amount: b.amount,
             spot: b.spot.map(Into::into),
-        }
-    }
-}
-
-/// Just enough of a spot to render a booking card.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpotCardResponse {
-    pub id: Uuid,
-    pub title: String,
-    pub images: Vec<String>,
-    /// `booked` is wall-clock in this zone; without it "upcoming" is answered wrong.
-    pub timezone: String,
-    pub address: Address,
-}
-
-impl From<SpotCardProjection> for SpotCardResponse {
-    fn from(s: SpotCardProjection) -> Self {
-        Self {
-            id: s.id,
-            title: s.title,
-            images: s.images,
-            timezone: s.timezone,
-            address: s.address,
         }
     }
 }

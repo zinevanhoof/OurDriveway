@@ -1,8 +1,9 @@
 use chrono::Utc;
 use shared::{
     error::myerror::{ContextExt, MyResult},
+    general_models::booking::Booked,
     responses::view::{
-        BalanceResponse, HostBookingsPageResponse, HostSpotListItemResponse, HostSpotResponse,
+        BalanceResponse, HostBookingsPageResponse, HostSpotResponse, HostSpotsPageResponse,
     },
 };
 use uuid::Uuid;
@@ -13,7 +14,7 @@ use crate::{
         booking_repository::ViewBookingRepository, spot_repository::ViewSpotRepository,
         wallet_repository::WalletRepository,
     },
-    service::settled_before,
+    service::{BAD_BOOKINGS_PAGE, BAD_PAGE, settled_before},
 };
 
 /// `host_id = caller` — everything the caller reads as a host.
@@ -28,27 +29,32 @@ pub struct HostService {
 }
 
 impl HostService {
-    /// The caller's own listings, newest first.
+    /// One window of the caller's own listings, newest first.
     ///
     /// Includes their inactive spots, which is what the live switch is for, and excludes
     /// their deleted ones.
-    pub async fn spots(&self, host_id: Uuid) -> MyResult<Vec<HostSpotListItemResponse>> {
+    pub async fn spots(
+        &self,
+        host_id: Uuid,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> MyResult<HostSpotsPageResponse> {
+        let (limit, offset) = policy::page::window(limit, offset).context_bad_request(BAD_PAGE)?;
+
         let mut conn = shared::db::conn(&self.db).await?;
 
-        let spots = ViewSpotRepository::find_list_for_host(&mut conn, host_id).await?;
+        let total = ViewSpotRepository::count_for_host(&mut conn, host_id).await?;
+        let spots = ViewSpotRepository::find_page_for_host(&mut conn, host_id, limit, offset).await?;
 
-        Ok(spots
-            .into_iter()
-            .map(HostSpotListItemResponse::from)
-            .collect())
+        Ok(HostSpotsPageResponse {
+            spots: spots.into_iter().map(Into::into).collect(),
+            next_offset: policy::page::next_offset(offset, limit, total),
+            total,
+        })
     }
 
-    /// One spot as its host sees it, with the slots still taken on it.
-    ///
-    /// **Two statements**, and the second is keyed off the first. The booking *rows* are
-    /// not here — who is coming is [`Self::spot_bookings`], a separate read with its own
-    /// cache lifetime. What stays is one merged `booked` map, which the edit form needs to
-    /// warn a host before they remove hours someone has taken.
+    /// One spot as its host sees it. The spot only — its bookings are
+    /// [`Self::spot_bookings`] and its taken slots [`Self::booked`].
     ///
     /// A non-host gets 404, not 403 — a 403 would confirm the existence of a listing the
     /// caller is not allowed to see.
@@ -59,14 +65,33 @@ impl HostService {
             .await?
             .context_not_found(("Not Found", "That spot doesn't exist."))?;
 
+        Ok(HostSpotResponse::from(spot))
+    }
+
+    /// Every slot a reserved or confirmed booking still holds on one spot, merged into
+    /// one map. What the edit form checks before a host removes hours someone has taken.
+    ///
+    /// **Two statements, and the first is the authorization** — the same `find_for_host`
+    /// as [`Self::spot`], so a non-host gets the same 404.
+    pub async fn booked(&self, spot_id: Uuid, host_id: Uuid) -> MyResult<Booked> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let spot = ViewSpotRepository::find_for_host(&mut conn, spot_id, host_id)
+            .await?
+            .context_not_found(("Not Found", "That spot doesn't exist."))?;
+
         // `Utc::now()` rather than a client-supplied `$now`. Three of the four GraphQL
         // documents this replaces made the browser pass one, which meant a client could ask
         // what was booked at any time it liked — harmless, but there is no reason to take the
         // instant from the caller when the server has one.
-        let booked =
+        let rows =
             ViewBookingRepository::find_booked_for_host_spot(&mut conn, &spot, Utc::now()).await?;
 
-        Ok(HostSpotResponse::new(spot, booked))
+        let mut merged = Booked::new();
+        for (date, slots) in rows.into_iter().flatten() {
+            merged.entry(date).or_default().extend(slots);
+        }
+        Ok(merged)
     }
 
     /// One window of one spot's bookings: the manage screen's two-row preview and the
@@ -78,9 +103,9 @@ impl HostService {
     /// window carries a caller. A non-host gets 404 from the first statement and never
     /// reaches the other two.
     ///
-    /// Every parameter is parsed by [`policy::bookings`], which is also what decides that
-    /// an unknown tab or status, a limit out of range or a negative offset is a 422
-    /// rather than something silently clamped.
+    /// Every parameter is parsed by [`policy::bookings`] and [`policy::page`], which are
+    /// also what decide that an unknown tab or status, a limit out of range or a negative
+    /// offset is a 422 rather than something silently clamped.
     pub async fn spot_bookings(
         &self,
         spot_id: Uuid,
@@ -90,18 +115,9 @@ impl HostService {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> MyResult<HostBookingsPageResponse> {
-        let parsed = (|| {
-            Some((
-                policy::bookings::scope(scope.as_deref())?,
-                policy::bookings::statuses(status.as_deref())?,
-                policy::bookings::limit(limit)?,
-                policy::bookings::offset(offset)?,
-            ))
-        })();
-        let (past, statuses, limit, offset) = parsed.context_bad_request((
-            "Invalid page",
-            "Ask for scope=upcoming or scope=past, status from reserved, confirmed, cancelled, released, a limit from 1 to 50, and an offset from 0.",
-        ))?;
+        let (past, statuses, limit, offset) =
+            policy::bookings::window(scope.as_deref(), status.as_deref(), limit, offset)
+                .context_bad_request(BAD_BOOKINGS_PAGE)?;
 
         let mut conn = shared::db::conn(&self.db).await?;
 
@@ -123,7 +139,7 @@ impl HostService {
 
         Ok(HostBookingsPageResponse {
             bookings: bookings.into_iter().map(Into::into).collect(),
-            next_offset: policy::bookings::next_offset(offset, limit, total),
+            next_offset: policy::page::next_offset(offset, limit, total),
             total,
         })
     }

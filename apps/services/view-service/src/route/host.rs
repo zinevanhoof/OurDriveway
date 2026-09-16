@@ -12,35 +12,41 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     extractors::authed_jwt::AuthedJwt,
+    general_models::booking::Booked,
     responses::view::{
-        BalanceResponse, HostBookingsPageResponse, HostSpotListItemResponse, HostSpotResponse,
+        BalanceResponse, HostBookingsPageResponse, HostSpotResponse, HostSpotsPageResponse,
     },
 };
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{
+    AppState,
+    route::{BookingsQuery, PageQuery},
+};
 
-/// `GET /api/view/host/spots` — the caller's own listings, newest first.
+/// `GET /api/view/host/spots?limit=&offset=` — one window of the caller's own listings,
+/// newest first.
 ///
 /// Includes their inactive spots, which is what the live switch is for, and excludes their
 /// deleted ones.
 pub async fn spots(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<Json<Vec<HostSpotListItemResponse>>> {
-    Ok(Json(state.host_service.spots(user_id).await?))
+    Query(q): Query<PageQuery>,
+) -> MyResult<Json<HostSpotsPageResponse>> {
+    Ok(Json(
+        state.host_service.spots(user_id, q.limit, q.offset).await?,
+    ))
 }
 
 /// `GET /api/view/host/spots/{id}` — one spot as its host sees it.
 ///
 /// Serves both the manage screen and the edit form. They differ in which fields they
-/// render, not in which they may read, so they are one route. It carries the taken slots
-/// as one `booked` map — the edit form needs them to stop a host removing a slot someone
-/// has taken — but not the booking rows, which are [`bookings`].
+/// render, not in which they may read, so they are one route. No bookings: the rows are
+/// [`bookings`] and the taken slots [`booked`].
 ///
 /// A non-host gets 404, not 403 — a 403 would confirm the existence of a listing the
 /// caller is not allowed to see.
@@ -52,25 +58,17 @@ pub async fn spot(
     Ok(Json(state.host_service.spot(spot_id, user_id).await?))
 }
 
-/// Query for [`bookings`]. All absent means the first twenty of every booking still to
-/// come.
+/// `GET /api/view/host/spots/{id}/booked` — every slot still held on one spot, merged.
 ///
-/// Plain options for the same reason as [`WalletQuery`]: each is a rule stated once next
-/// to the read, and a 422 for any of them comes from the service rather than from an
-/// extractor that would answer before the caller's ownership of the spot had been
-/// established.
-///
-/// [`WalletQuery`]: crate::route::account::WalletQuery
-#[derive(Deserialize)]
-pub struct BookingsQuery {
-    /// `upcoming` (the default) or `past`.
-    pub scope: Option<String>,
-    /// Comma-separated, e.g. `confirmed` or `cancelled,released`. Absent is every status.
-    pub status: Option<String>,
-    /// 1 to 50, 20 when absent.
-    pub limit: Option<i64>,
-    /// 0 when absent. The client never computes one — it asks for what `nextOffset` said.
-    pub offset: Option<i64>,
+/// The edit form's warning before a host removes hours someone has taken. One map rather
+/// than the booking rows: it is one question, and it has to see every future slot at once,
+/// which the paged [`bookings`] would make it walk for.
+pub async fn booked(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+) -> MyResult<Json<Booked>> {
+    Ok(Json(state.host_service.booked(spot_id, user_id).await?))
 }
 
 /// `GET /api/view/host/spots/{id}/bookings?scope=&status=&limit=&offset=` — one window

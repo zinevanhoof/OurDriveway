@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
-import { useQuery, useQueryClient } from '@tanstack/vue-query';
+import { useQuery } from '@tanstack/vue-query';
 import { formatCents } from '@/lib/money';
 import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDates';
 import { locateUser, nearer, type Position } from '@/lib/geo';
-import { mergeBooked } from '@/lib/bookingAvailability';
 import { useAuthStore } from '@/stores/auth';
 import { fetchBalance, fetchNextBooking, fetchSpot, fetchSpotsNear } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
@@ -23,7 +22,6 @@ import { Badge } from '@/components/ui/badge';
 
 const auth = useAuthStore()
 const router = useRouter()
-const queryClient = useQueryClient()
 
 // Every query here waits on the session: main.ts rehydrates it asynchronously, and
 // without this they all fire once with an undefined id first.
@@ -46,6 +44,9 @@ const { data: nextBooking } = useQuery({
     staleTime: 0,
 })
 
+// The card's title and zone come from `spot` on the booking — a renter's booking is the
+// one exception that carries a card of its spot.
+//
 // `nextSlot` — not the booking's first slot — because a booking with an 09:00 and a 14:00
 // slot today has to read 14:00 once the morning is over. It returns null when every slot
 // has passed, which the server's `ends_at > now` makes rare but not impossible: the
@@ -59,7 +60,8 @@ const next = computed<NextUp | null>(() => {
     return slot ? { booking, slot } : null
 })
 
-const nextTimezone = computed(() => next.value?.booking?.spot?.timezone)
+const nextSpot = computed(() => next.value?.booking.spot)
+const nextTimezone = computed(() => nextSpot.value?.timezone)
 const happeningNow = computed(() => isActiveNow(next.value?.booking, nextTimezone.value))
 
 // ─── available to withdraw ──────────────────────────────────────────────────
@@ -116,10 +118,9 @@ const detailOpen = ref(false)
 const bookingOpen = ref(false)
 
 // Set only when the sheet was opened from the upcoming-booking card. It is what
-// tells the drawer to list that booking's schedule and to drop the book button —
-// you cannot book a spot you have already booked. Same two modes as the map and the
-// bookings list, one drawer instead of two.
-const selectedBooking = ref<any>(null)
+// tells the drawer to read the spot as the renter's, list that booking's schedule and
+// drop the book button — you cannot book a spot you have already booked.
+const selectedBooking = ref<NextBookingResponse | null>(null)
 
 const openSpot = (id: string) => {
     selectedBooking.value = null
@@ -127,40 +128,19 @@ const openSpot = (id: string) => {
     detailOpen.value = true
 }
 
-// Feeds the booking form the drawer hands off to. urql dedupes it against the
-// drawer's identical query, so this is still one request.
-//
-// `network-only` because this is the one query someone books against, and cached
-// availability is stale by construction: every write in this app goes through REST, so
-// there are no GraphQL mutations for graphcache to invalidate on. The list queries stay
-// cached and re-run on every pan.
-//
-// Freshness, not correctness. A row that landed a moment ago can already be wrong; the
-// authority is the server's availability check, published under compare-and-swap. This
-// only stops the picker offering slots it then has to retract.
+// Feeds the booking form the drawer hands off to — the same key as the drawer's query,
+// so this is still one request. The listing only: the form reads what is taken itself,
+// fresh on every opening. Not for a booking the renter holds, whose spot the drawer
+// reads through the renter namespace instead.
 const { data: selectedSpot } = useQuery({
     queryKey: computed(() => viewKeys.spot(selectedId.value ?? '')),
     queryFn: () => fetchSpot(selectedId.value!),
-    enabled: computed(() => selectedId.value !== null),
-    staleTime: 0,
-})
-
-const reexecuteSpot = () =>
-    queryClient.invalidateQueries({ queryKey: viewKeys.spot(selectedId.value ?? '') })
-
-// `staleTime: 0` alone is not enough: `selectedId` is never cleared on close, so
-// reopening the *same* spot changes neither the key nor the enabled state, and a query
-// that is already mounted does not refetch on its own — the picker would keep whatever
-// it read the first time, including slots this renter has since held and abandoned.
-// Opening the form is therefore an explicit invalidation. (Same reasoning as under
-// urql, where the equivalent was that neither the variables nor the pause changed.)
-watch(bookingOpen, (isOpen) => {
-    if (isOpen) void reexecuteSpot()
+    enabled: computed(() => selectedId.value !== null && !selectedBooking.value),
 })
 
 const openBooking = () => {
     selectedBooking.value = next.value?.booking ?? null
-    selectedId.value = next.value?.booking?.spot?.id ?? null
+    selectedId.value = next.value?.booking?.spotId ?? null
     detailOpen.value = true
 }
 </script>
@@ -195,7 +175,7 @@ const openBooking = () => {
                 <Text size="eyebrow" weight="bold">
                     {{ happeningNow ? 'Happening now' : 'Upcoming booking' }}
                 </Text>
-                <Title weight="semibold">{{ next.booking.spot?.title }}</Title>
+                <Title weight="semibold">{{ nextSpot?.title }}</Title>
                 <Text>
                     {{ formatDay(next.slot[0], nextTimezone) }} · {{ formatSlots([next.slot[1]]) }}
                 </Text>
@@ -263,9 +243,7 @@ const openBooking = () => {
         </div>
 
         <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" :booking="selectedBooking"
-            :bookable="!selectedBooking" @book="bookingOpen = true" />
-        <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot"
-            :booked="mergeBooked(selectedSpot?.bookings)"
-            @booked="() => reexecuteSpot()" />
+            :renter="!!selectedBooking" :bookable="!selectedBooking" @book="bookingOpen = true" />
+        <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot" />
     </div>
 </template>

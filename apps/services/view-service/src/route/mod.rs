@@ -1,6 +1,6 @@
 //! HTTP shape only: extract, call one service method, pick a status.
 //!
-//! Ten endpoints in **four namespaces, one predicate each**. The namespace is the
+//! **Four namespaces, one predicate each**. The namespace is the
 //! authorization, written where the URL is:
 //!
 //! | namespace | predicate |
@@ -52,7 +52,39 @@
 //! `pending` are decided by folding what came back, and a handler holding that fold would
 //! be a handler holding a rule.
 
+use serde::Deserialize;
+
 pub mod account;
 pub mod host;
 pub mod public;
 pub mod renter;
+
+/// Query for every paged spot list. Both absent means the first twenty.
+///
+/// Plain options for the same reason as [`account::WalletQuery`]: the range is a rule
+/// stated once in `policy::page`, and a 400 for it comes from the service rather than
+/// from an extractor.
+#[derive(Deserialize)]
+pub struct PageQuery {
+    /// 1 to 50, 20 when absent.
+    pub limit: Option<i64>,
+    /// 0 when absent. The client never computes one — it asks for what `nextOffset` said.
+    pub offset: Option<i64>,
+}
+
+/// Query for every paged booking list, host's or renter's. All absent means the first
+/// twenty of every booking still to come.
+///
+/// A 400 for any of these comes from the service, and on the host's side only after the
+/// caller's ownership of the spot has been established.
+#[derive(Deserialize)]
+pub struct BookingsQuery {
+    /// `upcoming` (the default) or `past`.
+    pub scope: Option<String>,
+    /// Comma-separated, e.g. `confirmed` or `cancelled,released`. Absent is every status.
+    pub status: Option<String>,
+    /// 1 to 50, 20 when absent.
+    pub limit: Option<i64>,
+    /// 0 when absent. The client never computes one — it asks for what `nextOffset` said.
+    pub offset: Option<i64>,
+}

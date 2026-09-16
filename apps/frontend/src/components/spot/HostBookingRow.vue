@@ -14,11 +14,11 @@ import { Surface } from '@/components/base/surface'
 import { Text } from '@/components/base/text'
 import { Money } from '@/components/base/money'
 
-import type { HostBookingListItemResponse } from '@/types/responses/view/HostBookingListItemResponse'
+import type { HostBookingResponse } from '@/types/responses/view/HostBookingResponse'
 import { formatDay, formatSlots, sortedDays } from '@/lib/bookingDates'
 
 const { booking, timezone } = defineProps<{
-    booking: HostBookingListItemResponse
+    booking: HostBookingResponse
     timezone?: string
 }>()
 

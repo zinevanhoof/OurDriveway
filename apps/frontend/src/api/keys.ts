@@ -20,11 +20,16 @@
 export const viewKeys = {
   account: ["account"] as const,
   spots: ["spots"] as const,
+  /** Every page of the host's listings: `useInfiniteQuery` holds them all under this. */
   hostSpots: ["spots", "host"] as const,
   nearby: (lng: number, lat: number, meters: number) =>
     ["spots", "near", lng, lat, meters] as const,
   spot: (id: string) => ["spots", id] as const,
+  /** A spot the caller booked. Under `["spots"]`, so a listing edit refreshes it too. */
+  renterSpot: (id: string) => ["spots", id, "renter"] as const,
   hostSpot: (id: string) => ["spots", id, "host"] as const,
+  /** The host's merged taken-slot map, for the edit form's warning. */
+  hostSpotBooked: (id: string) => ["spots", id, "host", "booked"] as const,
   /**
    * One tab of one spot's paged bookings. Under `hostSpot`'s key on purpose: a booking
    * landing invalidates `["spots"]`, and this has to go with it.
@@ -38,7 +43,13 @@ export const viewKeys = {
   hostSpotBookingsPreview: (id: string) =>
     ["spots", id, "host", "bookings", "preview"] as const,
   bookings: ["bookings"] as const,
-  renterBookings: ["bookings", "renter"] as const,
+  /**
+   * The taken slots on a public spot. Under `["bookings"]` rather than the spot's key: a
+   * booking landing is what changes them, and that invalidates `["bookings"]`.
+   */
+  spotBookings: (id: string) => ["bookings", "spot", id] as const,
+  /** Every page of one tab of the renter's own bookings. */
+  renterBookings: (scope: string) => ["bookings", "renter", scope] as const,
   nextBooking: ["bookings", "next"] as const,
   booking: (id: string) => ["bookings", id] as const,
   /** Every page of the wallet: `useInfiniteQuery` holds all its months under this. */

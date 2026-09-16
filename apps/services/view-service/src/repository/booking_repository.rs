@@ -5,7 +5,7 @@ use shared::domain_models::view::booking::{ViewBooking, ViewBookingPatch};
 use shared::error::myerror::MyResult;
 use shared::general_models::booking::Booked;
 use shared::projections::booking::{
-    HostBookingListProjection, PublicBookingProjection, RenterBookingProjection,
+    HostBookingProjection, PublicBookingProjection, RenterBookingProjection,
 };
 use shared::projections::spot::{HostSpotProjection, PublicSpotProjection};
 use shared::schema::view::{app_user, booking};
@@ -32,7 +32,8 @@ use uuid::Uuid;
 /// | [`find_booked_for_host_spot`] | `host` | the parent read already matched `host_id = caller` |
 /// | [`count_for_host_spot`] | `host` | same — the paged list's count |
 /// | [`find_page_for_host_spot`] | `host` | same — one page of the paged list |
-/// | [`find_list_for_renter`] | `renter` | `renter_id = caller` |
+/// | [`count_for_renter`] | `renter` | `renter_id = caller` |
+/// | [`find_page_for_renter`] | `renter` | same — one page, spot card embedded (the exception) |
 /// | [`find_next_for_renter`] | `renter` | `renter_id = caller` |
 /// | [`find_for_renter`] | `renter` | `renter_id = caller` |
 ///
@@ -56,7 +57,8 @@ use uuid::Uuid;
 /// [`find_booked_for_host_spot`]: ViewBookingRepository::find_booked_for_host_spot
 /// [`count_for_host_spot`]: ViewBookingRepository::count_for_host_spot
 /// [`find_page_for_host_spot`]: ViewBookingRepository::find_page_for_host_spot
-/// [`find_list_for_renter`]: ViewBookingRepository::find_list_for_renter
+/// [`count_for_renter`]: ViewBookingRepository::count_for_renter
+/// [`find_page_for_renter`]: ViewBookingRepository::find_page_for_renter
 /// [`find_next_for_renter`]: ViewBookingRepository::find_next_for_renter
 /// [`find_for_renter`]: ViewBookingRepository::find_for_renter
 pub struct ViewBookingRepository;
@@ -68,8 +70,9 @@ impl ViewBookingRepository {
     /// selected, so there is no row in flight carrying a renter's name to a reader who may
     /// not have it.
     ///
-    /// `belonging_to` rather than `spot_id.eq(id)`: the parent row is already in hand, so
-    /// the foreign key is read off it instead of being passed again. `status IN
+    /// `belonging_to` rather than `spot_id.eq(id)`: the route reads the spot first, which is
+    /// what 404s an inactive one, so the foreign key is read off that row instead of being
+    /// passed again. `status IN
     /// ('reserved','confirmed')` is what makes these rows public, and also why no client
     /// has to remember to exclude released and cancelled bookings. `ends_at > $2` bounds
     /// it, served by `booking_spot (spot_id, ends_at)`.
@@ -131,14 +134,14 @@ impl ViewBookingRepository {
         // Two statements rather than one boxed query: `.count()` after boxing loses
         // the select, and the halves differ by a single operator.
         Ok(if past {
-            HostBookingListProjection::belonging_to(spot)
+            HostBookingProjection::belonging_to(spot)
                 .filter(booking::ends_at.le(now))
                 .filter(booking::status.eq_any(statuses))
                 .count()
                 .get_result(conn)
                 .await?
         } else {
-            HostBookingListProjection::belonging_to(spot)
+            HostBookingProjection::belonging_to(spot)
                 .filter(booking::ends_at.gt(now))
                 .filter(booking::status.eq_any(statuses))
                 .count()
@@ -168,13 +171,13 @@ impl ViewBookingRepository {
         statuses: &[&str],
         limit: i64,
         offset: i64,
-    ) -> MyResult<Vec<HostBookingListProjection>> {
+    ) -> MyResult<Vec<HostBookingProjection>> {
         // Boxed, unlike every other read here, because `.asc()` and `.desc()` are
         // different types and this one statement has to be able to be either.
-        let page = HostBookingListProjection::belonging_to(spot)
+        let page = HostBookingProjection::belonging_to(spot)
             .left_join(app_user::table.on(app_user::id.eq(booking::renter_id)))
             .filter(booking::status.eq_any(statuses))
-            .select(HostBookingListProjection::as_select())
+            .select(HostBookingProjection::as_select())
             .limit(limit)
             .offset(offset)
             .into_boxed();
@@ -190,24 +193,76 @@ impl ViewBookingRepository {
         Ok(page.load(conn).await?)
     }
 
-    /// The caller's own bookings as a renter, newest first.
+    /// How many of the caller's own bookings one tab holds.
     ///
-    /// Scoped by `renter_id = $1` rather than by a select rule: this endpoint answers
-    /// "mine", and a booking the caller merely *hosts* belongs on the spot's page instead.
-    /// Nothing here needs cutting, because everything returned is theirs.
-    ///
-    /// `RenterBookingProjection::query()` is the `booking ⟕ spot` join, held by
-    /// `HasQuery` because all three renter reads use the same one. The scope is still a
-    /// `.filter()` — `base_query` takes no arguments, so it cannot hold an identity.
-    pub async fn find_list_for_renter(
+    /// The renter half of [`Self::count_for_host_spot`], with the ownership in the `WHERE`
+    /// rather than in a parent read: there is no parent to prove anything. No spot join —
+    /// a count renders no card.
+    pub async fn count_for_renter(
         conn: &mut AsyncPgConnection,
         renter_id: Uuid,
+        now: DateTime<Utc>,
+        past: bool,
+        statuses: &[&str],
+    ) -> MyResult<i64> {
+        let mine = booking::renter_id
+            .eq(renter_id)
+            .and(booking::status.eq_any(statuses));
+
+        // Two statements for the same reason as the host's count.
+        Ok(if past {
+            booking::table
+                .filter(mine.and(booking::ends_at.le(now)))
+                .count()
+                .get_result(conn)
+                .await?
+        } else {
+            booking::table
+                .filter(mine.and(booking::ends_at.gt(now)))
+                .count()
+                .get_result(conn)
+                .await?
+        })
+    }
+
+    /// One window of one tab of the caller's own bookings, each with its spot card.
+    ///
+    /// Scoped by `renter_id = $1` rather than by a select rule: this endpoint answers
+    /// "mine", and a booking the caller merely *hosts* belongs on the host's page instead.
+    /// Nothing here needs cutting, because everything returned is theirs. Ordered like the
+    /// host's list: soonest first ahead, most recent first behind.
+    ///
+    /// `RenterBookingProjection::query()` is the `booking ⟕ spot` join — the one place a
+    /// booking read carries its spot, see the exception on that projection.
+    // ponytail: OFFSET paging, same ceiling as `find_page_for_host_spot`.
+    pub async fn find_page_for_renter(
+        conn: &mut AsyncPgConnection,
+        renter_id: Uuid,
+        now: DateTime<Utc>,
+        past: bool,
+        statuses: &[&str],
+        limit: i64,
+        offset: i64,
     ) -> MyResult<Vec<RenterBookingProjection>> {
-        Ok(RenterBookingProjection::query()
-            .filter(booking::renter_id.eq(renter_id))
-            .order(booking::ends_at.desc())
-            .load(conn)
-            .await?)
+        let page = RenterBookingProjection::query()
+            .filter(
+                booking::renter_id
+                    .eq(renter_id)
+                    .and(booking::status.eq_any(statuses)),
+            )
+            .limit(limit)
+            .offset(offset)
+            .into_boxed();
+
+        let page = if past {
+            page.filter(booking::ends_at.le(now))
+                .order(booking::ends_at.desc())
+        } else {
+            page.filter(booking::ends_at.gt(now))
+                .order(booking::ends_at.asc())
+        };
+
+        Ok(page.load(conn).await?)
     }
 
     /// The caller's soonest booking that has not ended, or `None`.

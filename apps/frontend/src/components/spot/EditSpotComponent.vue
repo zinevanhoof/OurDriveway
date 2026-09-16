@@ -19,7 +19,7 @@ import CreateSpotBasicInfo from '@/components/forms/create-spot-form/CreateSpotB
 import CreateSpotAvailability from '@/components/forms/create-spot-form/CreateSpotAvailability.vue';
 import CreateSpotImages from '@/components/forms/create-spot-form/CreateSpotImages.vue';
 
-import { fetchHostSpot } from '@/api/viewApi';
+import { fetchHostSpot, fetchHostSpotBooked } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
 import { useDeleteSpot, useUpdateSpot } from '@/api/spotApi';
 import type { ApiError } from '@/api/client';
@@ -37,6 +37,13 @@ const router = useRouter()
 const { data } = useQuery({
     queryKey: viewKeys.hostSpot(id),
     queryFn: () => fetchHostSpot(id),
+})
+
+// The slots still taken, for the warning below. Its own read: the spot carries no
+// bookings, and this changes far more often than the listing does.
+const { data: booked } = useQuery({
+    queryKey: viewKeys.hostSpotBooked(id),
+    queryFn: () => fetchHostSpotBooked(id),
 })
 
 // Same rules as the create form, minus the address: a spot's location is fixed at
@@ -151,7 +158,7 @@ const hasSlots = () =>
  * only the warning that it is about to happen.
  */
 const casualties = computed(() =>
-    bookedOutside(availability.value, data.value?.booked ?? {}, today.value))
+    bookedOutside(availability.value, booked.value ?? {}, today.value))
 
 const submit = handleSubmit(async (values) => {
     formErrors.value = []

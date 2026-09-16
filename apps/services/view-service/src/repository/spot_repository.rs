@@ -2,10 +2,11 @@ use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::view::spot::ViewSpotPatch;
 use shared::error::myerror::MyResult;
+use diesel::dsl::exists;
 use shared::projections::spot::{
-    HostSpotListProjection, HostSpotProjection, PublicSpotPinProjection, PublicSpotProjection,
+    HostSpotProjection, PublicSpotPinProjection, PublicSpotProjection, RenterSpotProjection,
 };
-use shared::schema::view::{app_user, spot};
+use shared::schema::view::{app_user, booking, spot};
 use uuid::Uuid;
 
 use crate::policy::geo;
@@ -46,7 +47,8 @@ mod sql {
 /// | [`find_for_public`] | `public` | `id = $1 AND active` |
 /// | [`find_pins_for_public`] | `public` | `active AND NOT deleted AND host_id <> $1` |
 /// | [`find_for_host`] | `host` | `id = $1 AND host_id = $2` |
-/// | [`find_list_for_host`] | `host` | `host_id = $1 AND NOT deleted` |
+/// | [`find_page_for_host`] | `host` | `host_id = $1 AND NOT deleted` |
+/// | [`find_for_renter`] | `renter` | `id = $1 AND EXISTS (booking by $2 on it)` |
 ///
 /// A new read cannot inherit half a rule, because there is no rule to inherit — it picks
 /// a projection, and the projection's name says which namespace may hold it.
@@ -58,7 +60,8 @@ mod sql {
 /// [`find_for_public`]: ViewSpotRepository::find_for_public
 /// [`find_pins_for_public`]: ViewSpotRepository::find_pins_for_public
 /// [`find_for_host`]: ViewSpotRepository::find_for_host
-/// [`find_list_for_host`]: ViewSpotRepository::find_list_for_host
+/// [`find_page_for_host`]: ViewSpotRepository::find_page_for_host
+/// [`find_for_renter`]: ViewSpotRepository::find_for_renter
 ///
 /// The two writes differ only in whether a missing row is created. `merge` applies a
 /// `SpotCreated`; `patch` applies an edit and is a no-op on a row that was never created.
@@ -76,12 +79,9 @@ impl ViewSpotRepository {
     /// answers one audience, so there is no identity in it to compare and no field to cut
     /// afterwards.
     ///
-    /// The parent half only. The route issues
-    /// [`ViewBookingRepository::find_for_public_spot`] against the row this returns, via
-    /// `belonging_to` — see the note on two statements in `repository/mod.rs`.
-    ///
-    /// A `deleted` spot still resolves here on purpose: a renter's past booking has to
-    /// keep rendering a title and an address. It is the *lists* that filter it out.
+    /// Also the gate on `/public/spots/{id}/bookings`: that route reads this first, so an
+    /// inactive spot's taken slots 404 exactly like the spot does, and then issues
+    /// [`ViewBookingRepository::find_for_public_spot`] against the row via `belonging_to`.
     ///
     /// [`ViewBookingRepository::find_for_public_spot`]:
     ///     crate::repository::booking_repository::ViewBookingRepository::find_for_public_spot
@@ -98,7 +98,7 @@ impl ViewSpotRepository {
             .optional()?)
     }
 
-    /// One spot as its host sees it. The parent half.
+    /// One spot as its host sees it.
     ///
     /// `host_id = $2` is the whole authorization: a non-host matches no row and the
     /// route answers 404, which is also what a stranger asking about a spot that does not
@@ -125,22 +125,65 @@ impl ViewSpotRepository {
             .optional()?)
     }
 
-    /// The caller's own listings.
+    /// How many listings the caller has that are not deleted. What `nextOffset` is
+    /// derived from.
+    pub async fn count_for_host(conn: &mut AsyncPgConnection, host_id: Uuid) -> MyResult<i64> {
+        Ok(spot::table
+            .filter(spot::host_id.eq(host_id).and(spot::deleted.eq(false)))
+            .count()
+            .get_result(conn)
+            .await?)
+    }
+
+    /// One window of the caller's own listings, newest first.
     ///
     /// `host_id = $1` admits a host's inactive spots on purpose — that is what the
     /// live switch is for. `deleted` is filtered here instead, because a deleted row
     /// survives only so past bookings resolve, and must not appear in the host's own
     /// list.
-    pub async fn find_list_for_host(
+    // ponytail: OFFSET paging. A listing created between two page requests shifts the
+    // window by one; keyset on (created_at, id) if that ever shows up on screen.
+    pub async fn find_page_for_host(
         conn: &mut AsyncPgConnection,
         host_id: Uuid,
-    ) -> MyResult<Vec<HostSpotListProjection>> {
+        limit: i64,
+        offset: i64,
+    ) -> MyResult<Vec<HostSpotProjection>> {
         Ok(spot::table
             .filter(spot::host_id.eq(host_id).and(spot::deleted.eq(false)))
-            .order(spot::created_at.desc())
-            .select(HostSpotListProjection::as_select())
+            .order((spot::created_at.desc(), spot::id.desc()))
+            .limit(limit)
+            .offset(offset)
+            .select(HostSpotProjection::as_select())
             .load(conn)
             .await?)
+    }
+
+    /// One spot the caller has booked, whatever the state of the listing now.
+    ///
+    /// `EXISTS (a booking of theirs on it)` is the whole authorization. Any status counts,
+    /// released included: a renter looking at a hold that just lapsed may still open the
+    /// spot it was for. Someone who never booked here matches no row and gets 404.
+    pub async fn find_for_renter(
+        conn: &mut AsyncPgConnection,
+        spot_id: Uuid,
+        renter_id: Uuid,
+    ) -> MyResult<Option<RenterSpotProjection>> {
+        Ok(spot::table
+            .left_join(app_user::table.on(app_user::id.eq(spot::host_id)))
+            .filter(
+                spot::id.eq(spot_id).and(exists(
+                    booking::table.filter(
+                        booking::spot_id
+                            .eq(spot_id)
+                            .and(booking::renter_id.eq(renter_id)),
+                    ),
+                )),
+            )
+            .select(RenterSpotProjection::as_select())
+            .first(conn)
+            .await
+            .optional()?)
     }
 
     /// Spots within `meters` of a point, **never including the caller's own**.

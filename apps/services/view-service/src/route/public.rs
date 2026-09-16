@@ -13,7 +13,7 @@ use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     extractors::authed_jwt::AuthedJwt,
-    responses::view::{NearbyResponse, PublicSpotResponse},
+    responses::view::{NearbyResponse, PublicBookingResponse, PublicSpotResponse},
 };
 use uuid::Uuid;
 
@@ -21,9 +21,8 @@ use crate::AppState;
 
 /// `GET /api/view/public/spots/{id}` — one active spot as a prospective renter sees it.
 ///
-/// The bookings that come with it are the availability answer and nothing else: which
-/// slots are taken and until when, with no renter, no amount and no hold expiry. A host
-/// looking at their own listing wants `/host/spots/{id}` instead.
+/// The spot only. A host looking at their own listing wants `/host/spots/{id}` instead,
+/// and a renter looking at one they booked `/renter/spots/{id}`.
 ///
 /// The caller is authenticated but not otherwise used: an inactive spot 404s for everyone
 /// here, including its host, because "public spot" is the whole question this route
@@ -34,6 +33,19 @@ pub async fn spot(
     Path(spot_id): Path<Uuid>,
 ) -> MyResult<Json<PublicSpotResponse>> {
     Ok(Json(state.public_service.spot(spot_id).await?))
+}
+
+/// `GET /api/view/public/spots/{id}/bookings` — the taken slots on one active spot.
+///
+/// The availability answer and nothing else: which slots are taken and until when, with
+/// no renter, no amount and no hold expiry. Read by the booking form when it opens, so
+/// the picker subtracts what is taken *now* rather than whatever the detail sheet loaded.
+pub async fn spot_bookings(
+    _: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+) -> MyResult<Json<Vec<PublicBookingResponse>>> {
+    Ok(Json(state.public_service.spot_bookings(spot_id).await?))
 }
 
 /// Query for [`nearby`].

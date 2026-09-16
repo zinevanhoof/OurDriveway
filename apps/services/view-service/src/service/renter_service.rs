@@ -1,55 +1,77 @@
 use chrono::Utc;
 use shared::{
     error::myerror::{ContextExt, MyResult},
-    responses::view::{NextBookingResponse, RenterBookingResponse},
+    responses::view::{
+        NextBookingResponse, RenterBookingResponse, RenterBookingsPageResponse,
+        RenterSpotResponse,
+    },
 };
 use uuid::Uuid;
 
-use crate::repository::booking_repository::ViewBookingRepository;
+use crate::{
+    policy,
+    repository::{booking_repository::ViewBookingRepository, spot_repository::ViewSpotRepository},
+    service::BAD_BOOKINGS_PAGE,
+};
 
 /// `renter_id = caller` — everything the caller reads as a renter.
 ///
-/// Three reads over one projection and one join, which is why `RenterBookingProjection`
-/// carries that join on itself via `HasQuery`. They differ in `WHERE` and `LIMIT`, not in
-/// shape.
-///
-/// They do **not** share a response. `/next` renders a card with four fields and says so;
-/// sending it a full booking because the query happened to select one is how a wire
-/// contract stops meaning anything.
+/// Their bookings, the next one due, one by id, and a spot they booked. Every statement
+/// carries the caller itself; unlike `host`, there is no parent read whose success proves
+/// anything for the next one.
 pub struct RenterService {
     /// The pool. See [`crate::service::account_service::AccountService::db`].
     pub db: shared::db::Db,
 }
 
 impl RenterService {
-    /// The caller's own bookings, newest first.
-    ///
-    /// A booking the caller merely *hosts* is deliberately not here — that belongs on the
-    /// spot's page under `host`, where the host is already looking at their listing.
-    pub async fn bookings(&self, renter_id: Uuid) -> MyResult<Vec<RenterBookingResponse>> {
+    /// One spot the caller has booked. 404 for any spot they never booked, so a renter
+    /// cannot use this to read a paused listing they have no business with.
+    pub async fn spot(&self, spot_id: Uuid, renter_id: Uuid) -> MyResult<RenterSpotResponse> {
         let mut conn = shared::db::conn(&self.db).await?;
 
-        let bookings = ViewBookingRepository::find_list_for_renter(&mut conn, renter_id).await?;
+        let spot = ViewSpotRepository::find_for_renter(&mut conn, spot_id, renter_id)
+            .await?
+            .context_not_found(("Not Found", "That spot doesn't exist."))?;
 
-        Ok(bookings
-            .into_iter()
-            .map(RenterBookingResponse::from)
-            .collect())
+        Ok(RenterSpotResponse::from(spot))
     }
 
-    /// The caller's soonest booking that has not ended, or `None`.
-    ///
-    /// **This read exists to replace a client-side fold that was wrong.** `HomeView.vue`
-    /// fetched the renter's entire booking history to render one card, filtered to
-    /// `confirmed`, and ranked what was left by comparing `"YYYY-MM-DDTHH:MM"` wall-clock
-    /// strings — which orders wrong across time zones, as that file's own comment said.
-    ///
-    /// `ends_at` is an instant, so one `ORDER BY … LIMIT 1` is correct in every zone at
-    /// once and reads one row.
-    ///
-    /// `None` when there is nothing coming, rather than a 404: "you have no bookings" is an
-    /// answer, and a 404 would make the home screen log an error on a perfectly ordinary
-    /// account.
+    /// One window of the caller's own bookings, each with its spot card — the one
+    /// exception to spots and bookings being separate reads.
+    pub async fn bookings(
+        &self,
+        renter_id: Uuid,
+        scope: Option<String>,
+        status: Option<String>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> MyResult<RenterBookingsPageResponse> {
+        let (past, statuses, limit, offset) =
+            policy::bookings::window(scope.as_deref(), status.as_deref(), limit, offset)
+                .context_bad_request(BAD_BOOKINGS_PAGE)?;
+
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        // One instant for both statements, as on the host's list.
+        let now = Utc::now();
+
+        let total =
+            ViewBookingRepository::count_for_renter(&mut conn, renter_id, now, past, &statuses)
+                .await?;
+        let bookings = ViewBookingRepository::find_page_for_renter(
+            &mut conn, renter_id, now, past, &statuses, limit, offset,
+        )
+        .await?;
+
+        Ok(RenterBookingsPageResponse {
+            bookings: bookings.into_iter().map(Into::into).collect(),
+            next_offset: policy::page::next_offset(offset, limit, total),
+            total,
+        })
+    }
+
+    /// The caller's soonest confirmed booking that has not ended, or `None`.
     pub async fn next(&self, renter_id: Uuid) -> MyResult<Option<NextBookingResponse>> {
         let mut conn = shared::db::conn(&self.db).await?;
 
@@ -60,14 +82,7 @@ impl RenterService {
         )
     }
 
-    /// One of the caller's own bookings.
-    ///
-    /// `renter_id = caller` and nothing else. This used to be
-    /// `(renter_id = $2 OR host_id = $2)`, one read answering both parties to a booking;
-    /// the host half is [`crate::service::host_service::HostService::spot`] now, which is
-    /// where a host is already looking.
-    ///
-    /// 404 for a booking that is not the caller's, same as everywhere else.
+    /// One of the caller's own bookings, by id.
     pub async fn booking(
         &self,
         booking_id: Uuid,

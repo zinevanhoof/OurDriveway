@@ -1,80 +1,68 @@
 <script setup lang="ts">
+// "My bookings": the renter's own bookings, under an upcoming/past tab, paged.
+//
+// Each row draws its spot from the card the booking carries — the one exception to a
+// booking never carrying its spot — so the list is one request per page. Tapping a row
+// opens the spot detail sheet for that booking.
+import { computed, ref, useTemplateRef } from 'vue';
+import { useInfiniteQuery, useQueryClient } from '@tanstack/vue-query';
+
 import { fetchRenterBookings } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
-import type { RenterBookingResponse } from '@/types/responses/view/RenterBookingResponse';
-import {
-    Tabs,
-    TabsContent,
-    TabsList,
-    TabsTrigger,
-} from '@/components/ui/tabs'
-import { useQuery, useQueryClient } from '@tanstack/vue-query';
-import { computed } from 'vue';
+import { useLoadMore } from '@/lib/loadMore';
+import type { BookingScope } from '@/types/responses/view/HostBookingsPageResponse';
 import BookedSpotRow from './BookedSpotRow.vue';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Text } from '@/components/base/text';
 
 const queryClient = useQueryClient()
 
+const scope = ref<BookingScope>('upcoming')
+
 // `staleTime: 0`, and not as an optimisation to skip: a booking's status changes
 // underneath this list constantly and never through anything this client did. A webhook
 // confirms it, the expiry sweeper releases it, the host withdraws the spot — every one
-// of those is an event on the log, so there is nothing here to invalidate on and a
-// cached list shows holds that lapsed hours ago.
+// of those is an event on the log, so there is nothing here to invalidate on.
 //
-// The `renterId` variable and the `pause` that guarded it are gone: the server takes the
-// renter from the token, so there is no id to wait for the session to rehydrate.
-const { data } = useQuery({
-    queryKey: viewKeys.renterBookings,
-    queryFn: fetchRenterBookings,
+// Released holds are left out server-side: an abandoned checkout is noise, not a record.
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending } = useInfiniteQuery({
+    queryKey: computed(() => viewKeys.renterBookings(scope.value)),
+    queryFn: ({ pageParam }) =>
+        fetchRenterBookings({
+            scope: scope.value,
+            status: ['reserved', 'confirmed', 'cancelled'],
+            offset: pageParam,
+        }),
+    initialPageParam: 0,
+    getNextPageParam: (last) => last.nextOffset ?? undefined,
     staleTime: 0,
 })
 
-// A booking that ended without happening is not history the renter wants a tab
-// full of — an abandoned checkout in particular is noise, not a record. The one
-// exception is a booking the *host* withdrew: that one has to stay visible, or a
-// trip someone paid for just disappears without ever saying why.
-const live = computed(() =>
-    (data.value ?? []).filter(
-        (b) =>
-            b.status !== 'released' &&
-            (b.status !== 'cancelled' || b.cancelReason === 'spot_unavailable'),
-    ),
-)
-
-// One comparison against the server-folded end instant, in place of walking every
-// booking's date map. `Date.parse` rather than a string compare: the server emits
-// RFC 3339 with an offset, which doesn't sort against an ISO "Z" string.
-const stillToCome = (booking: RenterBookingResponse) => Date.parse(booking.endsAt) > Date.now()
-
-const upcoming = computed(() => live.value.filter(stillToCome))
-const past = computed(() => live.value.filter((b) => !stillToCome(b)))
+const bookings = computed(() => data.value?.pages.flatMap((p) => p.bookings) ?? [])
 
 /** After a cancel, re-read past the projection rather than trusting the cache. */
 const refresh = () => queryClient.invalidateQueries({ queryKey: viewKeys.bookings })
+
+useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNextPage, fetchNextPage })
 </script>
 
 <template>
-    <Tabs default-value="upcoming" class="gap-5">
-        <TabsList class="w-full group-data-horizontal/tabs:h-10">
-            <TabsTrigger value="upcoming" class="font-bold">
-                Upcoming
-            </TabsTrigger>
-            <TabsTrigger value="past" class="font-bold">
-                Past
-            </TabsTrigger>
-        </TabsList>
-        <TabsContent value="upcoming" class="space-y-2">
-            <BookedSpotRow v-for="booking in upcoming" :key="booking?.id" :booking="booking"
-                @changed="refresh" />
-            <Text v-if="!upcoming.length" size="sm" class="py-8 text-center">
-                Nothing booked yet.
-            </Text>
-        </TabsContent>
-        <TabsContent value="past" class="space-y-2">
-            <BookedSpotRow v-for="booking in past" :key="booking?.id" :booking="booking" past />
-            <Text v-if="!past.length" size="sm" class="py-8 text-center">
-                No past bookings.
-            </Text>
-        </TabsContent>
-    </Tabs>
+    <div class="space-y-2">
+        <Tabs v-model="scope">
+            <TabsList class="w-full group-data-horizontal/tabs:h-10">
+                <TabsTrigger value="upcoming" class="font-bold">Upcoming</TabsTrigger>
+                <TabsTrigger value="past" class="font-bold">Past</TabsTrigger>
+            </TabsList>
+        </Tabs>
+
+        <BookedSpotRow v-for="booking in bookings" :key="booking.id" :booking="booking"
+            :past="scope === 'past'" @changed="refresh" />
+        <Text v-if="!isPending && !bookings.length" size="sm" class="py-8 text-center">
+            {{ scope === 'upcoming' ? 'Nothing booked yet.' : 'No past bookings.' }}
+        </Text>
+
+        <!-- Crossing this asks for the next page. -->
+        <div ref="sentinel" class="h-px"></div>
+        <Text v-if="isFetchingNextPage" size="sm" class="pb-4 text-center">Loading…</Text>
+    </div>
 </template>

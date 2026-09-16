@@ -36,11 +36,12 @@
 //! | `spot` | `find_for_public` | `public` | `id = $1 AND active` |
 //! | | `find_pins_for_public` | `public` | `active AND NOT deleted AND host_id <> $1` |
 //! | | `find_for_host` | `host` | `id = $1 AND host_id = $2` |
-//! | | `find_list_for_host` | `host` | `host_id = $1 AND NOT deleted` |
+//! | | `find_page_for_host` | `host` | `host_id = $1 AND NOT deleted` |
+//! | | `find_for_renter` | `renter` | `id = $1 AND EXISTS (booking WHERE spot_id = $1 AND renter_id = $2)` |
 //! | `booking` | `find_for_public_spot` | `public` | `spot_id = parent AND status IN ('reserved','confirmed')` |
 //! | | `find_booked_for_host_spot` | `host` | `spot_id = parent AND status IN ('reserved','confirmed')` — ownership already proved |
 //! | | `find_page_for_host_spot` | `host` | `spot_id = parent AND status IN ($statuses)` — same |
-//! | | `find_list_for_renter` | `renter` | `renter_id = $1` |
+//! | | `find_page_for_renter` | `renter` | `renter_id = $1 AND status IN ($statuses)` — joins its spot card, **the one exception** |
 //! | | `find_next_for_renter` | `renter` | `renter_id = $1 AND status = 'confirmed' AND ends_at > $2` |
 //! | | `find_for_renter` | `renter` | `id = $1 AND renter_id = $2` |
 //! | `payment` + `payout` | `wallet::find_month_for_account` | `account` | `host_id = $1 OR renter_id = $1`, as five separately-indexed branches |
@@ -72,31 +73,18 @@
 //! (`shared::projections`): a public read does not select what it may not return, so
 //! there is nothing in flight to cut and no `Option` that means "denied".
 //!
-//! ## A parent and its children are two statements
+//! ## A spot and its bookings are separate routes
 //!
-//! `/public/spots/{id}` and `/host/spots/{id}` each read a spot and then the bookings on
-//! it, through `belonging_to`. **That is deliberate, not a missing join.** One join would
-//! repeat the spot's `images`, `address` and `availability` once per booking, and those
-//! are the expensive columns; two statements also give parent and children independent
-//! cache keys, so a booking landing invalidates the availability without refetching the
-//! listing.
+//! No response carries both. `/public/spots/{id}` and `/public/spots/{id}/bookings` are two
+//! requests, and so are `/host/spots/{id}` and `/host/spots/{id}/bookings`. A listing is
+//! edited rarely and the bookings on it change constantly, so they get independent cache
+//! keys, and a screen that needs only one of them fetches only that one.
 //!
-//! A single-statement form does exist and was built and verified during the diesel
-//! migration — a correlated `array_agg` over a row constructor, decoded through diesel's
-//! `Record<(…)>` type, fully typed. It is not used here for the reasons above.
-//!
-//! `belonging_to` rather than `spot_id.eq(id)` because the parent row is already in hand:
-//! the foreign key is read off the row the first statement authorised, so a second
-//! argument cannot name a spot that statement refused.
-//!
-//! ### `grouped_by` is the reassembly half, and has no caller
-//!
-//! It is the tool for a *list* of parents each with children —
-//! `children.grouped_by(&parents)` gives `Vec<Vec<Child>>` aligned with `parents`, to be
-//! zipped. No endpoint here returns that shape: `/host/spots` renders no bookings. When
-//! one appears it is one line, and the fallible `try_grouped_by` is the one to reach for —
-//! it surfaces orphans instead of dropping them, and this read model has no foreign keys,
-//! so a child whose parent has not been projected yet is expected rather than corrupt.
+//! The booking routes still read the spot first and then the bookings `belonging_to` it.
+//! That first statement is the gate — `active` for the public, `host_id = caller` for the
+//! host — and `belonging_to` reads the foreign key off the row it authorised, so a second
+//! argument cannot name a spot that statement refused. The renter's routes have no such
+//! parent: `renter_id = caller` is in each statement's own `WHERE`.
 //!
 //! ### `BoxableExpression` is not used
 //!
@@ -507,16 +495,19 @@ mod live_tests {
         .await
         .unwrap();
 
-        // The renter's read LEFT JOINs, so the booking comes back with its spot
+        // The renter's reads LEFT JOIN the spot card (the one exception to spots and
+        // bookings being separate reads), so the booking comes back with its spot
         // unresolved rather than not coming back at all.
-        let mine = ViewBookingRepository::find_list_for_renter(db, renter_id)
-            .await
-            .unwrap();
+        //
+        // `at - 1s`, because this booking's `ends_at` **is** `at`.
+        let before = at - chrono::Duration::seconds(1);
+        let statuses = &crate::policy::bookings::STATUSES;
+        let mine =
+            ViewBookingRepository::find_page_for_renter(db, renter_id, before, false, statuses, 20, 0)
+                .await
+                .unwrap();
         assert_eq!(mine.len(), 1, "the booking must still be returned");
-        assert!(
-            mine[0].spot.is_none(),
-            "an unprojected spot is an absent join"
-        );
+        assert!(mine[0].spot.is_none(), "an unprojected spot is an absent join");
         assert!(
             ViewBookingRepository::find_for_renter(db, booking_id, renter_id)
                 .await
@@ -525,7 +516,7 @@ mod live_tests {
             "…and the by-id read is the same join, so it must not drop the row either"
         );
 
-        // The targets arrive. Nothing revisits the booking, and the joins resolve
+        // The targets arrive. Nothing revisits the booking, and the reads resolve
         // themselves — which is the property the old `link_refs`/`backfill_links` pair
         // spent four methods and three tests approximating.
         ViewUserRepository::upsert(db, a_user(renter_id))
@@ -539,13 +530,23 @@ mod live_tests {
         .await
         .unwrap();
 
-        let mine = ViewBookingRepository::find_list_for_renter(db, renter_id)
-            .await
-            .unwrap();
+        let mine =
+            ViewBookingRepository::find_page_for_renter(db, renter_id, before, false, statuses, 20, 0)
+                .await
+                .unwrap();
         let card = mine[0].spot.as_ref().expect("the spot resolves now");
         assert_eq!(card.title, "Driveway");
         assert_eq!(card.id, spot_id);
         assert_eq!(card.timezone, "Europe/Brussels");
+
+        let spot_page = ViewSpotRepository::find_for_renter(db, spot_id, renter_id)
+            .await
+            .unwrap()
+            .expect("its renter reads the whole spot");
+        assert!(
+            spot_page.host.is_none(),
+            "a host who has not been projected is an absent join"
+        );
 
         // The other absent join, on the host's side of the same booking. It needs the
         // spot to exist, because the parent read is what the children belong to — which
@@ -893,6 +894,63 @@ mod live_tests {
         assert_eq!(detail.amount, 4200);
         assert_eq!(detail.id, booking_id);
 
+        // ── renter: their bookings, and the spots those are on ───────────────
+        //
+        // The booking is `released` by now. It still opens its spot — a lapsed hold's
+        // renter may look at where it was.
+        assert!(
+            ViewSpotRepository::find_for_renter(db, spot_id, renter)
+                .await
+                .unwrap()
+                .is_some(),
+            "a renter reads a spot they have a booking on"
+        );
+        for outsider in [stranger, host] {
+            assert!(
+                ViewSpotRepository::find_for_renter(db, spot_id, outsider)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "nobody else reads it through the renter namespace, its host included"
+            );
+            assert!(
+                ViewBookingRepository::find_page_for_renter(db, outsider, at, false, all, 20, 0)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "and nobody else's bookings are on their page"
+            );
+        }
+        assert_eq!(
+            ViewBookingRepository::find_page_for_renter(db, renter, at, false, all, 20, 0)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the renter's own booking is on theirs"
+        );
+        assert_eq!(
+            ViewBookingRepository::count_for_renter(db, renter, at, false, all)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            ViewBookingRepository::find_page_for_renter(
+                db,
+                renter,
+                at,
+                false,
+                &["reserved", "confirmed", "cancelled"],
+                20,
+                0
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "a released hold is left off when the list asks without it"
+        );
+
         // ── renter: the next-up card is one confirmed, unfinished row ────────
         //
         // The booking above is `released` by this point, so there is nothing coming.
@@ -942,12 +1000,20 @@ mod live_tests {
             .await
             .unwrap();
         assert!(
-            !ViewSpotRepository::find_list_for_host(db, host)
+            !ViewSpotRepository::find_page_for_host(db, host, 50, 0)
                 .await
                 .unwrap()
                 .iter()
                 .any(|s| s.id == spot_id),
             "a deleted spot must not appear in its host's list"
+        );
+        assert_eq!(ViewSpotRepository::count_for_host(db, host).await.unwrap(), 0);
+        assert!(
+            ViewSpotRepository::find_for_renter(db, spot_id, renter)
+                .await
+                .unwrap()
+                .is_some(),
+            "a renter still reads a paused, deleted spot they booked"
         );
         assert!(
             ViewSpotRepository::find_for_host(db, spot_id, host)
@@ -1080,6 +1146,23 @@ mod live_tests {
             past.iter().map(|b| b.id).collect::<Vec<_>>(),
             vec![ids[3], ids[4]],
             "what is over reads most recent first, and holds nothing from the other tab"
+        );
+
+        // The renter's side of the same five bookings: the same split and the same orders.
+        let renters_upcoming =
+            ViewBookingRepository::find_page_for_renter(db, renter, at, false, all, 20, 0)
+                .await
+                .unwrap();
+        assert_eq!(
+            renters_upcoming.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![ids[2], ids[1], ids[0]],
+            "the renter's page reads soonest first too"
+        );
+        assert_eq!(
+            ViewBookingRepository::count_for_renter(db, renter, at, true, all)
+                .await
+                .unwrap(),
+            2
         );
 
         for id in &ids {

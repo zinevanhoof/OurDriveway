@@ -32,12 +32,13 @@ import type { AcceptableValue } from "reka-ui";
 
 import * as bookingApi from "@/api/bookingApi";
 import * as paymentApi from "@/api/paymentApi";
-import { fetchAccount } from "@/api/viewApi";
+import { fetchAccount, fetchSpotBookings } from "@/api/viewApi";
 import { useUpdateUser } from "@/api/userApi";
 import { viewKeys } from "@/api/keys";
 import type { TimeSlot } from "@/types/domain/spot";
 import {
     type SpotAvailability,
+    mergeBooked,
     remainingWindows,
     subtract,
     toMin,
@@ -57,13 +58,6 @@ const props = defineProps<{
         address?: { formatted?: string };
         availability?: SpotAvailability;
     };
-    /**
-     * Slots already taken, as `mergeBooked()` of the spot's still-to-come bookings.
-     *
-     * Its own prop rather than a field on `spot`: it comes from a sibling query, not
-     * from the spot row — there is no denormalized copy on the spot any more.
-     */
-    booked?: Record<string, TimeSlot[]>;
 }>();
 
 const router = useRouter();
@@ -71,10 +65,22 @@ const router = useRouter();
 const open = defineModel<boolean>({ required: true });
 const emit = defineEmits<{ booked: [bookingId: string] }>();
 
-// No reshaping and no filtering: everything in `booked` is taken, and a lapsed hold
-// stops blocking when the expiry sweeper releases it server-side rather than being
-// filtered out here.
-const occupied = computed(() => props.booked ?? {});
+// The taken slots, read by this form and nothing else — the spot carries none.
+//
+// Enabled only while open, and `staleTime: 0`, so every opening reads what is taken *now*:
+// this is the one query someone books against. Freshness, not correctness — the server's
+// availability check is the authority; this only stops the picker offering slots it then
+// has to retract.
+const { data: taken } = useQuery({
+    queryKey: computed(() => viewKeys.spotBookings(props.spot?.id ?? "")),
+    queryFn: () => fetchSpotBookings(props.spot!.id),
+    enabled: computed(() => open.value && !!props.spot),
+    staleTime: 0,
+});
+
+// No filtering: everything this returns is taken, and a lapsed hold stops blocking when
+// the expiry sweeper releases it server-side rather than being filtered out here.
+const occupied = computed(() => mergeBooked(taken.value));
 
 // ─── Calendar: only host-open dates (minus bookings) within 90 days ───
 const minDate = today(getLocalTimeZone());

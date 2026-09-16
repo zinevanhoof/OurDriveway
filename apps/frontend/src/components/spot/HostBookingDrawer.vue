@@ -17,10 +17,10 @@ import AvatarFallback from "@/components/ui/avatar/AvatarFallback.vue";
 import { Text, Title } from "@/components/base/text";
 import { Money } from "@/components/base/money";
 import { formatDay, formatSlots, sortedDays } from "@/lib/bookingDates";
-import type { HostBookingListItemResponse } from "@/types/responses/view/HostBookingListItemResponse";
+import type { HostBookingResponse } from "@/types/responses/view/HostBookingResponse";
 
 const props = defineProps<{
-  booking: HostBookingListItemResponse | null;
+  booking: HostBookingResponse | null;
   /** The spot's zone. The slots are wall-clock in it, and are printed as stored. */
   timezone?: string;
 }>();

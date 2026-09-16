@@ -1,4 +1,4 @@
-import type { HostBookingListItemResponse } from "./HostBookingListItemResponse";
+import type { HostBookingResponse } from "./HostBookingResponse";
 
 /**
  * `GET /api/view/host/spots/{id}/bookings?scope=&status=&limit=&offset=` — one window of
@@ -13,7 +13,7 @@ import type { HostBookingListItemResponse } from "./HostBookingListItemResponse"
  * same reason it never computes the wallet's `nextMonth`.
  */
 export type HostBookingsPageResponse = {
-  bookings: HostBookingListItemResponse[];
+  bookings: HostBookingResponse[];
   /** Null at the end of the list. */
   nextOffset: number | null;
   /** Every booking in this scope and status, not just this window. */

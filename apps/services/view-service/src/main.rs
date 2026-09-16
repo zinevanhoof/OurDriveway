@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the rules and the two problems that came with the old arrangement (a denied field
     // nulling a whole GraphQL array, and VULN-001's indexed-equality oracle).
     //
-    // Ten endpoints in four namespaces, one predicate each — see `route/mod.rs`. The
+    // Four namespaces, one predicate each — see `route/mod.rs`. The
     // namespace is the authorization, so a route says who may read it in the same place
     // it says what it returns, and each namespace's reads are one service in `service/`.
     //
@@ -196,6 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Router::new()
                 .route("/spots", get(route::host::spots))
                 .route("/spots/{id}", get(route::host::spot))
+                .route("/spots/{id}/booked", get(route::host::booked))
                 .route("/spots/{id}/bookings", get(route::host::bookings))
                 .route("/balance", get(route::host::balance)),
         )
@@ -204,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Router::new()
                 // `/next` before `/{id}`: axum matches the literal segment first either
                 // way, but the ordering is what a reader checks.
+                .route("/spots/{id}", get(route::renter::spot))
                 .route("/bookings", get(route::renter::bookings))
                 .route("/bookings/next", get(route::renter::next))
                 .route("/bookings/{id}", get(route::renter::booking)),
@@ -212,7 +214,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "/api/view/public",
             Router::new()
                 .route("/spots/nearby", get(route::public::nearby))
-                .route("/spots/{id}", get(route::public::spot)),
+                .route("/spots/{id}", get(route::public::spot))
+                .route("/spots/{id}/bookings", get(route::public::spot_bookings)),
         )
         // Waits on the aggregate versions a client echoes back, against this
         // service's own database — see `bus::await_version`. Transport-level, so it is

@@ -1,7 +1,10 @@
 <script setup lang="ts">
-// One booking card. Upcoming and Past are the same card — Past just loses the
-// footer and the tap target, which is why this is one component with a flag and
-// not two near-identical blocks that drift the first time a class changes.
+// One booking card in "My bookings". Upcoming and Past are the same card — Past just
+// loses the footer, which is why this is one component with a flag and not two
+// near-identical blocks that drift the first time a class changes.
+//
+// The spot's title, photo, address and zone come from `booking.spot` — the one exception
+// to a booking never carrying its spot. Tapping the card opens the full spot sheet.
 import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
 import { Clock, CreditCard, MapPin, Navigation, X } from "@lucide/vue";
@@ -13,23 +16,27 @@ import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import Button from "@/components/ui/button/Button.vue";
 import { Badge } from "@/components/ui/badge";
 import Separator from "@/components/ui/separator/Separator.vue";
-import SpotDetailDrawer from "@/components/spot/SpotDetailDrawer.vue";
 import { Surface } from "@/components/base/surface";
 import { Text, Title } from "@/components/base/text";
 import { Money } from "@/components/base/money";
+import SpotDetailDrawer from "@/components/spot/SpotDetailDrawer.vue";
 import { canCancel, formatDay, formatSlots, isActiveNow, sortedDays } from "@/lib/bookingDates";
+import type { RenterBookingResponse } from "@/types/responses/view/RenterBookingResponse";
 
-const props = defineProps<{ booking: any; past?: boolean }>();
+const props = defineProps<{ booking: RenterBookingResponse; past?: boolean }>();
 const emit = defineEmits<{ changed: [] }>();
 
 const router = useRouter();
+
+/** Null only while the spot has not been projected yet. */
+const spot = computed(() => props.booking.spot);
 
 const detailOpen = ref(false);
 const confirmOpen = ref(false);
 const cancelling = ref(false);
 const resuming = ref(false);
 
-const timezone = computed(() => props.booking?.spot?.timezone);
+const timezone = computed(() => spot.value?.timezone);
 const days = computed(() => sortedDays(props.booking));
 const active = computed(() => isActiveNow(props.booking, timezone.value));
 /** Reserved holds get the release flow; only a paid booking can be cancelled. */
@@ -75,7 +82,7 @@ const STATUS_CLASS: Record<string, string> = {
 };
 
 function directions() {
-  const address = props.booking?.spot?.address?.formatted;
+  const address = spot.value?.address?.formatted;
   if (!address) return;
   const q = encodeURIComponent(address);
   // `geo:` is the whole point on Android: it resolves to the system chooser across
@@ -140,19 +147,16 @@ async function cancel() {
 
 <template>
   <Surface variant="elevated" class="gap-2">
-    <Surface variant="none" size="none" orientation="horizontal"
-      :class="['items-start gap-3', !past && 'cursor-pointer']" @click="!past && (detailOpen = true)">
-      <img v-if="booking?.spot?.images?.[0]" :src="booking.spot.images[0]"
-        class="w-20 h-20 shrink-0 rounded-lg object-cover" />
-      <div class="flex-1 space-y-1">
-        <Title weight="semibold">{{ booking?.spot?.title }}</Title>
+    <Surface variant="none" size="none" orientation="horizontal" class="items-start gap-3 cursor-pointer"
+      @click="detailOpen = true">
+      <img v-if="spot?.images?.[0]" :src="spot.images[0]" class="w-20 h-20 shrink-0 rounded-lg object-cover" />
+      <div class="flex-1 min-w-0 space-y-1">
+        <Title weight="semibold">{{ spot?.title }}</Title>
         <Text class="flex gap-1 items-center">
           <MapPin :size="16" class="shrink-0" />
-          {{ booking?.spot?.address?.line1 }} · {{ booking?.spot?.address?.city }}
+          {{ spot?.address?.line1 }} · {{ spot?.address?.city }}
         </Text>
-        <!-- Dropped once it's history: which Tuesday it was is not what someone
-             scanning past bookings is looking for. -->
-        <Text v-if="!past && days.length" class="flex gap-1 items-center">
+        <Text v-if="days.length" class="flex gap-1 items-center">
           <Clock :size="16" class="shrink-0" />
           <span>
             {{ formatDay(days[0][0], timezone) }} · {{ formatSlots(days[0][1]) }}
@@ -199,10 +203,9 @@ async function cancel() {
       </div>
     </template>
 
-    <!-- The same sheet the map opens, minus anything that would book it again, plus
-         the full schedule the card only had room to summarise. -->
-    <SpotDetailDrawer v-model:open="detailOpen" :spot-id="booking?.spot?.id ?? null"
-      :booking="booking" />
+    <!-- The same sheet the map opens, minus anything that would book it again, plus the
+         full schedule, plate and total the card only had room to summarise. -->
+    <SpotDetailDrawer v-model:open="detailOpen" :spot-id="booking.spotId" :booking="booking" renter />
 
     <!-- Defaults left alone on purpose: drag-to-dismiss, the handle, backdrop tap
          and Esc are all vaul's, and a confirmation is the last place to break the
@@ -219,7 +222,7 @@ async function cancel() {
               {{ reserved ? "Give up these times?" : "Cancel this booking?" }}
             </Title>
             <Text size="sm">
-              {{ booking?.spot?.title }} —
+              {{ spot?.title }} —
               <span v-if="days.length">{{ formatDay(days[0][0], timezone) }}</span>.
               The slots go straight back on the market.
               <template v-if="reserved">You haven't been charged.</template>

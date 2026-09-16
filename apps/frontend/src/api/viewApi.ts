@@ -6,13 +6,30 @@ import type {
   BookingStatus,
   HostBookingsPageResponse,
 } from "@/types/responses/view/HostBookingsPageResponse";
-import type { HostSpotListItemResponse } from "@/types/responses/view/HostSpotListItemResponse";
-import type { HostSpotResponse } from "@/types/responses/view/HostSpotResponse";
+import type {
+  HostSpotResponse,
+  HostSpotsPageResponse,
+} from "@/types/responses/view/HostSpotResponse";
 import type { NearbyResponse } from "@/types/responses/view/NearbyResponse";
 import type { NextBookingResponse } from "@/types/responses/view/NextBookingResponse";
+import type { PublicBookingResponse } from "@/types/responses/view/PublicBookingResponse";
 import type { PublicSpotResponse } from "@/types/responses/view/PublicSpotResponse";
-import type { RenterBookingResponse } from "@/types/responses/view/RenterBookingResponse";
+import type {
+  RenterBookingResponse,
+  RenterBookingsPageResponse,
+} from "@/types/responses/view/RenterBookingResponse";
+import type { RenterSpotResponse } from "@/types/responses/view/RenterSpotResponse";
+import type { Booked } from "@/types/domain/spot";
 import type { WalletResponse } from "@/types/responses/view/WalletResponse";
+
+/** One window of a paged list. Omit both for the first twenty; pass back `nextOffset`. */
+export type Page = { limit?: number; offset?: number };
+
+/** One window of a booking list: a {@link Page} plus the tab and the statuses. */
+export type BookingsPage = Page & { scope?: BookingScope; status?: BookingStatus[] };
+
+const bookingsQuery = (params: BookingsPage) =>
+  query({ ...params, status: params.status?.join(",") });
 
 // Every read the client makes, over plain REST.
 //
@@ -69,20 +86,26 @@ export const fetchWallet = (month?: string) =>
 
 // ─── host ───────────────────────────────────────────────────────────────────
 
-/** The caller's own listings, newest first. Excludes deleted ones, keeps inactive. */
-export const fetchHostSpots = () =>
-  get<HostSpotListItemResponse[]>("/api/view/host/spots");
+/** One window of the caller's own listings, newest first. Excludes deleted, keeps inactive. */
+export const fetchHostSpots = (page: Page = {}) =>
+  get<HostSpotsPageResponse>(`/api/view/host/spots${query(page)}`);
 
 /**
- * One spot as its host sees it, with the slots still taken on it merged into `booked`.
+ * One spot as its host sees it. The spot only: who is coming is
+ * {@link fetchHostSpotBookings}, and the slots still taken {@link fetchHostSpotBooked}.
  *
  * Serves the manage screen and the edit form: they render different fields but may read
- * the same ones. The booking rows — who is coming — are {@link fetchHostSpotBookings}.
- *
- * This was `/spots/:id/manage`, a path segment shared with nothing.
+ * the same ones. This was `/spots/:id/manage`, a path segment shared with nothing.
  */
 export const fetchHostSpot = (id: string) =>
   get<HostSpotResponse>(`/api/view/host/spots/${id}`);
+
+/**
+ * Every slot a reserved or confirmed booking still holds on the host's spot, merged into
+ * one map. The edit form's warning before a host removes hours someone has taken.
+ */
+export const fetchHostSpotBooked = (id: string) =>
+  get<Booked>(`/api/view/host/spots/${id}/booked`);
 
 /**
  * One window of one spot's bookings: the manage screen's preview and the paged screen.
@@ -94,17 +117,9 @@ export const fetchHostSpot = (id: string) =>
  * to 20 (at most 50), `offset` to 0. Pass back whatever `nextOffset` said — `null` there
  * is the end of the list.
  */
-export const fetchHostSpotBookings = (
-  spotId: string,
-  params: {
-    scope?: BookingScope;
-    status?: BookingStatus[];
-    limit?: number;
-    offset?: number;
-  } = {},
-) =>
+export const fetchHostSpotBookings = (spotId: string, params: BookingsPage = {}) =>
   get<HostBookingsPageResponse>(
-    `/api/view/host/spots/${spotId}/bookings${query({ ...params, status: params.status?.join(",") })}`,
+    `/api/view/host/spots/${spotId}/bookings${bookingsQuery(params)}`,
   );
 
 /**
@@ -119,9 +134,23 @@ export const fetchBalance = () => get<BalanceResponse>("/api/view/host/balance")
 
 // ─── renter ─────────────────────────────────────────────────────────────────
 
-/** The caller's own bookings as a renter, newest first. */
-export const fetchRenterBookings = () =>
-  get<RenterBookingResponse[]>("/api/view/renter/bookings");
+/**
+ * One window of the caller's own bookings, under one tab: `upcoming` soonest first,
+ * `past` most recent first.
+ *
+ * **Each carries a card of its spot** — the one exception to a booking never carrying
+ * its spot, because every row of the list draws one.
+ */
+export const fetchRenterBookings = (params: BookingsPage = {}) =>
+  get<RenterBookingsPageResponse>(`/api/view/renter/bookings${bookingsQuery(params)}`);
+
+/**
+ * One spot the caller has booked, whole, with its host. Unlike {@link fetchSpot} it still
+ * answers after the host pauses or deletes the listing; it 404s for a spot the caller
+ * never booked.
+ */
+export const fetchRenterSpot = (id: string) =>
+  get<RenterSpotResponse>(`/api/view/renter/spots/${id}`);
 
 /**
  * The soonest confirmed booking that has not ended yet, or `null`.
@@ -159,11 +188,18 @@ export const fetchSpotsNear = (lng: number, lat: number, meters: number) =>
   );
 
 /**
- * One spot as a prospective renter sees it: the listing plus what is still booked on it,
- * with no renter names or amounts attached.
+ * One spot as a prospective renter sees it. The listing only — what is booked on it is
+ * {@link fetchSpotBookings}.
  *
  * 404s for an inactive spot, including for its own host — a host looking at their listing
- * wants {@link fetchHostSpot}.
+ * wants {@link fetchHostSpot}, a renter looking at one they booked {@link fetchRenterSpot}.
  */
 export const fetchSpot = (id: string) =>
   get<PublicSpotResponse>(`/api/view/public/spots/${id}`);
+
+/**
+ * The bookings still taking slots on an active spot, with no renter names or amounts
+ * attached. What the booking form subtracts from the open hours.
+ */
+export const fetchSpotBookings = (id: string) =>
+  get<PublicBookingResponse[]>(`/api/view/public/spots/${id}/bookings`);

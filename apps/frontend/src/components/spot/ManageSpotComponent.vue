@@ -13,7 +13,7 @@ import type { TimeSlot, WeeklyAvailability } from '@/types/domain/spot';
 
 import HostBookingRow from './HostBookingRow.vue';
 import HostBookingDrawer from './HostBookingDrawer.vue';
-import type { HostBookingListItemResponse } from '@/types/responses/view/HostBookingListItemResponse';
+import type { HostBookingResponse } from '@/types/responses/view/HostBookingResponse';
 import Switch from '../ui/switch/Switch.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer'
 import { FieldError } from '@/components/ui/field'
@@ -142,10 +142,10 @@ const { data: preview } = useQuery({
 const visibleBookings = computed(() => preview.value?.bookings ?? [])
 
 // Same drawer as the bookings screen: the row already carries everything it shows.
-const selected = ref<HostBookingListItemResponse | null>(null)
+const selected = ref<HostBookingResponse | null>(null)
 const detailOpen = ref(false)
 
-const openBooking = (booking: HostBookingListItemResponse) => {
+const openBooking = (booking: HostBookingResponse) => {
     selected.value = booking
     detailOpen.value = true
 }

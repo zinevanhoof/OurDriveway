@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 /// The same nesting as `main.rs`, duplicated on purpose: `main` builds its router around
 /// an `AppState` holding a live pool, so a test sharing that construction would be an
-/// `#[ignore]`d test nobody runs. What is copied here is ten path strings — if they drift
+/// `#[ignore]`d test nobody runs. What is copied here is the path strings — if they drift
 /// from `main.rs`, this stops testing the thing it names, which is the trade.
 fn app() -> Router {
     async fn ok() -> &'static str {
@@ -30,11 +30,14 @@ fn app() -> Router {
             Router::new()
                 .route("/spots", get(ok))
                 .route("/spots/{id}", get(ok))
+                .route("/spots/{id}/booked", get(ok))
+                .route("/spots/{id}/bookings", get(ok))
                 .route("/balance", get(ok)),
         )
         .nest(
             "/api/view/renter",
             Router::new()
+                .route("/spots/{id}", get(ok))
                 .route("/bookings", get(ok))
                 .route("/bookings/next", get(ok))
                 .route("/bookings/{id}", get(ok)),
@@ -43,7 +46,8 @@ fn app() -> Router {
             "/api/view/public",
             Router::new()
                 .route("/spots/nearby", get(ok))
-                .route("/spots/{id}", get(ok)),
+                .route("/spots/{id}", get(ok))
+                .route("/spots/{id}/bookings", get(ok)),
         )
 }
 
@@ -64,12 +68,16 @@ async fn every_route_resolves() {
         "/api/view/account/wallet",
         "/api/view/host/spots",
         "/api/view/host/spots/018f0000-0000-7000-8000-000000000000",
+        "/api/view/host/spots/018f0000-0000-7000-8000-000000000000/booked",
+        "/api/view/host/spots/018f0000-0000-7000-8000-000000000000/bookings",
         "/api/view/host/balance",
+        "/api/view/renter/spots/018f0000-0000-7000-8000-000000000000",
         "/api/view/renter/bookings",
         "/api/view/renter/bookings/next",
         "/api/view/renter/bookings/018f0000-0000-7000-8000-000000000000",
         "/api/view/public/spots/nearby",
         "/api/view/public/spots/018f0000-0000-7000-8000-000000000000",
+        "/api/view/public/spots/018f0000-0000-7000-8000-000000000000/bookings",
     ] {
         assert_eq!(status(path).await, 200, "{path} must resolve");
     }

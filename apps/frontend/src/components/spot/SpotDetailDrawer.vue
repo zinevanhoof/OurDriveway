@@ -1,11 +1,11 @@
 <script setup lang="ts">
-// The spot detail sheet, shared by the map (where it leads to booking) and the
-// renter's booking list (where it is read-only). It owns its own query rather than
-// taking a spot object, so a caller only has to know an id — which is all either
-// caller has when the user taps.
+// The spot detail sheet, shared by the map (where it leads to booking) and a renter's
+// booking — from "My bookings" or the home screen's next one — where it is read-only and
+// lists that booking's schedule. It owns its own query rather than taking a spot object,
+// so a caller only has to know an id — which is all any caller has when the user taps.
 import { useQuery } from "@tanstack/vue-query";
 import { computed } from "vue";
-import { fetchSpot } from "@/api/viewApi";
+import { fetchRenterSpot, fetchSpot } from "@/api/viewApi";
 import { viewKeys } from "@/api/keys";
 import type { ApiError } from "@/api/client";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
@@ -23,6 +23,12 @@ const props = withDefaults(defineProps<{
   spotId: string | null;
   /** Show the book button. Off for a booking the renter already holds. */
   bookable?: boolean;
+  /**
+   * Read the spot as one the caller booked (`/renter/spots/{id}`) rather than as a public
+   * listing. On for a booking the renter holds: that read still answers after the host
+   * pauses or deletes the listing, where the public one 404s.
+   */
+  renter?: boolean;
   /**
    * A booking on this spot, when the renter is looking at one they hold. Its whole
    * schedule is listed — the card only had room for the first day.
@@ -47,22 +53,22 @@ const emit = defineEmits<{ book: [] }>();
 // Disabled until something is selected, so nothing runs at render time and there is
 // one query total rather than one per pin.
 //
-// The endpoint returns the bookings too; this sheet does not read them, and the picker
-// next door does the subtracting. Both share the `spots/<id>` key, so vue-query serves
-// the second from cache exactly as urql's document dedupe did — and the three variables
-// that used to be needed (a record-id spelling, a plain uuid, and a `now`) are one path
-// parameter.
+// The listing only. The public read shares the `spots/<id>` key with the map's and the
+// home screen's own copy, which feeds the booking form, so vue-query serves one from
+// the other. The renter's read is a different key, because it is a different route.
 const { data, isError, error, refetch } = useQuery({
-  queryKey: computed(() => viewKeys.spot(props.spotId ?? "")),
-  queryFn: () => fetchSpot(props.spotId!),
+  queryKey: computed(() =>
+    props.renter ? viewKeys.renterSpot(props.spotId ?? "") : viewKeys.spot(props.spotId ?? ""),
+  ),
+  queryFn: () => (props.renter ? fetchRenterSpot(props.spotId!) : fetchSpot(props.spotId!)),
   enabled: computed(() => props.spotId !== null),
 });
 
 const spot = computed(() => data.value);
 
-// The spot's own zone, not the viewer's — same rule as the card. Falls back to the
-// booking's copy so the list still labels "Today" correctly before FULL_SPOT lands.
-const timezone = computed(() => spot.value?.timezone ?? props.booking?.spot?.timezone);
+// The spot's own zone, not the viewer's — same rule as the card. The schedule waits for
+// it rather than labelling "Today" in the viewer's zone first.
+const timezone = computed(() => spot.value?.timezone);
 const days = computed(() => sortedDays(props.booking));
 </script>
 
@@ -80,7 +86,8 @@ const days = computed(() => sortedDays(props.booking));
         <Text size="sm">{{ (error as ApiError).detail.join(' ') }}</Text>
         <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
       </div>
-      <div v-else class="m-4 space-y-4">
+      <!-- The sheet caps at 80vh, so a long schedule scrolls inside it. -->
+      <div v-else class="m-4 space-y-4 overflow-y-auto no-scrollbar">
         <!-- `touch-pan-x`: without it the browser claims a vertical swipe here for
              scrolling and cancels the pointer stream, so vaul never sees the drag and
              the sheet won't close when the gesture starts on a photo. Declaring the

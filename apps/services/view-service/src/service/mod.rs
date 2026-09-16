@@ -31,6 +31,19 @@ pub mod host_service;
 pub mod public_service;
 pub mod renter_service;
 
+/// The 400 for a list window out of range. One wording for every paged route.
+pub const BAD_PAGE: (&str, &str) = (
+    "Invalid page",
+    "Ask for a limit from 1 to 50 and an offset from 0.",
+);
+
+/// The 400 for a booking list request that is not one: [`BAD_PAGE`] plus the tab and the
+/// statuses.
+pub const BAD_BOOKINGS_PAGE: (&str, &str) = (
+    "Invalid page",
+    "Ask for scope=upcoming or scope=past, status from reserved, confirmed, cancelled, released, a limit from 1 to 50, and an offset from 0.",
+);
+
 /// The instant a booking must have ended before for its payment to count as settled.
 ///
 /// Used by the two money reads — [`account_service::AccountService::wallet`] shows it per

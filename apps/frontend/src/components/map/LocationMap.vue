@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/vue-query";
+import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import { onMounted, onBeforeUnmount, ref, computed, watch, h, render } from "vue";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
@@ -10,7 +10,6 @@ import { viewKeys } from "@/api/keys";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import type { SpotFilter } from "@/types/SpotFilter";
 import { spotMatches } from "@/lib/spotFilter";
-import { mergeBooked } from "@/lib/bookingAvailability";
 import { locateUser } from "@/lib/geo";
 import MapPinComponent from "./MapPinComponent.vue";
 import MapSearchComponent from "./MapSearchComponent.vue";
@@ -56,8 +55,6 @@ const filter = ref<SpotFilter>({ single: {} });
 // divs (Vue patches in place) so the raised/shrink tween runs on live DOM nodes.
 const selectedId = ref<string | null>(null);
 
-const queryClient = useQueryClient();
-
 // The caller's own spots are excluded server-side and unconditionally now — that used
 // to be true of `SPOTS_NEARBY` and not of this one, so the map showed a host their own
 // driveway as somewhere to park.
@@ -78,24 +75,13 @@ const { data: spotsInRadius } = useQuery({
 // runs at render time and there is one query total, not one per pin. The host's
 // profile comes back on the same response — a LEFT JOIN now rather than a record link.
 //
-// `staleTime: 0` because this is the one read someone books against, and cached
-// availability is stale by construction: a booking's status changes through events on
-// the log, never through anything this client did, so there is nothing to invalidate
-// on. The radius query keeps the default and re-runs on every pan.
-//
-// Freshness, not correctness. The authority is the server's availability check inside
-// the reserve transaction; this only stops the picker offering slots it then retracts.
+// The listing only. What is booked on it is the booking form's own read, fetched fresh
+// every time the form opens, so this one can keep the default cache.
 const { data: selectedSpot } = useQuery({
   queryKey: computed(() => viewKeys.spot(selectedId.value ?? "")),
   queryFn: () => fetchSpot(selectedId.value!),
   enabled: computed(() => selectedId.value !== null),
-  staleTime: 0,
 });
-
-const reexecuteSpot = () =>
-  queryClient.invalidateQueries({
-    queryKey: viewKeys.spot(selectedId.value ?? ""),
-  });
 
 // The map filter stays client-side: which weekday and time slot a spot is open on is a
 // fold over its availability, which a query cannot express. Recomputes on filter change
@@ -124,14 +110,6 @@ const detailOpen = computed({
 });
 
 const bookingOpen = ref(false);
-
-// The policy alone is not enough: `selectedId` is never cleared on close, so reopening
-// the *same* pin changes neither variables nor pause state and urql does not re-execute —
-// the picker would keep whatever it read the first time, including slots this renter has
-// since held and abandoned. Opening the form is therefore an explicit refetch.
-watch(bookingOpen, (isOpen) => {
-  if (isOpen) void reexecuteSpot();
-});
 
 // ─── Clustering ────────────────────────────────────────────────────────────────
 // Several spots can share one address (an apartment block's parking, a house with
@@ -419,8 +397,6 @@ onBeforeUnmount(() => {
     </Drawer>
     <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable :modal="false"
       @book="bookingOpen = true" />
-    <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot"
-      :booked="mergeBooked(selectedSpot?.bookings)"
-      @booked="() => reexecuteSpot()" />
+    <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot" />
   </div>
 </template>

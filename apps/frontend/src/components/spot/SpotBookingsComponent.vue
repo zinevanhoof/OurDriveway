@@ -4,9 +4,8 @@
 //
 // Same endpoint as the preview, which asks it for two confirmed rows. This one pages
 // through it twenty at a time, under two tab rows: upcoming/past and confirmed/cancelled.
-import { computed, ref, useTemplateRef, watch } from 'vue'
+import { computed, ref, useTemplateRef } from 'vue'
 import { useInfiniteQuery, useQuery } from '@tanstack/vue-query'
-import { useIntersectionObserver } from '@vueuse/core'
 import { useRouter } from 'vue-router'
 
 import FullScreenLayoutComponent from '@/components/FullScreenLayoutComponent.vue'
@@ -20,7 +19,8 @@ import { fetchHostSpot, fetchHostSpotBookings } from '@/api/viewApi'
 import { viewKeys } from '@/api/keys'
 import type { ApiError } from '@/api/client'
 import type { BookingScope } from '@/types/responses/view/HostBookingsPageResponse'
-import type { HostBookingListItemResponse } from '@/types/responses/view/HostBookingListItemResponse'
+import type { HostBookingResponse } from '@/types/responses/view/HostBookingResponse'
+import { useLoadMore } from '@/lib/loadMore'
 
 const { id } = defineProps<{ id: string }>()
 
@@ -57,31 +57,15 @@ const bookings = computed(() => data.value?.pages.flatMap((p) => p.bookings) ?? 
 
 // ─── one booking ────────────────────────────────────────────────────────────
 
-const selected = ref<HostBookingListItemResponse | null>(null)
+const selected = ref<HostBookingResponse | null>(null)
 const detailOpen = ref(false)
 
-const openBooking = (booking: HostBookingListItemResponse) => {
+const openBooking = (booking: HostBookingResponse) => {
     selected.value = booking
     detailOpen.value = true
 }
 
-// ─── infinite scroll ────────────────────────────────────────────────────────
-//
-// The observer records whether the sentinel is on screen; the watcher decides whether to
-// ask for another page. Split for the reason spelled out in `WalletComponent`: an
-// IntersectionObserver reports *transitions*, and a first page that does not fill the
-// screen leaves the sentinel visible with no further callback ever coming.
-const sentinel = useTemplateRef<HTMLElement>('sentinel')
-const sentinelVisible = ref(false)
-useIntersectionObserver(sentinel, ([entry]) => {
-    sentinelVisible.value = !!entry?.isIntersecting
-})
-
-watch([sentinelVisible, hasNextPage, isFetchingNextPage], () => {
-    if (sentinelVisible.value && hasNextPage.value && !isFetchingNextPage.value) {
-        void fetchNextPage()
-    }
-}, { immediate: true })
+useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNextPage, fetchNextPage })
 </script>
 
 <template>

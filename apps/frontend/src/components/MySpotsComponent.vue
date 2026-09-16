@@ -10,8 +10,9 @@ import { Badge } from '@/components/ui/badge';
 import { useRouter } from 'vue-router';
 import { fetchHostSpots } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
-import { useQuery, useQueryClient } from '@tanstack/vue-query';
-import { computed, onMounted } from 'vue';
+import { useInfiniteQuery, useQueryClient } from '@tanstack/vue-query';
+import { computed, onMounted, useTemplateRef } from 'vue';
+import { useLoadMore } from '@/lib/loadMore';
 
 const router = useRouter()
 const queryClient = useQueryClient()
@@ -20,12 +21,18 @@ const queryClient = useQueryClient()
 // Deleted listings are already excluded server-side, which the `deleted: { eq: false }`
 // in the document this replaces had to say explicitly — a host's own *inactive*
 // spots are still returned, because that is what the live switch is for.
-const { data } = useQuery({
+//
+// Paged, twenty at a time, like every list. The server says which offset is next.
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
     queryKey: viewKeys.hostSpots,
-    queryFn: fetchHostSpots,
+    queryFn: ({ pageParam }) => fetchHostSpots({ offset: pageParam }),
+    initialPageParam: 0,
+    getNextPageParam: (last) => last.nextOffset ?? undefined,
 })
 
-const spots = computed(() => data.value ?? [])
+const spots = computed(() => data.value?.pages.flatMap((p) => p.spots) ?? [])
+
+useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNextPage, fetchNextPage })
 
 // A spot created in AddSpotView would otherwise be served from cache on arrival here.
 // The write's `X-Version` already made the request wait for the projection; this is only about the
@@ -87,5 +94,8 @@ onMounted(() => {
                 </div>
             </Surface>
         </ul>
+        <!-- Crossing this asks for the next page. -->
+        <div ref="sentinel" class="h-px"></div>
+        <Text v-if="isFetchingNextPage" size="sm" class="pb-4 text-center">Loading…</Text>
     </div>
 </template>
