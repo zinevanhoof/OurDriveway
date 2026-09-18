@@ -189,7 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "/api/view/account",
             Router::new()
                 .route("/", get(route::account::account))
-                .route("/wallet", get(route::account::wallet)),
+                .route("/wallet", get(route::account::wallet))
+                .route("/notifications", get(route::account::notifications)),
         )
         .nest(
             "/api/view/host",
@@ -197,6 +198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .route("/spots", get(route::host::spots))
                 .route("/spots/{id}", get(route::host::spot))
                 .route("/spots/{id}/booked", get(route::host::booked))
+                .route("/spots/{id}/summary", get(route::host::spot_summary))
+                .route("/summary", get(route::host::summary))
                 .route("/spots/{id}/bookings", get(route::host::bookings))
                 .route("/balance", get(route::host::balance)),
         )
@@ -215,7 +218,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Router::new()
                 .route("/spots/nearby", get(route::public::nearby))
                 .route("/spots/{id}", get(route::public::spot))
-                .route("/spots/{id}/bookings", get(route::public::spot_bookings)),
+                .route("/spots/{id}/bookings", get(route::public::spot_bookings))
+                .route("/spots/{id}/summary", get(route::public::spot_summary))
+                .route("/users/{id}/summary", get(route::public::user_summary)),
         )
         // Waits on the aggregate versions a client echoes back, against this
         // service's own database — see `bus::await_version`. Transport-level, so it is

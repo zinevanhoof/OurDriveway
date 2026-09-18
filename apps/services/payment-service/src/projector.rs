@@ -83,6 +83,10 @@ impl Projector for BookingProjector {
                 )
                 .await
             }
+
+            // A rating moves no money. Only the version below is recorded, so a worker
+            // waiting on this booking's version is not left waiting on a skipped event.
+            BookingEvent::Rated { .. } => Ok(()),
         }?;
 
         shared::set_version!(

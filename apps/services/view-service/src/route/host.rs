@@ -17,7 +17,8 @@ use shared::{
     extractors::authed_jwt::AuthedJwt,
     general_models::booking::Booked,
     responses::view::{
-        BalanceResponse, HostBookingsPageResponse, HostSpotResponse, HostSpotsPageResponse,
+        BalanceResponse, HostBookingsPageResponse, HostSpotResponse, HostSpotSummaryResponse,
+        HostSpotsPageResponse, HostSummaryResponse,
     },
 };
 use uuid::Uuid;
@@ -56,6 +57,27 @@ pub async fn spot(
     Path(spot_id): Path<Uuid>,
 ) -> MyResult<Json<HostSpotResponse>> {
     Ok(Json(state.host_service.spot(spot_id, user_id).await?))
+}
+
+/// `GET /api/view/host/summary` — the caller's totals as a host: spots, completed
+/// bookings, earned. The profile page's row.
+pub async fn summary(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+) -> MyResult<Json<HostSummaryResponse>> {
+    Ok(Json(state.host_service.summary(user_id).await?))
+}
+
+/// `GET /api/view/host/spots/{id}/summary` — how one of the caller's spots is doing:
+/// completed bookings, earned, rating. The manage screen's tiles.
+///
+/// Same 404-not-403 as [`spot`], from the same statement.
+pub async fn spot_summary(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+) -> MyResult<Json<HostSpotSummaryResponse>> {
+    Ok(Json(state.host_service.spot_summary(spot_id, user_id).await?))
 }
 
 /// `GET /api/view/host/spots/{id}/booked` — every slot still held on one spot, merged.

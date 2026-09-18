@@ -19,5 +19,7 @@
 
 pub mod bookings;
 pub mod geo;
+pub mod occupancy;
 pub mod page;
+pub mod rating;
 pub mod wallet;

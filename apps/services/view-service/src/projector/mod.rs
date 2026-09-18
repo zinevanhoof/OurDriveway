@@ -9,6 +9,7 @@ use shared::{
         payment::payout::status as payout_status,
         view::{
             booking::{ViewBooking, ViewBookingPatch},
+            notification::kinds,
             payment::{ViewPayment, ViewPaymentPatch},
             payout::ViewPayout,
             spot::ViewSpotPatch,
@@ -23,7 +24,8 @@ use shared::{
 };
 
 use crate::repository::{
-    booking_repository::ViewBookingRepository, payment_repository::ViewPaymentRepository,
+    booking_repository::ViewBookingRepository,
+    notification_repository::NotificationRepository, payment_repository::ViewPaymentRepository,
     payout_repository::ViewPayoutRepository, spot_repository::ViewSpotRepository,
     user_repository::ViewUserRepository,
 };
@@ -47,7 +49,7 @@ impl Projector for UserProjector {
         &self,
         conn: &mut AsyncPgConnection,
         event: UserEvent,
-        _at: DateTime<Utc>,
+        at: DateTime<Utc>,
         version: i64,
     ) -> MyResult<()> {
         let user_id = event.user_id();
@@ -80,6 +82,15 @@ impl Projector for UserProjector {
             UserEvent::EmailVerified { .. }
             | UserEvent::VerificationRequested(_)
             | UserEvent::PasswordResetRequested(_) => Ok(()),
+
+            // The envelope's time is the watermark, so a replay lands on the same one.
+            UserEvent::NotificationsSeen { .. } => {
+                NotificationRepository::mark_seen(&mut *conn, user_id, at).await
+            }
+
+            UserEvent::NotificationDismissed {
+                kind, subject_id, ..
+            } => NotificationRepository::dismiss(&mut *conn, user_id, &kind, subject_id, at).await,
         }?;
 
         // After the match, so it runs for the arms that store nothing too. "Applied"
@@ -183,6 +194,9 @@ impl Projector for BookingProjector {
                     ViewBookingPatch::confirmed(),
                 )
                 .await?;
+                // The host's shows now. The renter's rating prompt is dated at the
+                // booking's end and shows up by itself then, with no timer to fire it.
+                NotificationRepository::insert_for_confirmed(&mut *conn, booking_id, at).await?;
                 shared::set_version!(
                     conn,
                     "booking",
@@ -217,6 +231,28 @@ impl Projector for BookingProjector {
                     ViewBookingPatch::cancelled(reason),
                 )
                 .await?;
+                // A booking that never happened cannot be rated, and is no longer news to
+                // its host.
+                NotificationRepository::handle(
+                    &mut *conn,
+                    booking_id,
+                    &[kinds::RATE_BOOKING, kinds::SPOT_BOOKED],
+                    at,
+                )
+                .await?;
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
+            }
+
+            BookingEvent::Rated { booking_id, rating } => {
+                ViewBookingRepository::rate(&mut *conn, booking_id, rating).await?;
+                NotificationRepository::handle(&mut *conn, booking_id, &[kinds::RATE_BOOKING], at)
+                    .await?;
                 shared::set_version!(
                     conn,
                     "booking",

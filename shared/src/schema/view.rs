@@ -10,6 +10,7 @@ diesel::table! {
         email -> Text,
         license_plates -> Array<Text>,
         country -> Nullable<Text>,
+        notifications_seen_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -30,6 +31,17 @@ diesel::table! {
         rating -> Nullable<Int4>,
         ends_at -> Timestamptz,
         created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    notification (subject_id, kind, user_id) {
+        subject_id -> Uuid,
+        kind -> Text,
+        user_id -> Uuid,
+        data -> Jsonb,
+        visible_from -> Timestamptz,
+        handled_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -79,4 +91,11 @@ diesel::table! {
     }
 }
 
-diesel::allow_tables_to_appear_in_same_query!(app_user, booking, payment, payout, spot,);
+diesel::allow_tables_to_appear_in_same_query!(
+    app_user,
+    booking,
+    notification,
+    payment,
+    payout,
+    spot,
+);

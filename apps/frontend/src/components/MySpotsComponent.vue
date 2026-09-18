@@ -4,13 +4,13 @@ import { Text, Title } from '@/components/base/text';
 import { Money } from '@/components/base/money';
 import { SectionHeader } from '@/components/base/section-header';
 
-import { ChevronRight, MapPin, Plus, TrendingUp } from '@lucide/vue';
+import { ChevronRight, MapPin, Plus, TrendingDown, TrendingUp } from '@lucide/vue';
 import Button from '@/components/ui/button/Button.vue';
 import { Badge } from '@/components/ui/badge';
 import { useRouter } from 'vue-router';
-import { fetchHostSpots } from '@/api/viewApi';
+import { fetchHostSpots, fetchHostSummary } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
-import { useInfiniteQuery, useQueryClient } from '@tanstack/vue-query';
+import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { computed, onMounted, useTemplateRef } from 'vue';
 import { useLoadMore } from '@/lib/loadMore';
 
@@ -31,6 +31,22 @@ const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuer
 })
 
 const spots = computed(() => data.value?.pages.flatMap((p) => p.spots) ?? [])
+
+// The two tiles. The same totals the profile reads, so the two screens share one cache.
+const { data: summary } = useQuery({
+    queryKey: viewKeys.hostSummary,
+    queryFn: fetchHostSummary,
+})
+
+/**
+ * This month against last, as a whole percentage, or null when last month earned nothing
+ * — a change from zero has no percentage worth printing.
+ */
+const monthChange = computed(() => {
+    const s = summary.value
+    if (!s || s.earnedLastMonthCents === 0) return null
+    return Math.round(((s.earnedThisMonthCents - s.earnedLastMonthCents) / s.earnedLastMonthCents) * 100)
+})
 
 useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNextPage, fetchNextPage })
 
@@ -58,16 +74,19 @@ onMounted(() => {
         <div class="grid grid-cols-2 gap-2">
             <Surface variant="elevated" size="lg">
                 <Text weight="normal">Earned this month</Text>
-                <Title size="2xl">$266</Title>
-                <Text weight="normal" tone="success" class="flex items-center gap-1">
-                    <TrendingUp :size="14" />
-                    +18% vs last
+                <Money :cents="summary?.earnedThisMonthCents ?? 0" size="2xl" />
+                <Text v-if="monthChange !== null" weight="normal" :tone="monthChange >= 0 ? 'success' : 'destructive'"
+                    class="flex items-center gap-1">
+                    <component :is="monthChange >= 0 ? TrendingUp : TrendingDown" :size="14" />
+                    {{ monthChange >= 0 ? '+' : '' }}{{ monthChange }}% vs last
                 </Text>
             </Surface>
             <Surface variant="elevated" size="lg">
                 <Text weight="normal">Active parking spots</Text>
-                <Title size="2xl">2/3</Title>
-                <Text>1 booked right now</Text>
+                <Title size="2xl">{{ summary?.activeSpots ?? 0 }}/{{ summary?.spots ?? 0 }}</Title>
+                <Text>
+                    {{ summary?.bookedNow ? `${summary.bookedNow} booked right now` : 'None booked right now' }}
+                </Text>
             </Surface>
         </div>
         <Text weight="semibold">All listings</Text>

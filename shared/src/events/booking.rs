@@ -47,6 +47,13 @@ pub enum BookingEvent {
         booking_id: Uuid,
         reason: CancelReason,
     },
+    /// The renter rated a booking that happened, 1 to 5.
+    ///
+    /// Only a confirmed booking can carry one, and every consumer guards on that the way
+    /// the transitions guard on status — a rating that lands on a row still `reserved`
+    /// matches nothing. Published by `BookingService::rate`, and replayed by the backfill
+    /// for rows that already have a rating.
+    Rated { booking_id: Uuid, rating: i32 },
 }
 
 /// Who withdrew a paid booking. The refund rules differ — a host who cancels owes
@@ -122,7 +129,8 @@ impl BookingEvent {
             Self::Created(e) => e.booking_id,
             Self::Confirmed { booking_id }
             | Self::Released { booking_id, .. }
-            | Self::Cancelled { booking_id, .. } => *booking_id,
+            | Self::Cancelled { booking_id, .. }
+            | Self::Rated { booking_id, .. } => *booking_id,
         }
     }
 }

@@ -137,6 +137,32 @@ mod live_tests {
         }
     }
 
+    /// A rating lands once, and only on a confirmed booking: a hold cannot be rated and
+    /// a second submit cannot overwrite the first.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_rating_lands_once_and_only_on_a_confirmed_booking() {
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+        let id = Uuid::now_v7();
+        BookingRepository::upsert(db, a_booking(id, Uuid::now_v7(), Utc::now()))
+            .await
+            .unwrap();
+
+        assert!(!BookingRepository::rate(db, id, 4).await.unwrap(), "still a hold");
+
+        BookingRepository::transition(db, id, status::CONFIRMED, &[status::RESERVED], None, None)
+            .await
+            .unwrap();
+        assert!(BookingRepository::rate(db, id, 4).await.unwrap());
+        assert!(!BookingRepository::rate(db, id, 1).await.unwrap(), "already rated");
+
+        let got = BookingRepository::find_by_id(db, id).await.unwrap().unwrap();
+        assert_eq!(got.rating, Some(4));
+
+        diesel::delete(booking::table.find(id)).execute(db).await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn a_booking_round_trips_and_transitions_are_guarded() {

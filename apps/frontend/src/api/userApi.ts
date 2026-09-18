@@ -80,6 +80,14 @@ export const resetPassword = (body: ResetPasswordRequest) =>
 
 export const logout = () => post<void>("/api/user/session/logout");
 
+/** The caller opened their notifications: everything visible now reads as seen. */
+export const markNotificationsSeen = () =>
+  post<void>("/api/user/notifications/seen");
+
+/** Done with one notification: it leaves the list for good. */
+export const dismissNotification = (kind: string, subjectId: string) =>
+  post<void>(`/api/user/notifications/${kind}/${subjectId}/dismiss`);
+
 /**
  * Rotates the session from the httponly refresh cookie.
  *

@@ -11,8 +11,9 @@ import { viewKeys } from '@/api/keys';
 import type { NextBookingResponse } from '@/types/responses/view/NextBookingResponse';
 import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
+import SpotRating from '@/components/spot/SpotRating.vue';
 import BookingFormComponent from '@/components/BookingFormComponent.vue';
-import { CarFront, ChevronRight, CirclePlus, MapPin, Search, Star, Wallet } from '@lucide/vue';
+import { CarFront, ChevronRight, CirclePlus, MapPin, Search, Wallet } from '@lucide/vue';
 import { Surface } from '@/components/base/surface';
 import { Text, Title } from '@/components/base/text';
 import { IconBox } from '@/components/base/icon-box';
@@ -182,7 +183,9 @@ const openBooking = () => {
             </div>
             <ChevronRight class="text-muted-foreground" />
         </Surface>
-        <Surface variant="elevated" orientation="horizontal" class="gap-3 bg-linear-135 from-accent to-card-2">
+        <Surface variant="elevated" orientation="horizontal"
+            class="gap-3 cursor-pointer bg-linear-135 from-accent to-card-2"
+            @click="router.push({ name: 'wallet' })">
             <IconBox tone="primary">
                 <Wallet />
             </IconBox>
@@ -190,8 +193,7 @@ const openBooking = () => {
                 <Text>Available to withdraw</Text>
                 <Money :cents="available" size="xl" />
             </div>
-            <Text size="sm" weight="semibold" tone="primary" class="flex items-center gap-1"
-                @click="router.push({ name: 'wallet' })">
+            <Text size="sm" weight="semibold" tone="primary" class="flex items-center gap-1">
                 Wallet
                 <ChevronRight />
             </Text>
@@ -225,15 +227,9 @@ const openBooking = () => {
                     <div v-else class="w-full h-28 bg-accent"></div>
                     <div class="p-2">
                         <Title size="sm" weight="semibold" class="truncate">{{ spot.title }}</Title>
-                        <!-- ponytail: hardcoded, because there is no rating in the
-                             system to show. `rating` is declared on booking in both
-                             schemas and nothing ever writes it: no BookingRated event,
-                             no endpoint, no projector arm folding an average onto the
-                             spot, no UI to submit one. That is the chain this needs. -->
-                        <Text class="flex items-center gap-1">
-                            <Star :size="16" />
-                            4.9
-                        </Text>
+                        <!-- Nothing until somebody rates the spot. Nothing writes a rating
+                             yet: that needs a BookingRated event, an endpoint and a UI. -->
+                        <SpotRating :spot-id="spot.id" />
                     </div>
                     <Badge class="absolute left-2 top-2 rounded-sm">
                         {{ formatCents(spot.pricePerHour) }}/hr

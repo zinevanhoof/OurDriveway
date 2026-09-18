@@ -2,7 +2,7 @@ use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::view::spot::ViewSpotPatch;
 use shared::error::myerror::MyResult;
-use diesel::dsl::exists;
+use diesel::dsl::{count, exists};
 use shared::projections::spot::{
     HostSpotProjection, PublicSpotPinProjection, PublicSpotProjection, RenterSpotProjection,
 };
@@ -132,6 +132,21 @@ impl ViewSpotRepository {
             .filter(spot::host_id.eq(host_id).and(spot::deleted.eq(false)))
             .count()
             .get_result(conn)
+            .await?)
+    }
+
+    /// `(listings, live listings)` for a host, not counting deleted ones. One pass.
+    pub async fn counts_for_host(
+        conn: &mut AsyncPgConnection,
+        host_id: Uuid,
+    ) -> MyResult<(i64, i64)> {
+        Ok(spot::table
+            .filter(spot::host_id.eq(host_id).and(spot::deleted.eq(false)))
+            .select((
+                count(spot::id),
+                count(spot::id).aggregate_filter(spot::active),
+            ))
+            .first(conn)
             .await?)
     }
 

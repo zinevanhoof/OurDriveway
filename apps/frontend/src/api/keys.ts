@@ -19,6 +19,7 @@
  */
 export const viewKeys = {
   account: ["account"] as const,
+  notifications: ["notifications"] as const,
   spots: ["spots"] as const,
   /** Every page of the host's listings: `useInfiniteQuery` holds them all under this. */
   hostSpots: ["spots", "host"] as const,
@@ -28,6 +29,17 @@ export const viewKeys = {
   /** A spot the caller booked. Under `["spots"]`, so a listing edit refreshes it too. */
   renterSpot: (id: string) => ["spots", id, "renter"] as const,
   hostSpot: (id: string) => ["spots", id, "host"] as const,
+  /** One spot's earned, bookings and rating, for its host's manage screen. */
+  hostSpotSummary: (id: string) => ["spots", id, "host", "summary"] as const,
+  /**
+   * The caller's totals as a host, for the profile and "Your parking spots". Under
+   * `["spots"]` so creating, pausing or deleting a listing refreshes the counts.
+   */
+  hostSummary: ["spots", "host", "summary"] as const,
+  /** A spot's public rating. */
+  spotSummary: (id: string) => ["spots", id, "summary"] as const,
+  /** A person's reputation as a host, under their name on a spot. */
+  userSummary: (id: string) => ["users", id, "summary"] as const,
   /** The host's merged taken-slot map, for the edit form's warning. */
   hostSpotBooked: (id: string) => ["spots", id, "host", "booked"] as const,
   /**

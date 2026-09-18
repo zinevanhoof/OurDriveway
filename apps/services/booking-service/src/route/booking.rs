@@ -4,7 +4,7 @@ use axum::http::{HeaderName, StatusCode};
 use shared::error::myerror::MyResult;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
-use shared::requests::booking::CreateBookingRequest;
+use shared::requests::booking::{CreateBookingRequest, RateBookingRequest};
 use shared::responses::booking::CreateBookingResponse;
 use shared::responses::common::{BackfilledResponse, X_VERSION};
 use uuid::Uuid;
@@ -65,6 +65,20 @@ pub async fn cancel(
     Path(booking_id): Path<Uuid>,
 ) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
     let version = state.booking_service.cancel(&user_id, &booking_id).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
+}
+
+/// The renter rates a booking that is over, 1 to 5, once.
+pub async fn rate(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(booking_id): Path<Uuid>,
+    Valid(request): Valid<RateBookingRequest>,
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state
+        .booking_service
+        .rate(&user_id, &booking_id, request)
+        .await?;
     Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 

@@ -18,6 +18,7 @@ import VerifyEmailView from "@/views/VerifyEmailView.vue";
 import ForgotPasswordView from "@/views/ForgotPasswordView.vue";
 import ResetPasswordView from "@/views/ResetPasswordView.vue";
 import CheckoutView from "@/views/CheckoutView.vue";
+import NotificationsView from "@/views/NotificationsView.vue";
 import WalletView from "@/views/wallet/WalletView.vue";
 import WalletWithdrawView from "@/views/wallet/WalletWithdrawView.vue";
 
@@ -80,6 +81,16 @@ const routes = [
     name: "spot-bookings",
     component: SpotBookingsView,
     props: true,
+    meta: {
+      header: null,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    // What the bell opens. Opening it marks everything seen.
+    path: "/notifications",
+    name: "notifications",
+    component: NotificationsView,
     meta: {
       header: null,
       requiresAuth: true,

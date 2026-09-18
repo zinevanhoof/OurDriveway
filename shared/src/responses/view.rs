@@ -28,6 +28,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::domain_models::view::notification::NotificationPayload;
 use crate::general_models::booking::Booked;
 use crate::general_models::spot::{Address, Availability};
 use crate::projections::{
@@ -104,7 +105,34 @@ impl From<AccountProjection> for AccountUserResponse {
     }
 }
 
+/// `GET /api/view/public/users/{id}/summary` — a person's reputation as a host.
+///
+/// Public, and its own route rather than fields on [`UserPublicResponse`]: that type is
+/// embedded in list rows — the renter on every host booking — and would compute these on
+/// every one of them. A client hides each figure that is zero.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSummaryResponse {
+    /// Confirmed bookings on their spots that are over.
+    pub bookings: i64,
+    /// The average rating they have received, or `null` when nobody has rated them.
+    pub rating: Option<f64>,
+    pub ratings: i64,
+}
+
 // ─── public spots ───────────────────────────────────────────────────────────
+
+/// `GET /api/view/public/spots/{id}/summary` — a spot's rating, for anyone.
+///
+/// Rating only: how much a spot has earned and how often it is booked are its host's
+/// business (`/host/spots/{id}/summary`). A client hides it when there are no ratings.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotSummaryResponse {
+    /// The average rating, or `null` when nobody has rated this spot.
+    pub rating: Option<f64>,
+    pub ratings: i64,
+}
 
 /// `GET /api/view/public/spots/{id}` — one active spot as a prospective renter sees it.
 ///
@@ -297,6 +325,44 @@ pub struct HostBookingsPageResponse {
     pub next_offset: Option<i64>,
     /// Every booking in this scope and status, not just this window.
     pub total: i64,
+}
+
+/// `GET /api/view/host/spots/{id}/summary` — how one of the host's own spots is doing.
+///
+/// The manage screen's tiles. Its own route rather than fields on [`HostSpotResponse`]:
+/// the listing changes rarely, these change with every booking, and the spot is also
+/// read by screens that show none of them.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSpotSummaryResponse {
+    /// Confirmed bookings on this spot that are over.
+    pub bookings: i64,
+    /// EUR cents. Succeeded payments on bookings still confirmed, upcoming ones included.
+    pub earned_cents: i64,
+    /// The average rating, or `null` when nobody has rated this spot.
+    pub rating: Option<f64>,
+    pub ratings: i64,
+}
+
+/// `GET /api/view/host/summary` — the caller's totals as a host: the profile row and the
+/// tiles on top of "Your parking spots".
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSummaryResponse {
+    /// Listings that are not deleted, paused ones included.
+    pub spots: i64,
+    /// Of those, the ones that are live.
+    pub active_spots: i64,
+    /// Listings with a confirmed booking happening at this moment, on each spot's clock.
+    pub booked_now: i64,
+    /// Confirmed bookings across all their spots that are over.
+    pub bookings: i64,
+    /// EUR cents. Succeeded payments on bookings still confirmed, upcoming ones included.
+    pub earned_cents: i64,
+    /// EUR cents. The same, for payments made this calendar month (UTC).
+    pub earned_this_month_cents: i64,
+    /// EUR cents. The same, for last calendar month — what "vs last" compares against.
+    pub earned_last_month_cents: i64,
 }
 
 /// `GET /api/view/host/balance` — what the host has to withdraw, and what is ripening.
@@ -533,4 +599,23 @@ pub struct WalletResponse {
     pub next_month: Option<String>,
     /// Newest first.
     pub transactions: Vec<WalletTransactionResponse>,
+}
+
+// ─── notifications ──────────────────────────────────────────────────────────
+
+/// `GET /api/view/account/notifications` — one open notification.
+///
+/// The payload is the stored [`NotificationPayload`] itself, flattened, rather than a
+/// response-side copy of every variant: it is already exactly what the drawer renders,
+/// and a second enum would double the work of adding a kind for no field of difference.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationResponse {
+    #[serde(flatten)]
+    pub payload: NotificationPayload,
+    /// When it became visible — for a rating prompt, when the booking ended.
+    pub at: DateTime<Utc>,
+    /// Visible since before the user last opened their notifications. The badge counts
+    /// the ones where this is `false`.
+    pub seen: bool,
 }

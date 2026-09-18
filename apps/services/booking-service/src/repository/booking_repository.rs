@@ -111,6 +111,27 @@ impl BookingRepository {
         Ok(())
     }
 
+    /// Sets the rating once, on a confirmed booking. `false` when the guard matched
+    /// nothing — already rated, or no longer confirmed — so a double submit is a 409
+    /// rather than an overwrite.
+    pub async fn rate(
+        conn: &mut AsyncPgConnection,
+        booking_id: Uuid,
+        rating: i32,
+    ) -> MyResult<bool> {
+        let rows = diesel::update(
+            booking::table.find(booking_id).filter(
+                booking::status
+                    .eq("confirmed")
+                    .and(booking::rating.is_null()),
+            ),
+        )
+        .set(booking::rating.eq(Some(rating)))
+        .execute(conn)
+        .await?;
+        Ok(rows == 1)
+    }
+
     /// The slots that block a new booking on one spot, as of `now`.
     ///
     /// This is the whole of what `spot.booked` used to be, asked directly. It is also

@@ -15,7 +15,7 @@ use shared::{
         booking_subject, format_version,
     },
     general_models::booking::Booked,
-    requests::booking::CreateBookingRequest,
+    requests::booking::{CreateBookingRequest, RateBookingRequest},
 };
 use uuid::Uuid;
 
@@ -299,6 +299,57 @@ impl BookingService {
             },
         )
         .await
+    }
+
+    /// The renter rates a booking that is over, once.
+    pub async fn rate(
+        &self,
+        renter_id: &Uuid,
+        booking_id: &Uuid,
+        request: RateBookingRequest,
+    ) -> MyResult<String> {
+        let mut conn = db::conn(&self.db).await?;
+        let booking = BookingRepository::find_by_id(&mut conn, *booking_id)
+            .await?
+            .context_not_found(NOT_FOUND)?;
+        authorize(&booking, renter_id, status::CONFIRMED)?;
+        (booking.ends_at <= Utc::now())
+            .context_conflict(("Not over yet", "A booking can be rated once it has ended."))?;
+
+        let (booking_id, rating) = (*booking_id, request.rating);
+        let version = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    // The guarded update is the real check: two submits racing past the
+                    // read above still produce one rating.
+                    BookingRepository::rate(conn, booking_id, rating)
+                        .await?
+                        .context_conflict(("Already rated", "This booking has a rating already."))?;
+
+                    let version =
+                        shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
+                    shared::set_version!(
+                        conn,
+                        "booking",
+                        shared::schema::booking::booking,
+                        &booking_id,
+                        version
+                    )?;
+
+                    let envelope = Envelope::new(
+                        BookingEvent::Rated { booking_id, rating },
+                        Some(booking.renter_id),
+                        aggregate_id("booking", &booking_id),
+                        version,
+                    );
+                    outbox::enqueue(conn, &booking_subject(&booking.spot_id), &envelope).await?;
+                    Ok(format_version(&envelope.aggregate, envelope.version))
+                }
+                .scope_boxed()
+            })
+            .await?;
+
+        Ok(version)
     }
 
     /// The shared tail of `release` and `cancel`: move the row, enqueue the event,

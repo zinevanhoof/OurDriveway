@@ -12,6 +12,7 @@ import type {
 } from "@/types/responses/view/HostSpotResponse";
 import type { NearbyResponse } from "@/types/responses/view/NearbyResponse";
 import type { NextBookingResponse } from "@/types/responses/view/NextBookingResponse";
+import type { NotificationResponse } from "@/types/responses/view/NotificationResponse";
 import type { PublicBookingResponse } from "@/types/responses/view/PublicBookingResponse";
 import type { PublicSpotResponse } from "@/types/responses/view/PublicSpotResponse";
 import type {
@@ -19,6 +20,12 @@ import type {
   RenterBookingsPageResponse,
 } from "@/types/responses/view/RenterBookingResponse";
 import type { RenterSpotResponse } from "@/types/responses/view/RenterSpotResponse";
+import type {
+  HostSpotSummaryResponse,
+  HostSummaryResponse,
+  SpotSummaryResponse,
+  UserSummaryResponse,
+} from "@/types/responses/view/SummaryResponse";
 import type { Booked } from "@/types/domain/spot";
 import type { WalletResponse } from "@/types/responses/view/WalletResponse";
 
@@ -69,6 +76,10 @@ const bookingsQuery = (params: BookingsPage) =>
 
 /** The caller's own profile, chosen by the server from the verified claim. */
 export const fetchAccount = () => get<AccountResponse>("/api/view/account");
+
+/** What the caller has open, newest first. The bell's badge counts `seen: false`. */
+export const fetchNotifications = () =>
+  get<NotificationResponse[]>("/api/view/account/notifications");
 
 /**
  * One month of the caller's money: charges as a host, charges as a renter, refunds either
@@ -131,6 +142,13 @@ export const fetchHostSpotBookings = (spotId: string, params: BookingsPage = {})
  * overpay anyone.
  */
 export const fetchBalance = () => get<BalanceResponse>("/api/view/host/balance");
+
+/** The caller's totals as a host — spots, completed bookings, earned. The profile row. */
+export const fetchHostSummary = () => get<HostSummaryResponse>("/api/view/host/summary");
+
+/** How one of the caller's spots is doing — completed bookings, earned, rating. 404s for anyone else. */
+export const fetchHostSpotSummary = (id: string) =>
+  get<HostSpotSummaryResponse>(`/api/view/host/spots/${id}/summary`);
 
 // ─── renter ─────────────────────────────────────────────────────────────────
 
@@ -203,3 +221,11 @@ export const fetchSpot = (id: string) =>
  */
 export const fetchSpotBookings = (id: string) =>
   get<PublicBookingResponse[]>(`/api/view/public/spots/${id}/bookings`);
+
+/** A spot's rating, for anyone. `rating` is null until somebody rates it. */
+export const fetchSpotSummary = (id: string) =>
+  get<SpotSummaryResponse>(`/api/view/public/spots/${id}/summary`);
+
+/** A person's reputation as a host: completed bookings and rating. Zeroes for a non-host. */
+export const fetchUserSummary = (id: string) =>
+  get<UserSummaryResponse>(`/api/view/public/users/${id}/summary`);

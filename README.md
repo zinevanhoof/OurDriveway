@@ -656,8 +656,9 @@ what the fix is.
 
   What genuinely stays shared: `events`, `general_models`, `rpc`, `email_token`, `media`,
   and the plumbing (`claims`, `extractors`, `error`, `db`, `env`, `validation`). One catch
-  to plan for: `bus/examples/seed.rs` writes user and spot rows directly with those types,
-  so the seed has to move with them or go through the HTTP API instead.
+  to plan for: `bus/examples/demo_seed.rs` writes user, spot, booking and payment rows
+  directly with those types, so the seed has to move with them or go through the HTTP API
+  instead.
 
 - [ ] **Reconciliation sweepers** for the two places that currently trust a single event:
   - a payout row left in `requested` if a transfer is made but the event is lost

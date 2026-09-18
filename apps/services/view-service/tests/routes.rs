@@ -31,6 +31,8 @@ fn app() -> Router {
                 .route("/spots", get(ok))
                 .route("/spots/{id}", get(ok))
                 .route("/spots/{id}/booked", get(ok))
+                .route("/spots/{id}/summary", get(ok))
+                .route("/summary", get(ok))
                 .route("/spots/{id}/bookings", get(ok))
                 .route("/balance", get(ok)),
         )
@@ -47,7 +49,9 @@ fn app() -> Router {
             Router::new()
                 .route("/spots/nearby", get(ok))
                 .route("/spots/{id}", get(ok))
-                .route("/spots/{id}/bookings", get(ok)),
+                .route("/spots/{id}/bookings", get(ok))
+                .route("/spots/{id}/summary", get(ok))
+                .route("/users/{id}/summary", get(ok)),
         )
 }
 
@@ -70,6 +74,8 @@ async fn every_route_resolves() {
         "/api/view/host/spots/018f0000-0000-7000-8000-000000000000",
         "/api/view/host/spots/018f0000-0000-7000-8000-000000000000/booked",
         "/api/view/host/spots/018f0000-0000-7000-8000-000000000000/bookings",
+        "/api/view/host/spots/018f0000-0000-7000-8000-000000000000/summary",
+        "/api/view/host/summary",
         "/api/view/host/balance",
         "/api/view/renter/spots/018f0000-0000-7000-8000-000000000000",
         "/api/view/renter/bookings",
@@ -78,6 +84,8 @@ async fn every_route_resolves() {
         "/api/view/public/spots/nearby",
         "/api/view/public/spots/018f0000-0000-7000-8000-000000000000",
         "/api/view/public/spots/018f0000-0000-7000-8000-000000000000/bookings",
+        "/api/view/public/spots/018f0000-0000-7000-8000-000000000000/summary",
+        "/api/view/public/users/018f0000-0000-7000-8000-000000000000/summary",
     ] {
         assert_eq!(status(path).await, 200, "{path} must resolve");
     }

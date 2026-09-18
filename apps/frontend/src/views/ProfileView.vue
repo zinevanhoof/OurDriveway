@@ -3,7 +3,7 @@ import Separator from '@/components/ui/separator/Separator.vue';
 import Button from '@/components/ui/button/Button.vue';
 import { Drawer, DrawerContent } from '@/components/ui/drawer';
 import { useQuery } from '@tanstack/vue-query';
-import { fetchAccount } from '@/api/viewApi';
+import { fetchAccount, fetchHostSummary } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
 import { useAuthStore } from '@/stores/auth.ts';
 import { computed, ref } from 'vue';
@@ -27,6 +27,13 @@ const router = useRouter()
 const { data } = useQuery({
     queryKey: viewKeys.account,
     queryFn: fetchAccount,
+})
+
+// The row under the name: this person's totals as a host. Its own read, not part of the
+// account — these change with every booking, the account almost never.
+const { data: summary } = useQuery({
+    queryKey: viewKeys.hostSummary,
+    queryFn: fetchHostSummary,
 })
 
 // No `!` here: the query has not resolved on first render, so this really is
@@ -78,17 +85,17 @@ const logout = async () => {
             <Separator />
             <div class="flex text-center font-bold">
                 <div class="flex-1">
-                    3
+                    {{ summary?.spots ?? 0 }}
                     <Text weight="bold">Spots</Text>
                 </div>
                 <Separator orientation="vertical" />
                 <div class="flex-1">
-                    148
-                    <Text weight="bold">Trips</Text>
+                    {{ summary?.bookings ?? 0 }}
+                    <Text weight="bold">Bookings</Text>
                 </div>
                 <Separator orientation="vertical" />
                 <div class="flex-1">
-                    {{ formatCents(124000) }}
+                    {{ formatCents(summary?.earnedCents ?? 0) }}
                     <Text weight="bold">Earned</Text>
                 </div>
             </div>

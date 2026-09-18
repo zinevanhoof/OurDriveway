@@ -29,6 +29,23 @@ pub enum UserEvent {
     /// A consumer that re-raises this event under a different version silently
     /// breaks that.
     PasswordResetRequested(PasswordResetRequested),
+    /// The user opened their notifications. The envelope's `occurred_at` is the
+    /// watermark: everything visible before it now reads as seen.
+    ///
+    /// Projected by view-service only. Not stored by user-service, so a backfill
+    /// cannot reproduce it — a rebuilt view shows every open notification as new
+    /// once more, which costs a badge and nothing else.
+    NotificationsSeen {
+        user_id: Uuid,
+    },
+    /// The user dismissed one notification — the way a kind with no event of its own to
+    /// finish it (`spot_booked`) is handled. Projected by view-service only, and scoped
+    /// to `user_id` there, so nobody can dismiss someone else's.
+    NotificationDismissed {
+        user_id: Uuid,
+        kind: String,
+        subject_id: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,7 +76,9 @@ impl UserEvent {
             Self::Registered(e) => e.user_id,
             Self::Updated(e) => e.user_id,
             Self::PasswordChanged(e) => e.user_id,
-            Self::EmailVerified { user_id } => *user_id,
+            Self::EmailVerified { user_id }
+            | Self::NotificationsSeen { user_id }
+            | Self::NotificationDismissed { user_id, .. } => *user_id,
             Self::VerificationRequested(e) => e.user_id,
             Self::PasswordResetRequested(e) => e.user_id,
         }

@@ -1,12 +1,16 @@
 use chrono::Utc;
 use shared::{
     error::myerror::{ContextExt, MyResult},
-    responses::view::{NearbyResponse, PublicBookingResponse, PublicSpotResponse},
+    responses::view::{
+        NearbyResponse, PublicBookingResponse, PublicSpotResponse, SpotSummaryResponse,
+        UserSummaryResponse,
+    },
 };
 use uuid::Uuid;
 
-use crate::repository::{
-    booking_repository::ViewBookingRepository, spot_repository::ViewSpotRepository,
+use crate::{
+    policy,
+    repository::{booking_repository::ViewBookingRepository, spot_repository::ViewSpotRepository},
 };
 
 /// No relationship required — what any signed-in caller may read about a listing.
@@ -37,6 +41,37 @@ impl PublicService {
             .context_not_found(("Not Found", "That spot doesn't exist."))?;
 
         Ok(PublicSpotResponse::from(spot))
+    }
+
+    /// A person's reputation as a host: completed bookings on their spots, and their
+    /// rating.
+    ///
+    /// No 404 for an id that matches nobody — zeroes are the answer, and a 404 would turn
+    /// this into a way to ask whether a user exists.
+    pub async fn user_summary(&self, user_id: Uuid) -> MyResult<UserSummaryResponse> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let stats = ViewBookingRepository::stats_for_host(&mut conn, user_id, Utc::now()).await?;
+
+        Ok(UserSummaryResponse {
+            bookings: stats.bookings,
+            rating: policy::rating::average(stats.rating_sum, stats.ratings),
+            ratings: stats.ratings,
+        })
+    }
+
+    /// A spot's rating, for anyone. Zeroes rather than a 404 for a spot nobody has rated
+    /// — and not gated on `active`, so a renter looking at a paused spot they booked
+    /// still sees it.
+    pub async fn spot_summary(&self, spot_id: Uuid) -> MyResult<SpotSummaryResponse> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let stats = ViewBookingRepository::stats_for_spot(&mut conn, spot_id, Utc::now()).await?;
+
+        Ok(SpotSummaryResponse {
+            rating: policy::rating::average(stats.rating_sum, stats.ratings),
+            ratings: stats.ratings,
+        })
     }
 
     /// The availability answer for one active spot: which slots are taken and until when,

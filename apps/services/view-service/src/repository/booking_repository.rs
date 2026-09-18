@@ -1,14 +1,16 @@
 use chrono::{DateTime, Utc};
+use diesel::dsl::{count, sum};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::view::booking::{ViewBooking, ViewBookingPatch};
 use shared::error::myerror::MyResult;
 use shared::general_models::booking::Booked;
 use shared::projections::booking::{
-    HostBookingProjection, PublicBookingProjection, RenterBookingProjection,
+    BookingStatsProjection, HostBookingProjection, PublicBookingProjection,
+    RenterBookingProjection,
 };
 use shared::projections::spot::{HostSpotProjection, PublicSpotProjection};
-use shared::schema::view::{app_user, booking};
+use shared::schema::view::{app_user, booking, spot};
 use uuid::Uuid;
 
 /// The `booking` table in the read model.
@@ -32,6 +34,9 @@ use uuid::Uuid;
 /// | [`find_booked_for_host_spot`] | `host` | the parent read already matched `host_id = caller` |
 /// | [`count_for_host_spot`] | `host` | same — the paged list's count |
 /// | [`find_page_for_host_spot`] | `host` | same — one page of the paged list |
+/// | [`stats_for_host`] | `host`, `public` | `host_id = $1` — completed bookings and ratings, no rows returned |
+/// | [`stats_for_host_spot`] | `host` | `spot_id = parent` — the same, for one spot |
+/// | [`stats_for_spot`] | `public` | `spot_id = $1` — the same; only its rating leaves the service |
 /// | [`count_for_renter`] | `renter` | `renter_id = caller` |
 /// | [`find_page_for_renter`] | `renter` | same — one page, spot card embedded (the exception) |
 /// | [`find_next_for_renter`] | `renter` | `renter_id = caller` |
@@ -57,6 +62,9 @@ use uuid::Uuid;
 /// [`find_booked_for_host_spot`]: ViewBookingRepository::find_booked_for_host_spot
 /// [`count_for_host_spot`]: ViewBookingRepository::count_for_host_spot
 /// [`find_page_for_host_spot`]: ViewBookingRepository::find_page_for_host_spot
+/// [`stats_for_host`]: ViewBookingRepository::stats_for_host
+/// [`stats_for_host_spot`]: ViewBookingRepository::stats_for_host_spot
+/// [`stats_for_spot`]: ViewBookingRepository::stats_for_spot
 /// [`count_for_renter`]: ViewBookingRepository::count_for_renter
 /// [`find_page_for_renter`]: ViewBookingRepository::find_page_for_renter
 /// [`find_next_for_renter`]: ViewBookingRepository::find_next_for_renter
@@ -191,6 +199,90 @@ impl ViewBookingRepository {
         };
 
         Ok(page.load(conn).await?)
+    }
+
+    /// How a host's bookings add up across all their spots: completed bookings, and the
+    /// ratings given.
+    ///
+    /// One pass over `booking_host_created (host_id, …)`. `FILTER` rather than a `WHERE`
+    /// on status, so a rating left on a booking is counted however its status reads.
+    pub async fn stats_for_host(
+        conn: &mut AsyncPgConnection,
+        host_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> MyResult<BookingStatsProjection> {
+        Ok(booking::table
+            .filter(booking::host_id.eq(host_id))
+            .select((
+                count(booking::id).aggregate_filter(
+                    booking::status.eq("confirmed").and(booking::ends_at.le(now)),
+                ),
+                sum(booking::rating),
+                count(booking::rating),
+            ))
+            .first(conn)
+            .await?)
+    }
+
+    /// Every confirmed booking of a host's that has not ended, with the zone of its spot:
+    /// `(spot_id, booked, timezone)`.
+    ///
+    /// What "booked right now" is folded from. The fold is `policy::occupancy`, not SQL,
+    /// because `booked` is wall-clock strings in each spot's own zone.
+    ///
+    // ponytail: loads every upcoming confirmed booking of the host to find the few that
+    // are active. Fine for a driveway host; a `starts_at` column would let the database
+    // bound it to `starts_at <= now < ends_at` if a host ever has thousands.
+    pub async fn find_unfinished_for_host(
+        conn: &mut AsyncPgConnection,
+        host_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> MyResult<Vec<(Uuid, Booked, String)>> {
+        Ok(booking::table
+            .inner_join(spot::table.on(spot::id.eq(booking::spot_id)))
+            .filter(
+                booking::host_id
+                    .eq(host_id)
+                    .and(booking::status.eq("confirmed"))
+                    .and(booking::ends_at.gt(now)),
+            )
+            .select((booking::spot_id, booking::booked, spot::timezone))
+            .load(conn)
+            .await?)
+    }
+
+    /// The same figures for one spot, for its host's manage screen.
+    ///
+    /// Takes the `HostSpotProjection`, so it is reachable only after `find_for_host`
+    /// matched `host_id = caller`.
+    pub async fn stats_for_host_spot(
+        conn: &mut AsyncPgConnection,
+        spot: &HostSpotProjection,
+        now: DateTime<Utc>,
+    ) -> MyResult<BookingStatsProjection> {
+        Self::stats_for_spot(conn, spot.id, now).await
+    }
+
+    /// The same figures for any spot, by id — the public read of a spot's rating.
+    ///
+    /// No gate: a rating is public by design, and a spot nobody has booked is zeroes
+    /// rather than a 404. Served by `booking_spot (spot_id, ends_at)`.
+    pub async fn stats_for_spot(
+        conn: &mut AsyncPgConnection,
+        spot_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> MyResult<BookingStatsProjection> {
+        Ok(booking::table
+            .filter(booking::spot_id.eq(spot_id))
+            .select((
+                count(booking::id).aggregate_filter(
+                    booking::status.eq("confirmed").and(booking::ends_at.le(now)),
+                ),
+                sum(booking::rating),
+                count(booking::rating),
+            ))
+            .first(conn)
+            .await?)
     }
 
     /// How many of the caller's own bookings one tab holds.
@@ -369,6 +461,25 @@ impl ViewBookingRepository {
             booking::table.filter(booking::id.eq(booking_id).and(booking::status.eq(from))),
         )
         .set((&patch, booking::hold_until.eq(None::<DateTime<Utc>>)))
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Stores a renter's rating, on a confirmed booking only.
+    ///
+    /// The `status = 'confirmed'` guard is the same kind as [`Self::settle`]'s: a rating
+    /// arriving for a row that is not (yet) confirmed matches nothing, rather than rating
+    /// a hold or a cancellation.
+    pub async fn rate(
+        conn: &mut AsyncPgConnection,
+        booking_id: Uuid,
+        rating: i32,
+    ) -> MyResult<()> {
+        diesel::update(
+            booking::table.filter(booking::id.eq(booking_id).and(booking::status.eq("confirmed"))),
+        )
+        .set(booking::rating.eq(Some(rating)))
         .execute(conn)
         .await?;
         Ok(())

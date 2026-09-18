@@ -5,7 +5,7 @@
 // so a caller only has to know an id — which is all any caller has when the user taps.
 import { useQuery } from "@tanstack/vue-query";
 import { computed } from "vue";
-import { fetchRenterSpot, fetchSpot } from "@/api/viewApi";
+import { fetchRenterSpot, fetchSpot, fetchUserSummary } from "@/api/viewApi";
 import { viewKeys } from "@/api/keys";
 import type { ApiError } from "@/api/client";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
@@ -18,6 +18,7 @@ import Avatar from "../ui/avatar/Avatar.vue";
 import AvatarImage from "../ui/avatar/AvatarImage.vue";
 import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
 import Button from "../ui/button/Button.vue";
+import SpotRating from "./SpotRating.vue";
 
 const props = withDefaults(defineProps<{
   spotId: string | null;
@@ -70,6 +71,24 @@ const spot = computed(() => data.value);
 // it rather than labelling "Today" in the viewer's zone first.
 const timezone = computed(() => spot.value?.timezone);
 const days = computed(() => sortedDays(props.booking));
+
+// The host's reputation, under their name. Its own read, once the host has resolved.
+const hostId = computed(() => spot.value?.host?.id ?? null);
+const { data: hostSummary } = useQuery({
+  queryKey: computed(() => viewKeys.userSummary(hostId.value ?? "")),
+  queryFn: () => fetchUserSummary(hostId.value!),
+  enabled: computed(() => hostId.value !== null),
+});
+
+// Each figure only when there is one: a new host shows their name and nothing else,
+// rather than "0 bookings".
+const hostRating = computed(() =>
+  hostSummary.value?.rating != null ? hostSummary.value.rating.toFixed(1) : null,
+);
+const hostBookings = computed(() => {
+  const n = hostSummary.value?.bookings ?? 0;
+  return n > 0 ? `${n} ${n === 1 ? "booking" : "bookings"}` : null;
+});
 </script>
 
 <template>
@@ -107,6 +126,7 @@ const days = computed(() => sortedDays(props.booking));
           <Text class="flex max-w-3/4 gap-1 items-center">
             {{ spot?.address?.formatted }}
           </Text>
+          <SpotRating v-if="spotId" :spot-id="spotId" />
         </div>
         <!-- The whole schedule, which is what the card's "+N more" points at.
              Rows are the unit here rather than a paragraph of dates: a booking can
@@ -143,14 +163,19 @@ const days = computed(() => sortedDays(props.booking));
         <div class="flex items-center gap-2">
           <Avatar size="lg">
             <AvatarImage v-if="spot?.host?.profilePicture" :src="spot?.host.profilePicture" />
-            <AvatarFallback
-              :name="{ firstName: spot?.host?.firstName ?? '', lastName: spot?.host?.lastName ?? '' }" />
+            <AvatarFallback :name="{ firstName: spot?.host?.firstName ?? '', lastName: spot?.host?.lastName ?? '' }" />
           </Avatar>
           <div>
             <Title weight="semibold">{{ spot?.host?.firstName }} {{ spot?.host?.lastName }}</Title>
-            <Text class="flex items-center gap-1">
-              <Star :size="16" class="fill-star text-star" />
-              4.9 · 128 trips
+            <Text v-if="hostRating || hostBookings" class="flex items-center gap-1">
+              <template v-if="hostRating">
+                <Star :size="16" class="fill-star text-star" />
+                <span>{{ hostRating }}</span>
+              </template>
+              <!-- Spans, not bare text: adjacent text nodes merge into one anonymous
+                   flex item, and `gap` only spaces items. -->
+              <span v-if="hostRating && hostBookings">·</span>
+              <span v-if="hostBookings">{{ hostBookings }}</span>
             </Text>
           </div>
         </div>

@@ -3,7 +3,8 @@ use shared::{
     error::myerror::{ContextExt, MyResult},
     general_models::booking::Booked,
     responses::view::{
-        BalanceResponse, HostBookingsPageResponse, HostSpotResponse, HostSpotsPageResponse,
+        BalanceResponse, HostBookingsPageResponse, HostSpotResponse, HostSpotSummaryResponse,
+        HostSpotsPageResponse, HostSummaryResponse,
     },
 };
 use uuid::Uuid;
@@ -50,6 +51,79 @@ impl HostService {
             spots: spots.into_iter().map(Into::into).collect(),
             next_offset: policy::page::next_offset(offset, limit, total),
             total,
+        })
+    }
+
+    /// The caller's totals as a host: listings and how many are live and occupied,
+    /// completed bookings, and earned — ever, this month and last month.
+    ///
+    /// Five statements on one connection and one `now`, so the figures describe the same
+    /// moment. A caller who has never hosted gets zeroes, which is the honest answer.
+    pub async fn summary(&self, host_id: Uuid) -> MyResult<HostSummaryResponse> {
+        let mut conn = shared::db::conn(&self.db).await?;
+        let now = Utc::now();
+
+        // This month and the one before it, as the wallet draws them: UTC months.
+        let (this_start, this_end) = policy::wallet::bounds(&policy::wallet::label(now))
+            .expect("the label of a real instant is a real month");
+        let (last_start, _) =
+            policy::wallet::bounds(&policy::wallet::label(this_start - chrono::Duration::seconds(1)))
+                .expect("the label of a real instant is a real month");
+
+        let (spots, active_spots) = ViewSpotRepository::counts_for_host(&mut conn, host_id).await?;
+        let stats = ViewBookingRepository::stats_for_host(&mut conn, host_id, now).await?;
+        let earned_cents = WalletRepository::earned_for_host(&mut conn, host_id).await?;
+        let (earned_this_month_cents, earned_last_month_cents) =
+            WalletRepository::earned_by_month_for_host(
+                &mut conn, host_id, last_start, this_start, this_end,
+            )
+            .await?;
+
+        // Listings, not bookings: two bookings in one driveway at once is still one
+        // driveway occupied.
+        let unfinished = ViewBookingRepository::find_unfinished_for_host(&mut conn, host_id, now).await?;
+        let booked_now = unfinished
+            .iter()
+            .filter(|(_, booked, tz)| policy::occupancy::active_now(booked, tz, now))
+            .map(|(spot_id, _, _)| spot_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
+
+        Ok(HostSummaryResponse {
+            spots,
+            active_spots,
+            booked_now,
+            bookings: stats.bookings,
+            earned_cents,
+            earned_this_month_cents,
+            earned_last_month_cents,
+        })
+    }
+
+    /// How one of the caller's spots is doing: completed bookings, earned, rating.
+    ///
+    /// **The first statement is the authorization** — the same `find_for_host` as
+    /// [`Self::spot`], so a non-host gets the same 404 and never reaches the aggregates.
+    pub async fn spot_summary(
+        &self,
+        spot_id: Uuid,
+        host_id: Uuid,
+    ) -> MyResult<HostSpotSummaryResponse> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let spot = ViewSpotRepository::find_for_host(&mut conn, spot_id, host_id)
+            .await?
+            .context_not_found(("Not Found", "That spot doesn't exist."))?;
+
+        let stats = ViewBookingRepository::stats_for_host_spot(&mut conn, &spot, Utc::now()).await?;
+        let earned_cents =
+            WalletRepository::earned_for_host_spot(&mut conn, host_id, spot.id).await?;
+
+        Ok(HostSpotSummaryResponse {
+            bookings: stats.bookings,
+            earned_cents,
+            rating: policy::rating::average(stats.rating_sum, stats.ratings),
+            ratings: stats.ratings,
         })
     }
 

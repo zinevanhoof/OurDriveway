@@ -129,3 +129,20 @@ pub struct RenterBookingSpotProjection {
     pub address: Address,
     pub timezone: String,
 }
+
+/// How a host's bookings add up — for one person, or for one of their spots.
+///
+/// One aggregate row, not a group of columns, so `Queryable` alone, like
+/// `wallet::BalanceProjection`. Derived on every read, never stored: "completed" is a
+/// fact about the clock, and no event announces it for a projector to count.
+#[derive(Debug, Clone, Queryable)]
+pub struct BookingStatsProjection {
+    /// Confirmed bookings that are over. A cancelled one is not a booking received, and
+    /// one still to come has not happened yet.
+    pub bookings: i64,
+    /// The sum of every rating given, `None` when there are none. Sum and count rather
+    /// than `avg`, which Postgres answers as `numeric`.
+    pub rating_sum: Option<i64>,
+    /// How many ratings there are.
+    pub ratings: i64,
+}

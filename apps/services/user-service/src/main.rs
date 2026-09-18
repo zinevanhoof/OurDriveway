@@ -152,7 +152,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // there is no id in the path and nothing to scope under.
         // PATCH is also the change-password form: same record, and the service
         // decides from the body which event that becomes.
-        .route("/api/user", patch(route::user::update_user));
+        .route("/api/user", patch(route::user::update_user))
+        .route(
+            "/api/user/notifications/seen",
+            post(route::user::notifications_seen),
+        )
+        .route(
+            "/api/user/notifications/{kind}/{subject_id}/dismiss",
+            post(route::user::dismiss_notification),
+        );
 
     // No GraphQL proxy here any more: every client read is served by
     // view-service from the combined projection. This database is private to

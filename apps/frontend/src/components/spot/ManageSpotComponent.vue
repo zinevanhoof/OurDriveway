@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useQuery } from '@tanstack/vue-query';
 import Button from '../ui/button/Button.vue';
-import { fetchHostSpot, fetchHostSpotBookings } from '@/api/viewApi';
+import { fetchHostSpot, fetchHostSpotBookings, fetchHostSpotSummary } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
 import { computed, ref } from 'vue';
 import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
@@ -37,6 +37,13 @@ const router = useRouter()
 const { data } = useQuery({
     queryKey: viewKeys.hostSpot(id),
     queryFn: () => fetchHostSpot(id),
+})
+
+// The three tiles: this spot's earned, completed bookings and rating. Its own read — the
+// listing changes rarely, these change with every booking.
+const { data: summary } = useQuery({
+    queryKey: viewKeys.hostSpotSummary(id),
+    queryFn: () => fetchHostSpotSummary(id),
 })
 
 const routeToSpotEdit = () => router.push({ name: 'spot-edit', params: { id } })
@@ -195,17 +202,20 @@ const openBooking = (booking: HostBookingResponse) => {
         <FieldError v-if="errors.length" :errors="errors" />
         <div class="grid grid-cols-3 gap-2">
             <Surface variant="elevated" class="text-center">
-                <Money :cents="12800" size="md" class="justify-center" />
+                <Money :cents="summary?.earnedCents ?? 0" size="md" class="justify-center" />
                 <Text>Earned</Text>
             </Surface>
             <Surface variant="elevated" class="text-center">
-                <Title>14</Title>
-                <Text>Trips</Text>
+                <Title>{{ summary?.bookings ?? 0 }}</Title>
+                <Text>Bookings</Text>
             </Surface>
             <Surface variant="elevated" class="text-center">
                 <Title class="flex justify-center items-center gap-1">
-                    <Star :size="14" />
-                    4.9
+                    <template v-if="summary?.rating != null">
+                        <Star :size="14" />
+                        {{ summary.rating.toFixed(1) }}
+                    </template>
+                    <template v-else>—</template>
                 </Title>
                 <Text>Rating</Text>
             </Surface>

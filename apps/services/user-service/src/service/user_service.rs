@@ -4,6 +4,7 @@ use diesel_async::AsyncConnection;
 use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::domain_models::user::{User, UserPatch};
+use shared::domain_models::view::notification::kinds;
 use shared::error::myerror::{ContextExt, MyError, MyResult};
 use shared::events::user::{
     PasswordResetRequested, UserEvent, UserPasswordChanged, UserRegistered, UserUpdated,
@@ -337,6 +338,62 @@ impl UserService {
         .await?;
 
         Ok(())
+    }
+
+    /// The caller opened their notifications. Returns the version, so the badge's
+    /// next read can wait for view-service to have moved the watermark.
+    ///
+    /// Bumps the row's version like any other write, which retires a pending reset
+    /// link the same way a profile edit does — see `forgot_password`. Someone reading
+    /// their notifications is logged in and has no use for one.
+    pub async fn notifications_seen(&self, uid: &Uuid) -> MyResult<String> {
+        self.notification_event(*uid, UserEvent::NotificationsSeen { user_id: *uid })
+            .await
+    }
+
+    /// The caller dismissed one of their notifications. Same versioning as
+    /// [`Self::notifications_seen`].
+    ///
+    /// The kind is checked against the known set so a client cannot put arbitrary text
+    /// on the stream; whose notification it is, is view-service's `user_id = caller`.
+    pub async fn dismiss_notification(
+        &self,
+        uid: &Uuid,
+        kind: String,
+        subject_id: Uuid,
+    ) -> MyResult<String> {
+        kinds::ALL
+            .contains(&kind.as_str())
+            .context_not_found(("Not Found", "No such notification."))?;
+        self.notification_event(
+            *uid,
+            UserEvent::NotificationDismissed {
+                user_id: *uid,
+                kind,
+                subject_id,
+            },
+        )
+        .await
+    }
+
+    /// Bumps the row's version and enqueues a notification event beside it. No column
+    /// changes: the enqueue is the write, and it has to be atomic with the version.
+    async fn notification_event(&self, uid: Uuid, event: UserEvent) -> MyResult<String> {
+        let mut conn = db::conn(&self.db).await?;
+
+        conn.transaction::<_, MyError, _>(|conn| {
+            async move {
+                let version = shared::next_version!(conn, shared::schema::user::app_user, &uid)?;
+                shared::set_version!(conn, "user", shared::schema::user::app_user, &uid, version)?;
+
+                let envelope =
+                    Envelope::new(event, Some(uid), aggregate_id("user", &uid), version);
+                outbox::enqueue(conn, &user_subject(&uid), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
+            }
+            .scope_boxed()
+        })
+        .await
     }
 
     /// Asks notification-service to mail a password-reset link.

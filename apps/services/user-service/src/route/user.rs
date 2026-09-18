@@ -1,8 +1,9 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderName, StatusCode},
 };
+use uuid::Uuid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::responses::common::{BackfilledResponse, X_VERSION};
 use shared::{error::myerror::MyResult, extract::Valid, requests::user::UpdateUserRequest};
@@ -21,6 +22,29 @@ pub async fn update_user(
     Valid(req): Valid<UpdateUserRequest>,
 ) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
     let version = state.user_service.update_user(&user_id, req).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
+}
+
+/// `POST /api/user/notifications/seen` — the caller opened their notifications.
+pub async fn notifications_seen(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state.user_service.notifications_seen(&user_id).await?;
+    Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
+}
+
+/// `POST /api/user/notifications/{kind}/{subject_id}/dismiss` — the caller is done with
+/// one notification. Only theirs: view-service scopes it to the caller's id.
+pub async fn dismiss_notification(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path((kind, subject_id)): Path<(String, Uuid)>,
+) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
+    let version = state
+        .user_service
+        .dismiss_notification(&user_id, kind, subject_id)
+        .await?;
     Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
 }
 

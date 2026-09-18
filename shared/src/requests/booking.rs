@@ -38,6 +38,14 @@ pub struct CreateBookingRequest {
     pub license_plate: String,
 }
 
+/// What the rating drawer posts for a booking that is over.
+#[derive(Deserialize, Validate)]
+#[serde(rename_all = "camelCase")]
+pub struct RateBookingRequest {
+    #[garde(range(min = 1, max = 5))]
+    pub rating: i32,
+}
+
 /// A booking with no slots would authorise a free reservation that blocks nothing.
 fn not_empty(map: &HashMap<String, Vec<TimeSlot>>, _: &()) -> garde::Result {
     if map.values().any(|slots| !slots.is_empty()) {
@@ -127,6 +135,13 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn rating_is_one_to_five() {
+        let rate = |rating| RateBookingRequest { rating }.validate().is_ok();
+        assert!(rate(1) && rate(5));
+        assert!(!rate(0) && !rate(6));
     }
 
     #[test]

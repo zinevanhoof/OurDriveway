@@ -42,12 +42,16 @@
 //! | | `find_booked_for_host_spot` | `host` | `spot_id = parent AND status IN ('reserved','confirmed')` — ownership already proved |
 //! | | `find_page_for_host_spot` | `host` | `spot_id = parent AND status IN ($statuses)` — same |
 //! | | `find_page_for_renter` | `renter` | `renter_id = $1 AND status IN ($statuses)` — joins its spot card, **the one exception** |
+//! | | `stats_for_host` | `host`, `public` | `host_id = $1` — one aggregate row |
+//! | | `stats_for_host_spot` | `host` | `spot_id = parent` — one aggregate row |
 //! | | `find_next_for_renter` | `renter` | `renter_id = $1 AND status = 'confirmed' AND ends_at > $2` |
 //! | | `find_for_renter` | `renter` | `id = $1 AND renter_id = $2` |
 //! | `payment` + `payout` | `wallet::find_month_for_account` | `account` | `host_id = $1 OR renter_id = $1`, as five separately-indexed branches |
 //! | | `wallet::find_previous_month_for_account` | `account` | the same, as four `max()`es |
 //! | | `wallet::balance_for_host` | `host` | `host_id = $1` |
+//! | | `wallet::earned_for_host`, `earned_for_host_spot` | `host` | `host_id = $1` (and `spot_id = $2`) |
 //! | `app_user` | `find_for_account` | `account` | `id = $1` — the verified claim picks the row |
+//! | `notification` | `find_open_for_account` | `account` | `user_id = $1 AND handled_at IS NULL AND visible_from <= $2` |
 //!
 //! The namespace column is not decoration: it is the route prefix the function is
 //! reachable through, and the two must not drift. A read whose `WHERE` does not match its
@@ -96,6 +100,7 @@
 //! these.
 
 pub mod booking_repository;
+pub mod notification_repository;
 pub mod payment_repository;
 pub mod payout_repository;
 pub mod spot_repository;
@@ -138,10 +143,12 @@ mod live_tests {
     use shared::events::spot::SpotCreated;
     use shared::general_models::booking::Booked;
     use shared::general_models::spot::{Address, Availability, TimeSlot, WeeklyAvailability};
-    use shared::schema::view::{app_user, booking, payment, payout, spot};
+    use shared::domain_models::view::notification::{NotificationPayload, kinds};
+    use shared::schema::view::{app_user, booking, notification, payment, payout, spot};
     use uuid::Uuid;
 
     use super::booking_repository::ViewBookingRepository;
+    use super::notification_repository::NotificationRepository;
     use super::spot_repository::ViewSpotRepository;
     use super::user_repository::ViewUserRepository;
 
@@ -442,6 +449,112 @@ mod live_tests {
         assert_eq!(hold, None);
 
         diesel::delete(booking::table.find(booking_id))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    /// A confirmation tells the host at once and the renter at the booking's end. Each
+    /// is gone for good once handled or dismissed — a replayed `Confirmed` must not
+    /// bring either back.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_confirmed_booking_notifies_the_host_now_and_the_renter_at_the_end() {
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+        let (renter_id, host_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now();
+        ViewUserRepository::upsert(db, a_user(renter_id)).await.unwrap();
+
+        let confirmed = |ends_at| ViewBooking {
+            id: Uuid::now_v7(),
+            version: 1,
+            spot_id: Uuid::now_v7(),
+            host_id,
+            renter_id,
+            booked: Booked::new(),
+            license_plate: "1-ABC-123".into(),
+            amount: 500,
+            status: status::CONFIRMED.to_string(),
+            hold_until: None,
+            release_reason: None,
+            cancel_reason: None,
+            rating: None,
+            ends_at,
+            created_at: now,
+        };
+        let (past, future) = (
+            confirmed(now - chrono::Duration::hours(1)),
+            confirmed(now + chrono::Duration::hours(1)),
+        );
+        for b in [&past, &future] {
+            ViewBookingRepository::upsert(db, b.clone()).await.unwrap();
+            NotificationRepository::insert_for_confirmed(db, b.id, now).await.unwrap();
+        }
+        // Redelivered `Confirmed`: still one row.
+        NotificationRepository::insert_for_confirmed(db, past.id, now).await.unwrap();
+
+        // The host hears about both bookings at once, with the renter's name.
+        let hosts = NotificationRepository::find_open_for_account(db, host_id, now)
+            .await
+            .unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert!(hosts.iter().all(|n| matches!(
+            &n.data,
+            NotificationPayload::SpotBooked { renter_name: Some(name), .. } if name == "Ada"
+        )));
+
+        // A dismissal only ever reaches the dismisser's own row.
+        NotificationRepository::dismiss(db, renter_id, kinds::SPOT_BOOKED, past.id, now)
+            .await
+            .unwrap();
+        NotificationRepository::dismiss(db, host_id, kinds::SPOT_BOOKED, future.id, now)
+            .await
+            .unwrap();
+        let hosts = NotificationRepository::find_open_for_account(db, host_id, now)
+            .await
+            .unwrap();
+        assert_eq!(hosts.len(), 1, "the renter could not dismiss the host's");
+        assert_eq!(hosts[0].subject_id, past.id);
+
+        let open = NotificationRepository::find_open_for_account(db, renter_id, now)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1, "the future booking is not over yet");
+        assert_eq!(open[0].subject_id, past.id);
+        assert_eq!(
+            NotificationRepository::seen_at(db, renter_id).await.unwrap(),
+            None
+        );
+
+        // Forward only: an older watermark applied late changes nothing.
+        NotificationRepository::mark_seen(db, renter_id, now).await.unwrap();
+        NotificationRepository::mark_seen(db, renter_id, now - chrono::Duration::days(1))
+            .await
+            .unwrap();
+        let seen = NotificationRepository::seen_at(db, renter_id).await.unwrap();
+        assert_eq!(seen.map(|s| s.timestamp_micros()), Some(now.timestamp_micros()));
+
+        NotificationRepository::handle(db, past.id, &[kinds::RATE_BOOKING], now)
+            .await
+            .unwrap();
+        NotificationRepository::insert_for_confirmed(db, past.id, now).await.unwrap();
+        assert!(
+            NotificationRepository::find_open_for_account(db, renter_id, now)
+                .await
+                .unwrap()
+                .is_empty(),
+            "handled stays handled, even through a replay"
+        );
+
+        for b in [&past, &future] {
+            diesel::delete(notification::table.filter(notification::subject_id.eq(b.id)))
+                .execute(db)
+                .await
+                .unwrap();
+            diesel::delete(booking::table.find(b.id)).execute(db).await.unwrap();
+        }
+        diesel::delete(app_user::table.find(renter_id))
             .execute(db)
             .await
             .unwrap();
@@ -1171,6 +1284,167 @@ mod live_tests {
                 .await
                 .unwrap();
         }
+        diesel::delete(spot::table.find(spot_id))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    /// A host's summary figures: only completed confirmed bookings count as bookings,
+    /// earned counts every succeeded payment on a still-confirmed booking (upcoming
+    /// included), and the spot's figures agree with the host's when it is their only one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_hosts_summary_counts_completed_bookings_and_confirmed_earnings() {
+        use super::payment_repository::ViewPaymentRepository;
+        use super::wallet_repository::WalletRepository;
+        use shared::domain_models::view::ViewPayment;
+
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+        let (host, renter) = (Uuid::now_v7(), Uuid::now_v7());
+        let spot_id = Uuid::now_v7();
+        let at = Utc::now();
+
+        ViewSpotRepository::merge(
+            db,
+            spot_id,
+            ViewSpotPatch::created(spot_created(spot_id, host), at),
+        )
+        .await
+        .unwrap();
+
+        // Past and confirmed: a booking, and its money. Future and confirmed: money, not
+        // yet a booking. Past and cancelled: neither.
+        let rows = [
+            (Uuid::now_v7(), status::CONFIRMED, -2, 1_000),
+            (Uuid::now_v7(), status::CONFIRMED, 2, 300),
+            (Uuid::now_v7(), status::CANCELLED, -3, 5_000),
+        ];
+        for (id, booking_status, hours, amount) in rows {
+            ViewBookingRepository::upsert(
+                db,
+                ViewBooking {
+                    id,
+                    version: 1,
+                    spot_id,
+                    host_id: host,
+                    renter_id: renter,
+                    booked: Booked::new(),
+                    license_plate: "1-ABC-123".into(),
+                    amount,
+                    status: booking_status.to_string(),
+                    hold_until: None,
+                    release_reason: None,
+                    cancel_reason: None,
+                    rating: None,
+                    ends_at: at + chrono::TimeDelta::hours(hours),
+                    created_at: at,
+                },
+            )
+            .await
+            .unwrap();
+            ViewPaymentRepository::upsert(
+                db,
+                ViewPayment {
+                    id,
+                    version: 1,
+                    booking_id: id,
+                    host_id: host,
+                    renter_id: renter,
+                    amount,
+                    status: shared::domain_models::payment::status::SUCCEEDED.to_string(),
+                    created_at: at,
+                    refunded_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let stats = ViewBookingRepository::stats_for_host(db, host, at).await.unwrap();
+        assert_eq!(stats.bookings, 1, "only the confirmed booking that is over counts");
+        assert_eq!(stats.ratings, 0);
+        assert_eq!(stats.rating_sum, None, "nobody has rated, so there is no sum");
+
+        // `Rated` lands on a confirmed booking and nowhere else.
+        let (past_confirmed, _, _, _) = rows[0];
+        let (past_cancelled, _, _, _) = rows[2];
+        ViewBookingRepository::rate(db, past_confirmed, 5).await.unwrap();
+        ViewBookingRepository::rate(db, past_cancelled, 1).await.unwrap();
+        let rated = ViewBookingRepository::stats_for_host(db, host, at).await.unwrap();
+        assert_eq!(
+            (rated.rating_sum, rated.ratings),
+            (Some(5), 1),
+            "the rating on the cancelled booking matched no row"
+        );
+        assert_eq!(
+            WalletRepository::earned_for_host(db, host).await.unwrap(),
+            1_300,
+            "earned is every paid booking still confirmed, the upcoming one included"
+        );
+        assert_eq!(ViewSpotRepository::count_for_host(db, host).await.unwrap(), 1);
+        assert_eq!(
+            ViewSpotRepository::counts_for_host(db, host).await.unwrap(),
+            (1, 1),
+            "one listing, and it is live"
+        );
+
+        // All three payments were made `at`, so this month holds the two still confirmed
+        // and last month nothing.
+        let (this_start, this_end) =
+            crate::policy::wallet::bounds(&crate::policy::wallet::label(at)).unwrap();
+        let (last_start, _) = crate::policy::wallet::bounds(&crate::policy::wallet::label(
+            this_start - chrono::Duration::seconds(1),
+        ))
+        .unwrap();
+        assert_eq!(
+            WalletRepository::earned_by_month_for_host(db, host, last_start, this_start, this_end)
+                .await
+                .unwrap(),
+            (1_300, 0)
+        );
+
+        // "Booked right now" is folded from the unfinished confirmed bookings: only the
+        // future one here, carrying its spot's zone.
+        let unfinished = ViewBookingRepository::find_unfinished_for_host(db, host, at)
+            .await
+            .unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].0, spot_id);
+        assert_eq!(unfinished[0].2, "Europe/Brussels");
+
+        let spot = ViewSpotRepository::find_for_host(db, spot_id, host)
+            .await
+            .unwrap()
+            .expect("its host may read it");
+        let spot_stats = ViewBookingRepository::stats_for_host_spot(db, &spot, at)
+            .await
+            .unwrap();
+        assert_eq!(spot_stats.bookings, 1, "the only spot agrees with its host");
+        assert_eq!(
+            WalletRepository::earned_for_host_spot(db, host, spot_id)
+                .await
+                .unwrap(),
+            1_300
+        );
+        assert_eq!(
+            WalletRepository::earned_for_host_spot(db, renter, spot_id)
+                .await
+                .unwrap(),
+            0,
+            "a spot's earnings are its host's, not anyone who names the spot"
+        );
+
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+        diesel::delete(payment::table.filter(payment::id.eq_any(&ids)))
+            .execute(db)
+            .await
+            .unwrap();
+        diesel::delete(booking::table.filter(booking::id.eq_any(&ids)))
+            .execute(db)
+            .await
+            .unwrap();
         diesel::delete(spot::table.find(spot_id))
             .execute(db)
             .await

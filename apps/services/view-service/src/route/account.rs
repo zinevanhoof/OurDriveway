@@ -18,7 +18,7 @@ use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     extractors::authed_jwt::AuthedJwt,
-    responses::view::{AccountResponse, WalletResponse},
+    responses::view::{AccountResponse, NotificationResponse, WalletResponse},
 };
 
 use crate::AppState;
@@ -35,6 +35,15 @@ pub async fn account(
     State(state): State<AppState>,
 ) -> MyResult<Json<AccountResponse>> {
     Ok(Json(state.account_service.account(user_id).await?))
+}
+
+/// `GET /api/view/account/notifications` — what the caller has open, newest first. The
+/// bell's badge is the count of `seen: false`.
+pub async fn notifications(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+) -> MyResult<Json<Vec<NotificationResponse>>> {
+    Ok(Json(state.account_service.notifications(user_id).await?))
 }
 
 /// Query for [`wallet`]. Absent means the current month.

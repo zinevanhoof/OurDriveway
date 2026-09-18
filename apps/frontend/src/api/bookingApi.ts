@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/vue-query";
 import { del, post } from "./client";
 import { viewKeys } from "./keys";
 import type { CreateBookingRequest } from "@/types/requests/booking/CreateBookingRequest";
+import type { RateBookingRequest } from "@/types/requests/booking/RateBookingRequest";
 import type { CreateBookingResponse } from "@/types/responses/booking/CreateBookingResponse";
 
 /**
@@ -45,7 +46,27 @@ export const release = (bookingId: string, keepalive = false) =>
 export const cancel = (bookingId: string) =>
   post<void>(`/api/booking/${bookingId}/cancel`);
 
+/** Rates a booking that is over, 1 to 5, once. A second rating is a 409. */
+export const rate = (bookingId: string, body: RateBookingRequest) =>
+  post<void>(`/api/booking/${bookingId}/rating`, body);
+
 // ─── hooks ──────────────────────────────────────────────────────────────────
+
+export function useRateBooking() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ bookingId, rating }: { bookingId: string; rating: number }) =>
+      rate(bookingId, { rating }),
+    onSuccess: () => {
+      // The prompt goes, and the spot's and host's averages move.
+      queryClient.invalidateQueries({ queryKey: viewKeys.notifications });
+      queryClient.invalidateQueries({ queryKey: viewKeys.bookings });
+      queryClient.invalidateQueries({ queryKey: viewKeys.spots });
+      queryClient.invalidateQueries({ queryKey: ["users"] });
+    },
+  });
+}
 
 export function useCreateBooking() {
   const queryClient = useQueryClient();

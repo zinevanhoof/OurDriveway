@@ -13,7 +13,10 @@ use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     extractors::authed_jwt::AuthedJwt,
-    responses::view::{NearbyResponse, PublicBookingResponse, PublicSpotResponse},
+    responses::view::{
+        NearbyResponse, PublicBookingResponse, PublicSpotResponse, SpotSummaryResponse,
+        UserSummaryResponse,
+    },
 };
 use uuid::Uuid;
 
@@ -33,6 +36,27 @@ pub async fn spot(
     Path(spot_id): Path<Uuid>,
 ) -> MyResult<Json<PublicSpotResponse>> {
     Ok(Json(state.public_service.spot(spot_id).await?))
+}
+
+/// `GET /api/view/public/spots/{id}/summary` — a spot's rating, for anyone.
+pub async fn spot_summary(
+    _: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+) -> MyResult<Json<SpotSummaryResponse>> {
+    Ok(Json(state.public_service.spot_summary(spot_id).await?))
+}
+
+/// `GET /api/view/public/users/{id}/summary` — a person's reputation as a host.
+///
+/// Completed bookings on their spots and their rating, for the line under a host's name.
+/// Zeroes for someone who has never hosted, and for an id that matches nobody.
+pub async fn user_summary(
+    _: AuthedJwt,
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+) -> MyResult<Json<UserSummaryResponse>> {
+    Ok(Json(state.public_service.user_summary(user_id).await?))
 }
 
 /// `GET /api/view/public/spots/{id}/bookings` — the taken slots on one active spot.

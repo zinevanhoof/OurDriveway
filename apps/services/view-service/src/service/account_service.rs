@@ -1,13 +1,18 @@
 use chrono::Utc;
 use shared::{
     error::myerror::{ContextExt, MyResult},
-    responses::view::{AccountResponse, WalletResponse, WalletTransactionResponse},
+    responses::view::{
+        AccountResponse, NotificationResponse, WalletResponse, WalletTransactionResponse,
+    },
 };
 use uuid::Uuid;
 
 use crate::{
     policy,
-    repository::{user_repository::ViewUserRepository, wallet_repository::WalletRepository},
+    repository::{
+        notification_repository::NotificationRepository, user_repository::ViewUserRepository,
+        wallet_repository::WalletRepository,
+    },
     service::settled_before,
 };
 
@@ -38,6 +43,25 @@ impl AccountService {
             id: user_id,
             user: user.map(Into::into),
         })
+    }
+
+    /// The caller's open notifications, newest first, each marked seen or not against
+    /// when they last opened the list.
+    pub async fn notifications(&self, user_id: Uuid) -> MyResult<Vec<NotificationResponse>> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let seen_at = NotificationRepository::seen_at(&mut conn, user_id).await?;
+        let open =
+            NotificationRepository::find_open_for_account(&mut conn, user_id, Utc::now()).await?;
+
+        Ok(open
+            .into_iter()
+            .map(|n| NotificationResponse {
+                seen: seen_at.is_some_and(|s| n.visible_from <= s),
+                at: n.visible_from,
+                payload: n.data,
+            })
+            .collect())
     }
 
     /// One month of everything that moved the caller's money, newest first.
