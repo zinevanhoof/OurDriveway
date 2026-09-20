@@ -11,8 +11,8 @@ export { default as Surface } from "./Surface.vue";
  * evidence says there is no decision behind it:
  *
  *   radius  `rounded-md` is used 48 times against `rounded-lg` 14, and the 14 follow no
- *           rule — the same kind of panel is `rounded-md` in ManageSpotComponent and
- *           `rounded-lg` in CheckoutComponent.
+ *           rule — the same kind of panel is `rounded-md` in ManageSpotView and
+ *           `rounded-lg` in CheckoutView.
  *
  * **No default gap.** There was one — `gap-3`, on the grounds that it covered 8 of the
  * 10 rows with children side by side. Migrating the app disproved that: the rows did

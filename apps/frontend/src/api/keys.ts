@@ -5,7 +5,7 @@
  * read. Kept together because the two ends are otherwise a string literal in a
  * component and a matching one in a mutation handler, which is exactly the pair
  * that drifts — and did: the connect-status query had a hand-written
- * `['connect','account']` in `WalletWithdrawComponent` while everything else
+ * `['connect','account']` in `WalletWithdrawView` while everything else
  * came from here.
  *
  * Here rather than in `viewApi.ts`, where this lived, because the mutations that

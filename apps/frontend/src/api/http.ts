@@ -14,7 +14,7 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 // App.vue, which is a separate question deliberately kept separate.
 //
 // Its other callers are capability decisions too: the platform geolocation prompt
-// (lib/geo.ts), opening a maps app (BookedSpotRow), and choosing an `ourdriveway://`
+// (lib/geo.ts), opening a maps app (RenterBookingRow), and choosing an `ourdriveway://`
 // return URL over an http one for a redirect payment.
 export const native = isTauri();
 

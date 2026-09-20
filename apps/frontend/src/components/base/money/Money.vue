@@ -44,7 +44,7 @@ const props = withDefaults(defineProps<{
 })
 
 // U+2212 MINUS SIGN, not a hyphen: it aligns with the digits at these weights, which is
-// why WalletComponent's local helper used it.
+// why WalletView's local helper used it.
 const label = computed(() =>
   props.signed
     ? `${props.cents >= 0 ? "+" : "−"}${formatCents(Math.abs(props.cents))}`

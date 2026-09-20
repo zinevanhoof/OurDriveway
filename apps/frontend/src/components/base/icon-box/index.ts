@@ -25,7 +25,7 @@ export const iconBoxVariants = cva("flex shrink-0 items-center justify-center", 
     },
     tone: {
       accent: "bg-accent text-accent-foreground",
-      // Accent ground, primary glyph — WalletComponent's "money in" treatment, which is
+      // Accent ground, primary glyph — WalletView's "money in" treatment, which is
       // a different thing from `accent` and was reached by hand in three places.
       brand: "bg-accent text-primary",
       primary: "bg-primary text-primary-foreground",

@@ -11,10 +11,10 @@ import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import type { SpotFilter } from "@/types/SpotFilter";
 import { spotMatches } from "@/lib/spotFilter";
 import { locateUser } from "@/lib/geo";
-import MapPinComponent from "./MapPinComponent.vue";
-import MapSearchComponent from "./MapSearchComponent.vue";
-import SpotDetailDrawer from "../spot/SpotDetailDrawer.vue";
-import BookingFormComponent from "../BookingFormComponent.vue";
+import MapPin from "./MapPin.vue";
+import MapSearch from "./MapSearch.vue";
+import SpotDetailDrawer from "@/components/spot/SpotDetailDrawer.vue";
+import BookingForm from "@/components/booking/BookingForm.vue";
 import { Surface } from "@/components/base/surface";
 import { Title } from "@/components/base/text";
 import { Money } from "@/components/base/money";
@@ -164,7 +164,7 @@ function renderPin(p: Pin) {
   // by latitude, so a z-class on the inner button can't lift it above siblings.
   p.div.style.zIndex = selected ? "10" : "";
   render(
-    h(MapPinComponent, {
+    h(MapPin, {
       pricePerHour: p.price,
       count: p.spots.length,
       selected,
@@ -365,7 +365,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div ref="el" class="relative h-full w-full">
-    <MapSearchComponent @select="map?.jumpTo({ center: $event, zoom: 15 })" @filter="filter = $event" />
+    <MapSearch @select="map?.jumpTo({ center: $event, zoom: 15 })" @filter="filter = $event" />
     <!-- Cluster tap: pick one of the spots sharing this location. -->
     <Drawer v-model:open="clusterOpen" :modal="false"
       @animation-end="releaseCluster">
@@ -397,6 +397,6 @@ onBeforeUnmount(() => {
     </Drawer>
     <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable :modal="false"
       @book="bookingOpen = true" />
-    <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot" />
+    <BookingForm v-model="bookingOpen" :spot="selectedSpot" />
   </div>
 </template>

@@ -3,7 +3,7 @@
  * `shared::responses::view::NotificationResponse`.
  *
  * A union on `kind`: a new kind is a new member here and a new branch in
- * `NotificationsComponent`.
+ * `NotificationsView`.
  */
 export type NotificationResponse = {
   /** When it became visible — a rating prompt when the booking ended, the rest when they happened. */

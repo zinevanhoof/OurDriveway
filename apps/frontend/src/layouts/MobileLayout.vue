@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import MobileNavbar from '@/components/MobileNavbar.vue';
+import MobileNavbar from '@/components/layout/MobileNavbar.vue';
 import LocationMap from '@/components/map/LocationMap.vue';
 import { useAuthStore } from '@/stores/auth';
 import { computed } from 'vue';

@@ -13,7 +13,7 @@ import type { NextBookingResponse } from '@/types/responses/view/NextBookingResp
 import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import SpotRating from '@/components/spot/SpotRating.vue';
-import BookingFormComponent from '@/components/BookingFormComponent.vue';
+import BookingForm from '@/components/booking/BookingForm.vue';
 import { CarFront, ChevronRight, CirclePlus, MapPin, Search, Wallet } from '@lucide/vue';
 import { Surface } from '@/components/base/surface';
 import { Text, Title } from '@/components/base/text';
@@ -21,7 +21,7 @@ import { IconBox } from '@/components/base/icon-box';
 import { Money } from '@/components/base/money';
 import { SectionHeader } from '@/components/base/section-header';
 import { Badge } from '@/components/ui/badge';
-import MobileHomeHeader from '@/components/header/MobileHomeHeader.vue';
+import HomeHeader from '@/components/header/HomeHeader.vue';
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -156,7 +156,7 @@ const openBooking = () => {
          reachable and a screen reader announces no action. ProfileView's
          `<button class="flex … w-full text-left">` is the shape that fixes it
          without disturbing layout — worth doing to the whole screen at once. -->
-    <MobileHomeHeader />
+    <HomeHeader />
     <div class="px-4 pt-2 pb-3 space-y-4">
         <div class="grid grid-cols-2 gap-2">
             <Surface variant="primary" size="lg" class="gap-8" @click="router.push({ name: 'search' })">
@@ -247,6 +247,6 @@ const openBooking = () => {
 
         <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" :booking="selectedBooking"
             :renter="!!selectedBooking" :bookable="!selectedBooking" @book="bookingOpen = true" />
-        <BookingFormComponent v-model="bookingOpen" :spot="selectedSpot" />
+        <BookingForm v-model="bookingOpen" :spot="selectedSpot" />
     </div>
 </template>

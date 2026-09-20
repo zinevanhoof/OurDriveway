@@ -1,24 +1,32 @@
-import HomeView from "@/views/HomeView.vue";
 import { createWebHistory, createRouter } from "vue-router";
 import type { RouteLocationNormalized } from "vue-router";
-import ProfileView from "@/views/ProfileView.vue";
-import SearchView from "@/views/SearchView.vue";
-import LoginView from "@/views/LoginView.vue";
-import SignupView from "@/views/SignupView.vue";
 import { useAuthStore } from "@/stores/auth";
-import SpotsView from "@/views/SpotsView.vue";
-import AddSpotView from "@/views/AddSpotView.vue";
-import ManageSpotView from "@/views/ManageSpotView.vue";
-import SpotBookingsView from "@/views/SpotBookingsView.vue";import EditSpotView from "@/views/EditSpotView.vue";
-import EditProfileView from "@/views/EditProfileView.vue";
-import ChangePasswordView from "@/views/ChangePasswordView.vue";
-import VerifyEmailView from "@/views/VerifyEmailView.vue";
-import ForgotPasswordView from "@/views/ForgotPasswordView.vue";
-import ResetPasswordView from "@/views/ResetPasswordView.vue";
-import CheckoutView from "@/views/CheckoutView.vue";
+
+import HomeView from "@/views/HomeView.vue";
+import SearchView from "@/views/SearchView.vue";
 import NotificationsView from "@/views/NotificationsView.vue";
+
+import LoginView from "@/views/auth/LoginView.vue";
+import SignupView from "@/views/auth/SignupView.vue";
+import VerifyEmailView from "@/views/auth/VerifyEmailView.vue";
+import ForgotPasswordView from "@/views/auth/ForgotPasswordView.vue";
+import ResetPasswordView from "@/views/auth/ResetPasswordView.vue";
+
+import MySpotsView from "@/views/spot/MySpotsView.vue";
+import AddSpotView from "@/views/spot/AddSpotView.vue";
+import EditSpotView from "@/views/spot/EditSpotView.vue";
+import ManageSpotView from "@/views/spot/ManageSpotView.vue";
+import SpotBookingsView from "@/views/spot/SpotBookingsView.vue";
+
+import MyBookingsView from "@/views/booking/MyBookingsView.vue";
+import CheckoutView from "@/views/booking/CheckoutView.vue";
+
 import WalletView from "@/views/wallet/WalletView.vue";
 import WalletWithdrawView from "@/views/wallet/WalletWithdrawView.vue";
+
+import ProfileView from "@/views/profile/ProfileView.vue";
+import EditProfileView from "@/views/profile/EditProfileView.vue";
+import ChangePasswordView from "@/views/profile/ChangePasswordView.vue";
 
 export type RouteMeta = {
   requiresAuth: boolean;
@@ -50,9 +58,21 @@ const routes = [
     } satisfies RouteMeta,
   },
   {
+    // Host side only. `/bookings` is the renter's mirror of this — one screen each,
+    // because one screen with a tab per persona is two screens wearing a trenchcoat.
     path: "/spots",
     name: "spots",
-    component: SpotsView,
+    component: MySpotsView,
+    meta: {
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    // Renter side: the bookings this user made, not the ones made on their spots.
+    // Those are `/spot/:id/bookings`.
+    path: "/bookings",
+    name: "bookings",
+    component: MyBookingsView,
     meta: {
       requiresAuth: true,
     } satisfies RouteMeta,

@@ -14,10 +14,10 @@ import { CalendarDays, Star } from "@lucide/vue";
 import { Text, Title } from "@/components/base/text";
 import { Money } from "@/components/base/money";
 import { SectionHeader } from "@/components/base/section-header";
-import Avatar from "../ui/avatar/Avatar.vue";
-import AvatarImage from "../ui/avatar/AvatarImage.vue";
-import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
-import Button from "../ui/button/Button.vue";
+import Avatar from "@/components/ui/avatar/Avatar.vue";
+import AvatarImage from "@/components/ui/avatar/AvatarImage.vue";
+import AvatarFallback from "@/components/ui/avatar/AvatarFallback.vue";
+import Button from "@/components/ui/button/Button.vue";
 import SpotRating from "./SpotRating.vue";
 import { isPlaceholder, placeholders } from "@/lib/placeholders";
 
