@@ -114,7 +114,7 @@ fn verification_url(user_id: &Uuid) -> MyResult<String> {
         // binds to nothing but the account.
         None,
     )?;
-    Ok(format!("{}/verify?token={token}", CONFIG.app_base_url))
+    Ok(format!("{}/verify-email?token={token}", CONFIG.app_base_url))
 }
 
 /// Minted here for the same reasons as [`verification_url`], plus one.

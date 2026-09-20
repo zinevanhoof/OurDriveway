@@ -10,6 +10,7 @@ import { useRouter } from "vue-router";
 import { fetchNotifications } from "@/api/viewApi";
 import { dismissNotification, markNotificationsSeen } from "@/api/userApi";
 import { viewKeys } from "@/api/keys";
+import { isPlaceholder, placeholders } from "@/lib/placeholders";
 import { Text } from "@/components/base/text";
 import FullScreenLayoutComponent from "@/components/FullScreenLayoutComponent.vue";
 import RateBookingDrawer from "@/components/booking/RateBookingDrawer.vue";
@@ -17,7 +18,11 @@ import type { NotificationResponse } from "@/types/responses/view/NotificationRe
 
 const queryClient = useQueryClient();
 const router = useRouter();
-const { data } = useQuery({ queryKey: viewKeys.notifications, queryFn: fetchNotifications });
+const { data, isPlaceholderData } = useQuery({
+  queryKey: viewKeys.notifications,
+  queryFn: fetchNotifications,
+  placeholderData: placeholders.notifications,
+});
 
 const key = (n: NotificationResponse) => `${n.kind}:${n.bookingId}`;
 
@@ -28,7 +33,8 @@ const fresh = ref(new Set<string>());
 const stopSnapshot = watch(
   data,
   async (list) => {
-    if (!list) return;
+    // The skeleton's rows are not what the user saw: wait for the real answer.
+    if (!list || isPlaceholderData.value) return;
     queueMicrotask(() => stopSnapshot());
     const unseen = list.filter((n) => !n.seen);
     fresh.value = new Set(unseen.map(key));
@@ -69,6 +75,7 @@ const when = (at: string) =>
       <Text v-if="data && !data.length" class="text-muted-foreground">You're all caught up.</Text>
       <div class="space-y-3">
         <button v-for="n in data" :key="key(n)" type="button" @click="select(n)"
+          :data-loading="isPlaceholder(n.bookingId)"
           class="flex w-full items-center gap-3 rounded-lg border border-border p-3 text-left"
           :class="fresh.has(key(n)) && 'bg-primary/10 border-primary'">
           <template v-if="n.kind === 'rate_booking'">

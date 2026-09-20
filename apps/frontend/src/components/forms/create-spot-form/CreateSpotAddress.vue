@@ -100,7 +100,7 @@ const onSelect = (value: AcceptableValue) => {
                     Line 1
                 </FieldLabel>
                 <Input id="address.line1" v-bind="componentField" placeholder="Line 1" autocomplete="off"
-                    :aria-invalid="!!errors.length" class="bg-card" />
+                    :aria-invalid="!!errors.length" />
                 <FieldError v-if="errors.length" :errors="errors" />
             </Field>
         </VeeField>
@@ -111,7 +111,7 @@ const onSelect = (value: AcceptableValue) => {
                     Line 2
                 </FieldLabel>
                 <Input id="address.line2" v-bind="componentField" placeholder="Line 2" autocomplete="off"
-                    :aria-invalid="!!errors.length" class="bg-card" />
+                    :aria-invalid="!!errors.length" />
                 <FieldError v-if="errors.length" :errors="errors" />
             </Field>
         </VeeField>
@@ -123,7 +123,7 @@ const onSelect = (value: AcceptableValue) => {
                         City
                     </FieldLabel>
                     <Input id="address.city" v-bind="componentField" placeholder="City" autocomplete="off"
-                        :aria-invalid="!!errors.length" class="bg-card" />
+                        :aria-invalid="!!errors.length" />
                     <FieldError v-if="errors.length" :errors="errors" />
                 </Field>
             </VeeField>
@@ -134,7 +134,7 @@ const onSelect = (value: AcceptableValue) => {
                         Postal Code
                     </FieldLabel>
                     <Input id="address.postalCode" v-bind="componentField" placeholder="Postal Code" autocomplete="off"
-                        :aria-invalid="!!errors.length" class="bg-card" />
+                        :aria-invalid="!!errors.length" />
                     <FieldError v-if="errors.length" :errors="errors" />
                 </Field>
             </VeeField>
@@ -147,7 +147,7 @@ const onSelect = (value: AcceptableValue) => {
                         Region
                     </FieldLabel>
                     <Input id="address.region" v-bind="componentField" placeholder="Region" autocomplete="off"
-                        :aria-invalid="!!errors.length" class="bg-card" />
+                        :aria-invalid="!!errors.length" />
                     <FieldError v-if="errors.length" :errors="errors" />
                 </Field>
             </VeeField>
@@ -158,7 +158,7 @@ const onSelect = (value: AcceptableValue) => {
                         Country
                     </FieldLabel>
                     <Input id="address.country" v-bind="componentField" placeholder="Country" autocomplete="off"
-                        :aria-invalid="!!errors.length" class="bg-card" />
+                        :aria-invalid="!!errors.length" />
                     <FieldError v-if="errors.length" :errors="errors" />
                 </Field>
             </VeeField>

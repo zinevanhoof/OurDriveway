@@ -176,7 +176,9 @@ const openBooking = (booking: HostBookingResponse) => {
             </Button>
         </div>
     </header>
-    <div class="space-y-3 px-4 pb-2 overflow-y-auto no-scrollbar">
+    <!-- Padding here, not in the view: this is the scroll container, as in
+         FullScreenLayoutComponent. -->
+    <div class="space-y-3 px-4 pb-3 overflow-y-auto no-scrollbar">
         <div class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
             <img v-for="key in data?.images" :key="key" :src="key"
                 class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />

@@ -35,7 +35,7 @@ const greeting = computed(() => {
 </script>
 
 <template>
-    <header class="flex shrink-0 px-4 py-2 justify-between items-center bg-background">
+    <header class="flex shrink-0 px-4 py-2 justify-between items-center">
         <div>
             <Text size="sm" weight="normal">{{ greeting }}</Text>
             <Title size="2xl" weight="extrabold">{{ user?.firstName }} {{ user?.lastName }}</Title>

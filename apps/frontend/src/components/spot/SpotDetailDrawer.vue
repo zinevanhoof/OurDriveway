@@ -19,6 +19,7 @@ import AvatarImage from "../ui/avatar/AvatarImage.vue";
 import AvatarFallback from "../ui/avatar/AvatarFallback.vue";
 import Button from "../ui/button/Button.vue";
 import SpotRating from "./SpotRating.vue";
+import { isPlaceholder, placeholders } from "@/lib/placeholders";
 
 const props = withDefaults(defineProps<{
   spotId: string | null;
@@ -57,12 +58,14 @@ const emit = defineEmits<{ book: [] }>();
 // The listing only. The public read shares the `spots/<id>` key with the map's and the
 // home screen's own copy, which feeds the booking form, so vue-query serves one from
 // the other. The renter's read is a different key, because it is a different route.
-const { data, isError, error, refetch } = useQuery({
+const { data, isError, error, refetch, isPlaceholderData } = useQuery({
   queryKey: computed(() =>
     props.renter ? viewKeys.renterSpot(props.spotId ?? "") : viewKeys.spot(props.spotId ?? ""),
   ),
   queryFn: () => (props.renter ? fetchRenterSpot(props.spotId!) : fetchSpot(props.spotId!)),
-  enabled: computed(() => props.spotId !== null),
+  // A placeholder booking row mounts this sheet too, with a placeholder spot id.
+  enabled: computed(() => props.spotId !== null && !isPlaceholder(props.spotId)),
+  placeholderData: placeholders.spot,
 });
 
 const spot = computed(() => data.value);
@@ -77,7 +80,7 @@ const hostId = computed(() => spot.value?.host?.id ?? null);
 const { data: hostSummary } = useQuery({
   queryKey: computed(() => viewKeys.userSummary(hostId.value ?? "")),
   queryFn: () => fetchUserSummary(hostId.value!),
-  enabled: computed(() => hostId.value !== null),
+  enabled: computed(() => hostId.value !== null && !isPlaceholder(hostId.value)),
 });
 
 // Each figure only when there is one: a new host shows their name and nothing else,
@@ -106,17 +109,21 @@ const hostBookings = computed(() => {
         <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
       </div>
       <!-- The sheet caps at 80vh, so a long schedule scrolls inside it. -->
+      <!-- `data-loading` sits on what the spot query fills — photos, title, price,
+           address, host — not on the sheet: the schedule comes from the booking the
+           caller passed, and the rest is fixed copy. -->
       <div v-else class="m-4 space-y-4 overflow-y-auto no-scrollbar">
         <!-- `touch-pan-x`: without it the browser claims a vertical swipe here for
              scrolling and cancels the pointer stream, so vaul never sees the drag and
              the sheet won't close when the gesture starts on a photo. Declaring the
              strip horizontal-only leaves the vertical axis to the drawer. -->
-        <div class="flex h-40 gap-4 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
+        <div class="flex h-40 gap-4 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar"
+          :data-loading="isPlaceholderData">
           <!-- `only:` = the sole image, so it fills the row instead of leaving a gap. -->
           <img v-for="key in spot?.images" :key="key" :src="key"
             class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md border-border" />
         </div>
-        <div>
+        <div :data-loading="isPlaceholderData">
           <SectionHeader>
             <Title size="lg">{{ spot?.title }}</Title>
             <template #action>
@@ -160,7 +167,7 @@ const hostBookings = computed(() => {
           </div>
         </div>
 
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2" :data-loading="isPlaceholderData">
           <Avatar size="lg">
             <AvatarImage v-if="spot?.host?.profilePicture" :src="spot?.host.profilePicture" />
             <AvatarFallback :name="{ firstName: spot?.host?.firstName ?? '', lastName: spot?.host?.lastName ?? '' }" />

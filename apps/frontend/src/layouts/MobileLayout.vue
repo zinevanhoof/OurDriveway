@@ -23,7 +23,6 @@ const onMap = computed(() => route.name === 'search')
 </script>
 
 <template>
-    <component :is="route.meta.header" v-if="auth.isAuthenticated && route.meta.header" />
     <main class="relative no-scrollbar flex flex-1 flex-col overflow-y-auto bg-background text-foreground">
         <RouterView />
         <!-- After the RouterView so it covers the (empty) SearchView on the map route.

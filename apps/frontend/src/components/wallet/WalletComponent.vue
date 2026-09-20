@@ -16,9 +16,8 @@
  * the booking's slots; the labels are ours, and the times print in the spot's own wall
  * clock through the same helpers every other booking on screen uses.
  */
-import { computed, ref, useTemplateRef, watchEffect } from 'vue'
+import { computed } from 'vue'
 import { useInfiniteQuery, useQuery } from '@tanstack/vue-query'
-import { useIntersectionObserver } from '@vueuse/core'
 import { ArrowUpRight, Banknote, CarFront, Clock, Landmark, RotateCcw } from '@lucide/vue'
 import { formatCents } from '@/lib/money'
 import { formatDay, formatSlots, sortedDays } from '@/lib/bookingDates'
@@ -26,6 +25,8 @@ import { fetchBalance, fetchWallet } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
 import type { ApiError } from '@/api/client';
 import type { WalletTransactionResponse } from '@/types/responses/view/WalletTransactionResponse';
+import type { WalletResponse } from '@/types/responses/view/WalletResponse';
+import { isPlaceholder, placeholders, withLoadingRow } from '@/lib/placeholders';
 import Button from '../ui/button/Button.vue'
 import { Badge } from '@/components/ui/badge'
 import { Surface } from '@/components/base/surface'
@@ -33,31 +34,43 @@ import { Text, Title } from '@/components/base/text'
 import { IconBox } from '@/components/base/icon-box'
 import { Money } from '@/components/base/money'
 import { SectionHeader } from '@/components/base/section-header'
+import { Sentinel } from '@/components/base/sentinel'
+import MobileWalletHeader from '@/components/header/MobileWalletHeader.vue'
 import { useRouter } from 'vue-router'
 
 const router = useRouter()
 
-const { data: balance } = useQuery({
+const { data: balance, isPlaceholderData: balanceLoading } = useQuery({
     queryKey: viewKeys.balance,
     queryFn: fetchBalance,
+    placeholderData: placeholders.balance,
 })
 
 // `pageParam` is a month string, and `undefined` on the first page means "whichever
 // month it is where the server is". The client deliberately does not compute that
 // itself: the month a row falls in is decided by the same boundaries the query uses.
-const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending, isError, error, refetch } = useInfiniteQuery({
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPlaceholderData: walletLoading, isError, error, refetch } = useInfiniteQuery({
     queryKey: viewKeys.wallet,
     queryFn: ({ pageParam }) => fetchWallet(pageParam),
     initialPageParam: undefined as string | undefined,
     // Null ends the list. A month with nothing in it is never requested, because the
     // server answers with the next month that actually holds something.
     getNextPageParam: (last) => last.nextMonth ?? undefined,
+    placeholderData: placeholders.wallet,
 })
 
 const pages = computed(() => data.value?.pages ?? [])
 // What actually renders. The current month is served whether or not it holds anything,
 // so page one is regularly empty; the tiles below still want it, the list does not.
-const months = computed(() => pages.value.filter((p) => p.transactions.length))
+// While the next month loads, a placeholder month stands in for it at the bottom.
+const months = computed(() =>
+    withLoadingRow(
+        pages.value.filter((p) => p.transactions.length),
+        isFetchingNextPage.value,
+        placeholders.wallet.pages,
+    ),
+)
+const isPlaceholderMonth = (page: WalletResponse) => isPlaceholder(page.transactions[0]?.id ?? '')
 const available = computed(() => balance.value?.availableCents ?? 0)
 const pending = computed(() => balance.value?.pendingCents ?? 0)
 
@@ -118,39 +131,22 @@ function sub(tx: WalletTransactionResponse): string {
     return when ? `Refunded · ${when}` : 'Refunded'
 }
 
-// Infinite scroll: one sentinel below the last month. The observer records whether it
-// is on screen; the watcher decides whether to ask for another month.
-//
-// Split that way because an IntersectionObserver reports *transitions*, and the
-// sentinel does not always make one. A quiet current month renders almost nothing, so
-// the sentinel is already in view on mount — before the first page has landed and
-// `hasNextPage` is still false — and it never leaves, so no second callback ever comes
-// and the older months are unreachable. As a watched state instead, the condition is
-// re-checked when `hasNextPage` flips, which also walks several short months in a row
-// until the sentinel is finally pushed off screen.
-const sentinel = useTemplateRef<HTMLElement>('sentinel')
-const sentinelVisible = ref(false)
-useIntersectionObserver(sentinel, ([entry]) => {
-    sentinelVisible.value = !!entry?.isIntersecting
-})
-
-watchEffect(() => {
-    if (sentinelVisible.value && hasNextPage.value && !isFetchingNextPage.value) {
-        void fetchNextPage()
-    }
-})
+// Infinite scroll is `<Sentinel>` below the last month. A quiet current month renders
+// almost nothing, so it is already in view on mount and never leaves — the component
+// watches state rather than waiting for a transition, which is what still walks several
+// short months in a row until it is finally pushed off screen.
 </script>
 
 
 <template>
-    <div class="space-y-4 px-4 py-2">
-        <Title as="h1" size="xl" weight="extrabold">Wallet</Title>
-
+    <MobileWalletHeader />
+    <div class="space-y-4 px-4 pt-2 pb-3">
         <!-- Balance -->
         <Surface variant="primary" size="lg" class="gap-4">
             <div>
                 <Text size="eyebrow" weight="semibold" tone="inverse" class="opacity-80">Available to withdraw</Text>
-                <Money :cents="available" tone="inverse" weight="extrabold" class="text-[34px] leading-none" />
+                <Money :cents="available" tone="inverse" weight="extrabold" class="text-[34px] leading-none"
+                    :data-loading="balanceLoading" />
             </div>
 
             <Surface v-if="pending > 0" variant="none" size="sm" orientation="horizontal" class="gap-2 bg-white/[0.14]">
@@ -160,7 +156,8 @@ watchEffect(() => {
                 </Text>
             </Surface>
 
-            <Button class="h-11 bg-primary-foreground text-primary font-bold"
+            <!-- Disabled on the placeholder balance: it would open withdraw with a fake maximum. -->
+            <Button class="h-11 bg-primary-foreground text-primary font-bold" :disabled="balanceLoading"
                 @click="router.push({ name: 'wallet-withdraw', params: { maxWithdraw: available } })">
                 <ArrowUpRight class="size-4.5" />
                 Withdraw
@@ -171,18 +168,19 @@ watchEffect(() => {
         <div class="grid grid-cols-2 gap-2">
             <Surface size="sm">
                 <Text size="xs" weight="bold" tone="default">MONEY IN · {{ currentMonthShort }}</Text>
-                <Money :cents="monthIn" size="xl" weight="extrabold" tone="success" />
+                <Money :cents="monthIn" size="xl" weight="extrabold" tone="success" :data-loading="walletLoading" />
             </Surface>
             <Surface size="sm">
                 <Text size="xs" weight="bold" tone="default">MONEY OUT · {{ currentMonthShort }}</Text>
-                <Money :cents="monthOut" size="xl" weight="extrabold" />
+                <Money :cents="monthOut" size="xl" weight="extrabold" :data-loading="walletLoading" />
             </Surface>
         </div>
 
         <!-- Combined history, one section per month that has rows. Every month past the
              first is one the server named because it holds something, so the only empty
              page is normally the current month, and a header over nothing is noise. -->
-        <section v-for="page in months" :key="page.month" class="space-y-2.5">
+        <section v-for="page in months" :key="page.month" class="space-y-2.5"
+            :data-loading="isPlaceholderMonth(page)">
             <SectionHeader as="header" class="items-baseline">
                 <Title as="h2" size="sm" weight="extrabold">{{ monthLabel(page.month) }}</Title>
                 <template #action>
@@ -212,12 +210,9 @@ watchEffect(() => {
             </Surface>
         </section>
 
-        <Text v-if="isPending" size="sm" class="py-6 text-center">
-            Loading…
-        </Text>
         <!-- A failed read used to render as an empty history, which reads as "you have
              never earned anything" — the one wrong thing this screen can say. -->
-        <div v-else-if="isError" class="space-y-2 py-6 text-center">
+        <div v-if="isError" class="space-y-2 py-6 text-center">
             <Text size="sm">{{ (error as ApiError).detail.join(' ') }}</Text>
             <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
         </div>
@@ -229,9 +224,6 @@ watchEffect(() => {
 
         <!-- Crossing this asks for the next month. It sits inside the scrolling page
              rather than at a fixed offset, so it fires exactly once per month. -->
-        <div ref="sentinel" class="h-px"></div>
-        <Text v-if="isFetchingNextPage" size="sm" class="pb-4 text-center">
-            Loading…
-        </Text>
+        <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
     </div>
 </template>

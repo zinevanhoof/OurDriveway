@@ -51,7 +51,7 @@ export const surfaceVariants = cva("flex rounded-md", {
     // so there is no existing convention to stay compatible with. `text-left` is here
     // because the common case is `as="button"`, which would otherwise centre its text.
     interactive: {
-      true: "cursor-pointer text-left transition-colors active:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50",
+      true: "cursor-pointer text-left transition-colors active:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/15 disabled:pointer-events-none disabled:opacity-50",
       false: "",
     },
   },

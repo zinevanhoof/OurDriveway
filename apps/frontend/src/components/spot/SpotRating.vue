@@ -10,6 +10,7 @@ import { Star } from "@lucide/vue";
 
 import { fetchSpotSummary } from "@/api/viewApi";
 import { viewKeys } from "@/api/keys";
+import { isPlaceholder } from "@/lib/placeholders";
 import { Text } from "@/components/base/text";
 
 const props = defineProps<{ spotId: string }>();
@@ -17,6 +18,8 @@ const props = defineProps<{ spotId: string }>();
 const { data } = useQuery({
   queryKey: computed(() => viewKeys.spotSummary(props.spotId)),
   queryFn: () => fetchSpotSummary(props.spotId),
+  // Skeleton cards render this with a placeholder id; there is nothing to ask about.
+  enabled: computed(() => !isPlaceholder(props.spotId)),
 });
 </script>
 

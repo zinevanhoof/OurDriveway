@@ -15,7 +15,7 @@ use crate::AppState;
 /// clicking has no session yet precisely because login is what verification
 /// gates.
 ///
-/// The frontend POSTs this from `/verify`; the link itself is a plain GET to a
+/// The frontend POSTs this from `/verify-email`; the link itself is a plain GET to a
 /// page. That split is not decoration: mail scanners prefetch links, so anything
 /// with an effect has to sit behind the verb they don't use.
 /// 202 with the version rather than 204: the login that follows reads

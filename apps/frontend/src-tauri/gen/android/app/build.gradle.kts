@@ -71,7 +71,15 @@ rust {
 }
 
 dependencies {
-    implementation("androidx.webkit:webkit:1.14.0")
+    // 1.15.0 and not 1.17.0, which is current: from 1.16.0 webkit depends on
+    // kotlin-stdlib 2.1.20, and this project's Kotlin Gradle plugin is 1.9.25, whose
+    // compiler reads metadata up to 2.0.0 only. Gradle resolves the stdlib to the
+    // highest requested version across the whole graph, so one such dependency fails
+    // every Kotlin file in the module, `generated/` included. Raise this after the
+    // Kotlin plugin goes to 2.x. core-splashscreen 1.2.0 is current and asks for
+    // stdlib 2.0.21, which is inside what 1.9.25 can read.
+    implementation("androidx.webkit:webkit:1.15.0")
+    implementation("androidx.core:core-splashscreen:1.2.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("com.google.android.material:material:1.12.0")

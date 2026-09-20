@@ -3,4 +3,33 @@
     <style name="Theme.our_driveway" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <!-- Customize your theme here. -->
     </style>
+
+    <!-- The launch theme, and the activity's real one in the manifest —
+         `installSplashScreen()` swaps it for `postSplashScreenTheme` on the way out.
+         Android 12+ shows this splash whether we configure it or not, so the choice is
+         between ours and the platform default; `core-splashscreen` backports the same
+         look down to our minSdk 24, where there would otherwise be nothing at all.
+
+         `Theme.SplashScreen.IconBackground` rather than plain `Theme.SplashScreen`:
+         that is the parent that makes `windowSplashScreenIconBackgroundColor` work
+         below API 31.
+
+         The icon is the adaptive foreground layer over a flat brand circle, drawn from
+         a vector rather than from `@mipmap/ic_launcher_foreground`. The splash renders
+         its icon at 240dp and that mipmap is a 108dp bitmap, so it arrived upscaled by
+         more than two and looked soft — the launcher icon is sharp because there the
+         same file is scaled down instead. `@drawable/ic_splash_logo` has no fixed
+         resolution and no such problem. It is also the only form that looks right on
+         API 24 and 25, where `@mipmap/ic_launcher` resolves to the legacy square PNG
+         rather than the adaptive XML and gets circle-cropped.
+
+         Window background is the app's own, so the hand-off to the webview underneath
+         it is not a colour change. Not overridden in values-night: the app is
+         light-only, as MainActivity's system-bar comment explains. -->
+    <style name="Theme.our_driveway.Starting" parent="Theme.SplashScreen.IconBackground">
+        <item name="windowSplashScreenBackground">@color/system_bars</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
+        <item name="windowSplashScreenIconBackgroundColor">@color/brand</item>
+        <item name="postSplashScreenTheme">@style/Theme.our_driveway</item>
+    </style>
 </resources>

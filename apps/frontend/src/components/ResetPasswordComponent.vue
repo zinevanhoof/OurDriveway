@@ -11,13 +11,11 @@ import { z } from 'zod'
 import { toTypedSchema } from '@vee-validate/zod'
 import { toast } from 'vue-sonner'
 
-import { Surface } from '@/components/base/surface'
-import { Text, Title } from '@/components/base/text'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Spinner } from '@/components/ui/spinner'
-
+import { Text, Title } from '@/components/base/text'
 import { useResetPassword } from '@/api/userApi'
 import type { ApiError } from '@/api/client'
 import { passwordRules } from '@/lib/passwordSchema'
@@ -76,60 +74,68 @@ const submit = handleSubmit(async ({ password }) => {
 </script>
 
 <template>
-    <div class="mx-4 mt-22 pb-2">
-        <Surface size="lg" class="gap-6">
-            <div class="grid gap-1">
-                <Title class="font-medium">
-                    {{ dead ? "Link didn't work" : 'Set a new password' }}
-                </Title>
-                <Text size="sm" weight="normal">
-                    <template v-if="dead && formErrors.length">{{ formErrors[0] }}</template>
-                    <template v-else-if="dead">
-                        This link is missing its token. Request a new one below.
-                    </template>
-                    <template v-else>Pick something you haven't used here before.</template>
-                </Text>
-            </div>
+    <div class="flex flex-1 flex-col gap-9 px-7 pt-24 pb-12">
+        <div class="flex flex-col items-center gap-4">
+            <img src="/ourdriveway-icon.svg" alt="OurDriveway" width="84" height="84"
+                class="size-21 rounded-[20px] shadow-[0_16px_32px_-14px] shadow-primary/50" />
+            <Title as="h1" class="text-3xl leading-none tracking-[-0.02em] whitespace-nowrap">
+                <span class="font-bold text-primary">Our</span><span class="font-extrabold">Driveway</span>
+            </Title>
+            <Text as="p" size="md" weight="semibold" class="text-center text-balance">
+                <template v-if="dead && formErrors.length">{{ formErrors[0] }}</template>
+                <template v-else-if="dead">
+                    This link is missing its token. Request a new one below.
+                </template>
+                <template v-else>Pick something you haven't used here before.</template>
+            </Text>
+        </div>
 
-            <form v-if="!dead" id="reset-password-form" @submit="submit">
-                <FieldGroup class="gap-4">
-                    <VeeField v-slot="{ componentField, errors }" name="password">
-                        <Field :data-invalid="!!errors.length" class="gap-1">
-                            <FieldLabel for="reset-password-new">New password</FieldLabel>
-                            <Input id="reset-password-new" type="password" v-bind="componentField"
-                                placeholder="New password" autocomplete="new-password"
-                                :aria-invalid="!!errors.length" />
-                            <FieldDescription>
-                                At least 8 characters, with an uppercase and a lowercase letter, a number and a
-                                special character.
-                            </FieldDescription>
-                            <FieldError v-if="errors.length" :errors="errors" />
-                        </Field>
-                    </VeeField>
+        <form v-if="!dead" id="reset-password-form" class="flex flex-col gap-4.5" @submit="submit">
+            <!-- The group holds the fields and nothing else. The submit button is a
+                 sibling of it, not a member. -->
+            <FieldGroup class="gap-4.5">
+                <VeeField v-slot="{ field, errors }" name="password">
+                    <Field class="gap-2" :data-invalid="!!errors.length">
+                        <FieldLabel class="font-bold" for="reset-password-new">
+                            New password
+                        </FieldLabel>
+                        <Input id="reset-password-new" type="password" v-bind="field" placeholder="••••••••"
+                            autocomplete="new-password" :aria-invalid="!!errors.length" class="h-13 rounded-lg border-2 border-accent px-4 focus-visible:ring-4" />
+                        <FieldDescription>
+                            At least 8 characters, with an uppercase and a lowercase letter, a number and a
+                            special character.
+                        </FieldDescription>
+                        <FieldError v-if="errors.length" :errors="errors" />
+                    </Field>
+                </VeeField>
 
-                    <VeeField v-slot="{ componentField, errors }" name="confirmPassword">
-                        <Field :data-invalid="!!errors.length" class="gap-1">
-                            <FieldLabel for="reset-password-confirm">Confirm new password</FieldLabel>
-                            <Input id="reset-password-confirm" type="password" v-bind="componentField"
-                                placeholder="New password" autocomplete="new-password"
-                                :aria-invalid="!!errors.length" />
-                            <FieldError v-if="errors.length" :errors="errors" />
-                        </Field>
-                    </VeeField>
+                <VeeField v-slot="{ field, errors }" name="confirmPassword">
+                    <Field class="gap-2" :data-invalid="!!errors.length">
+                        <FieldLabel class="font-bold" for="reset-password-confirm">
+                            Confirm new password
+                        </FieldLabel>
+                        <Input id="reset-password-confirm" type="password" v-bind="field" placeholder="••••••••"
+                            autocomplete="new-password" :aria-invalid="!!errors.length" class="h-13 rounded-lg border-2 border-accent px-4 focus-visible:ring-4" />
+                        <FieldError v-if="errors.length" :errors="errors" />
+                    </Field>
+                </VeeField>
+            </FieldGroup>
 
-                    <Button class="w-full" type="submit" :disabled="loading">
-                        <Spinner v-if="loading" />
-                        Set password
-                    </Button>
-                </FieldGroup>
-            </form>
-
-            <Button v-if="dead" class="w-full" @click="router.push({ name: 'forgot-password' })">
-                Request a new link
+            <Button type="submit" :disabled="loading" class="h-13 w-full rounded-lg text-[17px] font-extrabold">
+                <Spinner v-if="loading" />
+                Set password
             </Button>
-            <Button v-else variant="outline" class="w-full" @click="router.push({ name: 'login' })">
-                Back to login
-            </Button>
-        </Surface>
+        </form>
+
+        <!-- A button, not the footer link: on a dead link this is the only way
+             forward, and the footer is where the secondary exit lives. -->
+        <Button v-else class="h-13 w-full rounded-lg text-[17px] font-extrabold" @click="router.push({ name: 'forgot-password' })">
+            Request a new link
+        </Button>
+
+        <p class="mt-auto text-center text-[15px] font-semibold text-muted-foreground">
+            Remembered it?
+            <RouterLink to="/login" class="font-extrabold text-primary">Log in</RouterLink>
+        </p>
     </div>
 </template>

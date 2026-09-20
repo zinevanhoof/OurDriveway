@@ -8,6 +8,7 @@ import { locateUser, nearer, type Position } from '@/lib/geo';
 import { useAuthStore } from '@/stores/auth';
 import { fetchBalance, fetchNextBooking, fetchSpot, fetchSpotsNear } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
+import { isPlaceholder, placeholders } from '@/lib/placeholders';
 import type { NextBookingResponse } from '@/types/responses/view/NextBookingResponse';
 import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
@@ -20,6 +21,7 @@ import { IconBox } from '@/components/base/icon-box';
 import { Money } from '@/components/base/money';
 import { SectionHeader } from '@/components/base/section-header';
 import { Badge } from '@/components/ui/badge';
+import MobileHomeHeader from '@/components/header/MobileHomeHeader.vue';
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -71,15 +73,17 @@ const happeningNow = computed(() => isActiveNow(next.value?.booking, nextTimezon
 // and the screen it opens cannot show two different numbers. It used to be a GraphQL
 // aggregate over bookings windowed on `created_at`, which was the wrong field: when the
 // booking was *made*, not when the money was earned.
-const available = ref(0)
-onMounted(async () => {
-    if (paused.value) return
-    try {
-        available.value = (await fetchBalance()).availableCents
-    } catch {
-        // A tile that can't load its number shows zero rather than breaking the screen.
-    }
+//
+// The wallet's own query and key, so the two share one cache. A failed read leaves the
+// placeholder's `isPlaceholderData` false and `data` undefined, which shows zero rather
+// than breaking the screen — what the hand-rolled fetch here used to do on purpose.
+const { data: balance, isPlaceholderData: balanceLoading } = useQuery({
+    queryKey: viewKeys.balance,
+    queryFn: fetchBalance,
+    enabled: computed(() => !paused.value),
+    placeholderData: placeholders.balance,
 })
+const available = computed(() => balance.value?.availableCents ?? 0)
 
 // ─── nearby spots ───────────────────────────────────────────────────────────
 const here = ref<Position | null>(null)
@@ -99,6 +103,7 @@ const { data: nearby } = useQuery({
     queryKey: computed(() => viewKeys.nearby(here.value?.[0] ?? 0, here.value?.[1] ?? 0, 5000)),
     queryFn: () => fetchSpotsNear(here.value![0], here.value![1], 5000),
     enabled: computed(() => here.value !== null),
+    placeholderData: placeholders.nearby,
 })
 
 // Still sorted client-side, and still for a reason: ordering by distance would mean an
@@ -151,7 +156,8 @@ const openBooking = () => {
          reachable and a screen reader announces no action. ProfileView's
          `<button class="flex … w-full text-left">` is the shape that fixes it
          without disturbing layout — worth doing to the whole screen at once. -->
-    <div class="py-2 px-4 space-y-4">
+    <MobileHomeHeader />
+    <div class="px-4 pt-2 pb-3 space-y-4">
         <div class="grid grid-cols-2 gap-2">
             <Surface variant="primary" size="lg" class="gap-8" @click="router.push({ name: 'search' })">
                 <Search />
@@ -191,7 +197,7 @@ const openBooking = () => {
             </IconBox>
             <div class="flex-1">
                 <Text>Available to withdraw</Text>
-                <Money :cents="available" size="xl" />
+                <Money :cents="available" size="xl" :data-loading="balanceLoading" />
             </div>
             <Text size="sm" weight="semibold" tone="primary" class="flex items-center gap-1">
                 Wallet
@@ -222,7 +228,8 @@ const openBooking = () => {
             </Surface>
             <div v-else class="flex gap-2">
                 <Surface v-for="spot in nearest" :key="spot.id" @click="openSpot(spot.id)" variant="elevated"
-                    size="none" class="relative flex-1 min-w-0 overflow-hidden">
+                    size="none" class="relative flex-1 min-w-0 overflow-hidden"
+                    :data-loading="isPlaceholder(spot.id)">
                     <img v-if="spot.images?.[0]" class="w-full h-28 object-cover" :src="spot.images[0]">
                     <div v-else class="w-full h-28 bg-accent"></div>
                     <div class="p-2">

@@ -11,8 +11,9 @@ import { useRouter } from 'vue-router';
 import { fetchHostSpots, fetchHostSummary } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
 import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/vue-query';
-import { computed, onMounted, useTemplateRef } from 'vue';
-import { useLoadMore } from '@/lib/loadMore';
+import { computed, onMounted } from 'vue';
+import { Sentinel } from '@/components/base/sentinel';
+import { isPlaceholder, placeholders, withLoadingRow } from '@/lib/placeholders';
 
 const router = useRouter()
 const queryClient = useQueryClient()
@@ -28,14 +29,23 @@ const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuer
     queryFn: ({ pageParam }) => fetchHostSpots({ offset: pageParam }),
     initialPageParam: 0,
     getNextPageParam: (last) => last.nextOffset ?? undefined,
+    placeholderData: placeholders.hostSpots,
 })
 
-const spots = computed(() => data.value?.pages.flatMap((p) => p.spots) ?? [])
+// While the next page loads, one placeholder row at the bottom stands in for it.
+const spots = computed(() =>
+    withLoadingRow(
+        data.value?.pages.flatMap((p) => p.spots) ?? [],
+        isFetchingNextPage.value,
+        placeholders.hostSpots.pages[0].spots,
+    ),
+)
 
 // The two tiles. The same totals the profile reads, so the two screens share one cache.
-const { data: summary } = useQuery({
+const { data: summary, isPlaceholderData: summaryLoading } = useQuery({
     queryKey: viewKeys.hostSummary,
     queryFn: fetchHostSummary,
+    placeholderData: placeholders.hostSummary,
 })
 
 /**
@@ -48,8 +58,6 @@ const monthChange = computed(() => {
     return Math.round(((s.earnedThisMonthCents - s.earnedLastMonthCents) / s.earnedLastMonthCents) * 100)
 })
 
-useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNextPage, fetchNextPage })
-
 // A spot created in AddSpotView would otherwise be served from cache on arrival here.
 // The write's `X-Version` already made the request wait for the projection; this is only about the
 // client's own cache being fresher than `staleTime`.
@@ -61,7 +69,7 @@ onMounted(() => {
 </script>
 
 <template>
-    <div class="space-y-4">
+    <div class="flex min-h-0 flex-1 flex-col gap-4">
         <SectionHeader class="items-center">
             <Title size="xl" weight="extrabold">Your parking spots</Title>
             <template #action>
@@ -74,47 +82,52 @@ onMounted(() => {
         <div class="grid grid-cols-2 gap-2">
             <Surface variant="elevated" size="lg">
                 <Text weight="normal">Earned this month</Text>
-                <Money :cents="summary?.earnedThisMonthCents ?? 0" size="2xl" />
+                <Money :cents="summary?.earnedThisMonthCents ?? 0" size="2xl" :data-loading="summaryLoading" />
                 <Text v-if="monthChange !== null" weight="normal" :tone="monthChange >= 0 ? 'success' : 'destructive'"
-                    class="flex items-center gap-1">
+                    class="flex items-center gap-1" :data-loading="summaryLoading">
                     <component :is="monthChange >= 0 ? TrendingUp : TrendingDown" :size="14" />
                     {{ monthChange >= 0 ? '+' : '' }}{{ monthChange }}% vs last
                 </Text>
             </Surface>
             <Surface variant="elevated" size="lg">
                 <Text weight="normal">Active parking spots</Text>
-                <Title size="2xl">{{ summary?.activeSpots ?? 0 }}/{{ summary?.spots ?? 0 }}</Title>
-                <Text>
+                <Title size="2xl" :data-loading="summaryLoading">
+                    {{ summary?.activeSpots ?? 0 }}/{{ summary?.spots ?? 0 }}
+                </Title>
+                <Text :data-loading="summaryLoading">
                     {{ summary?.bookedNow ? `${summary.bookedNow} booked right now` : 'None booked right now' }}
                 </Text>
             </Surface>
         </div>
         <Text weight="semibold">All listings</Text>
-        <ul class="space-y-2">
-            <Surface v-for="spot in spots" :key="spot.id" as="li" orientation="horizontal" class="gap-3"
-                @click="router.push({ name: 'spot', params: { id: spot.id } })">
-                <img :src="spot.images[0]" class="size-12 rounded-sm object-cover">
-                <div class="flex-1 space-y-1">
-                    <Title size="sm" weight="bold" class="flex items-center gap-2">
-                        {{ spot.title }}
-                        <!-- A paused listing looks identical to a live one otherwise,
+        <!-- The only part that scrolls; everything above stays put. -->
+        <div class="min-h-0 flex-1 overflow-y-auto no-scrollbar pb-3">
+            <ul class="space-y-2">
+                <Surface v-for="spot in spots" :key="spot.id" as="li" orientation="horizontal" class="gap-3"
+                    :data-loading="isPlaceholder(spot.id)"
+                    @click="router.push({ name: 'spot', params: { id: spot.id } })">
+                    <img :src="spot.images[0]" class="size-12 rounded-sm object-cover">
+                    <div class="flex-1 space-y-1">
+                        <Title size="sm" weight="bold" class="flex items-center gap-2">
+                            {{ spot.title }}
+                            <!-- A paused listing looks identical to a live one otherwise,
                              and "why am I getting no bookings" is the question that
                              follows. -->
-                        <Badge v-if="!spot.active" variant="secondary">Paused</Badge>
-                    </Title>
-                    <Text as="p" class="flex items-center gap-1 leading-normal">
-                        <MapPin :size="14" />
-                        {{ spot.address.line1 }} - {{ spot.address.city }}
-                    </Text>
-                </div>
-                <div class="flex flex-col items-end">
-                    <Money :cents="spot.pricePerHour" suffix="/hr" size="lg" weight="semibold" />
-                    <ChevronRight class="text-muted-foreground" />
-                </div>
-            </Surface>
-        </ul>
-        <!-- Crossing this asks for the next page. -->
-        <div ref="sentinel" class="h-px"></div>
-        <Text v-if="isFetchingNextPage" size="sm" class="pb-4 text-center">Loading…</Text>
+                            <Badge v-if="!spot.active" variant="secondary">Paused</Badge>
+                        </Title>
+                        <Text as="p" class="flex items-center gap-1 leading-normal">
+                            <MapPin :size="14" />
+                            {{ spot.address.line1 }} - {{ spot.address.city }}
+                        </Text>
+                    </div>
+                    <div class="flex flex-col items-end">
+                        <Money :cents="spot.pricePerHour" suffix="/hr" size="lg" weight="semibold" />
+                        <ChevronRight class="text-muted-foreground" />
+                    </div>
+                </Surface>
+            </ul>
+            <!-- Crossing this asks for the next page. -->
+            <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
+        </div>
     </div>
 </template>

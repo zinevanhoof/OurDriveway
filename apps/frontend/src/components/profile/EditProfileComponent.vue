@@ -219,7 +219,7 @@ const submit = handleSubmit(async (form) => {
                             <Field :data-invalid="!!errors.length" class="gap-1">
                                 <FieldLabel for="edit-profile-firstName">First name</FieldLabel>
                                 <Input id="edit-profile-firstName" v-bind="componentField" placeholder="First name"
-                                    autocomplete="given-name" :aria-invalid="!!errors.length" class="bg-card" />
+                                    autocomplete="given-name" :aria-invalid="!!errors.length" />
                                 <FieldError v-if="errors.length" :errors="errors" />
                             </Field>
                         </VeeField>
@@ -227,7 +227,7 @@ const submit = handleSubmit(async (form) => {
                             <Field :data-invalid="!!errors.length" class="gap-1">
                                 <FieldLabel for="edit-profile-lastName">Last name</FieldLabel>
                                 <Input id="edit-profile-lastName" v-bind="componentField" placeholder="Last name"
-                                    autocomplete="family-name" :aria-invalid="!!errors.length" class="bg-card" />
+                                    autocomplete="family-name" :aria-invalid="!!errors.length" />
                                 <FieldError v-if="errors.length" :errors="errors" />
                             </Field>
                         </VeeField>
@@ -238,7 +238,7 @@ const submit = handleSubmit(async (form) => {
                             <FieldLabel for="edit-profile-email">Email</FieldLabel>
                             <Input id="edit-profile-email" type="email" v-bind="componentField"
                                 placeholder="example@gmail.com" autocomplete="email" :aria-invalid="!!errors.length"
-                                class="bg-card" />
+                                />
                             <FieldDescription>This is what you sign in with.</FieldDescription>
                             <FieldError v-if="errors.length" :errors="errors" />
                         </Field>
@@ -250,7 +250,7 @@ const submit = handleSubmit(async (form) => {
                                 <FieldLabel for="edit-profile-current-password">Current password</FieldLabel>
                                 <Input id="edit-profile-current-password" type="password" v-bind="componentField"
                                     placeholder="Current password" autocomplete="current-password"
-                                    :aria-invalid="!!errors.length" class="bg-card" />
+                                    :aria-invalid="!!errors.length" />
                                 <FieldDescription>
                                     Confirm it's you before changing the address you sign in with.
                                 </FieldDescription>
@@ -309,7 +309,7 @@ const submit = handleSubmit(async (form) => {
                                 <div class="flex gap-2 items-center">
                                     <Input v-bind="componentField" placeholder="1-ABC-123" autocomplete="off"
                                         :aria-label="`License plate ${index + 1}`" :aria-invalid="!!errors.length"
-                                        class="bg-card" />
+                                        />
                                     <Button type="button" variant="outline" size="icon" class="shrink-0"
                                         :aria-label="`Remove license plate ${index + 1}`" @click="removePlate(index)">
                                         <Trash2 class="text-destructive" />

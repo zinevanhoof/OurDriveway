@@ -266,7 +266,7 @@ async function giveUp() {
 </script>
 
 <template>
-  <div class="mx-auto w-full max-w-lg px-4 py-6 space-y-3">
+  <div class="mx-auto w-full max-w-lg px-4 pt-6 pb-3 space-y-3">
     <template v-if="screen === 'loading'">
       <Surface variant="none" size="none" class="items-center gap-3 py-16 text-center">
         <Spinner class="size-6" />

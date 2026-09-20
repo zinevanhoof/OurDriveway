@@ -87,6 +87,24 @@ async function bootstrap() {
   await installDeepLinks();
 
   app.mount("#app");
+
+  // Releases the Android splash screen, which has been held up since launch so the
+  // blank webview and the `refreshAccessToken`/`fetchMe` wait above never show.
+  // `MainActivity` injects `window.splash`; it is absent on web and on desktop, where
+  // nothing is waiting, and absent on Android too if the webview is old enough to lack
+  // WebMessageListener — every one of those cases is a no-op here rather than a branch.
+  //
+  // Inside `requestAnimationFrame`, not straight after `mount`: mounting builds the DOM
+  // but the frame carrying it has not been drawn yet, and letting the splash go first
+  // would put a blank frame between the two.
+  requestAnimationFrame(() => window.splash?.postMessage("ready"));
+}
+
+declare global {
+  interface Window {
+    /** Injected by `MainActivity.onWebViewCreate`. Android only. */
+    splash?: { postMessage(message: string): void };
+  }
 }
 
 /**
@@ -124,8 +142,9 @@ async function installDeepLinks() {
         // (`ourdriveway:///checkout`) the host is empty and the pathname carries the whole
         // path, which would otherwise produce `//checkout` and fail to match any route.
         // Accepting both spellings means a malformed return URL degrades to working.
-        const path =
-          `/${url.host}${url.pathname}`.replace(/\/{2,}/g, "/").replace(/(.)\/$/, "$1");
+        const path = `/${url.host}${url.pathname}`
+          .replace(/\/{2,}/g, "/")
+          .replace(/(.)\/$/, "$1");
         router.push({ path, query: Object.fromEntries(url.searchParams) });
       } catch {
         // A malformed link is not worth breaking startup over.

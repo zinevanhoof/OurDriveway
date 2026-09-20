@@ -4,7 +4,7 @@
 //
 // Same endpoint as the preview, which asks it for two confirmed rows. This one pages
 // through it twenty at a time, under two tab rows: upcoming/past and confirmed/cancelled.
-import { computed, ref, useTemplateRef } from 'vue'
+import { computed, ref } from 'vue'
 import { useInfiniteQuery, useQuery } from '@tanstack/vue-query'
 import { useRouter } from 'vue-router'
 
@@ -20,7 +20,8 @@ import { viewKeys } from '@/api/keys'
 import type { ApiError } from '@/api/client'
 import type { BookingScope } from '@/types/responses/view/HostBookingsPageResponse'
 import type { HostBookingResponse } from '@/types/responses/view/HostBookingResponse'
-import { useLoadMore } from '@/lib/loadMore'
+import { Sentinel } from '@/components/base/sentinel'
+import { isPlaceholder, placeholders, withLoadingRow } from '@/lib/placeholders'
 
 const { id } = defineProps<{ id: string }>()
 
@@ -40,7 +41,7 @@ const status = ref<'confirmed' | 'cancelled'>('confirmed')
 // One query, not four. Both tabs are part of the key, so switching is a different
 // cached list rather than a second copy of this block — and going back to a tab shows
 // the pages already fetched for it.
-const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending, isError, error, refetch } =
+const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isError, error, refetch } =
     useInfiniteQuery({
         queryKey: computed(() => viewKeys.hostSpotBookings(id, scope.value, status.value)),
         queryFn: ({ pageParam }) =>
@@ -48,9 +49,16 @@ const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending, isError
         initialPageParam: 0,
         // Null ends the list. The server says which offset is next; nothing here counts.
         getNextPageParam: (last) => last.nextOffset ?? undefined,
+        placeholderData: placeholders.hostBookings,
     })
 
-const bookings = computed(() => data.value?.pages.flatMap((p) => p.bookings) ?? [])
+const bookings = computed(() =>
+    withLoadingRow(
+        data.value?.pages.flatMap((p) => p.bookings) ?? [],
+        isFetchingNextPage.value,
+        placeholders.hostBookings.pages[0].bookings,
+    ),
+)
 // `total` is on every page and nothing here reads it: the screen scrolls rather than
 // counting. It stays on the response because the server counts anyway — `nextOffset` is
 // derived from it — and a tab that one day wants "Upcoming (7)" already has the number.
@@ -64,8 +72,6 @@ const openBooking = (booking: HostBookingResponse) => {
     selected.value = booking
     detailOpen.value = true
 }
-
-useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNextPage, fetchNextPage })
 </script>
 
 <template>
@@ -86,13 +92,13 @@ useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNe
 
             <div v-auto-animate class="space-y-2">
                 <HostBookingRow v-for="booking in bookings" :key="booking.id" :booking="booking"
-                    :timezone="timezone" interactive @click="openBooking(booking)" />
+                    :timezone="timezone" interactive :data-loading="isPlaceholder(booking.id)"
+                    @click="openBooking(booking)" />
             </div>
 
-            <Text v-if="isPending" size="sm" class="py-6 text-center">Loading…</Text>
             <!-- A failed read must not render as an empty list: "nothing is booked" is
                  the one wrong thing this screen can tell a host. -->
-            <div v-else-if="isError" class="space-y-2 py-6 text-center">
+            <div v-if="isError" class="space-y-2 py-6 text-center">
                 <Text size="sm">{{ (error as ApiError).detail.join(' ') }}</Text>
                 <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
             </div>
@@ -103,8 +109,7 @@ useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNe
             </Text>
 
             <!-- Crossing this asks for the next page. -->
-            <div ref="sentinel" class="h-px"></div>
-            <Text v-if="isFetchingNextPage" size="sm" class="pb-4 text-center">Loading…</Text>
+            <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
         </template>
     </FullScreenLayoutComponent>
 

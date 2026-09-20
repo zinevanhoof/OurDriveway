@@ -69,7 +69,7 @@ const submit = handleSubmit(async ({ confirmPassword, ...form }) => {
                             <FieldLabel for="change-password-current">Current password</FieldLabel>
                             <Input id="change-password-current" type="password" v-bind="componentField"
                                 placeholder="Current password" autocomplete="current-password"
-                                :aria-invalid="!!errors.length" class="bg-card" />
+                                :aria-invalid="!!errors.length" />
                             <FieldError v-if="errors.length" :errors="errors" />
                         </Field>
                     </VeeField>
@@ -79,7 +79,7 @@ const submit = handleSubmit(async ({ confirmPassword, ...form }) => {
                             <FieldLabel for="change-password-new">New password</FieldLabel>
                             <Input id="change-password-new" type="password" v-bind="componentField"
                                 placeholder="New password" autocomplete="new-password" :aria-invalid="!!errors.length"
-                                class="bg-card" />
+                                />
                             <FieldDescription>
                                 At least 8 characters, with an uppercase and a lowercase letter, a number and a
                                 special character.
@@ -93,7 +93,7 @@ const submit = handleSubmit(async ({ confirmPassword, ...form }) => {
                             <FieldLabel for="change-password-confirm">Confirm new password</FieldLabel>
                             <Input id="change-password-confirm" type="password" v-bind="componentField"
                                 placeholder="New password" autocomplete="new-password" :aria-invalid="!!errors.length"
-                                class="bg-card" />
+                                />
                             <FieldError v-if="errors.length" :errors="errors" />
                         </Field>
                     </VeeField>

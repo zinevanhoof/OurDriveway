@@ -1,14 +1,12 @@
 import HomeView from "@/views/HomeView.vue";
 import { createWebHistory, createRouter } from "vue-router";
 import type { RouteLocationNormalized } from "vue-router";
-import type { Component } from "vue";
 import ProfileView from "@/views/ProfileView.vue";
 import SearchView from "@/views/SearchView.vue";
 import LoginView from "@/views/LoginView.vue";
+import SignupView from "@/views/SignupView.vue";
 import { useAuthStore } from "@/stores/auth";
 import SpotsView from "@/views/SpotsView.vue";
-import MobileHomeHeader from "@/components/header/MobileHomeHeader.vue";
-import MobileProfileHeader from "@/components/header/MobileProfileHeader.vue";
 import AddSpotView from "@/views/AddSpotView.vue";
 import ManageSpotView from "@/views/ManageSpotView.vue";
 import SpotBookingsView from "@/views/SpotBookingsView.vue";import EditSpotView from "@/views/EditSpotView.vue";
@@ -23,7 +21,6 @@ import WalletView from "@/views/wallet/WalletView.vue";
 import WalletWithdrawView from "@/views/wallet/WalletWithdrawView.vue";
 
 export type RouteMeta = {
-  header: Component | null;
   requiresAuth: boolean;
 };
 
@@ -33,7 +30,6 @@ const routes = [
     name: "home",
     component: HomeView,
     meta: {
-      header: MobileHomeHeader,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -42,7 +38,14 @@ const routes = [
     name: "login",
     component: LoginView,
     meta: {
-      header: null,
+      requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    path: "/signup",
+    name: "signup",
+    component: SignupView,
+    meta: {
       requiresAuth: false,
     } satisfies RouteMeta,
   },
@@ -51,7 +54,6 @@ const routes = [
     name: "spots",
     component: SpotsView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -60,7 +62,6 @@ const routes = [
     name: "spot-add",
     component: AddSpotView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -70,7 +71,6 @@ const routes = [
     component: ManageSpotView,
     props: true,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -82,7 +82,6 @@ const routes = [
     component: SpotBookingsView,
     props: true,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -92,7 +91,6 @@ const routes = [
     name: "notifications",
     component: NotificationsView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -102,7 +100,6 @@ const routes = [
     component: EditSpotView,
     props: true,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -111,7 +108,6 @@ const routes = [
     name: "wallet",
     component: WalletView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -124,7 +120,6 @@ const routes = [
       maxWithdraw: Number(route.params.maxWithdraw),
     }),
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -133,7 +128,6 @@ const routes = [
     name: "profile",
     component: ProfileView,
     meta: {
-      header: MobileProfileHeader,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -142,7 +136,6 @@ const routes = [
     name: "profile-edit",
     component: EditProfileView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -151,18 +144,16 @@ const routes = [
     name: "profile-password",
     component: ChangePasswordView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
   {
     // Reached from a link in an email, so it must work for someone who cannot log
     // in yet — being unverified is precisely why they can't.
-    path: "/verify",
+    path: "/verify-email",
     name: "verify-email",
     component: VerifyEmailView,
     meta: {
-      header: null,
       requiresAuth: false,
     } satisfies RouteMeta,
   },
@@ -173,7 +164,6 @@ const routes = [
     name: "forgot-password",
     component: ForgotPasswordView,
     meta: {
-      header: null,
       requiresAuth: false,
     } satisfies RouteMeta,
   },
@@ -185,7 +175,6 @@ const routes = [
     name: "reset-password",
     component: ResetPasswordView,
     meta: {
-      header: null,
       requiresAuth: false,
     } satisfies RouteMeta,
   },
@@ -199,7 +188,6 @@ const routes = [
     name: "checkout",
     component: CheckoutView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -208,7 +196,6 @@ const routes = [
     name: "search",
     component: SearchView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -224,5 +211,13 @@ router.beforeEach(async (to) => {
 
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
     return { name: "login" };
+  }
+
+  // The mirror image: every public route is a way *into* a session — login,
+  // signup, and the three emailed-link screens — so with one already open there
+  // is nothing to do on them. Safe on a cold load from an email link, because
+  // `bootstrap` awaits the session refresh before installing the router.
+  if (!to.meta.requiresAuth && auth.isAuthenticated) {
+    return { name: "home" };
   }
 });

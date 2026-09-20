@@ -11,8 +11,14 @@ import BookedSpotsComponent from '@/components/BookedSpotsComponent.vue';
 </script>
 
 <template>
-    <div class="space-y-2 mt-4 mx-4 pb-2">
-        <Tabs default-value="my-parking-spots" class="gap-5">
+    <!-- Sized to the screen rather than to its content, down every level, so only the
+         lists inside the tabs scroll. `min-h-0` on each flex child is what lets it
+         shrink below its content; without it the chain grows and the page scrolls.
+
+         No bottom padding here: the lists scroll, so their `pb-3` is inside their own
+         scroll boxes, and those run flush to the navbar. -->
+    <div class="flex min-h-0 flex-1 flex-col px-4 pt-4">
+        <Tabs default-value="my-parking-spots" class="min-h-0 flex-1 gap-5">
             <TabsList class="w-full group-data-horizontal/tabs:h-10">
                 <TabsTrigger value="my-parking-spots" class="font-bold">
                     My parking spots
@@ -21,10 +27,12 @@ import BookedSpotsComponent from '@/components/BookedSpotsComponent.vue';
                     My bookings
                 </TabsTrigger>
             </TabsList>
-            <TabsContent value="my-parking-spots">
+            <TabsContent value="my-parking-spots" class="flex min-h-0 flex-col">
                 <MySpotsComponent />
             </TabsContent>
-            <TabsContent value="my-bookings">
+            <!-- `-mt-2`: this tab opens on a second row of tabs, and two tab bars 20px
+                 apart read as unrelated. -->
+            <TabsContent value="my-bookings" class="-mt-3 flex min-h-0 flex-col">
                 <BookedSpotsComponent />
             </TabsContent>
         </Tabs>

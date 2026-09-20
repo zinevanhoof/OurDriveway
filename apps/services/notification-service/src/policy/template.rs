@@ -72,7 +72,7 @@ mod tests {
     fn mail(first_name: Option<&str>, company_name: Option<&str>) -> Mail {
         Mail::VerifyEmail {
             to: "renter@example.com".to_string(),
-            verification_url: "https://ourdriveway.com/verify?token=abc".to_string(),
+            verification_url: "https://ourdriveway.com/verify-email?token=abc".to_string(),
             first_name: first_name.map(str::to_string),
             company_name: company_name.map(str::to_string),
         }
@@ -83,7 +83,7 @@ mod tests {
         let vars = variables(&mail(None, None));
         assert_eq!(
             vars.get("verification_url").and_then(Value::as_str),
-            Some("https://ourdriveway.com/verify?token=abc")
+            Some("https://ourdriveway.com/verify-email?token=abc")
         );
     }
 

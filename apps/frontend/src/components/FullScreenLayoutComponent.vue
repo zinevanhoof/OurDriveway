@@ -33,10 +33,16 @@ const emit = defineEmits(['close'])
             <Text v-if="description" weight="semibold">{{ description }}</Text>
         </div>
     </header>
-    <!-- The bottom padding is what stops the floating action sitting on top of the last
-         row of content: the bar overlays this box rather than taking space from it. -->
-    <main class="space-y-4 flex-1 px-4 py-4 bg-background overflow-y-auto no-scrollbar"
-        :class="$slots.action && 'pb-28'">
+    <!-- Page padding lives here and not in the view, unlike every other screen: this
+         `<main>` is the scroll container, and padding outside it would not scroll.
+
+         Bottom is the app-wide `pb-3`, plus the floating action's height when there is
+         one — the bar overlays this box rather than taking space from it. `pb-28` (7rem)
+         is exactly that: 0.75rem + the bar's pt-10 + h-11 button + pb-4 (6.25rem).
+         A ternary, not `pb-3` plus a conditional `pb-28`: two padding utilities on one
+         element are decided by stylesheet order, not by which was written last. -->
+    <main class="space-y-4 flex-1 px-4 pt-4 bg-background overflow-y-auto no-scrollbar"
+        :class="$slots.action ? 'pb-28' : 'pb-3'">
         <slot name="main"></slot>
     </main>
     <!-- Only when someone fills it. An always-rendered footer is a padded, bordered

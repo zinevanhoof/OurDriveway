@@ -4,12 +4,13 @@
 // Each row draws its spot from the card the booking carries — the one exception to a
 // booking never carrying its spot — so the list is one request per page. Tapping a row
 // opens the spot detail sheet for that booking.
-import { computed, ref, useTemplateRef } from 'vue';
+import { computed, ref } from 'vue';
 import { useInfiniteQuery, useQueryClient } from '@tanstack/vue-query';
 
 import { fetchRenterBookings } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
-import { useLoadMore } from '@/lib/loadMore';
+import { Sentinel } from '@/components/base/sentinel';
+import { isPlaceholder, placeholders, withLoadingRow } from '@/lib/placeholders';
 import type { BookingScope } from '@/types/responses/view/HostBookingsPageResponse';
 import BookedSpotRow from './BookedSpotRow.vue';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -36,18 +37,23 @@ const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending } = useI
     initialPageParam: 0,
     getNextPageParam: (last) => last.nextOffset ?? undefined,
     staleTime: 0,
+    placeholderData: placeholders.renterBookings,
 })
 
-const bookings = computed(() => data.value?.pages.flatMap((p) => p.bookings) ?? [])
+const bookings = computed(() =>
+    withLoadingRow(
+        data.value?.pages.flatMap((p) => p.bookings) ?? [],
+        isFetchingNextPage.value,
+        placeholders.renterBookings.pages[0].bookings,
+    ),
+)
 
 /** After a cancel, re-read past the projection rather than trusting the cache. */
 const refresh = () => queryClient.invalidateQueries({ queryKey: viewKeys.bookings })
-
-useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNextPage, fetchNextPage })
 </script>
 
 <template>
-    <div class="space-y-2">
+    <div class="flex min-h-0 flex-1 flex-col gap-2">
         <Tabs v-model="scope">
             <TabsList class="w-full group-data-horizontal/tabs:h-10">
                 <TabsTrigger value="upcoming" class="font-bold">Upcoming</TabsTrigger>
@@ -55,14 +61,16 @@ useLoadMore(useTemplateRef<HTMLElement>('sentinel'), { hasNextPage, isFetchingNe
             </TabsList>
         </Tabs>
 
-        <BookedSpotRow v-for="booking in bookings" :key="booking.id" :booking="booking"
-            :past="scope === 'past'" @changed="refresh" />
-        <Text v-if="!isPending && !bookings.length" size="sm" class="py-8 text-center">
-            {{ scope === 'upcoming' ? 'Nothing booked yet.' : 'No past bookings.' }}
-        </Text>
+        <!-- The only part that scrolls; the two tab bars stay put. -->
+        <div class="min-h-0 flex-1 space-y-2 overflow-y-auto no-scrollbar pb-3">
+            <BookedSpotRow v-for="booking in bookings" :key="booking.id" :booking="booking"
+                :past="scope === 'past'" :data-loading="isPlaceholder(booking.id)" @changed="refresh" />
+            <Text v-if="!isPending && !bookings.length" size="sm" class="py-8 text-center">
+                {{ scope === 'upcoming' ? 'Nothing booked yet.' : 'No past bookings.' }}
+            </Text>
 
-        <!-- Crossing this asks for the next page. -->
-        <div ref="sentinel" class="h-px"></div>
-        <Text v-if="isFetchingNextPage" size="sm" class="pb-4 text-center">Loading…</Text>
+            <!-- Crossing this asks for the next page. -->
+            <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
+        </div>
     </div>
 </template>

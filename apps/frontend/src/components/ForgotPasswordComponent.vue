@@ -2,26 +2,22 @@
 // Asks for a reset link. The other half of the flow is
 // `ResetPasswordComponent.vue`, which is where the link lands.
 //
-// The `Surface` shell rather than `FullScreenLayoutComponent`, matching
-// `VerifyEmailComponent`: this is reachable by someone with no session, and that
-// layout's close button is `router.back()`, which from a fresh tab goes nowhere.
+// Styled as the third auth screen, alongside login and signup, rather than with
+// `FullScreenLayoutComponent`: this is reachable by someone with no session, and
+// that layout's close button is `router.back()`, which from a fresh tab goes
+// nowhere.
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { useForm, Field as VeeField } from 'vee-validate'
 import { z } from 'zod'
 import { toTypedSchema } from '@vee-validate/zod'
 
-import { Surface } from '@/components/base/surface'
-import { Text, Title } from '@/components/base/text'
 import { Field, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Spinner } from '@/components/ui/spinner'
-
+import { Text, Title } from '@/components/base/text'
 import { useForgotPassword } from '@/api/userApi'
 import type { ApiError } from '@/api/client'
-
-const router = useRouter()
 
 const formSchema = toTypedSchema(
     z.object({ email: z.string().email() })
@@ -55,49 +51,53 @@ const submit = handleSubmit(async ({ email }) => {
 </script>
 
 <template>
-    <div class="mx-4 mt-22 pb-2">
-        <Surface size="lg" class="gap-6">
-            <div class="grid gap-1">
-                <Title class="font-medium">
-                    {{ sent ? 'Check your inbox' : 'Forgot password' }}
-                </Title>
-                <Text size="sm" weight="normal">
-                    <!-- Says nothing about whether the address exists, because the
-                         backend deliberately answers the same either way. -->
-                    <template v-if="sent">
-                        If that address has an account, a reset link is on its way. It expires in an
-                        hour, and only the most recent link works.
-                    </template>
-                    <template v-else>
-                        Enter your email and we'll send you a link to set a new password.
-                    </template>
-                </Text>
-            </div>
+    <div class="flex flex-1 flex-col gap-9 px-7 pt-24 pb-12">
+        <div class="flex flex-col items-center gap-4">
+            <img src="/ourdriveway-icon.svg" alt="OurDriveway" width="84" height="84"
+                class="size-21 rounded-[20px] shadow-[0_16px_32px_-14px] shadow-primary/50" />
+            <Title as="h1" class="text-3xl leading-none tracking-[-0.02em] whitespace-nowrap">
+                <span class="font-bold text-primary">Our</span><span class="font-extrabold">Driveway</span>
+            </Title>
+            <!-- Says nothing about whether the address exists, because the backend
+                 deliberately answers the same either way. -->
+            <Text as="p" size="md" weight="semibold" class="text-center text-balance">
+                <template v-if="sent">
+                    If that address has an account, a reset link is on its way. It expires in an
+                    hour, and only the most recent link works.
+                </template>
+                <template v-else>
+                    Enter your email and we'll send you a link to set a new password.
+                </template>
+            </Text>
+        </div>
 
-            <form v-if="!sent" id="forgot-password-form" @submit="submit">
-                <FieldGroup class="gap-4">
-                    <VeeField v-slot="{ componentField, errors }" name="email">
-                        <Field :data-invalid="!!errors.length" class="gap-1">
-                            <FieldLabel for="forgot-password-email">Email</FieldLabel>
-                            <Input id="forgot-password-email" type="email" v-bind="componentField"
-                                placeholder="example@gmail.com" autocomplete="email"
-                                :aria-invalid="!!errors.length" />
-                            <FieldError v-if="errors.length" :errors="errors" />
-                        </Field>
-                    </VeeField>
+        <form v-if="!sent" id="forgot-password-form" class="flex flex-col gap-4.5" @submit="submit">
+            <!-- The group holds the field and nothing else. The form-level error
+                 and the submit button are siblings of it, not members. -->
+            <FieldGroup class="gap-4.5">
+                <VeeField v-slot="{ field, errors }" name="email">
+                    <Field class="gap-2" :data-invalid="!!errors.length">
+                        <FieldLabel class="font-bold" for="forgot-password-email">
+                            Email
+                        </FieldLabel>
+                        <Input id="forgot-password-email" type="email" v-bind="field" placeholder="you@example.com"
+                            autocomplete="email" :aria-invalid="!!errors.length" class="h-13 rounded-lg border-2 border-accent px-4 focus-visible:ring-4" />
+                        <FieldError v-if="errors.length" :errors="errors" />
+                    </Field>
+                </VeeField>
+            </FieldGroup>
 
-                    <FieldError v-if="formErrors.length" :errors="formErrors" />
+            <FieldError v-if="formErrors.length" :errors="formErrors" />
 
-                    <Button class="w-full" type="submit" :disabled="loading">
-                        <Spinner v-if="loading" />
-                        Send reset link
-                    </Button>
-                </FieldGroup>
-            </form>
-
-            <Button variant="outline" class="w-full" @click="router.push({ name: 'login' })">
-                Back to login
+            <Button type="submit" :disabled="loading" class="h-13 w-full rounded-lg text-[17px] font-extrabold">
+                <Spinner v-if="loading" />
+                Send reset link
             </Button>
-        </Surface>
+        </form>
+
+        <p class="mt-auto text-center text-[15px] font-semibold text-muted-foreground">
+            Remembered it?
+            <RouterLink to="/login" class="font-extrabold text-primary">Log in</RouterLink>
+        </p>
     </div>
 </template>

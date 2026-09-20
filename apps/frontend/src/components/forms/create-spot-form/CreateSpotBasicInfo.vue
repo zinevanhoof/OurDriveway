@@ -26,7 +26,7 @@ import { Title } from '@/components/base/text'
                     Title
                 </FieldLabel>
                 <Input id="title" v-bind="componentField" placeholder="Title" autocomplete="off"
-                    :aria-invalid="!!errors.length" class="bg-card" />
+                    :aria-invalid="!!errors.length" />
                 <FieldError v-if="errors.length" :errors="errors" />
             </Field>
         </VeeField>
@@ -58,7 +58,7 @@ import { Title } from '@/components/base/text'
                     Price per hour
                 </FieldLabel>
                 <Input type="number" id="pricePerHour" v-bind="componentField" placeholder="Price per hour"
-                    autocomplete="off" :aria-invalid="!!errors.length" class="bg-card" />
+                    autocomplete="off" :aria-invalid="!!errors.length" />
                 <FieldError v-if="errors.length" :errors="errors" />
             </Field>
         </VeeField>
