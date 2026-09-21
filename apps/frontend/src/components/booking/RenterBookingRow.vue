@@ -12,8 +12,7 @@ import { toast } from "vue-sonner";
 import * as bookingApi from "@/api/bookingApi";
 import * as paymentApi from "@/api/paymentApi";
 import { native } from "@/api/http";
-import { Drawer, DrawerContent } from "@/components/ui/drawer";
-import Button from "@/components/ui/button/Button.vue";
+import { ConfirmDrawer } from "@/components/base/confirm-drawer";
 import { Badge } from "@/components/ui/badge";
 import Separator from "@/components/ui/separator/Separator.vue";
 import { Surface } from "@/components/base/surface";
@@ -210,34 +209,17 @@ async function cancel() {
     <!-- Defaults left alone on purpose: drag-to-dismiss, the handle, backdrop tap
          and Esc are all vaul's, and a confirmation is the last place to break the
          gesture someone already expects. -->
-    <Drawer v-model:open="confirmOpen">
-      <DrawerContent @close-auto-focus.prevent
-        class="data-[vaul-drawer-direction=bottom]:mb-15">
-        <div class="m-4 space-y-4">
-          <!-- A hold and a paid booking are different things to give up, and the copy
-               says so: nothing has been charged for a hold, so "cancel" would overstate
-               what is happening. -->
-          <div>
-            <Title size="lg">
-              {{ reserved ? "Give up these times?" : "Cancel this booking?" }}
-            </Title>
-            <Text size="sm">
-              {{ spot?.title }} —
-              <span v-if="days.length">{{ formatDay(days[0][0], timezone) }}</span>.
-              The slots go straight back on the market.
-              <template v-if="reserved">You haven't been charged.</template>
-            </Text>
-          </div>
-          <div class="space-y-2">
-            <Button variant="destructive" class="w-full h-11 font-bold" :disabled="cancelling" @click="cancel">
-              {{ cancelling ? "Releasing…" : reserved ? "Yes, give them up" : "Yes, cancel it" }}
-            </Button>
-            <Button variant="outline" class="w-full h-11 font-bold" @click="confirmOpen = false">
-              {{ reserved ? "Keep them" : "Keep booking" }}
-            </Button>
-          </div>
-        </div>
-      </DrawerContent>
-    </Drawer>
+    <!-- A hold and a paid booking are different things to give up, and the copy says so:
+         nothing has been charged for a hold, so "cancel" would overstate what is
+         happening. -->
+    <ConfirmDrawer v-model:open="confirmOpen"
+      :title="reserved ? 'Give up these times?' : 'Cancel this booking?'"
+      :confirm-label="reserved ? 'Yes, give them up' : 'Yes, cancel it'" pending-label="Releasing…"
+      :pending="cancelling" :cancel-label="reserved ? 'Keep them' : 'Keep booking'" @confirm="cancel">
+      {{ spot?.title }} —
+      <span v-if="days.length">{{ formatDay(days[0][0], timezone) }}</span>.
+      The slots go straight back on the market.
+      <template v-if="reserved">You haven't been charged.</template>
+    </ConfirmDrawer>
   </Surface>
 </template>

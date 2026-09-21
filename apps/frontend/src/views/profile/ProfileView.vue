@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import Separator from '@/components/ui/separator/Separator.vue';
-import Button from '@/components/ui/button/Button.vue';
-import { Drawer, DrawerContent } from '@/components/ui/drawer';
+import { ConfirmDrawer } from '@/components/base/confirm-drawer';
 import { useQuery } from '@tanstack/vue-query';
 import { fetchAccount, fetchHostSummary } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
@@ -133,26 +132,8 @@ const logout = async () => {
             </Surface>
         </Surface>
 
-        <Drawer v-model:open="confirmOpen">
-            <DrawerContent @close-auto-focus.prevent
-                class="data-[vaul-drawer-direction=bottom]:mb-15">
-                <div class="m-4 space-y-4">
-                    <div>
-                        <Title size="lg">Log out?</Title>
-                        <Text size="sm">
-                            You'll need to sign in again to book or manage your spots.
-                        </Text>
-                    </div>
-                    <div class="space-y-2">
-                        <Button variant="destructive" class="w-full h-11 font-bold" @click="logout">
-                            Log out
-                        </Button>
-                        <Button variant="outline" class="w-full h-11 font-bold" @click="confirmOpen = false">
-                            Cancel
-                        </Button>
-                    </div>
-                </div>
-            </DrawerContent>
-        </Drawer>
+        <ConfirmDrawer v-model:open="confirmOpen" title="Log out?" confirm-label="Log out" @confirm="logout">
+            You'll need to sign in again to book or manage your spots.
+        </ConfirmDrawer>
     </div>
 </template>

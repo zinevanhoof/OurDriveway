@@ -77,23 +77,24 @@ const openBooking = (booking: HostBookingResponse) => {
 <template>
     <FullScreenLayout @close="router.back()" title="Bookings" :description="spot?.title">
         <template #main>
-            <Tabs v-model="scope">
-                <TabsList class="w-full">
-                    <TabsTrigger value="upcoming">Upcoming</TabsTrigger>
-                    <TabsTrigger value="past">Past</TabsTrigger>
-                </TabsList>
-            </Tabs>
-            <Tabs v-model="status">
-                <TabsList class="w-full">
-                    <TabsTrigger value="confirmed">Confirmed</TabsTrigger>
-                    <TabsTrigger value="cancelled">Cancelled</TabsTrigger>
-                </TabsList>
-            </Tabs>
+            <div class="space-y-2">
+                <Tabs v-model="scope">
+                    <TabsList class="w-full">
+                        <TabsTrigger value="upcoming">Upcoming</TabsTrigger>
+                        <TabsTrigger value="past">Past</TabsTrigger>
+                    </TabsList>
+                </Tabs>
+                <Tabs v-model="status">
+                    <TabsList class="w-full">
+                        <TabsTrigger value="confirmed">Confirmed</TabsTrigger>
+                        <TabsTrigger value="cancelled">Cancelled</TabsTrigger>
+                    </TabsList>
+                </Tabs>
+            </div>
 
             <div v-auto-animate class="space-y-2">
-                <HostBookingRow v-for="booking in bookings" :key="booking.id" :booking="booking"
-                    :timezone="timezone" interactive :data-loading="isPlaceholder(booking.id)"
-                    @click="openBooking(booking)" />
+                <HostBookingRow v-for="booking in bookings" :key="booking.id" :booking="booking" :timezone="timezone"
+                    interactive :data-loading="isPlaceholder(booking.id)" @click="openBooking(booking)" />
             </div>
 
             <!-- A failed read must not render as an empty list: "nothing is booked" is

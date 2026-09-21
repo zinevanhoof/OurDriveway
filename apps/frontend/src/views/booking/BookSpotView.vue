@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { formatCents } from '@/lib/money';
-import { Drawer, DrawerContent } from "@/components/ui/drawer";
 import FullScreenLayout from "@/components/layout/FullScreenLayout.vue";
 import Calendar from "@/components/ui/calendar/Calendar.vue";
 import { ArrowRight, CalendarDays, Car, Clock, Plus, X } from "@lucide/vue";
@@ -32,49 +31,37 @@ import type { AcceptableValue } from "reka-ui";
 
 import * as bookingApi from "@/api/bookingApi";
 import * as paymentApi from "@/api/paymentApi";
-import { fetchAccount, fetchSpotBookings } from "@/api/viewApi";
+import { fetchAccount, fetchSpot, fetchSpotBookings } from "@/api/viewApi";
 import { useUpdateUser } from "@/api/userApi";
 import { viewKeys } from "@/api/keys";
 import type { TimeSlot } from "@/types/domain/spot";
 import {
-    type SpotAvailability,
     mergeBooked,
     remainingWindows,
     subtract,
     toMin,
 } from "@/lib/bookingAvailability";
 
-const props = defineProps<{
-    /**
-     * Structural rather than `SpotDetail`, so the form does not depend on the whole
-     * read-model shape for four fields. `pricePerHour` is now a plain number — it was
-     * `number | string` because auto GraphQL rendered an `int` column as a string often
-     * enough that both had to be accepted, hence the `Number()` at every use site.
-     */
-    spot?: {
-        id: string;
-        title: string;
-        pricePerHour: number;
-        address?: { formatted?: string };
-        availability?: SpotAvailability;
-    };
-}>();
+const { id } = defineProps<{ id: string }>();
 
 const router = useRouter();
 
-const open = defineModel<boolean>({ required: true });
-const emit = defineEmits<{ booked: [bookingId: string] }>();
+// The listing. Shares `viewKeys.spot(id)` with the map's and the home screen's own read,
+// which is what makes arriving here instant: the spot sheet you tapped "book" on has
+// already filled this key, so the form renders from cache and revalidates behind it.
+const { data: spot } = useQuery({
+    queryKey: computed(() => viewKeys.spot(id)),
+    queryFn: () => fetchSpot(id),
+});
 
 // The taken slots, read by this form and nothing else — the spot carries none.
 //
-// Enabled only while open, and `staleTime: 0`, so every opening reads what is taken *now*:
-// this is the one query someone books against. Freshness, not correctness — the server's
-// availability check is the authority; this only stops the picker offering slots it then
-// has to retract.
+// `staleTime: 0`, so every entry reads what is taken *now*: this is the one query someone
+// books against. Freshness, not correctness — the server's availability check is the
+// authority; this only stops the picker offering slots it then has to retract.
 const { data: taken } = useQuery({
-    queryKey: computed(() => viewKeys.spotBookings(props.spot?.id ?? "")),
-    queryFn: () => fetchSpotBookings(props.spot!.id),
-    enabled: computed(() => open.value && !!props.spot),
+    queryKey: computed(() => viewKeys.spotBookings(id)),
+    queryFn: () => fetchSpotBookings(id),
     staleTime: 0,
 });
 
@@ -86,7 +73,7 @@ const occupied = computed(() => mergeBooked(taken.value));
 const minDate = today(getLocalTimeZone());
 const maxDate = minDate.add({ days: 90 });
 const isDateDisabled = (date: DateValue) =>
-    remainingWindows(props.spot?.availability, occupied.value, date).length === 0;
+    remainingWindows(spot.value?.availability, occupied.value, date).length === 0;
 
 // ─── Date selection (source of truth, independent of picked slots) ───
 const selectedDates = ref<DateValue[]>([]);
@@ -121,7 +108,7 @@ watch(selectedDates, () => {
 const activePicked = computed(() => pickedSlots.value[activeKey.value] ?? []);
 const displayWindows = computed(() =>
     activeDate.value
-        ? subtract(remainingWindows(props.spot?.availability, occupied.value, activeDate.value), activePicked.value)
+        ? subtract(remainingWindows(spot.value?.availability, occupied.value, activeDate.value), activePicked.value)
         : [],
 );
 
@@ -206,7 +193,7 @@ const { mutateAsync: saveUser } = useUpdateUser();
 // ─── Pricing + totals ───
 // pricePerHour is EUR cents (integer) — see lib/money.ts. No `Number()`: it arrives as
 // a number now rather than as auto GraphQL's stringified int.
-const pricePerHourCents = computed(() => props.spot?.pricePerHour ?? 0);
+const pricePerHourCents = computed(() => spot.value?.pricePerHour ?? 0);
 // Rounded because half-hour slots on an odd cent price give a fractional cent.
 const slotCents = (s: TimeSlot) => Math.round(slotHours(s) * pricePerHourCents.value);
 const slotHours = (s: TimeSlot) => (toMin(s.end) - toMin(s.start)) / 60;
@@ -224,7 +211,7 @@ const totals = computed(() => {
 
 const description = computed(() => {
     const parts = [`${formatCents(pricePerHourCents.value)}/hr`];
-    if (props.spot?.address?.formatted) parts.push(props.spot.address.formatted);
+    if (spot.value?.address?.formatted) parts.push(spot.value.address.formatted);
     return parts.join(" · ");
 });
 
@@ -238,7 +225,7 @@ const description = computed(() => {
 const busy = ref(false);
 
 async function submit() {
-    if (!totals.value.slots || !plate.value || !props.spot || busy.value) return;
+    if (!totals.value.slots || !plate.value || !spot.value || busy.value) return;
     const booked: Record<string, TimeSlot[]> = {};
     for (const [k, arr] of Object.entries(pickedSlots.value)) if (arr.length) booked[k] = arr;
 
@@ -255,7 +242,7 @@ async function submit() {
         // `amountCents` is not sent. The server recomputes the price from the spot
         // and the minutes it authorises; the figure on screen is display only.
         const booking = await bookingApi.createBooking({
-            spotId: props.spot.id,
+            spotId: id,
             booked,
             licensePlate: plate.value,
         });
@@ -265,8 +252,9 @@ async function submit() {
         // code path for entry, reload, return and retry.
         const session = await paymentApi.createSession(booking.id);
 
-        emit("booked", booking.id);
-        void router.push({ path: "/checkout", query: { session_id: session.sessionId } });
+        // `replace`, not `push`: this screen has done its job, and leaving it on the stack
+        // means Back from checkout lands on a picker whose slots are already held.
+        void router.replace({ path: "/checkout", query: { session_id: session.sessionId } });
     } catch (e: any) {
         // Someone took the slots between rendering and submitting, the host isn't open
         // then, or the session couldn't be created. In the last case the hold exists with
@@ -277,31 +265,18 @@ async function submit() {
     }
 }
 
-
-// The drawer only hides on close (component stays mounted), so clear the picks when it
-// closes — reopening starts fresh.
+// No reset on the way out. This was a drawer that stayed mounted and had to clear its own
+// picks on close; as a route it is destroyed on leave and mounts fresh, so the state is
+// gone with it.
 //
-// It no longer releases anything. It used to, and that became a landmine the moment
-// `submit()` started navigating: closing the drawer on the way to checkout would have
-// released the booking it had just created. Giving up a hold is now an explicit button on
-// the checkout screen, with the expiry sweeper as the fallback for a closed tab.
-watch(open, (o) => {
-    if (!o) {
-        selectedDates.value = [];
-        activeKey.value = "";
-        pickedSlots.value = {};
-        drafts.value = {};
-        plateTerm.value = "";
-        plateOpen.value = false;
-    }
-});
+// It releases nothing either. It used to, and that became a landmine the moment `submit()`
+// started navigating: leaving on the way to checkout would have released the booking it
+// had just created. Giving up a hold is an explicit button on the checkout screen, with
+// the expiry sweeper as the fallback for a closed tab.
 </script>
 
 <template>
-    <Drawer :open="open" :dismissible="false">
-        <DrawerContent @close-auto-focus.prevent
-            class="h-[calc(100dvh-3.75rem)] [&>div:first-child]:hidden data-[vaul-drawer-direction=bottom]:mt-0 data-[vaul-drawer-direction=bottom]:mb-15 data-[vaul-drawer-direction=bottom]:max-h-[calc(100dvh-3.75rem)] data-[vaul-drawer-direction=bottom]:rounded-none z-50">
-            <FullScreenLayout @close="open = false" :title="spot?.title ?? 'Book this spot'"
+    <FullScreenLayout @close="router.back()" :title="spot?.title ?? 'Book this spot'"
                 :description="description" :show-action="totals.slots > 0">
                 <template #main>
                     <!-- Only the picker lives here now. Paying is `/checkout`, a route of
@@ -447,7 +422,5 @@ watch(open, (o) => {
                         <ArrowRight />
                     </Button>
                 </template>
-            </FullScreenLayout>
-        </DrawerContent>
-    </Drawer>
+    </FullScreenLayout>
 </template>

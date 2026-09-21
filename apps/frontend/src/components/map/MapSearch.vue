@@ -14,7 +14,7 @@ import {
 import { suggestAddress } from '@/api/spotApi';
 import type { AddressSuggestResponse } from '@/types/responses/spot/AddressSuggestResponse';
 import type { SpotFilter } from '@/types/SpotFilter';
-import MapSearchFilter from './MapSearchFilter.vue';
+import MapSearchFilterDrawer from './MapSearchFilterDrawer.vue';
 import Input from '@/components/ui/input/Input.vue';
 import Button from '@/components/ui/button/Button.vue';
 import { IconBox } from '@/components/base/icon-box';
@@ -73,7 +73,7 @@ const onSelect = (value: AcceptableValue) => {
                 <Search
                     class="absolute left-2 top-1/2 -translate-y-1/2 size-6 text-muted-foreground pointer-events-none" />
                 <Input v-model="term" placeholder="Search a place or address…"
-                    class="pl-10 border-transparent focus-visible:border-transparent rounded-sm shadow-none font-semibold" />
+                    class="pl-10 border-transparent rounded-sm shadow-none font-semibold" />
             </ComboboxAnchor>
             <!-- List aligns to the anchor (the input), not the padded card. Widen by
                  the card's 1rem horizontal padding (stays centered → edges match the
@@ -87,12 +87,12 @@ const onSelect = (value: AcceptableValue) => {
                 </ComboboxViewport>
             </ComboboxList>
         </Combobox>
-        <MapSearchFilter v-model:open="filterOpen" @update="filterSummary = $event"
+        <MapSearchFilterDrawer v-model:open="filterOpen" @update="filterSummary = $event"
             @apply="emit('filter', $event)">
-            <IconBox size="lg" class="cursor-pointer">
+            <IconBox size="lg">
                 <SlidersHorizontal />
             </IconBox>
-        </MapSearchFilter>
+        </MapSearchFilterDrawer>
         <Button v-if="filterSummary" size="xs" @click="filterOpen = true"
             class="absolute -bottom-4 left-2 rounded-full font-bold shadow-md">
             <SlidersHorizontal />

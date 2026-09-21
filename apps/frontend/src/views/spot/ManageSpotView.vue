@@ -15,7 +15,7 @@ import HostBookingRow from '@/components/spot/HostBookingRow.vue';
 import HostBookingDrawer from '@/components/spot/HostBookingDrawer.vue';
 import type { HostBookingResponse } from '@/types/responses/view/HostBookingResponse';
 import Switch from '@/components/ui/switch/Switch.vue';
-import { Drawer, DrawerContent } from '@/components/ui/drawer'
+import { ConfirmDrawer } from '@/components/base/confirm-drawer'
 import { FieldError } from '@/components/ui/field'
 import { Surface } from '@/components/base/surface'
 import { Text, Title } from '@/components/base/text'
@@ -270,29 +270,12 @@ const openBooking = (booking: HostBookingResponse) => {
         </div>
     </div>
 
-    <Drawer v-model:open="confirmOpen">
-        <DrawerContent @close-auto-focus.prevent
-            class="data-[vaul-drawer-direction=bottom]:mb-15">
-            <div class="m-4 space-y-4">
-                <div>
-                    <Title size="lg">Delete this listing?</Title>
-                    <Text size="sm">
-                        {{ data?.title }} comes off the market for good. Any booking it still
-                        owes is cancelled and refunded. This can't be undone — to pause it instead,
-                        turn off "Listing is live".
-                    </Text>
-                </div>
-                <div class="space-y-2">
-                    <Button variant="destructive" class="w-full h-11 font-bold" :disabled="deleting" @click="remove">
-                        {{ deleting ? "Deleting…" : "Yes, delete it" }}
-                    </Button>
-                    <Button variant="outline" class="w-full h-11 font-bold" @click="confirmOpen = false">
-                        Keep listing
-                    </Button>
-                </div>
-            </div>
-        </DrawerContent>
-    </Drawer>
+    <ConfirmDrawer v-model:open="confirmOpen" title="Delete this listing?" confirm-label="Yes, delete it"
+        pending-label="Deleting…" :pending="deleting" cancel-label="Keep listing" @confirm="remove">
+        {{ data?.title }} comes off the market for good. Any booking it still
+        owes is cancelled and refunded. This can't be undone — to pause it instead,
+        turn off "Listing is live".
+    </ConfirmDrawer>
 
     <HostBookingDrawer v-model:open="detailOpen" :booking="selected" :timezone="timezone" />
 </template>

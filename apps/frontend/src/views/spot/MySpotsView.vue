@@ -77,7 +77,7 @@ onMounted(() => {
          scroll box, and that runs flush to the navbar. -->
     <div class="flex min-h-0 flex-1 flex-col gap-4 px-4 pt-4">
         <SectionHeader class="items-center">
-            <Title size="xl" weight="extrabold">Your parking spots</Title>
+            <Title size="xl" weight="extrabold">My parking spots</Title>
             <template #action>
                 <Button @click="router.push({ name: 'spot-add' })" class="font-bold">
                     <Plus />

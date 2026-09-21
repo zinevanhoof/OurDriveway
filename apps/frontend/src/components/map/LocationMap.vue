@@ -5,19 +5,16 @@ import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { clusterPins, type MapSpot, type PinData } from "@/lib/mapPins";
 import { toast } from "vue-sonner";
-import { fetchSpot, fetchSpotsNear } from "@/api/viewApi";
+import { fetchSpotsNear } from "@/api/viewApi";
 import { viewKeys } from "@/api/keys";
-import { Drawer, DrawerContent } from "@/components/ui/drawer";
+import SpotClusterDrawer from "./SpotClusterDrawer.vue";
 import type { SpotFilter } from "@/types/SpotFilter";
 import { spotMatches } from "@/lib/spotFilter";
 import { locateUser } from "@/lib/geo";
 import MapPin from "./MapPin.vue";
 import MapSearch from "./MapSearch.vue";
 import SpotDetailDrawer from "@/components/spot/SpotDetailDrawer.vue";
-import BookingForm from "@/components/booking/BookingForm.vue";
-import { Surface } from "@/components/base/surface";
-import { Title } from "@/components/base/text";
-import { Money } from "@/components/base/money";
+import { useRouter } from "vue-router";
 
 // Dynamic OSM map via OpenFreeMap (Liberty vector style) + MapLibre GL. Keyless:
 // tiles + style are fetched straight from the browser, no API key to expose.
@@ -74,15 +71,6 @@ const { data: spotsInRadius } = useQuery({
 // Full detail for the selected pin, fetched on click (disabled until then) so nothing
 // runs at render time and there is one query total, not one per pin. The host's
 // profile comes back on the same response — a LEFT JOIN now rather than a record link.
-//
-// The listing only. What is booked on it is the booking form's own read, fetched fresh
-// every time the form opens, so this one can keep the default cache.
-const { data: selectedSpot } = useQuery({
-  queryKey: computed(() => viewKeys.spot(selectedId.value ?? "")),
-  queryFn: () => fetchSpot(selectedId.value!),
-  enabled: computed(() => selectedId.value !== null),
-});
-
 // The map filter stays client-side: which weekday and time slot a spot is open on is a
 // fold over its availability, which a query cannot express. Recomputes on filter change
 // without a refetch.
@@ -109,7 +97,7 @@ const detailOpen = computed({
   set: (v) => { if (!v) selectedId.value = null; },
 });
 
-const bookingOpen = ref(false);
+const router = useRouter();
 
 // ─── Clustering ────────────────────────────────────────────────────────────────
 // Several spots can share one address (an apartment block's parking, a house with
@@ -345,14 +333,14 @@ function reportLocateFailure() {
   });
 }
 
-// Both sheets are portalled to the body and neither is modal, so leaving the map with
-// one open would leave it floating over the next screen.
+// Leaving the map no longer clears the selection. It used to, to stop the sheets — which
+// are portalled to the body and non-modal, so the layout's `invisible` never reaches them
+// — floating over the next screen. But clearing state *animates* them shut, half a second
+// of sheet sliding down over whatever you just navigated to, and it threw away which pin
+// you were on. The sheets are `v-if`d on `active` instead: gone the same frame, and the
+// selection survives, so coming back to the map puts you where you left.
 watch(() => props.active, (active) => {
-  if (!active) {
-    selectedId.value = null;
-    clusterOpen.value = false;
-    bookingOpen.value = false;
-  } else if (locateFailed) {
+  if (active && locateFailed) {
     reportLocateFailure();
   }
 });
@@ -366,37 +354,16 @@ onBeforeUnmount(() => {
 <template>
   <div ref="el" class="relative h-full w-full">
     <MapSearch @select="map?.jumpTo({ center: $event, zoom: 15 })" @filter="filter = $event" />
-    <!-- Cluster tap: pick one of the spots sharing this location. -->
-    <Drawer v-model:open="clusterOpen" :modal="false"
-      @animation-end="releaseCluster">
-      <!-- The list scrolls by scrolling the sheet itself, not an inner box. vaul only
-           lets a downward drag close the drawer when the scroll container it finds is
-           the dialog (it checks `role="dialog"` explicitly); from a nested scroller the
-           gesture goes to that scroller and the sheet stays put. -->
-      <!-- No overlay, and outside pointer-downs are left alone: that event beats the
-           marker's click, so letting it dismiss would close and reopen the sheet on
-           every pin-to-pin tap. The canvas click handler closes it instead. -->
-      <!-- `after:hidden`: vaul paints a `height: 200%` `::after` below the sheet to cover
-           an overscroll rubber-band. Once the sheet is the scroll container that pseudo
-           becomes scrollable content — two screens of empty popover under a three-row
-           list. Nothing is lost: the navbar is z-60 over the drawer's z-50, so that
-           strip was never visible here. -->
-      <DrawerContent @close-auto-focus.prevent :overlay="false" @pointer-down-outside.prevent
-        class="overflow-y-auto after:hidden data-[vaul-drawer-direction=bottom]:mb-15">
-        <div class="m-4 space-y-3">
-          <Title size="lg">{{ openCluster?.spots.length }} spots here</Title>
-          <div class="space-y-2">
-            <Surface v-for="s in openCluster?.spots" :key="s.id" @click="openSpot(s.id)" as="button" variant="none"
-              orientation="horizontal" class="w-full justify-between gap-4 border border-border text-left">
-              <Title as="span" weight="semibold" class="truncate">{{ s.title }}</Title>
-              <Money :cents="s.price" suffix="/hr" size="md" weight="extrabold" tone="primary" class="shrink-0" />
-            </Surface>
-          </div>
-        </div>
-      </DrawerContent>
-    </Drawer>
-    <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable :modal="false"
-      @book="bookingOpen = true" />
-    <BookingForm v-model="bookingOpen" :spot="selectedSpot" />
+    <!-- `v-if="active"`: both sheets portal to the body, so the layout hiding the map
+         does not hide them. Unmounting is what makes them disappear on the same frame
+         the route changes — setting `open` to false would play the close animation on
+         top of the screen being navigated to. -->
+    <template v-if="active">
+      <!-- Cluster tap: pick one of the spots sharing this location. -->
+      <SpotClusterDrawer v-model:open="clusterOpen" :spots="openCluster?.spots" @select="openSpot"
+        @animation-end="releaseCluster" />
+      <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" bookable :modal="false"
+        @book="router.push({ name: 'book', params: { id: selectedId } })" />
+    </template>
   </div>
 </template>

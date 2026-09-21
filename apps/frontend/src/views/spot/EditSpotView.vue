@@ -10,7 +10,7 @@ import FullScreenLayout from '@/components/layout/FullScreenLayout.vue';
 import { FieldError } from '@/components/ui/field'
 import Button from '@/components/ui/button/Button.vue';
 import { Spinner } from '@/components/ui/spinner'
-import { Drawer, DrawerContent } from '@/components/ui/drawer'
+import { ConfirmDrawer } from '@/components/base/confirm-drawer'
 import { TriangleAlert } from '@lucide/vue'
 import { Surface } from '@/components/base/surface'
 import { Text, Title } from '@/components/base/text'
@@ -292,26 +292,9 @@ const showServerErrors = (err: ApiError) => {
     <!-- Defaults left alone on purpose: drag-to-dismiss, the handle, backdrop tap
          and Esc are all vaul's, and a confirmation is the last place to break the
          gesture someone already expects. -->
-    <Drawer v-model:open="confirmOpen">
-        <DrawerContent @close-auto-focus.prevent
-            class="data-[vaul-drawer-direction=bottom]:mb-15">
-            <div class="m-4 space-y-4">
-                <div>
-                    <Title size="lg">Delete this listing?</Title>
-                    <Text size="sm">
-                        {{ data?.title }} comes off the market for good. Any booking it still
-                        owes is cancelled and refunded. This can't be undone.
-                    </Text>
-                </div>
-                <div class="space-y-2">
-                    <Button variant="destructive" class="w-full h-11 font-bold" :disabled="deleting" @click="remove">
-                        {{ deleting ? "Deleting…" : "Yes, delete it" }}
-                    </Button>
-                    <Button variant="outline" class="w-full h-11 font-bold" @click="confirmOpen = false">
-                        Keep listing
-                    </Button>
-                </div>
-            </div>
-        </DrawerContent>
-    </Drawer>
+    <ConfirmDrawer v-model:open="confirmOpen" title="Delete this listing?" confirm-label="Yes, delete it"
+        pending-label="Deleting…" :pending="deleting" cancel-label="Keep listing" @confirm="remove">
+        {{ data?.title }} comes off the market for good. Any booking it still
+        owes is cancelled and refunded. This can't be undone.
+    </ConfirmDrawer>
 </template>

@@ -8,7 +8,7 @@
  * no mode flag and no branch on which query parameters are present, which is what makes a
  * redirect survivable: this component holds no state worth losing.
  *
- * It does not create the session. `BookingForm` does, because it is the one that
+ * It does not create the session. `BookSpotView` does, because it is the one that
  * knows which booking, and it navigates here with the id. That is also why the booking id
  * never appears in a URL — the server hands it back from the session when it is needed.
  *

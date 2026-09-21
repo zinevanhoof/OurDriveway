@@ -6,14 +6,13 @@ import { formatCents } from '@/lib/money';
 import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDates';
 import { locateUser, nearer, type Position } from '@/lib/geo';
 import { useAuthStore } from '@/stores/auth';
-import { fetchBalance, fetchNextBooking, fetchSpot, fetchSpotsNear } from '@/api/viewApi';
+import { fetchBalance, fetchNextBooking, fetchSpotsNear } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
 import { isPlaceholder, placeholders } from '@/lib/placeholders';
 import type { NextBookingResponse } from '@/types/responses/view/NextBookingResponse';
 import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import SpotRating from '@/components/spot/SpotRating.vue';
-import BookingForm from '@/components/booking/BookingForm.vue';
 import { CarFront, ChevronRight, CirclePlus, MapPin, Search, Wallet } from '@lucide/vue';
 import { Surface } from '@/components/base/surface';
 import { Text, Title } from '@/components/base/text';
@@ -121,7 +120,6 @@ const nearest = computed(() => {
 // only has to say which spot.
 const selectedId = ref<string | null>(null)
 const detailOpen = ref(false)
-const bookingOpen = ref(false)
 
 // Set only when the sheet was opened from the upcoming-booking card. It is what
 // tells the drawer to read the spot as the renter's, list that booking's schedule and
@@ -133,16 +131,6 @@ const openSpot = (id: string) => {
     selectedId.value = id
     detailOpen.value = true
 }
-
-// Feeds the booking form the drawer hands off to — the same key as the drawer's query,
-// so this is still one request. The listing only: the form reads what is taken itself,
-// fresh on every opening. Not for a booking the renter holds, whose spot the drawer
-// reads through the renter namespace instead.
-const { data: selectedSpot } = useQuery({
-    queryKey: computed(() => viewKeys.spot(selectedId.value ?? '')),
-    queryFn: () => fetchSpot(selectedId.value!),
-    enabled: computed(() => selectedId.value !== null && !selectedBooking.value),
-})
 
 const openBooking = () => {
     selectedBooking.value = next.value?.booking ?? null
@@ -246,7 +234,7 @@ const openBooking = () => {
         </div>
 
         <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" :booking="selectedBooking"
-            :renter="!!selectedBooking" :bookable="!selectedBooking" @book="bookingOpen = true" />
-        <BookingForm v-model="bookingOpen" :spot="selectedSpot" />
+            :renter="!!selectedBooking" :bookable="!selectedBooking"
+            @book="router.push({ name: 'book', params: { id: selectedId } })" />
     </div>
 </template>

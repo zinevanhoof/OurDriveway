@@ -19,6 +19,7 @@ import ManageSpotView from "@/views/spot/ManageSpotView.vue";
 import SpotBookingsView from "@/views/spot/SpotBookingsView.vue";
 
 import MyBookingsView from "@/views/booking/MyBookingsView.vue";
+import BookSpotView from "@/views/booking/BookSpotView.vue";
 import CheckoutView from "@/views/booking/CheckoutView.vue";
 
 import WalletView from "@/views/wallet/WalletView.vue";
@@ -196,6 +197,22 @@ const routes = [
     component: ResetPasswordView,
     meta: {
       requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    // Picking dates and slots on someone else's spot, then holding them. A route rather
+    // than a sheet over the map because it is a screen's worth of work with its own
+    // back-stack entry — and because it hands off to `/checkout`, so the two halves of
+    // booking are now both real URLs.
+    //
+    // Not under `/spot/:id/`: those are the host's own screens for a spot they own, and
+    // this is the renter's side.
+    path: "/book/:id",
+    name: "book",
+    component: BookSpotView,
+    props: true,
+    meta: {
+      requiresAuth: true,
     } satisfies RouteMeta,
   },
   {
