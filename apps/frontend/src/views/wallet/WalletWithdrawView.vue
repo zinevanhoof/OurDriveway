@@ -21,7 +21,7 @@ import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { toast } from 'vue-sonner'
 import { Landmark } from '@lucide/vue'
-import FullScreenLayout from '@/components/layout/FullScreenLayout.vue'
+import DetailLayout from '@/components/layout/DetailLayout.vue'
 import Button from '@/components/ui/button/Button.vue'
 import Spinner from '@/components/ui/spinner/Spinner.vue'
 import Separator from '@/components/ui/separator/Separator.vue'
@@ -151,8 +151,7 @@ watch(managementEl, (el) => {
 </script>
 
 <template>
-    <FullScreenLayout title="Withdraw" :description="`${formatCents(maxWithdraw)} available`"
-        @close="router.replace({ name: 'wallet' })"
+    <DetailLayout title="Withdraw" @close="router.replace({ name: 'wallet' })"
         :show-action="connectStatus?.state === 'enabled' && !belowMinimumBalance">
         <template #main>
             <!-- Asking Stripe, which is a round trip on every visit — see
@@ -290,5 +289,5 @@ watch(managementEl, (el) => {
                 {{ busy ? 'Withdrawing…' : `Withdraw ${formatCents(Math.max(cents, 0))}` }}
             </Button>
         </template>
-    </FullScreenLayout>
+    </DetailLayout>
 </template>

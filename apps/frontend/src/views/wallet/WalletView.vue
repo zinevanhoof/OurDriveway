@@ -35,7 +35,7 @@ import { IconBox } from '@/components/base/icon-box'
 import { Money } from '@/components/base/money'
 import { SectionHeader } from '@/components/base/section-header'
 import { Sentinel } from '@/components/base/sentinel'
-import WalletHeader from '@/components/header/WalletHeader.vue'
+import TabLayout from '@/components/layout/TabLayout.vue'
 import { useRouter } from 'vue-router'
 
 const router = useRouter()
@@ -139,91 +139,95 @@ function sub(tx: WalletTransactionResponse): string {
 
 
 <template>
-    <WalletHeader />
-    <div class="space-y-4 px-4 pt-2 pb-3">
-        <!-- Balance -->
-        <Surface variant="primary" size="lg" class="gap-4">
-            <div>
-                <Text size="eyebrow" weight="semibold" tone="inverse" class="opacity-80">Available to withdraw</Text>
-                <Money :cents="available" tone="inverse" weight="extrabold" class="text-[34px] leading-none"
-                    :data-loading="balanceLoading" />
+    <TabLayout title="Wallet">
+        <!-- The whole page under the header scrolls, so the header stays put and the
+             month sentinel at the bottom sits inside the box that moves. -->
+        <div class="min-h-0 flex-1 space-y-4 overflow-y-auto no-scrollbar pb-3">
+            <!-- Balance -->
+            <Surface variant="primary" size="lg" class="gap-4">
+                <div>
+                    <Text size="eyebrow" weight="semibold" tone="inverse" class="opacity-80">Available to withdraw</Text>
+                    <Money :cents="available" tone="inverse" weight="extrabold" class="text-[34px] leading-none"
+                        :data-loading="balanceLoading" />
+                </div>
+
+                <Surface v-if="pending > 0" variant="none" size="sm" orientation="horizontal"
+                    class="gap-2 bg-white/[0.14]">
+                    <Clock class="size-4 shrink-0 opacity-90" />
+                    <Text as="span" size="xs" weight="semibold" tone="inverse" class="leading-[1.35] opacity-95">
+                        {{ formatCents(pending) }} pending — clears 24h after each booking ends
+                    </Text>
+                </Surface>
+
+                <!-- Disabled on the placeholder balance: it would open withdraw with a fake maximum. -->
+                <Button class="h-11 bg-primary-foreground text-primary font-bold" :disabled="balanceLoading"
+                    @click="router.push({ name: 'wallet-withdraw', params: { maxWithdraw: available } })">
+                    <ArrowUpRight class="size-4.5" />
+                    Withdraw
+                </Button>
+            </Surface>
+
+            <!-- Month totals -->
+            <div class="grid grid-cols-2 gap-2">
+                <Surface size="sm">
+                    <Text size="xs" weight="bold" tone="default">MONEY IN · {{ currentMonthShort }}</Text>
+                    <Money :cents="monthIn" size="xl" weight="extrabold" tone="success" :data-loading="walletLoading" />
+                </Surface>
+                <Surface size="sm">
+                    <Text size="xs" weight="bold" tone="default">MONEY OUT · {{ currentMonthShort }}</Text>
+                    <Money :cents="monthOut" size="xl" weight="extrabold" :data-loading="walletLoading" />
+                </Surface>
             </div>
 
-            <Surface v-if="pending > 0" variant="none" size="sm" orientation="horizontal" class="gap-2 bg-white/[0.14]">
-                <Clock class="size-4 shrink-0 opacity-90" />
-                <Text as="span" size="xs" weight="semibold" tone="inverse" class="leading-[1.35] opacity-95">
-                    {{ formatCents(pending) }} pending — clears 24h after each booking ends
-                </Text>
-            </Surface>
+            <!-- Combined history, one section per month that has rows. Every month past the
+                 first is one the server named because it holds something, so the only empty
+                 page is normally the current month, and a header over nothing is noise. -->
+            <section v-for="page in months" :key="page.month" class="space-y-2.5"
+                :data-loading="isPlaceholderMonth(page)">
+                <SectionHeader as="header" class="items-baseline">
+                    <Title as="h2" size="sm" weight="extrabold">{{ monthLabel(page.month) }}</Title>
+                    <template #action>
+                        <Text as="span" size="xs" weight="semibold">{{ net(page) }} net</Text>
+                    </template>
+                </SectionHeader>
 
-            <!-- Disabled on the placeholder balance: it would open withdraw with a fake maximum. -->
-            <Button class="h-11 bg-primary-foreground text-primary font-bold" :disabled="balanceLoading"
-                @click="router.push({ name: 'wallet-withdraw', params: { maxWithdraw: available } })">
-                <ArrowUpRight class="size-4.5" />
-                Withdraw
-            </Button>
-        </Surface>
+                <Surface as="ul" size="none" class="overflow-hidden">
+                    <Surface v-for="tx in page.transactions" :key="tx.id" as="li" variant="none" size="sm"
+                        orientation="horizontal" class="gap-3 border-b border-border rounded-none last:border-b-0">
+                        <IconBox :tone="kindStyle[tx.kind].tone">
+                            <component :is="kindStyle[tx.kind].icon" />
+                        </IconBox>
 
-        <!-- Month totals -->
-        <div class="grid grid-cols-2 gap-2">
-            <Surface size="sm">
-                <Text size="xs" weight="bold" tone="default">MONEY IN · {{ currentMonthShort }}</Text>
-                <Money :cents="monthIn" size="xl" weight="extrabold" tone="success" :data-loading="walletLoading" />
-            </Surface>
-            <Surface size="sm">
-                <Text size="xs" weight="bold" tone="default">MONEY OUT · {{ currentMonthShort }}</Text>
-                <Money :cents="monthOut" size="xl" weight="extrabold" :data-loading="walletLoading" />
-            </Surface>
-        </div>
+                        <div class="flex-1">
+                            <Title size="sm" weight="semibold">{{ title(tx) }}</Title>
+                            <Text class="flex items-center gap-1.5">
+                                {{ sub(tx) }}
+                                <Badge v-if="tx.pending" class="bg-accent px-1.5 text-primary">
+                                    PENDING
+                                </Badge>
+                            </Text>
+                        </div>
 
-        <!-- Combined history, one section per month that has rows. Every month past the
-             first is one the server named because it holds something, so the only empty
-             page is normally the current month, and a header over nothing is noise. -->
-        <section v-for="page in months" :key="page.month" class="space-y-2.5"
-            :data-loading="isPlaceholderMonth(page)">
-            <SectionHeader as="header" class="items-baseline">
-                <Title as="h2" size="sm" weight="extrabold">{{ monthLabel(page.month) }}</Title>
-                <template #action>
-                    <Text as="span" size="xs" weight="semibold">{{ net(page) }} net</Text>
-                </template>
-            </SectionHeader>
-
-            <Surface as="ul" size="none" class="overflow-hidden">
-                <Surface v-for="tx in page.transactions" :key="tx.id" as="li" variant="none" size="sm"
-                    orientation="horizontal" class="gap-3 border-b border-border rounded-none last:border-b-0">
-                    <IconBox :tone="kindStyle[tx.kind].tone">
-                        <component :is="kindStyle[tx.kind].icon" />
-                    </IconBox>
-
-                    <div class="flex-1">
-                        <Title size="sm" weight="semibold">{{ title(tx) }}</Title>
-                        <Text class="flex items-center gap-1.5">
-                            {{ sub(tx) }}
-                            <Badge v-if="tx.pending" class="bg-accent px-1.5 text-primary">
-                                PENDING
-                            </Badge>
-                        </Text>
-                    </div>
-
-                    <Money :cents="tx.amountCents" signed size="sm" weight="bold" />
+                        <Money :cents="tx.amountCents" signed size="sm" weight="bold" />
+                    </Surface>
                 </Surface>
-            </Surface>
-        </section>
+            </section>
 
-        <!-- A failed read used to render as an empty history, which reads as "you have
-             never earned anything" — the one wrong thing this screen can say. -->
-        <div v-if="isError" class="space-y-2 py-6 text-center">
-            <Text size="sm">{{ (error as ApiError).detail.join(' ') }}</Text>
-            <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
+            <!-- A failed read used to render as an empty history, which reads as "you have
+                 never earned anything" — the one wrong thing this screen can say. -->
+            <div v-if="isError" class="space-y-2 py-6 text-center">
+                <Text size="sm">{{ (error as ApiError).detail.join(' ') }}</Text>
+                <Button variant="outline" size="sm" @click="() => refetch()">Try again</Button>
+            </div>
+            <!-- `hasNextPage` because a quiet current month is not an empty history: there
+                 are older months to come, and saying "nothing" over them is a lie. -->
+            <Text v-else-if="!hasNextPage && !months.length" size="sm" class="py-6 text-center">
+                Nothing has moved yet. Bookings you make and money you earn show up here.
+            </Text>
+
+            <!-- Crossing this asks for the next month. It sits inside the scrolling box
+                 rather than at a fixed offset, so it fires exactly once per month. -->
+            <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
         </div>
-        <!-- `hasNextPage` because a quiet current month is not an empty history: there
-             are older months to come, and saying "nothing" over them is a lie. -->
-        <Text v-else-if="!hasNextPage && !months.length" size="sm" class="py-6 text-center">
-            Nothing has moved yet. Bookings you make and money you earn show up here.
-        </Text>
-
-        <!-- Crossing this asks for the next month. It sits inside the scrolling page
-             rather than at a fixed offset, so it fires exactly once per month. -->
-        <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
-    </div>
+    </TabLayout>
 </template>

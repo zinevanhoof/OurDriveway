@@ -12,7 +12,7 @@ import { dismissNotification, markNotificationsSeen } from "@/api/userApi";
 import { viewKeys } from "@/api/keys";
 import { isPlaceholder, placeholders } from "@/lib/placeholders";
 import { Text } from "@/components/base/text";
-import FullScreenLayout from "@/components/layout/FullScreenLayout.vue";
+import DetailLayout from "@/components/layout/DetailLayout.vue";
 import RateBookingDrawer from "@/components/booking/RateBookingDrawer.vue";
 import type { NotificationResponse } from "@/types/responses/view/NotificationResponse";
 
@@ -70,7 +70,7 @@ const when = (at: string) =>
 </script>
 
 <template>
-  <FullScreenLayout @close="router.back()" title="Notifications">
+  <DetailLayout @close="router.back()" title="Notifications">
     <template #main>
       <Text v-if="data && !data.length" class="text-muted-foreground">You're all caught up.</Text>
       <div class="space-y-3">
@@ -97,7 +97,7 @@ const when = (at: string) =>
         </button>
       </div>
     </template>
-  </FullScreenLayout>
+  </DetailLayout>
 
   <RateBookingDrawer v-model:open="rateOpen" :booking-id="rating?.bookingId ?? null"
     :spot-title="rating?.spotTitle ?? null" />

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { formatCents } from '@/lib/money';
-import FullScreenLayout from "@/components/layout/FullScreenLayout.vue";
+import DetailLayout from "@/components/layout/DetailLayout.vue";
 import Calendar from "@/components/ui/calendar/Calendar.vue";
 import { ArrowRight, CalendarDays, Car, Clock, Plus, X } from "@lucide/vue";
 import Button from "@/components/ui/button/Button.vue";
@@ -209,12 +209,6 @@ const totals = computed(() => {
     return { dates, slots, hours, amountCents: Math.round(hours * pricePerHourCents.value) };
 });
 
-const description = computed(() => {
-    const parts = [`${formatCents(pricePerHourCents.value)}/hr`];
-    if (spot.value?.address?.formatted) parts.push(spot.value.address.formatted);
-    return parts.join(" · ");
-});
-
 // ─── Hold the slots, then hand off to checkout ───
 //
 // This component stops at the reservation. Paying happens at `/checkout`, which is a real
@@ -276,151 +270,169 @@ async function submit() {
 </script>
 
 <template>
-    <FullScreenLayout @close="router.back()" :title="spot?.title ?? 'Book this spot'"
-                :description="description" :show-action="totals.slots > 0">
-                <template #main>
-                    <!-- Only the picker lives here now. Paying is `/checkout`, a route of
+    <DetailLayout @close="router.back()" title="Book this spot" :show-action="totals.slots > 0">
+        <template #main>
+            <!-- The listing being booked. It used to be the header's title and a
+                         one-line "€x/hr · address" underneath; the header is a centred
+                         label now, and this is the size the thing deserves anyway — the
+                         renter arrives here from a pin and is still deciding.
+
+                         `touch-pan-x`: this screen renders inside a vaul drawer, and
+                         without it the browser claims a vertical swipe on a photo for
+                         scrolling and cancels the pointer stream, so the sheet won't
+                         close when the gesture starts here. Same note as SpotDetailDrawer. -->
+            <div class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
+                <!-- `only:` = the sole image, so it fills the row instead of
+                             leaving a gap. -->
+                <img v-for="key in spot?.images" :key="key" :src="key"
+                    class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
+            </div>
+            <div class="flex">
+                <div class="flex-1">
+                    <Title size="lg">{{ spot?.title }}</Title>
+                    <Text>{{ spot?.address?.formatted }}</Text>
+                </div>
+                <Money :cents="pricePerHourCents" suffix="/hr" size="lg" tone="primary" />
+            </div>
+            <!-- Only the picker lives here now. Paying is `/checkout`, a route of
                          its own, because a redirect payment method destroys this page. -->
-                        <div class="space-y-2">
-                            <Title weight="extrabold" class="text-[15px]">Pick your dates</Title>
-                            <Calendar multiple :model-value="(selectedDates as any)" @update:model-value="onDatesChange"
-                                :min-value="minDate" :max-value="maxDate" :is-date-disabled="isDateDisabled"
-                                class="bg-card rounded-lg border border-border" initial-focus />
-                        </div>
+            <div class="space-y-2">
+                <Title weight="extrabold" class="text-[15px]">Pick your dates</Title>
+                <Calendar multiple :model-value="(selectedDates as any)" @update:model-value="onDatesChange"
+                    :min-value="minDate" :max-value="maxDate" :is-date-disabled="isDateDisabled"
+                    class="bg-card rounded-lg border border-border" initial-focus />
+            </div>
 
-                        <Surface v-if="!selectedDates?.length" variant="dashed" size="lg"
-                            class="justify-center items-center gap-3 text-center">
-                            <IconBox size="lg">
-                                <CalendarDays />
-                            </IconBox>
-                            <div class="w-3/4">Tap the highlighted dates the host has opened up, then choose your time
-                                slots.</div>
+            <Surface v-if="!selectedDates?.length" variant="dashed" size="lg"
+                class="justify-center items-center gap-3 text-center">
+                <IconBox size="lg">
+                    <CalendarDays />
+                </IconBox>
+                <div class="w-3/4">Tap the highlighted dates the host has opened up, then choose your time
+                    slots.</div>
+            </Surface>
+
+            <div v-else class="space-y-2">
+                <FilterChips :items="dateChips" :active="activeKey" @select="activeKey = $event"
+                    @remove="(k) => selectedDates = selectedDates.filter(d => d.toString() !== k)" />
+                <div class="space-y-1">
+                    <Title weight="extrabold" class="text-[15px]">Choose your time</Title>
+                    <Text>Add one or more 30-min time slots
+                        within each of the host's open windows.</Text>
+                </div>
+
+                <Surface v-if="activeDate" class="gap-3">
+                    <SectionHeader>
+                        <Title>{{ dfShort.format(activeDate.toDate(getLocalTimeZone())) }}
+                        </Title>
+                        <template #action>
+                            <Text weight="bold" tone="primary">
+                                {{ activePicked.length ? `${activePicked.length} slot${activePicked.length >
+                                    1 ? 's'
+                                    : ''}` : 'No time yet' }}
+                            </Text>
+                        </template>
+                    </SectionHeader>
+
+                    <!-- Already-picked slots for this date -->
+                    <div v-if="activePicked.length" class="space-y-1.5">
+                        <Surface v-for="(s, i) in activePicked" :key="`${s.start}-${s.end}-${i}`" variant="accent"
+                            size="sm" orientation="horizontal" class="justify-between gap-2 text-sm font-semibold">
+                            <span>{{ s.start }} – {{ s.end }}</span>
+                            <Text as="span" weight="semibold" class="ml-auto">
+                                {{ slotHours(s) }} hr · {{ formatCents(slotCents(s)) }}
+                            </Text>
+                            <button type="button" @click="removeSlot(i)"
+                                class="cursor-pointer opacity-70 hover:opacity-100">
+                                <X :size="14" />
+                            </button>
                         </Surface>
+                    </div>
 
-                        <div v-else class="space-y-2">
-                            <FilterChips :items="dateChips" :active="activeKey" @select="activeKey = $event"
-                                @remove="(k) => selectedDates = selectedDates.filter(d => d.toString() !== k)" />
-                            <div class="space-y-1">
-                                <Title weight="extrabold" class="text-[15px]">Choose your time</Title>
-                                <Text>Add one or more 30-min time slots
-                                    within each of the host's open windows.</Text>
+                    <Separator v-if="activePicked.length && windowRows.length" />
+
+                    <!-- Open windows still available: add a slot inside each -->
+                    <div v-if="windowRows.length" class="space-y-2">
+                        <div v-for="{ win, key, draft } in windowRows" :key="key" class="space-y-1.5">
+                            <Text weight="bold" class="flex items-center gap-1">
+                                <Clock class="size-4" />
+                                Host open · {{ win.start }} - {{ win.end }}
+                            </Text>
+                            <div class="flex items-center gap-1">
+                                <Input type="time" step="1800" :min="win.start" :max="win.end" v-model="draft.start"
+                                    class="flex-1" />
+                                <ArrowRight class="text-muted-foreground size-4 shrink-0" />
+                                <Input type="time" step="1800" :min="win.start" :max="win.end" v-model="draft.end"
+                                    class="flex-1" />
+                                <Button size="icon" :disabled="!slotValid(win, draft)" @click="addSlot(win, draft)">
+                                    <Plus />
+                                </Button>
                             </div>
-
-                            <Surface v-if="activeDate" class="gap-3">
-                                <SectionHeader>
-                                    <Title>{{ dfShort.format(activeDate.toDate(getLocalTimeZone())) }}
-                                    </Title>
-                                    <template #action>
-                                        <Text weight="bold" tone="primary">
-                                            {{ activePicked.length ? `${activePicked.length} slot${activePicked.length >
-                                                1 ? 's'
-                                                : ''}` : 'No time yet' }}
-                                        </Text>
-                                    </template>
-                                </SectionHeader>
-
-                                <!-- Already-picked slots for this date -->
-                                <div v-if="activePicked.length" class="space-y-1.5">
-                                    <Surface v-for="(s, i) in activePicked" :key="`${s.start}-${s.end}-${i}`"
-                                        variant="accent" size="sm" orientation="horizontal"
-                                        class="justify-between gap-2 text-sm font-semibold">
-                                        <span>{{ s.start }} – {{ s.end }}</span>
-                                        <Text as="span" weight="semibold" class="ml-auto">
-                                            {{ slotHours(s) }} hr · {{ formatCents(slotCents(s)) }}
-                                        </Text>
-                                        <button type="button" @click="removeSlot(i)"
-                                            class="cursor-pointer opacity-70 hover:opacity-100">
-                                            <X :size="14" />
-                                        </button>
-                                    </Surface>
-                                </div>
-
-                                <Separator v-if="activePicked.length && windowRows.length" />
-
-                                <!-- Open windows still available: add a slot inside each -->
-                                <div v-if="windowRows.length" class="space-y-2">
-                                    <div v-for="{ win, key, draft } in windowRows" :key="key" class="space-y-1.5">
-                                        <Text weight="bold" class="flex items-center gap-1">
-                                            <Clock class="size-4" />
-                                            Host open · {{ win.start }} - {{ win.end }}
-                                        </Text>
-                                        <div class="flex items-center gap-1">
-                                            <Input type="time" step="1800" :min="win.start" :max="win.end"
-                                                v-model="draft.start" class="flex-1" />
-                                            <ArrowRight class="text-muted-foreground size-4 shrink-0" />
-                                            <Input type="time" step="1800" :min="win.start" :max="win.end"
-                                                v-model="draft.end" class="flex-1" />
-                                            <Button size="icon" :disabled="!slotValid(win, draft)"
-                                                @click="addSlot(win, draft)">
-                                                <Plus />
-                                            </Button>
-                                        </div>
-                                    </div>
-                                </div>
-                                <Text v-else-if="!activePicked.length">
-                                    No open time left on this date.
-                                </Text>
-                            </Surface>
                         </div>
+                    </div>
+                    <Text v-else-if="!activePicked.length">
+                        No open time left on this date.
+                    </Text>
+                </Surface>
+            </div>
 
-                        <!-- Which car. Required: the host has to know what is turning up,
+            <!-- Which car. Required: the host has to know what is turning up,
                              and a plate typed here is saved to the renter's account on
                              submit, so the next booking form offers it. -->
-                        <div class="space-y-2">
-                            <div class="space-y-1">
-                                <Title weight="extrabold" class="text-[15px]">Which car?</Title>
-                                <Text>Pick one of your plates, or type a new one — we'll remember it.</Text>
-                            </div>
-                            <Combobox v-model:open="plateOpen" :ignore-filter="true"
-                                :reset-search-term-on-blur="false" @update:model-value="pickPlate">
-                                <ComboboxAnchor class="bg-card rounded-md">
-                                    <ComboboxInput v-model="plateTerm" placeholder="1-ABC-123" maxlength="16"
-                                        autocapitalize="characters" @input="plateOpen = true" />
-                                </ComboboxAnchor>
-                                <ComboboxList>
-                                    <ComboboxViewport>
-                                        <ComboboxItem v-for="p in plateMatches" :key="p" :value="p">
-                                            <Car class="size-4" />
-                                            {{ p }}
-                                        </ComboboxItem>
-                                        <ComboboxItem v-if="newPlate" :value="typedPlate">
-                                            <Plus class="size-4" />
-                                            Use "{{ typedPlate }}"
-                                        </ComboboxItem>
-                                        <Text v-if="!plateMatches.length && !newPlate" class="px-2 py-1.5">
-                                            {{ plates.length ? 'No plate like that.' : 'Type your plate.' }}
-                                        </Text>
-                                    </ComboboxViewport>
-                                </ComboboxList>
-                            </Combobox>
-                            <Text v-if="newPlate && plate">
-                                {{ plate }} will be saved to your account.
+            <div class="space-y-2">
+                <div class="space-y-1">
+                    <Title weight="extrabold" class="text-[15px]">Which car?</Title>
+                    <Text>Pick one of your plates, or type a new one — we'll remember it.</Text>
+                </div>
+                <Combobox v-model:open="plateOpen" :ignore-filter="true" :reset-search-term-on-blur="false"
+                    @update:model-value="pickPlate">
+                    <ComboboxAnchor class="bg-card rounded-md">
+                        <ComboboxInput v-model="plateTerm" placeholder="1-ABC-123" maxlength="16"
+                            autocapitalize="characters" @input="plateOpen = true" />
+                    </ComboboxAnchor>
+                    <ComboboxList>
+                        <ComboboxViewport>
+                            <ComboboxItem v-for="p in plateMatches" :key="p" :value="p">
+                                <Car class="size-4" />
+                                {{ p }}
+                            </ComboboxItem>
+                            <ComboboxItem v-if="newPlate" :value="typedPlate">
+                                <Plus class="size-4" />
+                                Use "{{ typedPlate }}"
+                            </ComboboxItem>
+                            <Text v-if="!plateMatches.length && !newPlate" class="px-2 py-1.5">
+                                {{ plates.length ? 'No plate like that.' : 'Type your plate.' }}
                             </Text>
-                        </div>
-                </template>
+                        </ComboboxViewport>
+                    </ComboboxList>
+                </Combobox>
+                <Text v-if="newPlate && plate">
+                    {{ plate }} will be saved to your account.
+                </Text>
+            </div>
+        </template>
 
-                <!-- Summary and button together: they are one strip, and it rises off the
+        <!-- Summary and button together: they are one strip, and it rises off the
                      bottom the moment there is a slot to pay for. Showing the bar and
                      enabling the button stay two questions — the plate is still required,
                      so a renter who has picked a time but no car sees the price and a
                      disabled button rather than nothing at all. -->
-                <template #action>
-                    <div class="flex items-center justify-between pb-2.5 text-sm font-bold">
-                        <Text as="span" size="sm" weight="bold">
-                            {{ totals.dates }} date{{ totals.dates > 1 ? 's' : '' }} ·
-                            {{ totals.slots }} slot{{ totals.slots > 1 ? 's' : '' }} ·
-                            {{ totals.hours }} hr{{ totals.hours !== 1 ? 's' : '' }}
-                        </Text>
-                        <Money :cents="totals.amountCents" size="sm" />
-                    </div>
-                    <!-- Holds the slots and hands off to /checkout. The figure here is the
+        <template #action>
+            <div class="flex items-center justify-between pb-2.5 text-sm font-bold">
+                <Text as="span" size="sm" weight="bold">
+                    {{ totals.dates }} date{{ totals.dates > 1 ? 's' : '' }} ·
+                    {{ totals.slots }} slot{{ totals.slots > 1 ? 's' : '' }} ·
+                    {{ totals.hours }} hr{{ totals.hours !== 1 ? 's' : '' }}
+                </Text>
+                <Money :cents="totals.amountCents" size="sm" />
+            </div>
+            <!-- Holds the slots and hands off to /checkout. The figure here is the
                          picker's estimate; the server reprices from the minutes it actually
                          authorises, and that is what the checkout screen shows. -->
-                    <Button class="w-full h-11 font-bold" :disabled="!totals.slots || !plate || busy"
-                        @click="submit">
-                        Continue to payment
-                        <ArrowRight />
-                    </Button>
-                </template>
-    </FullScreenLayout>
+            <Button class="w-full h-11 font-bold" :disabled="!totals.slots || !plate || busy" @click="submit">
+                Continue to payment
+                <ArrowRight />
+            </Button>
+        </template>
+    </DetailLayout>
 </template>

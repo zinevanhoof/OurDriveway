@@ -4,13 +4,14 @@ import Button from '@/components/ui/button/Button.vue';
 import { fetchHostSpot, fetchHostSpotBookings, fetchHostSpotSummary } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
 import { computed, ref } from 'vue';
-import { ArrowLeft, Pencil, Star, Trash2 } from '@lucide/vue';
+import { Pencil, Star, Trash2 } from '@lucide/vue';
 import { useRouter } from 'vue-router';
 import { formatDay, formatSlots, todayIn } from '@/lib/bookingDates.ts';
 import { useDeleteSpot, useUpdateSpot } from '@/api/spotApi';
 import type { ApiError } from '@/api/client';
 import type { TimeSlot, WeeklyAvailability } from '@/types/domain/spot';
 
+import DetailLayout from '@/components/layout/DetailLayout.vue';
 import HostBookingRow from '@/components/spot/HostBookingRow.vue';
 import HostBookingDrawer from '@/components/spot/HostBookingDrawer.vue';
 import type { HostBookingResponse } from '@/types/responses/view/HostBookingResponse';
@@ -159,116 +160,107 @@ const openBooking = (booking: HostBookingResponse) => {
 </script>
 
 <template>
-    <header class="grid grid-cols-[1fr_auto_1fr] items-center px-4 py-3">
-        <Button size="icon-lg" @click="router.back()"
-            class="justify-self-start bg-card text-card-foreground border border-border shadow-xs rounded-full">
-            <ArrowLeft />
-        </Button>
-        <Title>Manage spot</Title>
-        <div class="flex gap-2 justify-self-end">
-            <Button size="icon-lg" @click="confirmOpen = true"
-                class="bg-card text-card-foreground border border-border shadow-xs rounded-full">
+    <DetailLayout title="Manage spot" @close="router.back()">
+        <template #actions>
+            <Button variant="pill" size="icon-lg" @click="confirmOpen = true">
                 <Trash2 class="text-destructive" />
             </Button>
-            <Button size="icon-lg" @click="routeToSpotEdit"
-                class="bg-card text-card-foreground border border-border shadow-xs rounded-full">
+            <Button variant="pill" size="icon-lg" @click="routeToSpotEdit">
                 <Pencil />
             </Button>
-        </div>
-    </header>
-    <!-- Padding here, not in the view: this is the scroll container, as in
-         FullScreenLayout. -->
-    <div class="space-y-3 px-4 pb-3 overflow-y-auto no-scrollbar">
-        <div class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
-            <img v-for="key in data?.images" :key="key" :src="key"
-                class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
-        </div>
-        <div class="flex">
-            <div class="flex-1">
-                <Title size="lg">{{ data?.title }}</Title>
-                <Text>
-                    {{ data?.address?.formatted }}
-                </Text>
+        </template>
+        <template #main>
+            <div class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
+                <img v-for="key in data?.images" :key="key" :src="key"
+                    class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
             </div>
-            <Money :cents="data?.pricePerHour ?? 0" suffix="/hr" size="lg" tone="primary" />
-        </div>
-        <Surface orientation="horizontal" class="justify-between">
-            <div>
-                <Text size="sm" tone="default">Listing is live</Text>
-                <Text>
-                    {{ live ? 'Drivers can book this now' : 'Hidden — bookings already made still stand' }}
-                </Text>
+            <div class="flex">
+                <div class="flex-1">
+                    <Title size="lg">{{ data?.title }}</Title>
+                    <Text>
+                        {{ data?.address?.formatted }}
+                    </Text>
+                </div>
+                <Money :cents="data?.pricePerHour ?? 0" suffix="/hr" size="lg" tone="primary" />
             </div>
-            <Switch :model-value="live" @update:model-value="toggleLive" />
-        </Surface>
-        <FieldError v-if="errors.length" :errors="errors" />
-        <div class="grid grid-cols-3 gap-2">
-            <Surface variant="elevated" class="text-center">
-                <Money :cents="summary?.earnedCents ?? 0" size="md" class="justify-center" />
-                <Text>Earned</Text>
-            </Surface>
-            <Surface variant="elevated" class="text-center">
-                <Title>{{ summary?.bookings ?? 0 }}</Title>
-                <Text>Bookings</Text>
-            </Surface>
-            <Surface variant="elevated" class="text-center">
-                <Title class="flex justify-center items-center gap-1">
-                    <template v-if="summary?.rating != null">
-                        <Star :size="14" />
-                        {{ summary.rating.toFixed(1) }}
-                    </template>
-                    <template v-else>—</template>
-                </Title>
-                <Text>Rating</Text>
-            </Surface>
-        </div>
-        <div v-for="section in sections" :key="section.title" class="space-y-2">
-            <SectionHeader>
-                <Title>{{ section.title }}</Title>
-                <template #action>
-                    <Text tone="primary" weight="semibold" class="flex gap-1 items-center" @click="routeToSpotEdit">
-                        <Pencil :size="16" />
-                        Edit
+            <Surface orientation="horizontal" class="justify-between">
+                <div>
+                    <Text size="sm" tone="default">Listing is live</Text>
+                    <Text>
+                        {{ live ? 'Drivers can book this now' : 'Hidden — bookings already made still stand' }}
                     </Text>
-                </template>
-            </SectionHeader>
-            <div class="space-y-2">
-                <Surface v-for="row in section.rows" :key="row.key" @click="toggle(row.key)">
-                    <Text size="sm" tone="default">{{ row.label }}</Text>
-                    <!-- Collapsed shows the first slot and how many are hidden; tapping
-                         reveals the rest in place, because a day's hours are one thought. -->
-                    <Text v-auto-animate>
-                        <div v-for="slot in slotsShown(row)" :key="slot.start">
-                            {{ formatSlots([slot]) }}
-                        </div>
-                        <div v-if="expanded !== row.key && row.slots.length > 1">
-                            +{{ row.slots.length - 1 }} more
-                        </div>
-                    </Text>
+                </div>
+                <Switch :model-value="live" @update:model-value="toggleLive" />
+            </Surface>
+            <FieldError v-if="errors.length" :errors="errors" />
+            <div class="grid grid-cols-3 gap-2">
+                <Surface variant="elevated" class="text-center">
+                    <Money :cents="summary?.earnedCents ?? 0" size="md" class="justify-center" />
+                    <Text>Earned</Text>
                 </Surface>
-                <Text v-if="!section.rows.length">
-                    {{ section.empty }}
-                </Text>
+                <Surface variant="elevated" class="text-center">
+                    <Title>{{ summary?.bookings ?? 0 }}</Title>
+                    <Text>Bookings</Text>
+                </Surface>
+                <Surface variant="elevated" class="text-center">
+                    <Title class="flex justify-center items-center gap-1">
+                        <template v-if="summary?.rating != null">
+                            <Star :size="14" />
+                            {{ summary.rating.toFixed(1) }}
+                        </template>
+                        <template v-else>—</template>
+                    </Title>
+                    <Text>Rating</Text>
+                </Surface>
             </div>
-        </div>
-        <div class="space-y-2">
-            <SectionHeader>
-                <Title>Upcoming bookings</Title>
-                <template #action>
-                    <Text @click="routeToSpotBookings" tone="primary" weight="semibold">
-                        See all
+            <div v-for="section in sections" :key="section.title" class="space-y-2">
+                <SectionHeader>
+                    <Title>{{ section.title }}</Title>
+                    <template #action>
+                        <Text tone="primary" weight="semibold" class="flex gap-1 items-center" @click="routeToSpotEdit">
+                            <Pencil :size="16" />
+                            Edit
+                        </Text>
+                    </template>
+                </SectionHeader>
+                <div class="space-y-2">
+                    <Surface v-for="row in section.rows" :key="row.key" @click="toggle(row.key)">
+                        <Text size="sm" tone="default">{{ row.label }}</Text>
+                        <!-- Collapsed shows the first slot and how many are hidden; tapping
+                             reveals the rest in place, because a day's hours are one thought. -->
+                        <Text v-auto-animate>
+                            <div v-for="slot in slotsShown(row)" :key="slot.start">
+                                {{ formatSlots([slot]) }}
+                            </div>
+                            <div v-if="expanded !== row.key && row.slots.length > 1">
+                                +{{ row.slots.length - 1 }} more
+                            </div>
+                        </Text>
+                    </Surface>
+                    <Text v-if="!section.rows.length">
+                        {{ section.empty }}
                     </Text>
-                </template>
-            </SectionHeader>
-            <div v-auto-animate class="space-y-2">
-                <HostBookingRow v-for="booking in visibleBookings" :key="booking.id" :booking="booking"
-                    :timezone="timezone" interactive @click="openBooking(booking)" />
-                <Text v-if="preview && !visibleBookings.length">
-                    Nothing booked yet.
-                </Text>
+                </div>
             </div>
-        </div>
-    </div>
+            <div class="space-y-2">
+                <SectionHeader>
+                    <Title>Upcoming bookings</Title>
+                    <template #action>
+                        <Text @click="routeToSpotBookings" tone="primary" weight="semibold">
+                            See all
+                        </Text>
+                    </template>
+                </SectionHeader>
+                <div v-auto-animate class="space-y-2">
+                    <HostBookingRow v-for="booking in visibleBookings" :key="booking.id" :booking="booking"
+                        :timezone="timezone" interactive @click="openBooking(booking)" />
+                    <Text v-if="preview && !visibleBookings.length">
+                        Nothing booked yet.
+                    </Text>
+                </div>
+            </div>
+        </template>
+    </DetailLayout>
 
     <ConfirmDrawer v-model:open="confirmOpen" title="Delete this listing?" confirm-label="Yes, delete it"
         pending-label="Deleting…" :pending="deleting" cancel-label="Keep listing" @confirm="remove">

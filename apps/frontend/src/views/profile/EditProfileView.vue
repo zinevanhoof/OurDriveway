@@ -7,7 +7,7 @@ import { z } from 'zod'
 import { toTypedSchema } from '@vee-validate/zod'
 import { Camera, Plus, Trash2 } from '@lucide/vue'
 
-import FullScreenLayout from '@/components/layout/FullScreenLayout.vue'
+import DetailLayout from '@/components/layout/DetailLayout.vue'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -184,8 +184,7 @@ const submit = handleSubmit(async (form) => {
 </script>
 
 <template>
-    <FullScreenLayout @close="router.back()" title="Edit profile"
-        description="Your details and the cars you park" :show-action="dirty">
+    <DetailLayout @close="router.back()" title="Edit profile" :show-action="dirty">
         <template #main>
             <form id="edit-profile-form" @submit="submit" class="space-y-4">
                 <div class="flex justify-center py-2">
@@ -337,5 +336,5 @@ const submit = handleSubmit(async (form) => {
                 Save changes
             </Button>
         </template>
-    </FullScreenLayout>
+    </DetailLayout>
 </template>

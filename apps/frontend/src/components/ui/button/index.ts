@@ -12,6 +12,12 @@ export const buttonVariants = cva(
         outline: 'border-border bg-background hover:bg-muted hover:text-foreground dark:bg-input/30 dark:border-input dark:hover:bg-input/50 aria-expanded:bg-muted aria-expanded:text-foreground shadow-xs',
         secondary: 'bg-secondary text-secondary-foreground hover:bg-secondary/80 aria-expanded:bg-secondary aria-expanded:text-secondary-foreground',
         ghost: 'hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 aria-expanded:bg-muted aria-expanded:text-foreground',
+        // The round header pill: the back arrow on the left of every screen, and
+        // whatever actions that screen puts on the right. A card background and
+        // `rounded-full`, so it reads as a control floating over the page rather than
+        // a button in it. `border-border` beats the base's `border-transparent`.
+        // Size is the caller's — headers pass `size="icon-lg"`.
+        pill: 'bg-card text-card-foreground border-border shadow-xs rounded-full hover:bg-muted',
         destructive: 'bg-destructive/10 hover:bg-destructive/20 focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40 dark:bg-destructive/20 text-destructive focus-visible:border-destructive/40 dark:hover:bg-destructive/30',
         link: 'text-primary underline-offset-4 hover:underline',
       },

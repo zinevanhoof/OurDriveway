@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { toTypedSchema } from '@vee-validate/zod'
 import { toast } from 'vue-sonner'
 
-import FullScreenLayout from '@/components/layout/FullScreenLayout.vue'
+import DetailLayout from '@/components/layout/DetailLayout.vue'
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -59,8 +59,7 @@ const submit = handleSubmit(async ({ confirmPassword, ...form }) => {
 </script>
 
 <template>
-    <FullScreenLayout @close="router.back()" title="Change password"
-        description="Confirm your current one to set a new one" :show-action="meta.dirty">
+    <DetailLayout @close="router.back()" title="Change password" :show-action="meta.dirty">
         <template #main>
             <form id="change-password-form" @submit="submit" class="space-y-4">
                 <FieldGroup class="gap-4">
@@ -110,5 +109,5 @@ const submit = handleSubmit(async ({ confirmPassword, ...form }) => {
                 Change password
             </Button>
         </template>
-    </FullScreenLayout>
+    </DetailLayout>
 </template>

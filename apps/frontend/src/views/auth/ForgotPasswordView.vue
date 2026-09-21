@@ -3,7 +3,7 @@
 // `ResetPasswordView.vue`, which is where the link lands.
 //
 // Styled as the third auth screen, alongside login and signup, rather than with
-// `FullScreenLayout`: this is reachable by someone with no session, and
+// `DetailLayout`: this is reachable by someone with no session, and
 // that layout's close button is `router.back()`, which from a fresh tab goes
 // nowhere.
 import { ref } from 'vue'

@@ -6,7 +6,7 @@ import { useForm } from 'vee-validate'
 import { z } from 'zod'
 import { toTypedSchema } from '@vee-validate/zod';
 
-import FullScreenLayout from '@/components/layout/FullScreenLayout.vue';
+import DetailLayout from '@/components/layout/DetailLayout.vue';
 import { FieldError } from '@/components/ui/field'
 import Button from '@/components/ui/button/Button.vue';
 import { Spinner } from '@/components/ui/spinner'
@@ -241,8 +241,7 @@ const showServerErrors = (err: ApiError) => {
 </script>
 
 <template>
-    <FullScreenLayout @close="router.back()" title="Edit listing" :description="data?.title"
-        :show-action="dirty">
+    <DetailLayout @close="router.back()" title="Edit listing" :show-action="dirty">
         <template #main>
             <form id="edit-spot-form" @submit="submit" class="space-y-4">
                 <SpotBasicInfoStep />
@@ -287,7 +286,7 @@ const showServerErrors = (err: ApiError) => {
                 Save changes
             </Button>
         </template>
-    </FullScreenLayout>
+    </DetailLayout>
 
     <!-- Defaults left alone on purpose: drag-to-dismiss, the handle, backdrop tap
          and Esc are all vaul's, and a confirmation is the last place to break the

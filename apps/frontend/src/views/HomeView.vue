@@ -6,21 +6,24 @@ import { formatCents } from '@/lib/money';
 import { formatDay, formatSlots, isActiveNow, nextSlot } from '@/lib/bookingDates';
 import { locateUser, nearer, type Position } from '@/lib/geo';
 import { useAuthStore } from '@/stores/auth';
-import { fetchBalance, fetchNextBooking, fetchSpotsNear } from '@/api/viewApi';
+import { fetchBalance, fetchNextBooking, fetchNotifications, fetchSpotsNear } from '@/api/viewApi';
 import { viewKeys } from '@/api/keys';
 import { isPlaceholder, placeholders } from '@/lib/placeholders';
 import type { NextBookingResponse } from '@/types/responses/view/NextBookingResponse';
 import type { TimeSlot } from '@/types/domain/spot';
 import SpotDetailDrawer from '@/components/spot/SpotDetailDrawer.vue';
 import SpotRating from '@/components/spot/SpotRating.vue';
-import { CarFront, ChevronRight, CirclePlus, MapPin, Search, Wallet } from '@lucide/vue';
+import { Bell, CarFront, ChevronRight, CirclePlus, MapPin, Search, Wallet } from '@lucide/vue';
 import { Surface } from '@/components/base/surface';
 import { Text, Title } from '@/components/base/text';
 import { IconBox } from '@/components/base/icon-box';
 import { Money } from '@/components/base/money';
 import { SectionHeader } from '@/components/base/section-header';
 import { Badge } from '@/components/ui/badge';
-import HomeHeader from '@/components/header/HomeHeader.vue';
+import Avatar from '@/components/ui/avatar/Avatar.vue';
+import AvatarImage from '@/components/ui/avatar/AvatarImage.vue';
+import AvatarFallback from '@/components/ui/avatar/AvatarFallback.vue';
+import TabLayout from '@/components/layout/TabLayout.vue';
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -28,6 +31,23 @@ const router = useRouter()
 // Every query here waits on the session: main.ts rehydrates it asynchronously, and
 // without this they all fire once with an undefined id first.
 const paused = computed(() => !auth.user?.id)
+
+// ─── the header ─────────────────────────────────────────────────────────────
+
+// Polled: a rating prompt comes due when a booking ends, and a minute late is fine.
+const { data: notifications } = useQuery({
+    queryKey: viewKeys.notifications,
+    queryFn: fetchNotifications,
+    refetchInterval: 60_000,
+})
+const unseen = computed(() => notifications.value?.filter((n) => !n.seen).length ?? 0)
+
+const greeting = computed(() => {
+    const h = new Date().getHours()
+    if (h < 12) return "Good morning"
+    if (h < 18) return "Good afternoon"
+    return "Good evening"
+})
 
 // ─── the soonest booking ────────────────────────────────────────────────────
 //
@@ -144,97 +164,123 @@ const openBooking = () => {
          reachable and a screen reader announces no action. ProfileView's
          `<button class="flex … w-full text-left">` is the shape that fixes it
          without disturbing layout — worth doing to the whole screen at once. -->
-    <HomeHeader />
-    <div class="px-4 pt-2 pb-3 space-y-4">
-        <div class="grid grid-cols-2 gap-2">
-            <Surface variant="primary" size="lg" class="gap-8" @click="router.push({ name: 'search' })">
-                <Search />
-                <div>
-                    <Title tone="inverse">Find parking</Title>
-                    <Text tone="inverse">Spots near you</Text>
-                </div>
-            </Surface>
-            <Surface variant="elevated" size="lg" class="gap-8" @click="router.push({ name: 'spot-add' })">
-                <CirclePlus class="text-primary" />
-                <div>
-                    <Title>Add a spot</Title>
-                    <Text>Earn from your driveway</Text>
-                </div>
-            </Surface>
-        </div>
-        <Surface v-if="next" variant="elevated" orientation="horizontal" class="gap-3" @click="openBooking">
-            <IconBox :tone="happeningNow ? 'primary' : 'accent'">
-                <CarFront />
-            </IconBox>
-            <div class="flex-1">
-                <Text size="eyebrow" weight="bold">
-                    {{ happeningNow ? 'Happening now' : 'Upcoming booking' }}
-                </Text>
-                <Title weight="semibold">{{ nextSpot?.title }}</Title>
-                <Text>
-                    {{ formatDay(next.slot[0], nextTimezone) }} · {{ formatSlots([next.slot[1]]) }}
-                </Text>
+    <TabLayout>
+        <!-- Not a page name but a greeting, so the slot rather than the `title` prop. -->
+        <template #title>
+            <div>
+                <Text size="sm" weight="normal">{{ greeting }}</Text>
+                <Title size="2xl" weight="extrabold">{{ auth.user?.firstName }} {{ auth.user?.lastName }}</Title>
             </div>
-            <ChevronRight class="text-muted-foreground" />
-        </Surface>
-        <Surface variant="elevated" orientation="horizontal"
-            class="gap-3 cursor-pointer bg-linear-135 from-accent to-card-2"
-            @click="router.push({ name: 'wallet' })">
-            <IconBox tone="primary">
-                <Wallet />
-            </IconBox>
-            <div class="flex-1">
-                <Text>Available to withdraw</Text>
-                <Money :cents="available" size="xl" :data-loading="balanceLoading" />
+        </template>
+        <template #actions>
+            <button type="button" class="relative" :aria-label="`Notifications, ${unseen} new`"
+                @click="router.push({ name: 'notifications' })">
+                <IconBox size="lg" tone="card" shape="circle">
+                    <Bell />
+                </IconBox>
+                <span v-if="unseen"
+                    class="absolute -right-1 -top-1 flex min-w-5 h-5 items-center justify-center rounded-full bg-destructive px-1 text-xs font-semibold text-white">
+                    {{ unseen > 9 ? '9+' : unseen }}
+                </span>
+            </button>
+            <Avatar @click="router.push({ name: 'profile' })" size="lg">
+                <AvatarImage v-if="auth.user?.profilePicture" :src="auth.user.profilePicture" />
+                <AvatarFallback
+                    :name="{ firstName: auth.user?.firstName ?? '', lastName: auth.user?.lastName ?? '' }" />
+            </Avatar>
+        </template>
+        <!-- Everything under the header scrolls, so the header stays put. -->
+        <div class="min-h-0 flex-1 space-y-4 overflow-y-auto no-scrollbar pb-3">
+            <div class="grid grid-cols-2 gap-2">
+                <Surface variant="primary" size="lg" class="gap-8" @click="router.push({ name: 'search' })">
+                    <Search />
+                    <div>
+                        <Title tone="inverse">Find parking</Title>
+                        <Text tone="inverse">Spots near you</Text>
+                    </div>
+                </Surface>
+                <Surface variant="elevated" size="lg" class="gap-8" @click="router.push({ name: 'spot-add' })">
+                    <CirclePlus class="text-primary" />
+                    <div>
+                        <Title>Add a spot</Title>
+                        <Text>Earn from your driveway</Text>
+                    </div>
+                </Surface>
             </div>
-            <Text size="sm" weight="semibold" tone="primary" class="flex items-center gap-1">
-                Wallet
-                <ChevronRight />
-            </Text>
-        </Surface>
-        <div class="space-y-2">
-            <SectionHeader>
-                <Title>Nearby spots</Title>
-                <template #action>
-                    <Text weight="bold" tone="primary" @click="router.push({ name: 'search' })">See all</Text>
-                </template>
-            </SectionHeader>
-            <!-- On native this really does re-prompt via Tauri's permission flow. On
-                 web a hard-denied permission cannot be re-asked from script, and only
-                 site settings can undo it — but the common case is a prompt that got
-                 dismissed, and that one this fixes. The row is the message; no toast. -->
-            <Surface v-if="!here" as="button" variant="elevated" orientation="horizontal" type="button" @click="locate"
-                :disabled="locating" class="w-full gap-3 text-left">
-                <IconBox>
-                    <MapPin />
+            <Surface v-if="next" variant="elevated" orientation="horizontal" class="gap-3" @click="openBooking">
+                <IconBox :tone="happeningNow ? 'primary' : 'accent'">
+                    <CarFront />
                 </IconBox>
                 <div class="flex-1">
-                    <Title weight="semibold">{{ locating ? 'Finding you…' : 'Turn on location' }}</Title>
-                    <Text>To see spots near you</Text>
+                    <Text size="eyebrow" weight="bold">
+                        {{ happeningNow ? 'Happening now' : 'Upcoming booking' }}
+                    </Text>
+                    <Title weight="semibold">{{ nextSpot?.title }}</Title>
+                    <Text>
+                        {{ formatDay(next.slot[0], nextTimezone) }} · {{ formatSlots([next.slot[1]]) }}
+                    </Text>
                 </div>
                 <ChevronRight class="text-muted-foreground" />
             </Surface>
-            <div v-else class="flex gap-2">
-                <Surface v-for="spot in nearest" :key="spot.id" @click="openSpot(spot.id)" variant="elevated"
-                    size="none" class="relative flex-1 min-w-0 overflow-hidden"
-                    :data-loading="isPlaceholder(spot.id)">
-                    <img v-if="spot.images?.[0]" class="w-full h-28 object-cover" :src="spot.images[0]">
-                    <div v-else class="w-full h-28 bg-accent"></div>
-                    <div class="p-2">
-                        <Title size="sm" weight="semibold" class="truncate">{{ spot.title }}</Title>
-                        <!-- Nothing until somebody rates the spot. Nothing writes a rating
-                             yet: that needs a BookingRated event, an endpoint and a UI. -->
-                        <SpotRating :spot-id="spot.id" />
+            <Surface variant="elevated" orientation="horizontal"
+                class="gap-3 cursor-pointer bg-linear-135 from-accent to-card-2"
+                @click="router.push({ name: 'wallet' })">
+                <IconBox tone="primary">
+                    <Wallet />
+                </IconBox>
+                <div class="flex-1">
+                    <Text>Available to withdraw</Text>
+                    <Money :cents="available" size="xl" :data-loading="balanceLoading" />
+                </div>
+                <Text size="sm" weight="semibold" tone="primary" class="flex items-center gap-1">
+                    Wallet
+                    <ChevronRight />
+                </Text>
+            </Surface>
+            <div class="space-y-2">
+                <SectionHeader>
+                    <Title>Nearby spots</Title>
+                    <template #action>
+                        <Text weight="bold" tone="primary" @click="router.push({ name: 'search' })">See all</Text>
+                    </template>
+                </SectionHeader>
+                <!-- On native this really does re-prompt via Tauri's permission flow. On
+                     web a hard-denied permission cannot be re-asked from script, and only
+                     site settings can undo it — but the common case is a prompt that got
+                     dismissed, and that one this fixes. The row is the message; no toast. -->
+                <Surface v-if="!here" as="button" variant="elevated" orientation="horizontal" type="button"
+                    @click="locate" :disabled="locating" class="w-full gap-3 text-left">
+                    <IconBox>
+                        <MapPin />
+                    </IconBox>
+                    <div class="flex-1">
+                        <Title weight="semibold">{{ locating ? 'Finding you…' : 'Turn on location' }}</Title>
+                        <Text>To see spots near you</Text>
                     </div>
-                    <Badge class="absolute left-2 top-2 rounded-sm">
-                        {{ formatCents(spot.pricePerHour) }}/hr
-                    </Badge>
+                    <ChevronRight class="text-muted-foreground" />
                 </Surface>
+                <div v-else class="flex gap-2">
+                    <Surface v-for="spot in nearest" :key="spot.id" @click="openSpot(spot.id)" variant="elevated"
+                        size="none" class="relative flex-1 min-w-0 overflow-hidden"
+                        :data-loading="isPlaceholder(spot.id)">
+                        <img v-if="spot.images?.[0]" class="w-full h-28 object-cover" :src="spot.images[0]">
+                        <div v-else class="w-full h-28 bg-accent"></div>
+                        <div class="p-2">
+                            <Title size="sm" weight="semibold" class="truncate">{{ spot.title }}</Title>
+                            <!-- Nothing until somebody rates the spot. Nothing writes a rating
+                                 yet: that needs a BookingRated event, an endpoint and a UI. -->
+                            <SpotRating :spot-id="spot.id" />
+                        </div>
+                        <Badge class="absolute left-2 top-2 rounded-sm">
+                            {{ formatCents(spot.pricePerHour) }}/hr
+                        </Badge>
+                    </Surface>
+                </div>
             </div>
         </div>
+    </TabLayout>
 
-        <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" :booking="selectedBooking"
-            :renter="!!selectedBooking" :bookable="!selectedBooking"
-            @book="router.push({ name: 'book', params: { id: selectedId } })" />
-    </div>
+    <SpotDetailDrawer v-model:open="detailOpen" :spot-id="selectedId" :booking="selectedBooking"
+        :renter="!!selectedBooking" :bookable="!selectedBooking"
+        @book="router.push({ name: 'book', params: { id: selectedId } })" />
 </template>

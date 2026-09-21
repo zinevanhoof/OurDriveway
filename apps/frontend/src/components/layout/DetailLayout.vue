@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { X } from '@lucide/vue';
+import { ArrowLeft } from '@lucide/vue';
 import { AnimatePresence, motion } from 'motion-v';
 import Button from '@/components/ui/button/Button.vue';
-import { Text, Title } from '@/components/base/text';
+import { Title } from '@/components/base/text';
 
-const { title, description, showAction = true } = defineProps<{
+const { title, showAction = true } = defineProps<{
     title: string
-    description?: string
     /**
      * Whether the `action` slot is being offered right now — a save button on a form
      * nobody has touched is an offer with nothing behind it.
@@ -24,13 +23,18 @@ const emit = defineEmits(['close'])
 </script>
 
 <template>
-    <header class="flex items-center gap-2 px-4 py-3.5 bg-card border-b border-border">
-        <Button size="icon" @click="emit('close')" class="bg-muted text-foreground">
-            <X />
+    <!-- Three columns, not a flex row: the outer two are `1fr` each, so the title sits
+         optically centred whether or not a screen fills `actions`. The header has no
+         background of its own — it floats over the `<main>` below it. -->
+    <header class="grid grid-cols-[1fr_auto_1fr] items-center px-4 py-3">
+        <Button variant="pill" size="icon-lg" class="justify-self-start" @click="emit('close')">
+            <ArrowLeft />
         </Button>
-        <div>
-            <Title weight="extrabold">{{ title }}</Title>
-            <Text v-if="description" weight="semibold">{{ description }}</Text>
+        <Title>{{ title }}</Title>
+        <!-- Whatever this screen can do to the thing it is showing: delete it, edit it.
+             Not the floating `action` below, which is what the screen's form submits. -->
+        <div v-if="$slots.actions" class="flex gap-2 justify-self-end">
+            <slot name="actions"></slot>
         </div>
     </header>
     <!-- Page padding lives here and not in the view, unlike every other screen: this
@@ -41,15 +45,10 @@ const emit = defineEmits(['close'])
          is exactly that: 0.75rem + the bar's pt-10 + h-11 button + pb-4 (6.25rem).
          A ternary, not `pb-3` plus a conditional `pb-28`: two padding utilities on one
          element are decided by stylesheet order, not by which was written last. -->
-    <main class="space-y-4 flex-1 px-4 pt-4 bg-background overflow-y-auto no-scrollbar"
+    <main class="space-y-4 flex-1 px-4 bg-background overflow-y-auto no-scrollbar"
         :class="$slots.action ? 'pb-28' : 'pb-3'">
         <slot name="main"></slot>
     </main>
-    <!-- Only when someone fills it. An always-rendered footer is a padded, bordered
-         strip of nothing on every screen whose action floats instead. -->
-    <footer v-if="$slots.footer" class="px-4 pb-4 pt-3 bg-card border-t border-border">
-        <slot name="footer"></slot>
-    </footer>
     <!-- The floating action: a button that arrives when there is something to do with it.
          `AnimatePresence` is what gives it an exit — undoing the change puts it away the
          same way it came.

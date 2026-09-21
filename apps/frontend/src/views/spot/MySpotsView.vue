@@ -2,7 +2,7 @@
 import { Surface } from '@/components/base/surface';
 import { Text, Title } from '@/components/base/text';
 import { Money } from '@/components/base/money';
-import { SectionHeader } from '@/components/base/section-header';
+import TabLayout from '@/components/layout/TabLayout.vue';
 
 import { ChevronRight, MapPin, Plus, TrendingDown, TrendingUp } from '@lucide/vue';
 import Button from '@/components/ui/button/Button.vue';
@@ -69,22 +69,15 @@ onMounted(() => {
 </script>
 
 <template>
-    <!-- Sized to the screen rather than to its content, down every level, so only the
-         listing list scrolls. `min-h-0` on each flex child is what lets it shrink below
-         its content; without it the chain grows and the page scrolls.
-
-         No bottom padding here: the list scrolls, so its `pb-3` is inside its own
-         scroll box, and that runs flush to the navbar. -->
-    <div class="flex min-h-0 flex-1 flex-col gap-4 px-4 pt-4">
-        <SectionHeader class="items-center">
-            <Title size="xl" weight="extrabold">My parking spots</Title>
-            <template #action>
-                <Button @click="router.push({ name: 'spot-add' })" class="font-bold">
-                    <Plus />
-                    Add
-                </Button>
-            </template>
-        </SectionHeader>
+    <!-- No bottom padding: the list scrolls, so its `pb-3` is inside its own scroll
+         box, and that runs flush to the navbar. -->
+    <TabLayout title="My parking spots">
+        <template #actions>
+            <Button @click="router.push({ name: 'spot-add' })" class="font-bold">
+                <Plus />
+                Add
+            </Button>
+        </template>
         <div class="grid grid-cols-2 gap-2">
             <Surface variant="elevated" size="lg">
                 <Text weight="normal">Earned this month</Text>
@@ -135,5 +128,5 @@ onMounted(() => {
             <!-- Crossing this asks for the next page. -->
             <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
         </div>
-    </div>
+    </TabLayout>
 </template>

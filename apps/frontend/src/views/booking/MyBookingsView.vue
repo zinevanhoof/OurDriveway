@@ -14,8 +14,8 @@ import { isPlaceholder, placeholders, withLoadingRow } from '@/lib/placeholders'
 import type { BookingScope } from '@/types/responses/view/HostBookingsPageResponse';
 import RenterBookingRow from '@/components/booking/RenterBookingRow.vue';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Text, Title } from '@/components/base/text';
-import { SectionHeader } from '@/components/base/section-header';
+import { Text } from '@/components/base/text';
+import TabLayout from '@/components/layout/TabLayout.vue';
 
 const queryClient = useQueryClient()
 
@@ -54,16 +54,9 @@ const refresh = () => queryClient.invalidateQueries({ queryKey: viewKeys.booking
 </script>
 
 <template>
-    <!-- Sized to the screen rather than to its content, down every level, so only the
-         list inside the tabs scrolls. `min-h-0` on each flex child is what lets it
-         shrink below its content; without it the chain grows and the page scrolls.
-
-         No bottom padding here: the list scrolls, so its `pb-3` is inside its own
-         scroll box, and that runs flush to the navbar. -->
-    <div class="flex min-h-0 flex-1 flex-col gap-4 px-4 pt-4">
-        <SectionHeader class="items-center">
-            <Title size="xl" weight="extrabold">My bookings</Title>
-        </SectionHeader>
+    <!-- No bottom padding: the list scrolls, so its `pb-3` is inside its own scroll
+         box, and that runs flush to the navbar. -->
+    <TabLayout title="My bookings">
         <Tabs v-model="scope">
             <TabsList class="w-full group-data-horizontal/tabs:h-10">
                 <TabsTrigger value="upcoming" class="font-bold">Upcoming</TabsTrigger>
@@ -73,8 +66,8 @@ const refresh = () => queryClient.invalidateQueries({ queryKey: viewKeys.booking
 
         <!-- The only part that scrolls; the two tab bars stay put. -->
         <div class="min-h-0 flex-1 space-y-2 overflow-y-auto no-scrollbar pb-3">
-            <RenterBookingRow v-for="booking in bookings" :key="booking.id" :booking="booking"
-                :past="scope === 'past'" :data-loading="isPlaceholder(booking.id)" @changed="refresh" />
+            <RenterBookingRow v-for="booking in bookings" :key="booking.id" :booking="booking" :past="scope === 'past'"
+                :data-loading="isPlaceholder(booking.id)" @changed="refresh" />
             <Text v-if="!isPending && !bookings.length" size="sm" class="py-8 text-center">
                 {{ scope === 'upcoming' ? 'Nothing booked yet.' : 'No past bookings.' }}
             </Text>
@@ -82,5 +75,5 @@ const refresh = () => queryClient.invalidateQueries({ queryKey: viewKeys.booking
             <!-- Crossing this asks for the next page. -->
             <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
         </div>
-    </div>
+    </TabLayout>
 </template>

@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { toTypedSchema } from '@vee-validate/zod';
 import { useRouter } from 'vue-router';
 
-import FullScreenLayout from '@/components/layout/FullScreenLayout.vue';
+import DetailLayout from '@/components/layout/DetailLayout.vue';
 import { FieldError } from '@/components/ui/field'
 import Button from '@/components/ui/button/Button.vue';
 import { Spinner } from '@/components/ui/spinner'
@@ -174,8 +174,7 @@ const showServerErrors = (err: ApiError) => {
 </script>
 
 <template>
-    <FullScreenLayout title="New listing" description="List your driveway to start earning"
-        @close="router.back()" :show-action="started">
+    <DetailLayout title="New listing" @close="router.back()" :show-action="started">
         <template #main>
             <form id="create-spot-form" @submit="submit" class="space-y-4">
                 <SpotBasicInfoStep />
@@ -193,5 +192,5 @@ const showServerErrors = (err: ApiError) => {
                 Publish listing
             </Button>
         </template>
-    </FullScreenLayout>
+    </DetailLayout>
 </template>

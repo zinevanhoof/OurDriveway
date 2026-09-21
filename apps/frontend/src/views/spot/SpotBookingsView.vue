@@ -8,7 +8,7 @@ import { computed, ref } from 'vue'
 import { useInfiniteQuery, useQuery } from '@tanstack/vue-query'
 import { useRouter } from 'vue-router'
 
-import FullScreenLayout from '@/components/layout/FullScreenLayout.vue'
+import DetailLayout from '@/components/layout/DetailLayout.vue'
 import HostBookingDrawer from '@/components/spot/HostBookingDrawer.vue'
 import HostBookingRow from '@/components/spot/HostBookingRow.vue'
 import Button from '@/components/ui/button/Button.vue'
@@ -75,7 +75,7 @@ const openBooking = (booking: HostBookingResponse) => {
 </script>
 
 <template>
-    <FullScreenLayout @close="router.back()" title="Bookings" :description="spot?.title">
+    <DetailLayout @close="router.back()" title="Bookings">
         <template #main>
             <div class="space-y-2">
                 <Tabs v-model="scope">
@@ -112,7 +112,7 @@ const openBooking = (booking: HostBookingResponse) => {
             <!-- Crossing this asks for the next page. -->
             <Sentinel :has-next-page="hasNextPage" :fetching="isFetchingNextPage" @load="fetchNextPage" />
         </template>
-    </FullScreenLayout>
+    </DetailLayout>
 
     <HostBookingDrawer v-model:open="detailOpen" :booking="selected" :timezone="timezone" />
 </template>
