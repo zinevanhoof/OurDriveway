@@ -38,7 +38,7 @@ function submit() {
     <DrawerContent class="data-[vaul-drawer-direction=bottom]:mb-15">
       <div class="m-4 space-y-4 text-center">
         <Title size="lg">How was your parking?</Title>
-        <Text class="text-muted-foreground">{{ spotTitle ?? "Your booking" }}</Text>
+        <Text>{{ spotTitle ?? "Your booking" }}</Text>
         <div class="flex justify-center gap-2" role="radiogroup" aria-label="Rating">
           <button v-for="n in 5" :key="n" type="button" role="radio" :aria-checked="rating === n"
             :aria-label="`${n} star${n > 1 ? 's' : ''}`" @click="rating = n">

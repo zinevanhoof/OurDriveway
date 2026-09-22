@@ -4,15 +4,15 @@
 // screen is up, so the user can still tell what just arrived.
 import { ref, watch } from "vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
-import { CalendarCheck, Star } from "@lucide/vue";
 import { useRouter } from "vue-router";
 
 import { fetchNotifications } from "@/api/viewApi";
 import { dismissNotification, markNotificationsSeen } from "@/api/userApi";
 import { viewKeys } from "@/api/keys";
-import { isPlaceholder, placeholders } from "@/lib/placeholders";
+import { placeholders } from "@/lib/placeholders";
 import { Text } from "@/components/base/text";
 import DetailLayout from "@/components/layout/DetailLayout.vue";
+import NotificationRow from "@/components/notification/NotificationRow.vue";
 import RateBookingDrawer from "@/components/booking/RateBookingDrawer.vue";
 import type { NotificationResponse } from "@/types/responses/view/NotificationResponse";
 
@@ -64,9 +64,6 @@ function select(n: NotificationResponse) {
       break;
   }
 }
-
-const when = (at: string) =>
-  new Date(at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 </script>
 
 <template>
@@ -74,27 +71,8 @@ const when = (at: string) =>
     <template #main>
       <Text v-if="data && !data.length" class="text-muted-foreground">You're all caught up.</Text>
       <div class="space-y-3">
-        <button v-for="n in data" :key="key(n)" type="button" @click="select(n)"
-          :data-loading="isPlaceholder(n.bookingId)"
-          class="flex w-full items-center gap-3 rounded-lg border border-border p-3 text-left"
-          :class="fresh.has(key(n)) && 'bg-primary/10 border-primary'">
-          <template v-if="n.kind === 'rate_booking'">
-            <Star :size="20" class="shrink-0 fill-star text-star" />
-            <div>
-              <Text weight="semibold">Rate your parking at {{ n.spotTitle ?? "your booking" }}</Text>
-              <Text size="sm" class="text-muted-foreground">Ended {{ when(n.at) }}</Text>
-            </div>
-          </template>
-          <template v-else-if="n.kind === 'spot_booked'">
-            <CalendarCheck :size="20" class="shrink-0 text-primary" />
-            <div>
-              <Text weight="semibold">
-                {{ n.renterName ?? "Someone" }} booked {{ n.spotTitle ?? "your spot" }}
-              </Text>
-              <Text size="sm" class="text-muted-foreground">{{ when(n.at) }}</Text>
-            </div>
-          </template>
-        </button>
+        <NotificationRow v-for="n in data" :key="key(n)" :notification="n" :fresh="fresh.has(key(n))"
+          @click="select(n)" />
       </div>
     </template>
   </DetailLayout>
