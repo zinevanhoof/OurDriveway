@@ -119,8 +119,10 @@ const hostBookings = computed(() => {
              strip horizontal-only leaves the vertical axis to the drawer. -->
         <div class="flex h-40 gap-4 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar"
           :data-loading="isPlaceholderData">
-          <!-- `only:` = the sole image, so it fills the row instead of leaving a gap. -->
-          <img v-for="key in spot?.images" :key="key" :src="key"
+          <!-- `only:` = the sole image, so it fills the row instead of leaving a gap.
+               `decoding="async"` keeps a full-size photo's decode off the main thread
+               while the sheet is animating open. -->
+          <img v-for="key in spot?.images" :key="key" :src="key" alt="" decoding="async"
             class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md border-border" />
         </div>
         <div :data-loading="isPlaceholderData">

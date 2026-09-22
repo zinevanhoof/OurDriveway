@@ -1,6 +1,7 @@
 import { createWebHistory, createRouter } from "vue-router";
 import type { RouteLocationNormalized } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
+import { trackNavDirection } from "./transition";
 
 import HomeView from "@/views/HomeView.vue";
 import SearchView from "@/views/SearchView.vue";
@@ -31,6 +32,14 @@ import ChangePasswordView from "@/views/profile/ChangePasswordView.vue";
 
 export type RouteMeta = {
   requiresAuth: boolean;
+  /**
+   * A navbar root. Two of these next to each other is a sideways move, so the page
+   * transition cross-fades instead of sliding — see `transition.ts`.
+   *
+   * Set it on the five paths `MobileNavbar` links to, and nothing else: a screen you
+   * pushed from a tab is not a tab.
+   */
+  tab?: boolean;
 };
 
 const routes = [
@@ -40,6 +49,7 @@ const routes = [
     component: HomeView,
     meta: {
       requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
   {
@@ -66,6 +76,7 @@ const routes = [
     component: MySpotsView,
     meta: {
       requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
   {
@@ -76,6 +87,7 @@ const routes = [
     component: MyBookingsView,
     meta: {
       requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
   {
@@ -130,6 +142,7 @@ const routes = [
     component: WalletView,
     meta: {
       requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
   {
@@ -234,6 +247,7 @@ const routes = [
     component: SearchView,
     meta: {
       requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
 ];
@@ -242,6 +256,11 @@ export const router = createRouter({
   history: createWebHistory(),
   routes,
 });
+
+// After, not before: this has to see the history counter the navigation just wrote, and a
+// guard that redirects must not leave a direction behind for a navigation that never
+// happened. It runs before Vue flushes the new route, so the page renders knowing it.
+router.afterEach(trackNavDirection);
 
 router.beforeEach(async (to) => {
   const auth = useAuthStore();

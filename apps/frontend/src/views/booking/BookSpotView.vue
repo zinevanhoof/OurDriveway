@@ -24,7 +24,8 @@ import {
 } from "@/components/ui/combobox";
 
 import { DateFormatter, DateValue, getLocalTimeZone, today } from "@internationalized/date";
-import { computed, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
+import { COVERED } from "@/router/transition";
 import { useRouter } from "vue-router";
 import { useQuery } from "@tanstack/vue-query";
 import type { AcceptableValue } from "reka-ui";
@@ -74,6 +75,20 @@ const minDate = today(getLocalTimeZone());
 const maxDate = minDate.add({ days: 90 });
 const isDateDisabled = (date: DateValue) =>
     remainingWindows(spot.value?.availability, occupied.value, date).length === 0;
+
+// **The calendar waits for the page to finish arriving.** It is a `CalendarCell` and a
+// trigger per day, each with its own handful of computeds — around a hundred component
+// instances — and mounting that on the frame the page starts sliding is what made getting
+// here stutter, most visibly coming off the map. A placeholder holds its exact height and
+// it mounts once the screen is still.
+//
+// It is not the availability maths: `remainingWindows` across a whole month grid measures
+// 0.1ms. It is the instance count.
+//
+// The `taken` query lands inside the same window, which is the second half of the win —
+// its re-render of every cell used to happen mid-animation too.
+const calendarReady = ref(false);
+onMounted(() => setTimeout(() => (calendarReady.value = true), COVERED * 1000));
 
 // ─── Date selection (source of truth, independent of picked slots) ───
 const selectedDates = ref<DateValue[]>([]);
@@ -283,8 +298,12 @@ async function submit() {
                          close when the gesture starts here. Same note as SpotDetailDrawer. -->
             <div class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
                 <!-- `only:` = the sole image, so it fills the row instead of
-                             leaving a gap. -->
-                <img v-for="key in spot?.images" :key="key" :src="key"
+                             leaving a gap.
+
+                             `decoding="async"`: a host's photo decodes at whatever size it
+                             was uploaded, and the default is to do that on the main thread
+                             — on the frame this page is sliding in on. -->
+                <img v-for="key in spot?.images" :key="key" :src="key" alt="" decoding="async"
                     class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
             </div>
             <div class="flex">
@@ -298,9 +317,28 @@ async function submit() {
                          its own, because a redirect payment method destroys this page. -->
             <div class="space-y-2">
                 <Title weight="extrabold" class="text-[15px]">Pick your dates</Title>
-                <Calendar multiple :model-value="(selectedDates as any)" @update:model-value="onDatesChange"
-                    :min-value="minDate" :max-value="maxDate" :is-date-disabled="isDateDisabled"
-                    class="bg-card rounded-lg border border-border" initial-focus />
+                <Calendar v-if="calendarReady" multiple :model-value="(selectedDates as any)"
+                    @update:model-value="onDatesChange" :min-value="minDate" :max-value="maxDate"
+                    :is-date-disabled="isDateDisabled" class="bg-card rounded-lg border border-border" initial-focus />
+                <!-- Its stand-in. One bar for the month heading and six rows at `aspect-7/1`
+                     — a row seven cells wide and one tall, which is exactly what the real
+                     grid's `aspect-square` cells add up to, so the height matches at any
+                     screen width and nothing below it jumps when the calendar arrives.
+
+                     Built from plain divs rather than the real template under
+                     `data-loading`, which is the house style everywhere else: that trick
+                     masks a template rendered over placeholder data, and the whole point
+                     here is that the template is not mounted yet. Eight elements, against
+                     the hundred this is standing in for. -->
+                <div v-else class="rounded-lg border border-border bg-card p-3" aria-hidden="true">
+                    <div class="mx-auto h-5 w-32 animate-pulse rounded-md bg-(--skeleton)"></div>
+                    <!-- `mt-4` is the real gap under the heading; `pt-5` stands in for the
+                         weekday row, which is a line of small text rather than a cell. -->
+                    <div class="mt-4 pt-5">
+                        <div v-for="row in 6" :key="row" class="aspect-7/1 animate-pulse rounded-md bg-(--skeleton)">
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <Surface v-if="!selectedDates?.length" variant="dashed" size="lg"

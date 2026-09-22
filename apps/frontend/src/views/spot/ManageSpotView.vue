@@ -171,7 +171,9 @@ const openBooking = (booking: HostBookingResponse) => {
         </template>
         <template #main>
             <div class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
-                <img v-for="key in data?.images" :key="key" :src="key"
+                <!-- `decoding="async"` so a full-size photo does not decode on the main
+                     thread while this page slides in. -->
+                <img v-for="key in data?.images" :key="key" :src="key" alt="" decoding="async"
                     class="snap-center shrink-0 h-full w-auto only:w-full object-cover rounded-md" />
             </div>
             <div class="flex">

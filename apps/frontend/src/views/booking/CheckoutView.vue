@@ -337,7 +337,7 @@ async function giveUp() {
           -->
           <div v-if="item.images?.length"
             class="flex h-40 gap-2 overflow-x-auto touch-pan-x snap-x snap-mandatory no-scrollbar">
-            <img v-for="key in item.images" :key="key" :src="key" alt=""
+            <img v-for="key in item.images" :key="key" :src="key" alt="" decoding="async"
               class="snap-center shrink-0 h-full w-full object-cover rounded-md bg-accent" />
           </div>
 

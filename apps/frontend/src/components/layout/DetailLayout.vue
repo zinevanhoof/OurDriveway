@@ -55,10 +55,14 @@ const emit = defineEmits(['close'])
 
          **The containing block comes from the parent.** This component has no root
          element of its own, so `absolute` resolves against the nearest positioned
-         ancestor: `MobileLayout`'s `<main class="relative">` for a routed screen, and
-         vaul's `fixed` drawer content for the booking form. Both put `bottom-0` where it
-         belongs — above the navbar, or at the bottom of the sheet. A third kind of parent
-         has to be positioned too.
+         ancestor, which for a routed screen is the per-page `absolute inset-0` box
+         `MobileLayout` wraps each page in for the slide transition. That is what puts
+         `bottom-0` above the navbar, and what makes the bar leave with its own page
+         rather than sitting over the one arriving. A parent of any other kind has to be
+         positioned too, and must not scroll: `bottom-0` inside a scrolling containing
+         block rides down with the content instead of staying put. The page box only
+         scrolls for a screen that brings no scroll container of its own, and every screen
+         with an action bar has one — `<main>` right above.
 
          `pointer-events-none` on the fade and `auto` on the button's wrapper: the scrim
          spans the width and would otherwise swallow taps meant for the content under it.
