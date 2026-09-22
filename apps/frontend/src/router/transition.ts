@@ -23,20 +23,22 @@ export function trackNavDirection(to: RouteLocationNormalized) {
   const moved = position() - last;
   last = position();
 
+  // A `replace` leaves the counter where it was, and every replace in this app is a
+  // screen getting out of the way — withdraw back to the wallet, a deleted listing back
+  // to the list — so "not forward" is the right reading of zero.
   navDirection.value =
-    // A navbar root is never slid to, whatever it is arrived from: the tabs are the
-    // app's floor, and a detail screen dismissing back to one is the same sideways
-    // move as switching tabs, not a pop that should drag a screen off to the right.
-    // Only `to` is asked — `from` being a tab is what a push *away* from one looks
-    // like, and that one does slide.
-    to.meta.tab
-      ? "tab"
-      : // A `replace` leaves the counter where it was, and every replace in this app is a
-        // screen getting out of the way — withdraw back to the wallet, a deleted listing
-        // back to the list — so "not forward" is the right reading of zero.
-        moved > 0
-        ? "forward"
-        : "back";
+    moved > 0
+      ? // Arriving at a navbar root under its own steam is a tab press, and the navbar is
+        // a `RouterLink`, so it is always this branch — whatever screen it was pressed
+        // from. Switching tabs and jumping to a tab out of a detail screen are the same
+        // sideways move; neither is a push that should slide.
+        to.meta.tab
+        ? "tab"
+        : "forward"
+      : // A pop lands wherever the stack left off, tab root or not, and it is still a
+        // dismissal: the screen being left has to slide off. Asking `to.meta.tab` here is
+        // what turned `router.back()` out of a detail screen into a fade.
+        "back";
 }
 
 // Not the app's usual `stiffness: 500, damping: 35`: that one is tuned to overshoot a
