@@ -19,15 +19,17 @@ const position = () =>
   (window.history.state as { position?: number } | null)?.position ?? 0;
 let last = position();
 
-export function trackNavDirection(
-  to: RouteLocationNormalized,
-  from: RouteLocationNormalized,
-) {
+export function trackNavDirection(to: RouteLocationNormalized) {
   const moved = position() - last;
   last = position();
 
   navDirection.value =
-    to.meta.tab && from.meta.tab
+    // A navbar root is never slid to, whatever it is arrived from: the tabs are the
+    // app's floor, and a detail screen dismissing back to one is the same sideways
+    // move as switching tabs, not a pop that should drag a screen off to the right.
+    // Only `to` is asked — `from` being a tab is what a push *away* from one looks
+    // like, and that one does slide.
+    to.meta.tab
       ? "tab"
       : // A `replace` leaves the counter where it was, and every replace in this app is a
         // screen getting out of the way — withdraw back to the wallet, a deleted listing
