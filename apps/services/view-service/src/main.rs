@@ -29,7 +29,7 @@ bus::version_reader! {
     /// but no `payment`, echoing a payment's version returned immediately; it holds both,
     /// so a client that has just paid or just withdrawn waits for the projector rather
     /// than reading a wallet without the thing it did in it.
-    fn version_of;
+    fn version_of, version_of_at;
     "user" => shared::schema::view::app_user,
     "spot" => shared::schema::view::spot,
     "booking" => shared::schema::view::booking,
@@ -115,14 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // This process assumes its database exists and is current, and fails at connect
     // above if it does not.
 
-    // One pool for the whole process — four projectors × PARTITIONS lanes, the
-    // election, the relay, the handlers and the await layer all share it.
+    // One pool for the whole process — four projectors, the handlers and the await
+    // layer all share it.
     //
     // This used to be 4 × 16 connections plus three more, on the theory that an open
     // transaction blocks every other session on the socket. It did not, but a
     // `Surreal::clone` carried a replayed sign-in that `bus/examples/clone_cost`
-    // priced at +27.5ms per transaction. A pool has neither problem: a lane borrows a
-    // connection for one event's transaction and gives it straight back.
+    // priced at +27.5ms per transaction. A pool has neither problem: a projector
+    // borrows a connection for one event's transaction and gives it straight back.
     let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
@@ -133,12 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // No leader election and no outbox relay: this service publishes nothing, and the
-    // projectors need no election — each partition is one durable consumer with
-    // `max_ack_pending: 1`, so JetStream hands out one event at a time *per partition*
-    // across every replica, in order.
+    // projectors need no election — they share one durable consumer per stream, so each
+    // event is applied once by whichever replica picked it up, and `projector::decide`
+    // keeps one aggregate's events in version order without the transport doing it.
     //
-    // Four projectors, `PARTITIONS` lanes each, all on the one connection above.
-    // A transaction per event, on a session that lives only as long as it does.
+    // Four projectors, all on the one pool above. A transaction per event.
     tokio::spawn(bus::projector::run(
         js.clone(),
         Arc::new(UserProjector),

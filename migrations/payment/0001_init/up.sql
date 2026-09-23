@@ -165,13 +165,6 @@ CREATE INDEX payout_host ON payout (host_id);
 -- second blocks and then reads the first's committed payout; on different keys neither
 -- waits, so hosts do not serialise against each other.
 
--- ─── leader election ────────────────────────────────────────────────────────
-CREATE TABLE _lease (
-    name       text PRIMARY KEY,
-    holder     text        NOT NULL,
-    expires_at timestamptz NOT NULL
-);
-
 -- ─── transactional outbox ───────────────────────────────────────────────────
 CREATE TABLE _outbox (
     id         uuid PRIMARY KEY,

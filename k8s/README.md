@@ -203,40 +203,36 @@ databases, and the log was the source of truth. None of that holds: services wri
 their own rows inside the request's transaction, projectors share durable
 consumers, and the log is a seven-day bus.
 
-### Projector throughput is `PARTITIONS`, not `replicas`
+### Projector throughput now scales with `replicas`
 
-Each stream is cut into `shared::events::PARTITIONS` (16) lanes. NATS assigns a
-lane from the subject as it stores each message, and a projector runs one durable
-consumer per lane with `max_ack_pending: 1` — so one aggregate's events stay
-strictly ordered while unrelated ones apply concurrently.
+Each projector holds **one durable consumer per stream**, shared by every replica.
+JetStream hands each message to whichever replica pulled first, so work distributes
+itself — nothing assigns, nothing rebalances, and a dead replica's in-flight
+messages are redelivered to another after `ack_wait`. Each replica applies up to
+`bus::projector::APPLY_CONCURRENCY` events at a time.
 
-Every replica opens every lane, and a lane's durable hands its one in-flight
-message to whichever replica pulled first. Nothing assigns partitions, nothing
-rebalances, and a dead replica's lane is picked up by another after `ack_wait`.
+Ordering does not come from the transport. `bus::projector::decide` reads the target
+aggregate's stored `version` under `FOR UPDATE` in the same transaction as the apply,
+applies only the next one, acks anything already stored, and `Nak`s anything from the
+aggregate's future so the server redelivers it after the gap closes.
 
-The consequence for scaling: **16 partitions means at most 16 concurrent applies
-per stream across the whole deployment, however many pods run.** `replicas: N` buys
-availability and request throughput; raising `PARTITIONS` is what buys projection
-throughput. It is a `const` in `shared`, not a value, because every service
-declares the streams at boot and they must agree.
+**This replaced 16 partitions per stream.** NATS used to assign a lane from the
+subject on ingest, and a projector ran one durable per lane with
+`max_ack_pending: 1`. That gave strict per-key order, but at a hard ceiling of 16
+concurrent applies per stream *across the whole deployment however many pods ran* —
+and 64 open consumers in view-service, which runs four projectors. Adding pods now
+raises projection throughput; it did not before.
 
-It no longer costs what it used to in connections. Each lane needed its own
-SurrealDB connection — 16 per projector, 64 from view-service, which runs four —
-because they could not be sessions on a shared socket: `Surreal::clone` raced its
-own sign-in, and a warmed clone deadlocked behind another lane's open transaction.
-Both were observed.
+Two operational notes went with it:
 
-A lane now borrows a connection from the pool for the length of one event's
-transaction and gives it straight back, so 16 lanes do not mean 16 connections
-held open. `max_connections` in `shared/src/db.rs` is the ceiling, and raising
-`PARTITIONS` raises concurrent demand on it rather than the count directly.
-
-Changing it needs the streams **drained** first — every `-pNN` durable at 0 pending
-in `nats consumer report <STREAM>` — and then a deploy. The stream config is
-reconciled on boot, but messages already stored keep the subject they were written
-with, so a key that moves lanes would have its older events in one lane and its newer
-ones in another, with no order between them. Drained, there is nothing left to race.
-Projectors normally sit at the head, so this is a check rather than a wait.
+- **Changing the partition count needed the streams drained first** — every `-pNN`
+  durable at 0 pending — because stored messages keep the subject they were written
+  with, so a key that moved lanes had its history split across two independently
+  ordered consumers. There are no lanes to move between.
+- **The connection bill is bounded by `APPLY_CONCURRENCY` × projectors**, not by a
+  lane count. `max_size` in `shared/src/db.rs` is the ceiling, and a pool timeout
+  surfaces as `MyError::Pool`, stops the projector and 503s the pod — so that
+  headroom is the part to watch.
 
 Two consequences worth knowing:
 
@@ -269,7 +265,7 @@ the Ingress routes `/api/<service>` and sends everything else to the SPA, so
 nothing outside the cluster can reach it. Note it is *unauthenticated inside* the
 cluster; see the handler's doc comment.
 
-Re-running one inside two minutes is a no-op by design: backfill event ids are
+Re-running one inside an hour is a no-op by design: backfill event ids are
 deterministic and land inside the stream's `duplicate_window`.
 
 ## Known ceilings

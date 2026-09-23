@@ -46,9 +46,9 @@ impl Readiness {
         })
     }
 
-    /// Called by a projector once **every** partition of the stream is drained.
-    /// Idempotent, and quiet when it is. A follower calls this on every poll of
-    /// the shared cursors — once a second — so logging unconditionally buried the
+    /// Called by a projector once its stream's consumer is drained.
+    /// Idempotent, and quiet when it is. Every replica calls this on every poll of
+    /// the shared cursor — four times a second — so logging unconditionally buried the
     /// log in a line that says nothing after the first one.
     pub fn mark_caught_up(&self, stream: &str) {
         if let Some(s) = self.streams.get(stream)
@@ -58,24 +58,17 @@ impl Readiness {
         }
     }
 
-    /// Called when a lane hits an error it can't apply.
+    /// Called when a projector hits an error it can't apply.
     ///
-    /// A lane must stop rather than skip the message: skipping makes this
-    /// projection permanently disagree with the log, which is far worse than
-    /// being drained. Flipping readiness is how the instance gets taken out of
-    /// rotation.
+    /// It must stop rather than skip the message: skipping makes this projection
+    /// permanently disagree with the log, which is far worse than being drained.
+    /// Flipping readiness is how the instance gets taken out of rotation.
     ///
-    /// Per stream, not per partition. One wedged lane means this stream's
-    /// projection is incomplete, and a client cannot know which aggregates fell in
-    /// that partition — so the whole stream is unready, which is what it already
-    /// meant before the lanes existed.
-    ///
-    /// **Sticky, and that is the point.** The readiness poller keeps running after a
-    /// lane dies, and the other fifteen lanes go on draining; once another replica
-    /// picks up the dead lane's unacked message, every consumer reports drained and
-    /// [`Self::mark_caught_up`] would put this instance straight back into rotation
-    /// with a lane that is never coming back. Clearing it needs a restart, which is
-    /// what "a diagnosable stopped replica" means.
+    /// **Sticky, and that is the point.** The readiness poller keeps running after the
+    /// projector dies; once another replica picks up its unacked messages, the consumer
+    /// reports drained and [`Self::mark_caught_up`] would put this instance straight
+    /// back into rotation with a projector that is never coming back. Clearing it needs
+    /// a restart, which is what "a diagnosable stopped replica" means.
     pub fn mark_failed(&self, stream: &str) {
         if let Some(s) = self.streams.get(stream) {
             s.caught_up.store(false, Ordering::Release);
@@ -147,10 +140,10 @@ where
 // `await_applied`, `APPLIED_TIMEOUT` and the `applied` watch that fed them are gone.
 //
 // They published `ack_floor.stream_sequence` from a stream's one consumer, so a
-// worker could ask "has my projection consumed the event that woke me". A stream has
-// `PARTITIONS` cursors now and that number has no single value: the lane holding the
-// event may be current while an unrelated lane sits at a lower floor, and the minimum
-// across them would stall a refund on a partition the worker does not care about.
+// worker could ask "has my projection consumed the event that woke me". That number
+// stopped meaning anything useful once applies ran concurrently: the floor sits behind
+// every in-flight message, so a refund would stall on events the worker does not care
+// about — and while the streams were partitioned it had no single value at all.
 //
 // The question is better asked per aggregate anyway, which is what the event already
 // carries — `bus::await_version::reached(db, table, id, envelope.version, timeout)`.

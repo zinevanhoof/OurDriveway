@@ -1,5 +1,5 @@
 -- spot-service's database. Private to its service; see migrations/user/0001_init.sql
--- for the shared reasoning about _lease, _outbox and why there is no row-level
+-- for the shared reasoning about _outbox and why there is no row-level
 -- security here.
 
 CREATE TABLE spot (
@@ -53,13 +53,6 @@ CREATE TABLE spot (
 );
 
 CREATE INDEX spot_host ON spot (host_id);
-
--- ─── leader election ────────────────────────────────────────────────────────
-CREATE TABLE _lease (
-    name       text PRIMARY KEY,
-    holder     text        NOT NULL,
-    expires_at timestamptz NOT NULL
-);
 
 -- ─── transactional outbox ───────────────────────────────────────────────────
 CREATE TABLE _outbox (

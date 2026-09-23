@@ -70,7 +70,7 @@ bus::version_reader! {
     /// The two aggregates this service stores. Anything else a client echoes back is
     /// `Unavailable` — nothing here to wait for, so the request proceeds rather than
     /// spending the timeout on a table this database does not have.
-    fn version_of;
+    fn version_of, version_of_at;
     "user" => shared::schema::user::app_user,
     "refresh_token" => shared::schema::user::refresh_token,
 }
@@ -115,15 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // "is NATS reachable" — which still matters, because the outbox relay needs it.
     let readiness = bus::Readiness::new(js.client().clone(), &[]);
 
-    // For the outbox relay, which is now the only thing here that must run on
-    // exactly one instance. There are no projectors left to elect for: this
-    // service writes its own rows inside the request's transaction, and the event
-    // goes into `_outbox` in that same transaction.
-    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
-
     // Carries every USERS and SESSIONS event this service commits. No longer
     // scaffolding — this is the only path by which those events reach NATS.
-    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone()));
 
     let state = AppState {
         user_service: Arc::new(UserService { db: db.clone() }),

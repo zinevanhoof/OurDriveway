@@ -70,7 +70,7 @@ impl UserService {
 
         // Deterministic event id, so two signups racing on the same address
         // collapse into one append: the id rides `Nats-Msg-Id`, and the stream's
-        // 120s `duplicate_window` discards the second server-side, atomically.
+        // `duplicate_window` discards the second server-side, atomically.
         //
         // This is the only guard that sees a *concurrent* duplicate — a
         // double-clicked button is enough. The read above cannot: both requests

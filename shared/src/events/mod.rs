@@ -126,11 +126,15 @@ pub fn split_aggregate(aggregate: &str) -> Option<(&str, Uuid)> {
 //
 // One stream per bounded context, each binding `<domain>.>`.
 //
-// The filter used to be `<domain>.*.>`, where the `*` matched a shard token that
-// every subject carried and `shard_of(id)` assigned in Rust. That token is gone;
-// what replaced it is [`PARTITIONS`], which is the same idea moved to where it
-// belongs — NATS assigns it on ingest, the application never computes it, and it
-// exists to parallelise *consumption* rather than to place rows.
+// Two generations of routing token have been removed from below that filter. First a
+// `<shard>` assigned by `shard_of(id)` in Rust, which existed so a future deployment
+// could pin one service instance per shard. Then a `<partition>` assigned by NATS on
+// ingest, which existed so sixteen consumers could each be ordered by
+// `max_ack_pending: 1`.
+//
+// Neither is needed to order anything any more: `bus::projector::decide` reads the
+// aggregate's stored version and refuses an event that is not the next one, so order
+// is a property of the data rather than of how the log is cut up.
 
 pub const STREAM_USERS: &str = "USERS";
 pub const STREAM_SESSIONS: &str = "SESSIONS";
@@ -140,34 +144,11 @@ pub const STREAM_PAYMENTS: &str = "PAYMENTS";
 
 const DAY: u64 = 24 * 60 * 60;
 
-/// How many ordered lanes each stream is cut into.
-///
-/// NATS hashes every subject into one of these on ingest (see
-/// [`partition_transform`]) and a projector runs one consumer per partition, each
-/// with `max_ack_pending: 1`. Same subject → same partition → strict order;
-/// different partitions run concurrently.
-///
-/// **A `const`, deliberately not an environment variable.** `bus::ensure_streams`
-/// runs in every service at boot and declares the same streams. If two services
-/// disagreed about this number, the first to boot would win and the other's lane
-/// filters would match nothing — for ever, silently. A const makes disagreement
-/// impossible and makes a change a visible commit.
-///
-/// Changing it is not a hot edit: a key moves lanes while its old lane may still
-/// hold unconsumed events for it, so the streams must be drained first. See the
-/// migration note in `bus::connect::ensure_streams`.
-///
-/// 16 rather than 64: this is the ceiling on concurrent applies per stream *no
-/// matter how many replicas run*, and each lane costs one JetStream consumer per
-/// projector plus one SurrealDB session. Raise it when the projectors are measurably
-/// the bottleneck, not before.
-pub const PARTITIONS: u8 = 16;
-
 /// `(stream, domain, max_age)`.
 ///
-/// `domain` is the first subject token, not the whole filter. The filter
-/// (`users.>`), the transform source (`users.*.*`) and a lane's filter
-/// (`users.7.>`) are all derived from it, so they cannot drift apart.
+/// `domain` is the first subject token, not the whole filter — [`stream_filter`]
+/// derives `users.>` from it, so the stream's binding and its consumers' cannot drift
+/// apart.
 ///
 /// **Every stream expires.** Four of these used to be `None` — infinite — because
 /// each service database was an `emptyDir` wiped on every pod restart and a
@@ -228,38 +209,6 @@ pub fn domain_of(stream: &str) -> Option<&'static str> {
         .iter()
         .find(|(name, ..)| *name == stream)
         .map(|(_, domain, _)| *domain)
-}
-
-/// The stream subject transform that assigns a partition on ingest:
-/// `("users.*.*", "users.{{partition(16,1,2)}}.{{wildcard(1)}}.{{wildcard(2)}}")`.
-///
-/// NATS applies this as it stores each message, so a publisher keeps sending the
-/// three-token subject and consumers see the four-token one. Nothing in this
-/// codebase hashes anything.
-///
-/// **Hashed on both wildcards**, because the ordering key is the whole
-/// `<entity>.<id>` pair — `payments.booking.<id>` and `payments.payout.<id>` are
-/// different aggregates on one stream and have no reason to share a lane.
-///
-/// The source has three tokens and the destination four, so a stored subject can
-/// never match the source again — the transform cannot compound, whatever else is
-/// later done to these streams.
-///
-/// Only `<domain>.<entity>.<id>` is transformed. A subject of any other shape still
-/// matches [`stream_filter`] and would be stored untransformed, where no lane filter
-/// reaches it — which is why `subjects_are_three_tokens` guards the grammar.
-pub fn partition_transform(domain: &str) -> (String, String) {
-    (
-        format!("{domain}.*.*"),
-        format!(
-            "{domain}.{{{{partition({PARTITIONS},1,2)}}}}.{{{{wildcard(1)}}}}.{{{{wildcard(2)}}}}"
-        ),
-    )
-}
-
-/// What one lane's consumer filters on — `"users.7.>"`.
-pub fn partition_filter(domain: &str, partition: u8) -> String {
-    format!("{domain}.{partition}.>")
 }
 
 // ─── Subjects ───────────────────────────────────────────────────────────────
@@ -399,55 +348,26 @@ mod tests {
         );
     }
 
-    /// The transform only rewrites what it matches, so every subject a service
-    /// publishes has to match its source pattern.
+    /// Every subject a service publishes starts with its stream's domain, so the
+    /// stream's `<domain>.>` binding claims it.
+    ///
+    /// This replaced `every_subject_is_partitioned`, which asserted the three-token
+    /// `<domain>.<entity>.<id>` grammar. That grammar was load-bearing only because the
+    /// partition transform matched `<domain>.*.*` exactly: a subject with any other
+    /// token count was stored untransformed, where no lane filter reached it, and sat in
+    /// the stream unconsumed rather than failing. With the transform gone, `>` matches
+    /// any number of trailing tokens and the only thing left to assert is the prefix.
     #[test]
-    fn every_subject_is_partitioned() {
+    fn every_subject_is_claimed_by_its_stream() {
         let id = Uuid::now_v7();
         for (subject, stream) in every_subject(&id) {
             let domain = domain_of(stream).expect("stream is in STREAMS");
-            let (source, destination) = partition_transform(domain);
-
-            // `<domain>.*.*` — same leading token, exactly three tokens.
-            let source_tokens: Vec<_> = source.split('.').collect();
-            let subject_tokens: Vec<_> = subject.split('.').collect();
-            assert_eq!(
-                subject_tokens.len(),
-                source_tokens.len(),
-                "{subject} does not match transform source {source}, so it would be \
-                 stored unpartitioned and no lane would consume it"
-            );
-            assert_eq!(subject_tokens[0], source_tokens[0]);
-
-            // The destination puts the partition where nothing can re-match the
-            // source: four tokens against the source's three.
-            assert_eq!(destination.split('.').count(), 4, "{destination}");
+            let filter = stream_filter(domain);
             assert!(
-                destination.contains(&format!("partition({PARTITIONS},1,2)")),
-                "{destination} must hash both key tokens"
+                subject.starts_with(&format!("{domain}.")),
+                "{subject} is not claimed by {filter}"
             );
         }
-    }
-
-    /// A lane filter must claim its own partition and nothing else.
-    #[test]
-    fn lane_filters_do_not_overlap() {
-        let filters: Vec<_> = (0..PARTITIONS)
-            .map(|p| partition_filter("users", p))
-            .collect();
-
-        assert_eq!(filters[0], "users.0.>");
-        assert_eq!(filters[7], "users.7.>");
-
-        // `users.1.>` must not also claim `users.11.…`, which is what a naive
-        // `starts_with("users.1")` would do. The trailing `.` is doing that work.
-        let stored = "users.11.user.019f";
-        let claiming: Vec<_> = filters
-            .iter()
-            .filter(|f| stored.starts_with(f.trim_end_matches('>')))
-            .collect();
-        assert_eq!(claiming.len(), 1, "{stored} matched {claiming:?}");
-        assert_eq!(claiming[0], "users.11.>");
     }
 
     #[test]

@@ -117,9 +117,9 @@ async fn sweep(db: &shared::db::Db) -> MyResult<()> {
                         Envelope::new(event, None, aggregate_id("booking", &booking_id), version);
                     // Deliberately NOT a v7 id, the only place in the system that isn't.
                     // It rides the `Nats-Msg-Id` header `publish` already sets, so two
-                    // instances sweeping the same booking inside the stream's 120s
+                    // instances sweeping the same booking inside the stream's
                     // duplicate_window collapse to one event — and the 60s tick sits
-                    // comfortably inside that.
+                    // comfortably inside that hour.
                     envelope.event_id = Uuid::new_v5(
                         &Uuid::NAMESPACE_OID,
                         format!("expire:{booking_id}").as_bytes(),

@@ -246,15 +246,30 @@ decides what shares an ordering: bookings are keyed on their **spot**, payments 
 **booking**, payouts on their **host**. That is what keeps, for example, every booking on
 one spot in order relative to each other.
 
-Each stream is split into **16 partitions** (`shared::events::PARTITIONS`). NATS assigns
-the partition from the subject as it stores the message, and each projector runs one
-durable consumer per partition, with one message in flight at a time. The result is
-strict order per key, parallelism across keys, and no partition assignment or rebalancing
-code anywhere.
+**Ordering lives in the data, not in the transport.** Every projected row carries the
+gapless per-aggregate `version` its owning service assigned inside the writing
+transaction, and a projector reads that version under `FOR UPDATE` before it applies
+anything (`bus::projector::decide`):
+
+- the next version → apply;
+- one already stored → ack and do nothing, so a redelivery or a duplicate is free;
+- a version from the future → **`Nak`**, and JetStream redelivers it once the event
+  before it has landed.
+
+That last case is the whole buffering mechanism. There is no park queue, no reorder
+window and no in-memory holding area — the server already has a durable one that is
+shared across replicas and survives a restart.
+
+Because of that, each projector needs only **one durable consumer per stream**, with a
+real in-flight window and applies running concurrently. This replaced sixteen consumers
+per stream each pinned to `max_ack_pending: 1`: a round trip per event, a ceiling of
+sixteen concurrent applies deployment-wide, sixty-four consumers open in view-service, and
+a subject-partitioning transform whose partition count could not be changed without
+draining every lane first.
 
 Delivery is **at-least-once**. Publishes carry `Nats-Msg-Id`, so a retry inside the
-stream's duplicate window is dropped by the server. Anything outside that window is
-absorbed by the consumers, because every projection is an idempotent upsert and every
+stream's one-hour duplicate window is dropped by the server. Anything outside that window
+is absorbed by the consumers: the version gate makes a re-applied event a no-op, and every
 side effect carries an idempotency key.
 
 ### The transactional outbox
@@ -267,10 +282,11 @@ So nothing publishes directly. A service writes its rows **and** an `_outbox` ro
 **same transaction**, and a relay (`bus/src/outbox.rs`) moves outbox rows to NATS
 afterwards. Either both the data and the event exist, or neither does.
 
-Only **one relay per service** runs at a time, chosen by a lease in the database
-(`bus/src/lease.rs`) that expires on the database's clock rather than any replica's. Two
-relays interleaving could publish one booking's `reserved → confirmed → cancelled` out of
-order, so the lease is load-bearing, not an optimisation.
+**Every replica runs a relay.** There used to be one, elected through a 30-second lease
+row, because two relays interleaving could publish a booking's `reserved → confirmed →
+cancelled` out of order. The version gate above refuses such an event rather than applying
+it, so the election, its lease table, its heartbeat and its half-minute handover on a
+rolling restart are all gone, and relay throughput scales with pods.
 
 ### CQRS: writes in the owner, reads in view-service
 
@@ -324,7 +340,7 @@ Background work comes in exactly three shapes, and each has its generic half in 
 
 | Loop                           | Driven by             | Does                                                                  | Example                                                           |
 | ------------------------------ | --------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| **Projector** (`projector.rs`) | a stream, partitioned | applies events to this service's tables — idempotent, ordered per key | view-service building the read model                              |
+| **Projector** (`projector.rs`) | a stream consumer     | applies events to this service's tables — idempotent, ordered per aggregate by its version | view-service building the read model         |
 | **Worker** (`worker.rs`)       | a stream consumer     | performs a side effect once per event                                 | send a verification email, issue a refund, make a payout transfer |
 | **Sweeper** (`sweeper.rs`)     | a timer               | reacts to time passing                                                | release booking holds whose 15 minutes are up                     |
 
@@ -433,7 +449,7 @@ apps/
   services/          the seven Rust services
   migrator/          the one process that applies schema to all five databases
   frontend/          Vue 3 app; src-tauri/ is the native shell (its own Cargo workspace)
-bus/                 NATS plumbing: outbox relay, projector, worker, lease, await-version, rpc
+bus/                 NATS plumbing: outbox relay, projector, worker, await-version, rpc
 shared/              runtime-free types: events, domain models, requests, responses, schema
 migrations/<db>/     SQL migrations per database (user, spot, booking, payment, view)
 docker/              dev compose file (YugabyteDB, NATS, Caddy, Stripe CLI) and Caddyfile
@@ -594,17 +610,19 @@ where state lives, and rebuilding projections in detail.
 - **Request throughput scales with replicas.** The services hold no state between
   requests, so `replicas: N` in a values file is the whole change. kube-proxy spreads
   connections, and the readiness probe keeps a pod out of rotation until it can serve.
-- **Projection throughput scales with partitions.** Every replica opens every partition,
-  and a partition's single in-flight message goes to whichever replica pulls it first.
-  There is no assignment and no rebalancing, and a dead replica's partitions are picked
-  up by others. The ceiling is 16 concurrent applies per stream, which is raised by
-  changing `PARTITIONS`, not by adding pods.
+- **Projection throughput scales with replicas.** Every replica pulls from the same
+  durable consumer, so each event is applied once by whoever asked first. There is no
+  assignment and no rebalancing, and a dead replica's in-flight messages are redelivered
+  to another after `ACK_WAIT`. This used to have a hard ceiling of 16 concurrent applies
+  per stream across the whole deployment, raised only by changing the partition count;
+  adding pods now raises it.
 - **Storage scales with YugabyteDB.** It splits tables into tablets across nodes and
   rebalances them itself, so nothing in the application decides where a row lives. It
   runs as a single node today (see below); the application code does not change when
   that becomes a real cluster.
 - **Connections are pooled.** A projector borrows a connection for one event's transaction
-  and returns it, so more partitions do not mean more connections held open.
+  and returns it, and its concurrency is bounded (`bus::projector::APPLY_CONCURRENCY`) so
+  the projectors cannot starve the request handlers of the pool.
 
 ## Status and known gaps
 
@@ -643,7 +661,7 @@ what the fix is.
       owns what. A type should live in `shared` only when more than one crate needs it. Today
       these don't:
   - the diesel schema modules `schema::{user,spot,booking,payment,view}` — each belongs to
-    the service that owns that database. `bus` keeps `_outbox` and `_lease`.
+    the service that owns that database. `bus` keeps `_outbox`.
   - `projections::*`, `responses::view` and `domain_models::view` — view-service only.
   - the row structs in `domain_models::{user,spot,booking,payment}` — each is used by its
     owner. Other services only read the `status` constants, which can stay shared as

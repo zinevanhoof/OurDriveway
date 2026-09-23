@@ -109,13 +109,6 @@ CREATE TABLE spot (
 -- Measured on yugabytedb/yugabyte:2025.2.5.2-b5 before any of this was written:
 -- without the FOR UPDATE two racers both see zero bookings and both insert.
 
--- ─── leader election ────────────────────────────────────────────────────────
-CREATE TABLE _lease (
-    name       text PRIMARY KEY,
-    holder     text        NOT NULL,
-    expires_at timestamptz NOT NULL
-);
-
 -- ─── transactional outbox ───────────────────────────────────────────────────
 CREATE TABLE _outbox (
     id         uuid PRIMARY KEY,

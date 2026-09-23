@@ -40,24 +40,27 @@
 #
 # ── Every table generated exactly once, in the crate that owns it ────────────
 #
-# `_lease` and `_outbox` are excluded HERE and generated instead into `bus/src/schema.rs`,
-# by a sixth invocation in `scripts/print-schema.sh` that passes `--only-tables` for just
-# those two. So nothing is hand-written and nothing is duplicated: each table has one
-# generated declaration, in the crate that owns it.
+# `_outbox` is excluded HERE and generated instead into `bus/src/schema.rs`, by a sixth
+# invocation in `scripts/print-schema.sh` that passes `--only-tables` for it. So nothing is
+# hand-written and nothing is duplicated: each table has one generated declaration, in the
+# crate that owns it.
 #
-# They are bus's, not a service's — every database has an identical copy because every
-# service runs its own outbox relay and leader election. Generating them per service would
-# give five structurally identical `_outbox` types, and `bus::outbox::enqueue` is generic
-# over whichever database its caller holds, so it cannot name one of them. Keeping them out
+# It is bus's, not a service's — every write-side database has an identical copy because
+# every one of those services runs its own outbox relay. Generating it per service would
+# give four structurally identical `_outbox` types, and `bus::outbox::enqueue` is generic
+# over whichever database its caller holds, so it cannot name one of them. Keeping it out
 # of `shared::schema` is what makes `bus::schema::_outbox` the only one that exists — the
 # rule that services reach the outbox through `bus` is then enforced by the compiler rather
 # than by a comment.
 #
-# The bus pass reads all five databases and refuses to write if they disagree, which is the
-# one thing five copies of a migration can get wrong.
+# `_lease` was excluded here too, for the elected outbox relay. Ordering moved into the
+# data (`bus::projector::decide`), so every replica relays and the table is gone.
+#
+# The bus pass reads every write-side database and refuses to write if they disagree, which
+# is the one thing four copies of a migration can get wrong.
 #
 # The service modules are left holding exactly the tables that service owns.
 
 [print_schema]
 with_docs = false
-filter = { except_tables = ["_lease", "_outbox"] }
+filter = { except_tables = ["_outbox"] }

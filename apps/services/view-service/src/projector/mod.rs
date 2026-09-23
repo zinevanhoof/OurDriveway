@@ -43,6 +43,7 @@ pub struct UserProjector;
 impl Projector for UserProjector {
     const STREAM: &'static str = STREAM_USERS;
     const DURABLE: &'static str = "view-users";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = UserEvent;
 
     async fn apply(
@@ -112,6 +113,7 @@ pub struct SpotProjector;
 impl Projector for SpotProjector {
     const STREAM: &'static str = STREAM_SPOTS;
     const DURABLE: &'static str = "view-spots";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = SpotEvent;
 
     async fn apply(
@@ -158,6 +160,7 @@ pub struct BookingProjector;
 impl Projector for BookingProjector {
     const STREAM: &'static str = STREAM_BOOKINGS;
     const DURABLE: &'static str = "view-bookings";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = BookingEvent;
 
     async fn apply(
@@ -282,6 +285,7 @@ pub struct PaymentProjector;
 impl Projector for PaymentProjector {
     const STREAM: &'static str = STREAM_PAYMENTS;
     const DURABLE: &'static str = "view-payments";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = PaymentEvent;
 
     async fn apply(

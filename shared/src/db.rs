@@ -47,11 +47,16 @@ pub async fn connect(url: &str) -> MyResult<Db> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
 
     Pool::builder()
-        // Sized for the shape of the work rather than guessed. A service runs
-        // PARTITIONS projector lanes, each holding a connection only for as long as
-        // one event's transaction, plus request handlers. Yugabyte's per-connection
-        // cost is closer to PostgreSQL's than to a thread pool's, so this is
-        // deliberately not large.
+        // Sized for the shape of the work rather than guessed. The standing demand from
+        // projectors is `bus::projector::APPLY_CONCURRENCY` × however many projectors the
+        // service runs — 4 × 4 in view-service, the most of any — each holding a
+        // connection only for as long as one event's transaction. Request handlers take
+        // the rest. Yugabyte's per-connection cost is closer to PostgreSQL's than to a
+        // thread pool's, so this is deliberately not large.
+        //
+        // A pool timeout is not a slow request here: it surfaces as `MyError::Pool`,
+        // which stops a projector and 503s the pod, so the headroom above the projectors'
+        // share is the part that matters.
         .max_size(20)
         .connection_timeout(Duration::from_secs(10))
         .build(manager)
@@ -199,17 +204,20 @@ macro_rules! next_version {
 ///
 /// Versions are gapless per aggregate — [`next_version!`] assigns them inside the
 /// writing transaction — so applying `$v` to a row at `$v - 2` means an event was
-/// missed, and nothing else in this codebase would say so: the `UPDATE` absorbs it
-/// and the status guards downstream drop the transition without a word.
+/// missed, and nothing else here would say so: the `UPDATE` absorbs it and the status
+/// guards downstream drop the transition without a word. So it is **logged at error and
+/// then applied anyway**.
 ///
-/// So it is **logged at error and then applied anyway**. Not fatal, deliberately: the
-/// streams expire (seven days), so a consumer created after an aggregate's early
-/// events aged out legitimately sees its first event at version 5. Stopping there
-/// would wedge that partition on a projection that is merely incomplete, which
-/// `POST /internal/backfill` exists to repair.
+/// `bus::projector::decide` is what acts on a gap now. It refuses an event that is not
+/// the next one and hands it back to JetStream, so a projector reaching this macro with
+/// a gap has already exhausted its redelivery budget and logged that. The two remaining
+/// readers of the log below are the paths that do **not** go through a projector:
+/// booking-service's sweeper, and `SpotProjector::cancel`, both of which bump a version
+/// outside the event they are applying.
 ///
-/// A backfill run re-emits current state at its current version, so it will log these
-/// by the tableful. Expected.
+/// Still not fatal. The streams expire (seven days), so a consumer created after an
+/// aggregate's early events aged out legitimately sees its first event at version 5, and
+/// `POST /internal/backfill` is what repairs a projection that is merely incomplete.
 ///
 /// ```ignore
 /// shared::set_version!(conn, "spot", shared::schema::view::spot, &spot_id, version)?;

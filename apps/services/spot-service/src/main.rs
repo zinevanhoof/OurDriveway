@@ -23,7 +23,7 @@ bus::version_reader! {
     /// rows, and nothing else. Anything else a client echoes here — a booking it just
     /// made, say — is `Unavailable`, so the request proceeds instead of waiting two
     /// seconds for a table this database does not have.
-    fn version_of;
+    fn version_of, version_of_at;
     "spot" => shared::schema::spot::spot,
 }
 
@@ -111,15 +111,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The projector is the only *writer* to `db`. The service reads a spot's host
     // before it publishes an edit — it still writes nothing, so the dual-write the
     // split avoids stays avoided.
-    //
-    // For the outbox relay, which is all this service runs off the bus — it has no
-    // projector and no worker, so there is nothing else here an election would gate.
-    // The relay has no backstop of its own, so exactly one instance may run it.
-    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
 
     // Carries every SPOTS event this service commits. This is now the only path by
     // which they reach NATS.
-    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone()));
 
     // Answers "what does spot 019fa… look like" for anyone who needs to *label* a spot
     // without becoming a consumer of SPOTS — payment-service, putting a title on a

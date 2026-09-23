@@ -28,11 +28,8 @@ const MAX_BYTES: i64 = 1024 * 1024 * 1024;
 /// boot.
 ///
 /// Every stream binds `<domain>.>`, so it claims every subject in its bounded
-/// context regardless of the entity keying below it, and carries a
-/// [`shared::events::partition_transform`] that rewrites
-/// `<domain>.<entity>.<id>` to `<domain>.<partition>.<entity>.<id>` **as it stores
-/// each message**. That is the whole of the partitioning: publishers are unchanged,
-/// consumers filter on one partition, and nothing in this codebase hashes anything.
+/// context regardless of the entity keying below it, and one durable consumer per
+/// projector reads the whole of it.
 ///
 /// `create_or_update_stream`, not `get_or_create_stream`. The latter takes an
 /// existing stream as-is and ignores everything below it, so `max_age`, `max_bytes`
@@ -41,43 +38,28 @@ const MAX_BYTES: i64 = 1024 * 1024 * 1024;
 /// source of truth instead, and a field NATS treats as immutable now fails loudly
 /// rather than being silently dropped.
 ///
-/// It matters more since the transform: a stream without one stores three-token
-/// subjects that no lane's `<domain>.<partition>.>` filter matches, so every consumer
-/// would sit at zero pending for ever with nothing logged.
+/// ## The partition transform is gone
 ///
-/// ## Changing `PARTITIONS` still needs a drain
+/// These streams used to carry a `subject_transform` rewriting
+/// `<domain>.<entity>.<id>` to `<domain>.<0..15>.<entity>.<id>` on ingest, so that
+/// sixteen consumers could each filter one lane and be individually ordered by
+/// `max_ack_pending: 1`. All of that existed to deliver one aggregate's events in
+/// order, and `bus::projector::decide` does that from the stored version now.
 ///
-/// This rewrites the transform on the live stream; it cannot re-shard what is already
-/// stored. Those messages keep the subject they were written with, so a key that
-/// moves lanes has its older events in the old lane and its newer ones in the new
-/// lane — two independent consumers, each `max_ack_pending: 1`, with no order between
-/// them. Shrinking the count is worse: anything stored above the new ceiling has no
-/// consumer at all, and the durables above it keep a backlog nobody drains.
+/// It came with a migration note that no longer applies: changing the partition count
+/// required draining every `-pNN` durable first, because stored messages keep the
+/// subject they were written with and a key that moved lanes had its history split
+/// across two independently-ordered consumers.
 ///
-/// So: get every `-pNN` durable to 0 pending (`nats consumer report <STREAM>`), then
-/// deploy. Drained, there is nothing left in the old lanes to race. Projectors
-/// normally sit at the head, so this is a check rather than a wait.
-///
-/// One residue: drained is not deleted. Old-subject messages stay for the rest of
-/// `max_age`, and a durable created *after* the change with [`DeliverPolicy::All`]
-/// — a renamed projector, a new service — filters them out rather than replaying
-/// them. Deleting the streams avoids that and costs seven days of integration
-/// events, which TiKV is authoritative over anyway.
-///
-/// [`DeliverPolicy::All`]: async_nats::jetstream::consumer::DeliverPolicy::All
+/// Removing it is safe in place. `create_or_update_stream` applies
+/// `subject_transform: None` to the live stream, new messages are stored with their
+/// published three-token subject, already-stored ones keep their four-token one, and
+/// `<domain>.>` matches both — `>` matches one *or more* trailing tokens.
 pub async fn ensure_streams(js: &Context) -> MyResult<()> {
     for (name, domain, max_age) in STREAMS {
-        let (source, destination) = shared::events::partition_transform(domain);
         js.create_or_update_stream(Config {
             name: (*name).to_string(),
             subjects: vec![shared::events::stream_filter(domain)],
-            // Applied on ingest, after `subjects` has matched. Which is why that
-            // filter stays `<domain>.>` rather than narrowing to the transform's
-            // source: narrowing it would reject the very messages this partitions.
-            subject_transform: Some(jetstream::stream::SubjectTransform {
-                source,
-                destination,
-            }),
             // File storage, still — a week of events outlives any single node's
             // memory and a consumer that was down overnight must find them. Not
             // because the stream is the source of truth; TiKV is.
@@ -87,17 +69,28 @@ pub async fn ensure_streams(js: &Context) -> MyResult<()> {
             max_bytes: MAX_BYTES,
             // Publishers set Nats-Msg-Id to the event id, so a retried publish
             // within this window is discarded instead of duplicating the event.
-            duplicate_window: std::time::Duration::from_secs(120),
+            //
+            // An hour, not the two minutes this used to be. The relay is
+            // at-least-once by construction — it publishes, then deletes the row,
+            // and a crash in that gap republishes on restart — so this window is
+            // what decides whether that tail reaches consumers at all. Two minutes
+            // covered a stall; it did not cover a pod restart, a rollout, or a node
+            // drain, and outside it the event genuinely landed twice.
+            //
+            // It is also what makes running a relay on EVERY replica cheap rather
+            // than merely correct: two relays reading the same batch publish the
+            // same event ids, and the server drops the second copy instead of
+            // waking every consumer with it.
+            //
+            // Cost is JetStream holding an id and a timestamp per published message
+            // for the window. Negligible here, and the first number to revisit if
+            // NATS memory ever becomes interesting.
+            duplicate_window: std::time::Duration::from_secs(60 * 60),
             ..Default::default()
         })
         .await
         .map_err(|e| MyError::Bus(format!("ensure stream {name}: {e}")))?;
-        tracing::info!(
-            stream = name,
-            domain,
-            partitions = shared::events::PARTITIONS,
-            "stream ready"
-        );
+        tracing::info!(stream = name, domain, "stream ready");
     }
     Ok(())
 }

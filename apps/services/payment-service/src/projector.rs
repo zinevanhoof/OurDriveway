@@ -34,6 +34,7 @@ impl Projector for BookingProjector {
     /// JetStream for both at once, and it refuses — "deliver policy can not be
     /// updated" — leaving whichever lost the race permanently stalled.
     const DURABLE: &'static str = "payment-booking-mirror";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = BookingEvent;
 
     async fn apply(
@@ -114,6 +115,7 @@ pub struct UserProjector;
 impl Projector for UserProjector {
     const STREAM: &'static str = STREAM_USERS;
     const DURABLE: &'static str = "payment-host-mirror";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = UserEvent;
 
     async fn apply(

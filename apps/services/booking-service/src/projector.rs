@@ -36,6 +36,7 @@ pub struct SpotProjector;
 impl Projector for SpotProjector {
     const STREAM: &'static str = STREAM_SPOTS;
     const DURABLE: &'static str = "booking-spots";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = SpotEvent;
 
     async fn apply(

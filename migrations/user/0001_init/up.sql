@@ -81,22 +81,14 @@ CREATE UNIQUE INDEX refresh_token_hash_idx ON refresh_token (token_hash);
 -- The sweeper's delete: everything already past its expiry.
 CREATE INDEX refresh_token_expires_idx ON refresh_token (expires_at);
 
--- ─── leader election ────────────────────────────────────────────────────────
--- One row, `leader`, and it exists for the OUTBOX RELAY only.
+-- `_lease` was here: one row, `leader`, existing for the OUTBOX RELAY only, because
+-- two relays could publish one aggregate's events out of order and the downstream
+-- `WHERE status IN …` guards drop such an event rather than reorder it.
 --
--- The projectors do not need it: they pull from one durable consumer per partition
--- with max_ack_pending 1, so JetStream hands out one event at a time across every
--- replica, in order. The relay has no such backstop — two relays could publish one
--- aggregate's events out of order, which the downstream `WHERE status IN …` guards
--- drop rather than reorder.
---
--- Expiry is compared against now() INSIDE the database. Replicas do not share a
--- clock; they do share this row.
-CREATE TABLE _lease (
-    name       text PRIMARY KEY,
-    holder     text        NOT NULL,
-    expires_at timestamptz NOT NULL
-);
+-- `bus::projector::decide` refuses an event whose version is not the next one for its
+-- aggregate and hands it back to JetStream, so ordering is a property of the row rather
+-- than of how many relays are running. Every replica relays now, and there is no
+-- election, no TTL and no ~30s handover on a rolling restart.
 
 -- ─── transactional outbox ───────────────────────────────────────────────────
 -- Events written in the SAME transaction as the data that caused them, then moved to

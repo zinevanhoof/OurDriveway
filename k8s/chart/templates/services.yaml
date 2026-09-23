@@ -9,7 +9,7 @@ two replicas sharing one database meant two projectors racing over one cursor.
 Sidecar-per-pod made "a database per replica" fall out of `replicas: N`.
 
 None of that is true any more. The databases are authoritative and live in YugabyteDB,
-projectors share a durable consumer per partition, and a service writes its own rows
+projectors share one durable consumer per stream, and a service writes its own rows
 inside the request's transaction. So the sidecar, the `fsGroup` that let it write a fresh
 emptyDir, the data volume, the schema mount and the startup probe are all gone, and
 "stateless" stopped being a property that told two services apart — everything here
