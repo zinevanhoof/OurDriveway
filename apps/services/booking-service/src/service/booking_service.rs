@@ -382,8 +382,25 @@ impl BookingService {
                     let version =
                         shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
 
-                    BookingRepository::transition(conn, booking_id, to, from, release, cancel)
-                        .await?;
+                    let moved =
+                        BookingRepository::transition(conn, booking_id, to, from, release, cancel)
+                            .await?;
+
+                    // The booking is already out of `from` — a double-submitted cancel,
+                    // or the sweeper releasing the hold a moment before this landed.
+                    // Nothing changed, so no version is committed and no event is
+                    // published; the client is told to wait for the version that IS
+                    // stored rather than one nothing will ever carry.
+                    //
+                    // `version - 1` is exactly that: `next_version!` returns `stored + 1`
+                    // and nothing has been written since, under the `FOR UPDATE` it took.
+                    if !moved.applied() {
+                        return Ok(format_version(
+                            &aggregate_id("booking", &booking_id),
+                            version - 1,
+                        ));
+                    }
+
                     shared::set_version!(
                         conn,
                         "booking",

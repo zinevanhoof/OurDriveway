@@ -46,49 +46,55 @@ impl Projector for BookingProjector {
     ) -> MyResult<()> {
         let booking_id = event.booking_id();
 
+        // `let _ =` on the three transitions below, and it is deliberate rather than
+        // noise. `transition` reports whether its guard matched because the *write-side*
+        // callers must act on it — minting a version for a row that did not move strands
+        // that version with no event behind it. A projector mints nothing: it applies the
+        // version the envelope already carries, so a refused transition is the ordinary
+        // idempotency of a redelivery and there is nothing to decide.
         match event {
             // A whole-row write, not a merge: BookingCreated is always the first event
             // for a booking and BOOKINGS never expires, so this row is only ever
             // created complete — which is also why nothing on this table is `Option`
             // except the genuinely optional columns.
             BookingEvent::Created(e) => {
-                BookingMirrorRepository::upsert(&mut *conn, BookingMirror::created(e)).await
+                BookingMirrorRepository::upsert(&mut *conn, BookingMirror::created(e)).await?;
             }
 
             BookingEvent::Confirmed { booking_id } => {
-                BookingMirrorRepository::transition(
+                let _ = BookingMirrorRepository::transition(
                     &mut *conn,
                     booking_id,
                     &[booking_status::RESERVED],
                     BookingMirrorPatch::status(booking_status::CONFIRMED),
                 )
-                .await
+                .await?;
             }
 
             BookingEvent::Released { booking_id, reason } => {
-                BookingMirrorRepository::transition(
+                let _ = BookingMirrorRepository::transition(
                     &mut *conn,
                     booking_id,
                     &[booking_status::RESERVED],
                     BookingMirrorPatch::released(reason),
                 )
-                .await
+                .await?;
             }
 
             BookingEvent::Cancelled { booking_id, reason } => {
-                BookingMirrorRepository::transition(
+                let _ = BookingMirrorRepository::transition(
                     &mut *conn,
                     booking_id,
                     &[booking_status::CONFIRMED],
                     BookingMirrorPatch::cancelled(reason),
                 )
-                .await
+                .await?;
             }
 
             // A rating moves no money. Only the version below is recorded, so a worker
             // waiting on this booking's version is not left waiting on a skipped event.
-            BookingEvent::Rated { .. } => Ok(()),
-        }?;
+            BookingEvent::Rated { .. } => {}
+        }
 
         shared::set_version!(
             conn,

@@ -51,9 +51,12 @@ impl PaymentWorkerService {
     /// - The projector's `WHERE status IN ['reserved']` is what keeps this idempotent:
     ///   a redelivery, or a payment landing after the hold lapsed, applies to nothing.
     ///
-    /// `payment_id` only names the event, so a redelivered webhook is discarded by the
-    /// stream's duplicate window instead of appending a second `Confirmed`.
-    pub async fn confirm_paid(&self, booking_id: Uuid, payment_id: Uuid) -> MyResult<i64> {
+    /// Takes no `payment_id`. It used to, solely to key a deterministic event id so a
+    /// redelivered webhook was discarded by the stream's duplicate window. The
+    /// `[reserved]` guard reports the redelivery directly now, which is both earlier and
+    /// exact — it stops before a version is committed rather than suppressing the event
+    /// afterwards.
+    pub async fn confirm_paid(&self, booking_id: Uuid) -> MyResult<i64> {
         let mut read = db::conn(&self.db).await?;
         let booking = BookingRepository::find_by_id(&mut read, booking_id)
             .await?
@@ -69,7 +72,7 @@ impl PaymentWorkerService {
                     // `status = ANY(['reserved'])` is what keeps this idempotent: a redelivered
                     // webhook, or a payment landing after the hold already lapsed, applies to
                     // nothing.
-                    BookingRepository::transition(
+                    let confirmed = BookingRepository::transition(
                         conn,
                         booking_id,
                         status::CONFIRMED,
@@ -78,18 +81,30 @@ impl PaymentWorkerService {
                         None,
                     )
                     .await?;
+
+                    // Applied to nothing, which is the idempotency this path is built for —
+                    // and it now says so rather than bumping a version for it. The caller
+                    // waits on the version that IS stored (`next_version!` returns
+                    // `stored + 1`, and nothing has written since under its `FOR UPDATE`),
+                    // so a redelivered webhook still resolves instead of waiting out a
+                    // version no event will ever carry.
+                    if !confirmed.applied() {
+                        return Ok(version - 1);
+                    }
+
                     shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking_id, version)?;
 
                     // `actor_id: None` — Stripe acted, not a user holding a token.
-                    let mut envelope = Envelope::new(
+                    //
+                    // A plain v7 event id. This used to be
+                    // `v5("payment-confirm:{payment_id}")` so a redelivered webhook could
+                    // not append a second `Confirmed`; the `[reserved]` guard above ends
+                    // that path before it reaches here instead.
+                    let envelope = Envelope::new(
                         BookingEvent::Confirmed { booking_id },
                         None,
                         aggregate_id("booking", &booking_id),
                         version,
-                    );
-                    envelope.event_id = Uuid::new_v5(
-                        &Uuid::NAMESPACE_OID,
-                        format!("payment-confirm:{payment_id}").as_bytes(),
                     );
 
                     bus::outbox::enqueue(conn, &booking_subject(&booking.spot_id), &envelope)

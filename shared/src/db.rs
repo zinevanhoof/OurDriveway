@@ -264,6 +264,47 @@ macro_rules! set_version {
     }};
 }
 
+/// Whether a guarded write actually moved a row.
+///
+/// Returned by every `transition`-style repository function whose `UPDATE` carries a
+/// `WHERE status IN (…)` guard, and the reason it is a type rather than a `bool`:
+///
+/// **`#[must_use]` on an `async fn` does not catch the mistake this exists to prevent.**
+/// The attribute fires when a *call's* value goes unused, and `transition(…).await?;`
+/// uses it — the `?` unwraps it and throws away what is inside. A discarded `bool` is
+/// legal Rust and compiles silently. A discarded `Changed` does not.
+///
+/// The mistake it prevents: a caller whose guard matched nothing still minting a version
+/// with `next_version!`, committing it with `set_version!`, and enqueueing an event that
+/// a deterministic id then collapses. The version survives, the event does not, and
+/// `bus::projector::decide` reads the hole as a permanent gap — parking that aggregate
+/// for the whole escape-hatch budget on every replay, for ever.
+///
+/// Not to be confused with `bus::await_version::Applied`, which answers "what version is
+/// this row at?". This answers "did my write happen?".
+#[must_use = "a refused write must not mint a version or publish an event"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Changed {
+    /// The guard matched and the row moved.
+    Yes,
+    /// The guard matched nothing. Somebody else already moved this row, or it is not in
+    /// a state this transition applies to.
+    No,
+}
+
+impl Changed {
+    /// `rows == 1`. Every caller's `UPDATE` is scoped by `find(id)`, a primary-key
+    /// lookup, so the count is 0 or 1 and never more.
+    pub fn from_rows(rows: usize) -> Self {
+        if rows == 1 { Self::Yes } else { Self::No }
+    }
+
+    /// For the `if !…applied() { return … }` at each call site.
+    pub fn applied(self) -> bool {
+        matches!(self, Self::Yes)
+    }
+}
+
 /// How many events are missing between `stored` and `incoming`, if any.
 ///
 /// Pure, so the rule can be read and tested without a database — which matters,

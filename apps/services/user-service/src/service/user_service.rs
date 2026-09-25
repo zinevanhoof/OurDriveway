@@ -49,16 +49,14 @@ impl UserService {
     /// Returns `user:<id>@<version>`, so the client can echo it and have the next
     /// call — a second submit of the same form, most usefully — see this write.
     pub async fn signup(&self, req: SignupRequest) -> MyResult<String> {
-        // Turns the common case into a 409. It is not the guard, though — see the
-        // deterministic event id below for the concurrent case this read cannot
-        // see, and `email_idx … UNIQUE` for the backstop behind both.
+        // Turns the common case into a 409. It is not the guard, though — the concurrent
+        // case this read cannot see belongs to `app_user_email_idx UNIQUE`, described
+        // below, which now answers 409 as well rather than 500.
         //
-        // A double-submitted form only gets the 409 if the first signup has been
+        // A double-submitted form only gets *this* 409 if the first signup has been
         // projected before the second one reads. That is what the version this returns
         // buys: the same client's second request carries `user:<id>@<n>` and the
-        // layer holds it until the row is there. Without the echo it falls through
-        // to the dedupe window below, which is silent — the same account, answered
-        // twice with success.
+        // layer holds it until the row is there.
         let mut read = db::conn(&self.db).await?;
         UserRepository::find_by_email(&mut read, req.email.to_string())
             .await?
@@ -68,38 +66,27 @@ impl UserService {
                 "An account with that email already exists.",
             ))?;
 
-        // Deterministic event id, so two signups racing on the same address
-        // collapse into one append: the id rides `Nats-Msg-Id`, and the stream's
-        // `duplicate_window` discards the second server-side, atomically.
+        // `app_user_email_idx UNIQUE` is what sees the *concurrent* duplicate — a
+        // double-clicked button is enough. The read above cannot: both requests run it
+        // before either commits and both see `None`. The second `INSERT` then violates
+        // that index, which `UserRepository::upsert` cannot absorb because it conflicts
+        // on `app_user::id` and each signup mints a fresh `user_id`. So the losing
+        // transaction rolls back whole — row, version and outbox row together — and the
+        // client gets a 409 (see the `UniqueViolation` arm in `MyError::into_response`).
         //
-        // This is the only guard that sees a *concurrent* duplicate — a
-        // double-clicked button is enough. The read above cannot: both requests
-        // run it before either publishes, both see None, and both would append a
-        // `Registered` carrying a different `user_id`. The projector applies the
-        // first, hits `email_idx … UNIQUE` on the second, and stops. That event is
-        // in the log for good, so every replay stops at it too: not a failed
-        // replica, a permanently unbuildable projection.
+        // There was a `v5("signup:{email}")` event id here, and thirty lines arguing that
+        // it was the only thing standing between this and a permanently unbuildable
+        // projection. That was true when the event was published independently of the row
+        // write: nothing rolled back, both racers appended, and view-service's projector
+        // stopped on its own unique index. It has not been true since the row and the
+        // event became one transaction, thirty lines below. The id was deduplicating an
+        // event that could no longer be written twice.
         //
-        // `publish_expecting` cannot do this job. It is a compare-and-swap on one
-        // *subject*, and each signup mints a fresh `user_id` — so the two racers
-        // publish to different subjects and both satisfy `Some(0)`. Making CAS bite
-        // would mean deriving the subject from the address, which both leaks
-        // email→user_id to anyone holding a user id and makes an abandoned address
-        // permanently unclaimable.
-        //
-        // Deliberately *not* normalised: the dedupe key must partition addresses
-        // exactly as `email_idx` does, and that index is on the raw string. Lower
-        // casing here would merge two signups the database considers distinct.
-        //
-        // Same pattern, and the same reason, as payment-service's event ids.
-        //
-        // Derived up here rather than beside the assignment below only because the
-        // address is moved into the event in between.
-        let event_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_OID,
-            format!("signup:{}", req.email).as_bytes(),
-        );
-
+        // Removing it also removes the one deterministic id in the codebase keyed on a
+        // *reusable* value. It was safe only because nothing deletes an `app_user` row;
+        // add account deletion and a re-registration inside the duplicate window would
+        // have had its `Registered` silently swallowed — row written, no event, user
+        // invisible to view-service.
         let user_id = Uuid::now_v7();
         // Beside the event rather than in it. Argon2 salts randomly, so this still
         // has to happen exactly once and on the write side — but the result belongs
@@ -132,13 +119,12 @@ impl UserService {
                     )
                     .await?;
 
-                    let mut envelope = Envelope::new(
+                    let envelope = Envelope::new(
                         UserEvent::Registered(registered),
                         Some(user_id),
                         aggregate_id("user", &user_id),
                         version,
                     );
-                    envelope.event_id = event_id;
 
                     outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
                     Ok(format_version(&envelope.aggregate, envelope.version))
@@ -855,5 +841,124 @@ impl UserService {
 
         tracing::info!(events = sent, "users backfilled");
         Ok(sent)
+    }
+}
+
+/// Signup against a real database, because the guard under test is an index.
+///
+/// ```sh
+/// docker compose -f docker/docker-compose-dev.yml up -d yugabyte
+/// cargo test --workspace -- --ignored
+/// ```
+#[cfg(test)]
+mod live_tests {
+    use axum::response::IntoResponse;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    use shared::schema::user::app_user;
+
+    use super::*;
+
+    async fn db() -> shared::db::Db {
+        // SAFETY: tests in one binary share an environment and every caller sets the
+        // same value.
+        unsafe {
+            std::env::set_var(
+                "USER_DATABASE_URL",
+                "postgres://yugabyte@127.0.0.1:5433/user",
+            )
+        };
+        migrator::ensure("user").await.expect("migrations apply");
+        shared::db::connect("postgres://yugabyte@127.0.0.1:5433/user")
+            .await
+            .expect("dev yugabyte on :5433")
+    }
+
+    /// Through serde, because `Email` and `Password` have no constructor from `String`
+    /// on purpose — one would skip the garde rules the newtype exists to carry.
+    fn a_signup(email: &str) -> SignupRequest {
+        serde_json::from_value(serde_json::json!({
+            "firstName": "Ada",
+            "lastName": "Lovelace",
+            "email": email,
+            "password": "Correct-horse9",
+        }))
+        .expect("a valid signup")
+    }
+
+    /// Two signups racing on one address, which a double-clicked button is enough to
+    /// produce. Exactly one account, exactly one event, and the loser gets a 409.
+    ///
+    /// `app_user_email_idx` is the whole guard. The `find_by_email` above runs in both
+    /// requests before either commits, so both see `None`; the index is what refuses the
+    /// second `INSERT`, and because `UserRepository::upsert` conflicts on `app_user::id`
+    /// — and each signup mints a fresh `user_id` — it cannot absorb the violation. The
+    /// losing transaction rolls back whole, taking its `_outbox` row with it.
+    ///
+    /// That rollback is why the `v5("signup:{email}")` event id this used to carry was
+    /// dead weight: there was never a second event for it to collapse.
+    ///
+    /// The status assertion is the other half. A real conflict used to surface as **500**
+    /// because the violation fell into `into_response`'s catch-all.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs docker/docker-compose-dev.yml"]
+    async fn two_racing_signups_make_one_account_and_a_409() {
+        let pool = db().await;
+        let email = format!("race-{}@example.com", Uuid::now_v7());
+
+        let (a, b) = (
+            UserService { db: pool.clone() },
+            UserService { db: pool.clone() },
+        );
+        let (one, two) = (email.clone(), email.clone());
+        let (first, second) = tokio::join!(
+            tokio::spawn(async move { a.signup(a_signup(&one)).await }),
+            tokio::spawn(async move { b.signup(a_signup(&two)).await })
+        );
+
+        let (first, second) = (first.unwrap(), second.unwrap());
+        let (winner, loser) = match (first, second) {
+            (Ok(v), Err(e)) | (Err(e), Ok(v)) => (v, e),
+            (Ok(_), Ok(_)) => panic!("both signups succeeded — the index did not hold"),
+            (Err(x), Err(y)) => panic!("both signups failed: {x} / {y}"),
+        };
+
+        assert!(winner.starts_with("user:"), "the winner answers a version");
+        assert_eq!(
+            loser.into_response().status(),
+            axum::http::StatusCode::CONFLICT,
+            "a losing signup is a conflict, not a server fault"
+        );
+
+        let mut c = shared::db::conn(&pool).await.unwrap();
+        let rows: i64 = app_user::table
+            .filter(app_user::email.eq(&email))
+            .count()
+            .get_result(&mut *c)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "exactly one account for one address");
+
+        let events: i64 = bus::schema::_outbox::table
+            .filter(bus::schema::_outbox::payload.like(format!("%{email}%")))
+            .count()
+            .get_result(&mut *c)
+            .await
+            .unwrap();
+        assert_eq!(events, 1, "the loser's outbox row must roll back with its row");
+
+        // The outbox row as well. Nothing drains `_outbox` in a test run, so leaving it
+        // grows a table this test then scans with `LIKE`.
+        diesel::delete(app_user::table.filter(app_user::email.eq(&email)))
+            .execute(&mut *c)
+            .await
+            .unwrap();
+        diesel::delete(
+            bus::schema::_outbox::table
+                .filter(bus::schema::_outbox::payload.like(format!("%{email}%"))),
+        )
+        .execute(&mut *c)
+        .await
+        .unwrap();
     }
 }

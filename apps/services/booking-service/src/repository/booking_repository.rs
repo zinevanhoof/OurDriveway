@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::db::Changed;
 use shared::domain_models::booking::Booking;
 use shared::error::myerror::MyResult;
 use shared::general_models::booking::Booked;
@@ -63,13 +64,18 @@ impl BookingRepository {
     /// hold lapses, with the sweeper's event arriving second, must not undo the
     /// confirmation. Matching nothing is a legitimate no-op, not an error.
     ///
-    /// **Returns nothing, and used to return the spot id.** That was a second
-    /// statement, deliberately run whether or not the guard applied, because the
-    /// caller needed the spot to advance its compare-and-swap cursor — and skipping
-    /// the advance on a refused transition would leave the subject head permanently
-    /// ahead of the cursor, refusing every later reserve on that spot. The cursor is
-    /// gone (see `SpotMirrorRepository`), no caller ever read the value, and the
-    /// second statement went with it.
+    /// **[`Changed::No`] when the guard matched nothing**, and the caller must act on it:
+    /// the booking is already where this was trying to move it, so there is no state
+    /// change to number and nothing to publish. A caller that bumped a version anyway
+    /// would commit a version no event ever carries, which `bus::projector::decide` then
+    /// reads as a permanent gap — parking that aggregate for the whole escape-hatch
+    /// budget on every replay. [`Changed`] is `#[must_use]`, so dropping the answer does
+    /// not compile; [`Self::rate`] below has always reported the same thing as a `bool`.
+    ///
+    /// It used to return the spot id — a second statement, deliberately run whether or
+    /// not the guard applied, because the caller needed the spot to advance its
+    /// compare-and-swap cursor. The cursor is gone (see `SpotMirrorRepository`), no
+    /// caller ever read the value, and the second statement went with it.
     ///
     /// The two reasons are separate columns, not one: `release_reason` says why a
     /// *hold* ended, `cancel_reason` says who withdrew a *paid* booking. Only ever one
@@ -82,7 +88,7 @@ impl BookingRepository {
         from: &[&str],
         release: Option<&str>,
         cancel: Option<&str>,
-    ) -> MyResult<()> {
+    ) -> MyResult<Changed> {
         // `.eq_any` rather than an `IN` list built by hand: the set is a parameter, so
         // there is no string to assemble and no arity to get wrong.
         //
@@ -107,8 +113,9 @@ impl BookingRepository {
             cancel.map(|c| booking::cancel_reason.eq(c)),
         ))
         .execute(conn)
-        .await?;
-        Ok(())
+        .await
+        .map(Changed::from_rows)
+        .map_err(Into::into)
     }
 
     /// Sets the rating once, on a confirmed booking. `false` when the guard matched

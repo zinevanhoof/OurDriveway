@@ -120,17 +120,22 @@ const NAK_DELAY: Duration = Duration::from_millis(200);
 
 /// How many deliveries a gap gets before it is applied anyway.
 ///
-/// The escape hatch is not optional. Versions are gapless *per aggregate*, but two paths
-/// bake a real, permanent gap into the data: two replicas sweeping one booking, and
-/// `SpotProjector::cancel`, both of which mint a deterministic event id and then let
-/// `outbox::enqueue`'s `ON CONFLICT DO UPDATE` overwrite the pending row at a higher
-/// version, so the lower one is never published. The streams also expire, so a consumer
-/// created after an aggregate's early events aged out legitimately sees its first event
-/// at version 5.
+/// **One legitimate source of gaps is left, and it is why the hatch stays:** the streams
+/// expire (seven days), so a consumer created after an aggregate's early events aged out
+/// sees its first event at version 5 on a row that is empty or behind. Nothing is wrong,
+/// there is simply no earlier event to wait for, and `POST /internal/backfill` is what
+/// repairs it.
 ///
-/// Without a hatch each of those wedges an aggregate for ever. With it, this is strictly
-/// better than what it replaces: it waits ~6s for the gap to close and otherwise does
-/// exactly what `set_version!` did on its own — log at error and apply.
+/// This used to list two more, both of which the codebase manufactured: two replicas
+/// sweeping one booking, and `SpotProjector::cancel`. Each minted a version, committed it
+/// for a guarded `UPDATE` that had matched nothing, and enqueued an event that a
+/// deterministic id then collapsed — leaving a version with no event behind it, for ever.
+/// The guards report their row count now and those callers return before committing
+/// anything, so a gap is no longer something this system produces on its own.
+///
+/// With the hatch, this is strictly better than what it replaces: it waits ~6s for the
+/// gap to close and otherwise does exactly what `set_version!` did on its own — log at
+/// error and apply.
 /// `i64` to match `message::Info::delivered`, which is signed because the protocol says
 /// so rather than because a delivery count can be negative.
 const MAX_GAP_WAIT: i64 = 30;
@@ -872,8 +877,8 @@ mod live_tests {
     /// no entry in `table_for`'s allowlist, for the reason `record` spells out), so the
     /// gate's read is written out here the same way `record`'s two writes are.
     ///
-    /// The aggregate name is ignored: these lanes project exactly one thing, and the
-    /// envelope's `session:<key>` id is the scratch table's primary key.
+    /// Reached only for this lane's **own** aggregate — [`recorder!`] wraps it with the
+    /// `Unavailable` arm that turns every other lane's events away first.
     fn scratch_version_at<'a>(
         conn: &'a mut AsyncPgConnection,
         _aggregate: &'a str,
@@ -910,10 +915,54 @@ mod live_tests {
         ($name:ident, $durable:literal) => {
             struct $name(Arc<Recorder>);
 
+            impl $name {
+                /// This lane's [`VersionAt`], and the **`Unavailable` arm is what keeps
+                /// these tests independent of each other.**
+                ///
+                /// Every test here shares one stream and one scratch table, and a
+                /// consumer's filter is the whole bounded context — so each lane sees
+                /// every other test's events, and always has. That was free while a
+                /// foreign event simply applied and was dropped by `record`. It stopped
+                /// being free when the version gate arrived: a foreign key's row is in
+                /// the shared table at whatever version *its owning test* has reached,
+                /// so a lane replaying someone else's stream position can read it
+                /// mid-flight and call it a gap. That is a `Nak`, and a Nak'd message
+                /// holds JetStream's `ack_floor` — the contiguous acked prefix — so one
+                /// test's transient state became another test's stalled cursor.
+                ///
+                /// Honest about what this is: a coupling removed on the merits, **not a
+                /// proven fix for a specific flake**. `restart_resumes_from_durable_state`
+                /// failed intermittently in full-workspace runs; by the time this was
+                /// written it had stopped reproducing, and it passes with this arm
+                /// disabled too. So this closes a real and demonstrable path — a test's
+                /// timing depending on what its neighbours happen to be doing — without
+                /// any claim to have closed that one.
+                ///
+                /// It is how a real service already behaves, not a test trick:
+                /// `version_reader!` answers `Unavailable` for an aggregate it does not
+                /// store, and `decide` applies it ungated rather than judging a version
+                /// it has no business knowing. view-service does exactly this for every
+                /// aggregate it does not project. Each lane here owns its aggregate name
+                /// the same way.
+                fn version_at<'a>(
+                    conn: &'a mut AsyncPgConnection,
+                    aggregate: &'a str,
+                    id: &'a Uuid,
+                ) -> futures::future::BoxFuture<'a, MyResult<crate::await_version::Applied>>
+                {
+                    if aggregate != $durable {
+                        return Box::pin(async {
+                            Ok(crate::await_version::Applied::Unavailable)
+                        });
+                    }
+                    scratch_version_at(conn, aggregate, id)
+                }
+            }
+
             impl Projector for $name {
                 const STREAM: &'static str = STREAM_SESSIONS;
                 const DURABLE: &'static str = $durable;
-                const VERSION_AT: crate::await_version::VersionAt = scratch_version_at;
+                const VERSION_AT: crate::await_version::VersionAt = $name::version_at;
                 /// `Value`, not a real event enum: these lanes also see whatever else
                 /// is on SESSIONS, and a decode failure stops a lane.
                 type Event = serde_json::Value;
@@ -984,6 +1033,9 @@ mod live_tests {
         js: Context,
         db: Db,
         readiness: Arc<Readiness>,
+        /// The aggregate name every event from this `Live` carries — the lane's own
+        /// `DURABLE`. See [`live`].
+        aggregate: &'static str,
     }
 
     /// Empties SESSIONS once per test binary, before any test publishes.
@@ -1013,7 +1065,11 @@ mod live_tests {
             .await;
     }
 
-    async fn live() -> Live {
+    /// `aggregate` is the lane's own `DURABLE`, and every event this publishes is stamped
+    /// with it. Pairs with the `Unavailable` arm in [`recorder!`]: each test's events name
+    /// an aggregate only that test's lane recognises, so the others apply them ungated and
+    /// `record` drops them, instead of parking on a version they cannot interpret.
+    async fn live(aggregate: &'static str) -> Live {
         shared::install_default_crypto_provider();
 
         let js = crate::connect(NATS)
@@ -1028,7 +1084,12 @@ mod live_tests {
         define_scratch_table(&db).await;
 
         let readiness = Readiness::new(js.client().clone(), &[STREAM_SESSIONS]);
-        Live { js, db, readiness }
+        Live {
+            js,
+            db,
+            readiness,
+            aggregate,
+        }
     }
 
     impl Live {
@@ -1050,7 +1111,7 @@ mod live_tests {
         async fn publish_as(&self, key: Uuid, version: i64, event_id: Uuid, backfill: bool) -> u64 {
             let envelope = Envelope {
                 event_id,
-                aggregate: aggregate_id("session", &key),
+                aggregate: aggregate_id(self.aggregate, &key),
                 version,
                 occurred_at: Utc::now(),
                 actor_id: None,
@@ -1129,7 +1190,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn same_key_stays_ordered() {
-        let live = live().await;
+        let live = live(OrderLanes::DURABLE).await;
         live.drop_lanes(OrderLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1183,7 +1244,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn different_keys_run_concurrently() {
-        let live = live().await;
+        let live = live(ConcurrentLanes::DURABLE).await;
         live.drop_lanes(ConcurrentLanes::DURABLE).await;
 
         let (left, right) = (Uuid::now_v7(), Uuid::now_v7());
@@ -1221,7 +1282,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn redelivery_is_idempotent() {
-        let live = live().await;
+        let live = live(RedeliveryLanes::DURABLE).await;
         live.drop_lanes(RedeliveryLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1282,7 +1343,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml; takes ~ack_wait"]
     async fn a_dead_instance_hands_its_work_over() {
-        let live = live().await;
+        let live = live(FailoverLanes::DURABLE).await;
         live.drop_lanes(FailoverLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1335,7 +1396,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn restart_resumes_from_durable_state() {
-        let live = live().await;
+        let live = live(RestartLanes::DURABLE).await;
         live.drop_lanes(RestartLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1403,7 +1464,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn a_duplicate_event_is_discarded_by_the_stream() {
-        let live = live().await;
+        let live = live(DuplicateLanes::DURABLE).await;
         live.drop_lanes(DuplicateLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1450,7 +1511,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn an_event_that_arrives_early_is_parked_until_its_predecessor_lands() {
-        let live = live().await;
+        let live = live(ParkLanes::DURABLE).await;
         live.drop_lanes(ParkLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1492,7 +1553,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn a_gap_that_never_closes_is_applied_rather_than_wedging_the_lane() {
-        let live = live().await;
+        let live = live(GapLanes::DURABLE).await;
         live.drop_lanes(GapLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1543,7 +1604,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn a_backfill_chain_at_one_version_applies_every_step() {
-        let live = live().await;
+        let live = live(BackfillLanes::DURABLE).await;
         live.drop_lanes(BackfillLanes::DURABLE).await;
 
         let key = Uuid::now_v7();

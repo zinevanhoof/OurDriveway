@@ -95,6 +95,18 @@ pub struct Pending {
 /// is one row rather than two — the same property the `Nats-Msg-Id` dedupe gives
 /// on the way out, applied on the way in.
 ///
+/// **`DO NOTHING`, not `DO UPDATE`.** It used to overwrite the pending row's subject and
+/// payload, which is wrong whenever two enqueues share an id but differ in content — and
+/// they did. Event ids were deterministic in seven places and keyed on the *aggregate*
+/// rather than the event, so a second caller could replace a pending event with a
+/// different one at a different version: a payout's `PayoutPaid` overwritten by a
+/// `PayoutFailed`, or a v2 replaced by a v3 whose predecessor then never published.
+///
+/// Those ids are gone — every event now carries a v7 — so in practice this clause fires
+/// only for [`backfill`], where the same id means the same `@version:step` and therefore
+/// the same payload. First writer wins, and "one event id, one event" is true rather than
+/// hoped.
+///
 /// ## `created_at` is `time::now()`, not `envelope.occurred_at`
 ///
 /// [`drain`] orders by this column, so it is what decides publication order — and
@@ -136,8 +148,7 @@ pub async fn enqueue<T: Serialize>(
             _outbox::payload.eq(&payload),
         ))
         .on_conflict(_outbox::id)
-        .do_update()
-        .set((_outbox::subject.eq(subject), _outbox::payload.eq(&payload)))
+        .do_nothing()
         .execute(conn)
         .await?;
     Ok(())

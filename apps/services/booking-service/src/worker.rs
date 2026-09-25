@@ -57,7 +57,7 @@ impl Worker for PaymentWorker {
         // An error NAKs and comes back in thirty seconds, which is what covers the one
         // ordering that can go wrong here: a booking whose `Reserved` this instance's
         // BOOKINGS projector has not applied yet.
-        self.service.confirm_paid(booking_id, payment_id).await?;
+        self.service.confirm_paid(booking_id).await?;
 
         Ok(())
     }

@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use diesel::dsl::sum;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::db::Changed;
 use shared::diesel_ext::to_bigint;
 use shared::domain_models::booking::status as booking_status;
 use shared::domain_models::payment::status;
@@ -89,19 +90,26 @@ impl PaymentRepository {
     /// five are `Option<String>`, so a swapped pair compiles and writes the wrong
     /// column — `set_covers_every_patchable_column` in the model is the reminder to
     /// come here, and the live round-trip is what would catch it.
+    ///
+    /// **[`Changed::No`] when the guard matched nothing.** The caller must not mint a
+    /// version or publish for a payment that did not move: a version committed with no
+    /// event behind it is a permanent gap to `bus::projector::decide`, which parks that
+    /// aggregate for the whole escape-hatch budget on every replay. [`Changed`] is
+    /// `#[must_use]`, so dropping the answer does not compile.
     pub async fn transition(
         conn: &mut AsyncPgConnection,
         payment_id: Uuid,
         from: &[&str],
         patch: PaymentPatch,
-    ) -> MyResult<()> {
+    ) -> MyResult<Changed> {
         diesel::update(payment::table.find(payment_id).filter(
             payment::status.eq_any(from.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
         ))
         .set(&patch)
         .execute(conn)
-        .await?;
-        Ok(())
+        .await
+        .map(Changed::from_rows)
+        .map_err(Into::into)
     }
 
     /// A host's settled income: paid, not refunded, and for a booking that has

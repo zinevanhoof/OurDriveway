@@ -106,6 +106,31 @@ impl IntoResponse for MyError {
                 status,
                 json!({ "status": status.as_u16(), "title": title, "detail": detail }),
             ),
+
+            // A unique index refused the write. That is not a server fault: it is the
+            // same conflict the handler's own pre-read reports as a 409, arriving from
+            // the only guard that sees a *concurrent* duplicate.
+            //
+            // `signup` is the live example. Its `find_by_email` turns the sequential case
+            // into a 409, but two requests racing both read `None` before either commits,
+            // and `app_user_email_idx` is what actually decides. Reaching here used to
+            // mean a double-clicked signup answered **500** — a real conflict wearing the
+            // wrong status, and unretryable-looking to a client that should simply be
+            // told the address is taken.
+            //
+            // Deliberately no `detail` from the database: an index name is an internal
+            // fact and some carry the value that collided.
+            MyError::Database(diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _,
+            )) => {
+                let status = StatusCode::CONFLICT;
+                (
+                    status,
+                    json!({ "status": status.as_u16(), "title": "Conflict", "detail": ["That value is already taken."] }),
+                )
+            }
+
             other => {
                 let status = StatusCode::INTERNAL_SERVER_ERROR;
                 (
