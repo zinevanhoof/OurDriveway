@@ -22,8 +22,8 @@ pub mod spot_repository;
 
 /// Round-trips the table through a real YugabyteDB.
 ///
-/// `#[ignore]`d — needs the dev cluster on :5433, and CI runs
-/// `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, so plain `cargo test --workspace` stays
+/// offline. CI brings the cluster up and runs these as a second step:
 ///
 /// ```sh
 /// docker compose -f docker/docker-compose-dev.yml up -d yugabyte

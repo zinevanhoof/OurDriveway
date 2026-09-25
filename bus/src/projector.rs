@@ -687,7 +687,7 @@ fn bus_err(msg: String) -> MyError {
 /// ```
 ///
 /// `#[ignore]`d and pointed at the dev stack, like the `live_tests` modules in the
-/// service repositories — CI has no broker.
+/// service repositories — CI brings the stack up and runs them after the unit tests.
 ///
 /// **They run on the real SESSIONS stream**, which is the one stream nothing in this
 /// codebase consumes, so a test's events cannot wake a real projector or worker. Each

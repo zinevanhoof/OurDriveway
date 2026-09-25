@@ -24,8 +24,8 @@ pub mod spot_mirror_repository;
 /// Round-trips both tables through a real YugabyteDB, and proves the reserve path
 /// cannot double-book.
 ///
-/// `#[ignore]`d — needs the dev cluster on :5433, and CI runs
-/// `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, so plain `cargo test --workspace` stays
+/// offline. CI brings the cluster up and runs these as a second step:
 ///
 /// ```sh
 /// docker compose -f docker/docker-compose-dev.yml up -d yugabyte
@@ -150,7 +150,10 @@ mod live_tests {
             .await
             .unwrap();
 
-        assert!(!BookingRepository::rate(db, id, 4).await.unwrap(), "still a hold");
+        assert!(
+            !BookingRepository::rate(db, id, 4).await.unwrap(),
+            "still a hold"
+        );
 
         assert_eq!(
             BookingRepository::transition(
@@ -166,12 +169,21 @@ mod live_tests {
             Changed::Yes
         );
         assert!(BookingRepository::rate(db, id, 4).await.unwrap());
-        assert!(!BookingRepository::rate(db, id, 1).await.unwrap(), "already rated");
+        assert!(
+            !BookingRepository::rate(db, id, 1).await.unwrap(),
+            "already rated"
+        );
 
-        let got = BookingRepository::find_by_id(db, id).await.unwrap().unwrap();
+        let got = BookingRepository::find_by_id(db, id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.rating, Some(4));
 
-        diesel::delete(booking::table.find(id)).execute(db).await.unwrap();
+        diesel::delete(booking::table.find(id))
+            .execute(db)
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

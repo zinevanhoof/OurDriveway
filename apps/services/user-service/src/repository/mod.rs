@@ -26,8 +26,8 @@ pub mod user_repository;
 
 /// Round-trips both tables through a real YugabyteDB.
 ///
-/// `#[ignore]`d — needs the dev cluster on :5433 with `migrations/user` applied, and
-/// CI runs `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, so plain `cargo test --workspace` stays
+/// offline. CI brings the cluster up and runs these as a second step:
 ///
 /// ```sh
 /// docker compose -f docker/docker-compose-dev.yml up -d yugabyte

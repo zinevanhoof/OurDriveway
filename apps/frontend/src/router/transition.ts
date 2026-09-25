@@ -10,8 +10,12 @@
 import { ref } from "vue";
 import type { RouteLocationNormalized } from "vue-router";
 
-/** `tab` is a sideways move between two navbar roots — neither a push nor a pop. */
-export type NavDirection = "forward" | "back" | "tab";
+/**
+ * `fade` is a move that is neither a push nor a pop, so it cross-fades instead of
+ * sliding: a sideways move between two navbar roots, or any navigation to or from an
+ * auth screen.
+ */
+export type NavDirection = "forward" | "back" | "fade";
 
 export const navDirection = ref<NavDirection>("forward");
 
@@ -19,9 +23,29 @@ const position = () =>
   (window.history.state as { position?: number } | null)?.position ?? 0;
 let last = position();
 
-export function trackNavDirection(to: RouteLocationNormalized) {
+/**
+ * The public routes — login, signup and the three emailed-link screens. The router guard
+ * already relies on "public" and "auth screen" being the same set. `=== false` rather
+ * than falsy: the start location a cold load navigates *from* has no meta at all.
+ */
+const isAuthScreen = (route: RouteLocationNormalized) =>
+  route.meta.requiresAuth === false;
+
+export function trackNavDirection(
+  to: RouteLocationNormalized,
+  from: RouteLocationNormalized,
+) {
   const moved = position() - last;
   last = position();
+
+  // Asked first, and in either direction. The auth screens are a flow of their own
+  // rather than a stack you drill into, and entering or leaving one is entering or
+  // leaving the app — so a slide, which says "deeper" or "back out", is the wrong
+  // picture for every one of these, back gesture included.
+  if (isAuthScreen(to) || isAuthScreen(from)) {
+    navDirection.value = "fade";
+    return;
+  }
 
   // A `replace` leaves the counter where it was, and every replace in this app is a
   // screen getting out of the way — withdraw back to the wallet, a deleted listing back
@@ -33,7 +57,7 @@ export function trackNavDirection(to: RouteLocationNormalized) {
         // from. Switching tabs and jumping to a tab out of a detail screen are the same
         // sideways move; neither is a push that should slide.
         to.meta.tab
-        ? "tab"
+        ? "fade"
         : "forward"
       : // A pop lands wherever the stack left off, tab root or not, and it is still a
         // dismissal: the screen being left has to slide off. Asking `to.meta.tab` here is
@@ -87,7 +111,7 @@ export const COVERED = 0.45;
 export const pageVariants = {
   enter: (custom: unknown) => {
     const d = custom as NavDirection;
-    if (d === "tab") return { opacity: 0, zIndex: 1 };
+    if (d === "fade") return { opacity: 0, zIndex: 1 };
     // A pop arrives underneath and already in place. It is not sliding in — it is
     // being uncovered, so it must not be seen moving at all.
     if (d === "back") return { x: 0, zIndex: 0 };
@@ -99,14 +123,14 @@ export const pageVariants = {
       x: 0,
       opacity: 1,
       zIndex: d === "back" ? 0 : 1,
-      transition: d === "tab" ? { duration: 0.15 } : slide,
+      transition: d === "fade" ? { duration: 0.15 } : slide,
     };
   },
   leave: (custom: unknown) => {
     const d = custom as NavDirection;
-    // A tab switch does not render the outgoing page at all: `duration: 0`, so it is
-    // gone on the frame the arriving one starts fading up from the background.
-    if (d === "tab")
+    // A fade does not render the outgoing page at all: `duration: 0`, so it is gone on
+    // the frame the arriving one starts fading up from the background.
+    if (d === "fade")
       return { opacity: 0, zIndex: 0, transition: { duration: 0 } };
     // A pop: this is the page that moves, and it stays in front the whole way out, so
     // the page being uncovered is never glimpsed sliding along behind it.

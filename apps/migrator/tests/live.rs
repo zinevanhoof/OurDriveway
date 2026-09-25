@@ -1,7 +1,7 @@
 //! What the migrator has to be true of, against a real cluster.
 //!
-//! `#[ignore]`d like every other database test in this workspace — CI has no Postgres,
-//! so these are run by hand:
+//! `#[ignore]`d like every other database test in this workspace, so plain `cargo test`
+//! stays offline. CI brings the cluster up and runs them as a second step:
 //!
 //! ```sh
 //! docker compose -f docker/docker-compose-dev.yml up -d yugabyte

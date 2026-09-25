@@ -73,6 +73,9 @@ pub struct Config {
     /// (`stripe listen --print-secret`), which is *not* the same value as a dashboard
     /// endpoint's in production.
     pub stripe_webhook_secret: String,
+    /// `https://api.stripe.com` everywhere real. Configurable only so the e2e suite can
+    /// stand in for Stripe with a stateful fake — see `e2e/src/fake.rs`.
+    pub stripe_api_base: String,
     /// How long after a booking ends its money becomes withdrawable by the host.
     ///
     /// The one knob on the earnings rule. A renter cannot cancel inside an hour of the
@@ -91,6 +94,7 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     jwt_secret: env::require("JWT_SECRET"),
     stripe_secret_key: env::require("STRIPE_SECRET_KEY"),
     stripe_webhook_secret: env::require("STRIPE_WEBHOOK_SECRET"),
+    stripe_api_base: env::require("STRIPE_API_BASE"),
     settlement_secs: env::require_parsed("SETTLEMENT_SECS"),
 });
 
@@ -135,7 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `shared::rpc`, which says so itself.
     let readiness = bus::Readiness::new(js.client().clone(), &[STREAM_BOOKINGS, STREAM_USERS]);
 
-    let stripe = Arc::new(Stripe::new(&CONFIG.stripe_secret_key));
+    let stripe = Arc::new(Stripe::new(
+        &CONFIG.stripe_secret_key,
+        &CONFIG.stripe_api_base,
+    ));
     let settlement = Arc::new(SettlementWorkerService {
         db: db.clone(),
         stripe: stripe.clone(),

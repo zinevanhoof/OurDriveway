@@ -9,6 +9,7 @@ members = [
     "apps/services/payment-service",
     "apps/migrator",
     "bus",
+    "e2e",
     "shared"
 ]
 # src-tauri is its own workspace root. Its dep graph shares nothing with the

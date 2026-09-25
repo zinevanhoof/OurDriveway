@@ -121,23 +121,66 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Migrate every database, in [`DATABASES`] order, stopping at the first failure.
+/// Create every missing database, one at a time, then migrate all five at once.
+///
+/// **Two phases, and the split is the whole point.** DDL on YugabyteDB costs ~150ms a
+/// statement, and the five histories are ~70 of them, so one after another a fresh cluster
+/// took ~18s. Migrating in parallel brings that to the slowest single database (~8s
+/// total, measured on the dev cluster). But `CREATE DATABASE` must not overlap anything:
+///
+/// - two concurrent creates: all but one fail with a misleading `Keyspace '<name>' already
+///   exists` and leave the name blocked for up to a minute (see `CREATES` in
+///   `tests/live.rs`, where it was found);
+/// - a create overlapping DDL in *another* database: the same error, or `Restart read
+///   required` from the catalog-version bump — measured while trying to start each
+///   database's migration straight after its own create.
+///
+/// So every create has finished before the first migration starts. DDL in different
+/// databases running side by side was clean in every measured run.
 ///
 /// **Deliberately not atomic, and not rolled back.** There is no transaction spanning five
-/// databases, so a failure at `booking` leaves `user` and `spot` at their new versions and
-/// `payment` and `view` untouched. Unwinding the two that succeeded would be a second set
-/// of migrations that can themselves fail; the supported recovery is to fix the broken
-/// migration and run this again, which is a no-op for everything already applied.
+/// databases, so a failure in `booking` leaves the others wherever they got to. Each
+/// migration is its own transaction, so no database is left half-way through one.
+/// Unwinding the ones that succeeded would be a second set of migrations that can
+/// themselves fail; the supported recovery is to fix the broken migration and run this
+/// again, which is a no-op for everything already applied.
 ///
-/// **Sequential on purpose — do not `join!` it.** YugabyteDB 2026.1 refuses concurrent
-/// `CREATE DATABASE`s: all but one fail with a misleading `Keyspace '<name>' already
-/// exists` and leave the name blocked for up to a minute. See `CREATES` in
-/// `tests/live.rs`, where it was found.
+/// Every database runs to completion even when another fails — a spawned migration cannot
+/// be stopped mid-statement anyway — and every failure is logged. The error returned is the
+/// first in [`databases`] order, so two runs that fail the same way report it the same way.
 pub async fn run_all() -> Result<(), Error> {
+    let mut ready = Vec::new();
     for db in databases() {
-        run_one(db).await?;
+        let url = url_of(&db)?;
+        ensure_database(db.name, &url).await?;
+        ready.push((db, url));
     }
-    Ok(())
+
+    // A task each, not a `join_all`: the harness runs diesel's synchronous migrations
+    // under `block_in_place`, which blocks whatever task polls it — five futures in one
+    // task would still run one after another.
+    let running: Vec<_> = ready
+        .into_iter()
+        .map(|(db, url)| {
+            let name = db.name;
+            (name, tokio::spawn(migrate(db, url)))
+        })
+        .collect();
+
+    let mut first = None;
+    for (name, task) in running {
+        let result = task.await.unwrap_or_else(|e| {
+            Err(Error::Migrate {
+                database: name,
+                source: format!("the migration task panicked: {e}"),
+            })
+        });
+        if let Err(e) = result {
+            tracing::error!(error = %e, "migration failed");
+            first.get_or_insert(e);
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// [`run_one`] for the named database, **at most once in this process**.
@@ -188,14 +231,21 @@ pub async fn ensure(name: &str) -> Result<(), Error> {
 
 /// Create the database if it is not there, then apply whatever it is missing.
 pub async fn run_one(db: Database) -> Result<(), Error> {
-    let url = std::env::var(db.env).map_err(|_| Error::MissingUrl {
+    let url = url_of(&db)?;
+    ensure_database(db.name, &url).await?;
+    migrate(db, url).await
+}
+
+fn url_of(db: &Database) -> Result<String, Error> {
+    std::env::var(db.env).map_err(|_| Error::MissingUrl {
         database: db.name,
         env: db.env,
-    })?;
+    })
+}
 
-    tracing::info!(database = db.name, "connecting");
-    ensure_database(db.name, &url).await?;
-
+/// Apply whatever `db` is missing. Assumes the database exists — see [`ensure_database`].
+async fn migrate(db: Database, url: String) -> Result<(), Error> {
+    tracing::info!(database = db.name, "migrating");
     let conn = AsyncPgConnection::establish(&url)
         .await
         .map_err(|e| Error::Connect {

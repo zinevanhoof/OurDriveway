@@ -51,6 +51,9 @@ pub struct Config {
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
     pub locationiq_api_key: String,
+    /// `https://api.locationiq.com` everywhere real. Configurable only so the e2e suite
+    /// can answer geocoding itself — see `e2e/src/fake.rs`.
+    pub locationiq_base_url: String,
     /// Where listing photos are served from, e.g. `https://images.ourdriveway.com`.
     ///
     /// Read only to VALIDATE: the images a host sends back must be URLs
@@ -66,6 +69,7 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     port: env::require_parsed("PORT"),
     jwt_secret: env::require("JWT_SECRET"),
     locationiq_api_key: env::require("LOCATIONIQ_API_KEY"),
+    locationiq_base_url: env::require("LOCATIONIQ_BASE_URL"),
     media_base: env::require("MEDIA_BASE"),
 });
 
