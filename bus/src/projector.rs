@@ -711,10 +711,15 @@ mod live_tests {
     use super::*;
 
     const NATS: &str = "nats://127.0.0.1:4222";
-    const URL: &str = "postgres://yugabyte@127.0.0.1:5433/view";
-    /// Any database with a connection; the scratch table is created below.
-    // The database name is part of `URL` above now, rather than a separate argument to
-    // `connect` — one `DATABASE_URL` per service replaced addr/user/pass/db.
+    /// `yugabyte`, the maintenance database every cluster has from its first boot.
+    ///
+    /// It was `view`, and that only worked on a machine where something had already
+    /// created `view`. These tests migrate nothing — they need a connection and their own
+    /// scratch table — so on a fresh cluster (CI) nobody had, and the pool, which
+    /// connects lazily, reported the missing database as a 10s timeout on the first
+    /// `get()` in every test. A database that always exists needs no ordering against
+    /// whichever test binary happens to create the service databases first.
+    const URL: &str = "postgres://yugabyte@127.0.0.1:5433/yugabyte";
     /// Written by these tests alone, and defined up front — sixteen lanes creating it
     /// implicitly would all write the same table-definition key and take a TiKV write
     /// conflict. An earlier spike learned that the hard way.
@@ -722,10 +727,9 @@ mod live_tests {
     /// **Two leading underscores on purpose.** It is never dropped — the eight live tests
     /// run concurrently, so a teardown in any one of them would pull the table out from
     /// under the others, which is the same race `define_scratch_table` retries around.
-    /// So it survives the run and would be picked up by `scripts/print-schema.sh` as if
-    /// it were a real table. `diesel print-schema` skips `__%` (its table listing filters
-    /// `NOT LIKE '\_\_%'`), which is the same reason `__diesel_schema_migrations` needs no
-    /// entry in `diesel.toml`.
+    /// It lives in `yugabyte` now, which `scripts/print-schema.sh` never reads; the prefix
+    /// stays because a dev cluster may still have one in `view` from before, and
+    /// `diesel print-schema` skips `__%` (its table listing filters `NOT LIKE '\_\_%'`).
     const TABLE: &str = "__bus_livetest";
 
     /// How long a recorded apply holds its lane open.
