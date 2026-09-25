@@ -48,6 +48,10 @@ pub struct Config {
     pub jwt_expiration: i64,
     /// Days.
     pub refresh_token_expiration: i64,
+    /// `Secure` on the refresh-token cookie. `true` behind HTTPS, which production
+    /// always is. `false` only for dev over plain HTTP on the LAN, where a browser
+    /// would silently drop a `Secure` cookie and every refresh would log the user out.
+    pub cookie_secure: bool,
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
@@ -59,6 +63,7 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     email_token_secret: env::require("EMAIL_TOKEN_SECRET"),
     jwt_expiration: env::require_parsed("JWT_EXPIRATION"),
     refresh_token_expiration: env::require_parsed("REFRESH_TOKEN_EXPIRATION"),
+    cookie_secure: env::require_parsed("COOKIE_SECURE"),
 });
 
 mod auth;

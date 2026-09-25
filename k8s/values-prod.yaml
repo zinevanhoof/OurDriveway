@@ -5,7 +5,7 @@ tag: latest
 replicas: 2
 
 ingress:
-  host: ourdriveway.example.com
+  host: ourdriveway.com
   tls:
     enabled: true
 
@@ -14,10 +14,27 @@ services:
   # images sat on the pod's emptyDir and a second replica would serve 404s for
   # every image the first one received. The images are in R2 now, so it scales
   # with everything else.
+  # A map merge, so this replaces only these two keys of media's env — the rest, and
+  # its `secrets` list, come from values.yaml.
   media:
     env:
-      S3_ENDPOINT: https://REPLACE-ME.r2.cloudflarestorage.com
+      # The account id is not a secret: it is in every presigned URL a browser sees.
+      S3_ENDPOINT: https://41b38b255942623d7927f3916220b974.r2.cloudflarestorage.com
       S3_BUCKET: ourdriveway
+
+# Sized for the 4-CPU / 8 GB VPS, and measured on a k3d node limited to exactly that:
+# the whole node — k3s included — sat at ~1.9 GB idle and peaked near 3 GB under
+# 200 concurrent logins or 5,000 reads/s. Untuned, a tserver sizes itself to the whole
+# machine and would crowd out everything else on it.
+#
+# Deliberately no Kubernetes memory limit on the pod: its YSQL backends are separate
+# processes outside these caps, and an OOM kill here takes down the only copy of the
+# data. The caps keep it in bounds instead; the 2Gi request in values.yaml reserves
+# its floor. `yb_num_shards_per_tserver=1` keeps a single node from splitting every
+# table into tablets it cannot use — the dev compose file runs the same.
+yugabyte:
+  tserverFlags: "memory_limit_hard_bytes=2684354560,yb_num_shards_per_tserver=1"
+  masterFlags: "memory_limit_hard_bytes=536870912"
 
 nats:
   config:

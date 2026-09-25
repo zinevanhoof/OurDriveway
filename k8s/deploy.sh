@@ -22,6 +22,31 @@ cd "$REPO_ROOT"
   exit 1
 }
 
+# Refuse a weak or incomplete secrets file before anything touches the cluster. A missing
+# key would only surface as one pod crash-looping on its Config; a short password would
+# not surface at all.
+secret() { grep -E "^$1=" k8s/secrets.env | tail -n 1 | cut -d= -f2-; }
+fail() { echo "k8s/secrets.env: $*" >&2; exit 1; }
+
+# Every key the example declares, so there is no second list here to fall out of step.
+for key in $(grep -oE '^[A-Z0-9_]+=' k8s/secrets.env.example | tr -d '='); do
+  [[ -n "$(secret "$key")" ]] || fail "$key is missing or empty"
+done
+
+# The four this deployment generates itself. Letters and digits only, because the two
+# passwords are spliced into DATABASE_URL and NATS_URL unescaped.
+invented=(JWT_SECRET EMAIL_TOKEN_SECRET YSQL_PASSWORD NATS_PASSWORD)
+for key in "${invented[@]}"; do
+  value="$(secret "$key")"
+  [[ ${#value} -ge 32 && "$value" =~ ^[A-Za-z0-9]+$ ]] ||
+    fail "$key must be at least 32 letters or digits — generate it with: openssl rand -hex 32"
+done
+# Distinct, all four. JWT_SECRET == EMAIL_TOKEN_SECRET would turn every mailed
+# verification link into a bearer token (see shared/src/email_token.rs); the passwords
+# being equal would make one leak two.
+[[ -z "$(for key in "${invented[@]}"; do secret "$key"; echo; done | sort | uniq -d)" ]] ||
+  fail "${invented[*]} must all be different values"
+
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
 # Kept out of the chart on purpose: Helm stores every value it renders in the

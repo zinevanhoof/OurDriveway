@@ -23,7 +23,7 @@ pub struct Config {
     /// `https://<account>.r2.cloudflarestorage.com`. The S3 API endpoint, which is
     /// NOT the public read URL — see `media_base`.
     pub s3_endpoint: String,
-    /// Where those objects are *served* from, e.g. `https://images.ourdriveway.com`.
+    /// Where those objects are *served* from, e.g. `https://assets.ourdriveway.com`.
     /// A different hostname from `s3_endpoint`, and the one that goes into events:
     /// this service mints the absolute URL clients store. Must match the base that
     /// spot-service and user-service validate against, or every upload is refused

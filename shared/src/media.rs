@@ -26,7 +26,7 @@ pub const PREFIX_SPOTS: &str = "spots";
 /// Profile pictures.
 pub const PREFIX_AVATARS: &str = "avatars";
 
-/// Where images are served from, e.g. `https://images.ourdriveway.com`.
+/// Where images are served from, e.g. `https://assets.ourdriveway.com`.
 ///
 /// A process-wide `OnceLock` rather than a parameter because the validators are
 /// `garde` custom functions on the request structs, which take no state — the same

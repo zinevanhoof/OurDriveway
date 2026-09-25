@@ -1,0 +1,71 @@
+{{/*
+Who may open a connection to the two stateful things in the cluster.
+
+A password is one lock; this is the second. Without these, any pod in the cluster — the
+frontend's Caddy, a debug pod, anything a future chart installs — could dial YSQL on
+5433 and NATS on 4222 and only the password stood in the way. With them, the ports are
+closed at the network layer to everything but the pods that actually need them.
+
+The admitted pods carry a label, set in services.yaml and migrator-job.yaml from the same
+`db` / `nats` flags that decide whether a pod gets the connection URL at all — so a pod
+is let in exactly when it is given the credentials, and the two cannot drift:
+
+  ourdriveway.com/db-client: "true"     the five services with a database, the migrator
+  ourdriveway.com/nats-client: "true"   every service but media
+
+Each policy lists the one port its clients use. Everything else on those pods is shut
+to the cluster: yugabyted's UI (15433), the master and tserver ports (7000/7100/9000/
+9100), and NATS monitoring (8222). Probes are unaffected — Yugabyte's are `exec`, and
+the kubelet's httpGet to NATS comes from the node, which k3s's policy controller admits.
+Operators are unaffected, because neither route below crosses the pod network: `kubectl
+port-forward` for NATS monitoring, `kubectl exec` into yugabyte-0 for YSQL and its UI
+(yugabyted binds the pod IP only, so port-forward cannot reach it — see yugabyte.yaml).
+
+New pods wait a few seconds: k3s's controller adds a pod's IP to the allow rule shortly
+after it starts, so a connection made in the first moments is dropped. The services
+ride that out — init containers and connect-at-boot retries — but a one-shot debug pod
+that dials immediately will see it as a timeout.
+
+A `from.podSelector` with no namespaceSelector means *this namespace only*, which is
+the intent: nothing outside `ourdriveway` has a reason to reach either.
+
+Enforced by k3s out of the box (its embedded kube-router policy controller). A CNI
+without NetworkPolicy support would accept these objects and enforce nothing, so check
+that on any other cluster before counting on them.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: yugabyte-clients
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: yugabyte
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              ourdriveway.com/db-client: "true"
+      ports:
+        - protocol: TCP
+          port: 5433
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nats-clients
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nats
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              ourdriveway.com/nats-client: "true"
+      ports:
+        - protocol: TCP
+          port: 4222

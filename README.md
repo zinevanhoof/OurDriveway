@@ -499,7 +499,7 @@ top of its `main.rs`. Roughly:
 | all but notification-service       | `JWT_SECRET`                                                                                                                                                         |
 | all but media-service              | `NATS_URL`                                                                                                                                                           |
 | user, spot, booking, payment, view | `DATABASE_URL` (e.g. `postgres://yugabyte@127.0.0.1:5433/booking`)                                                                                                   |
-| user-service                       | `JWT_EXPIRATION`, `REFRESH_TOKEN_EXPIRATION`, `EMAIL_TOKEN_SECRET`, `MEDIA_BASE`                                                                                     |
+| user-service                       | `JWT_EXPIRATION`, `REFRESH_TOKEN_EXPIRATION`, `COOKIE_SECURE`, `EMAIL_TOKEN_SECRET`, `MEDIA_BASE`                                                                    |
 | spot-service                       | `LOCATIONIQ_API_KEY`, `LOCATIONIQ_BASE_URL`, `MEDIA_BASE`                                                                                                            |
 | payment-service                    | `STRIPE_API_BASE`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `SETTLEMENT_SECS`                                                                                   |
 | view-service                       | `SETTLEMENT_SECS`                                                                                                                                                    |

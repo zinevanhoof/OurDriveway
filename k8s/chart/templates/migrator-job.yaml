@@ -53,10 +53,13 @@ spec:
       labels:
         app.kubernetes.io/name: migrator
         app.kubernetes.io/instance: {{ .Release.Name }}
+        # Admitted to YSQL by templates/network-policy.yaml, like the services.
+        ourdriveway.com/db-client: "true"
     spec:
       # Never. A failed migration must surface as a failed Job, not as a pod that
       # quietly restarts until it happens to work.
       restartPolicy: Never
+      automountServiceAccountToken: false
       initContainers:
         # Same /dev/tcp wait the services use. The yugabyte Service is headless, so
         # this proves a listener, not readiness — the connect in the migrator is what
@@ -87,9 +90,8 @@ spec:
             - name: {{ $db | upper }}_DATABASE_URL
               value: "postgres://yugabyte:$(YSQL_PASSWORD)@yugabyte:5433/{{ $db }}"
             {{- end }}
-          envFrom:
-            - secretRef:
-                name: {{ .Values.secretName }}
+          # No `envFrom`: the database password above is the only secret this reads,
+          # and it used to be handed every other one — Stripe, R2, Resend — besides.
           # Set here though the app Deployments have none: a Job competing for an
           # unbounded share while the cluster is mid-deploy is the wrong trade.
           resources:

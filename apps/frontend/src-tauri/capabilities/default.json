@@ -13,9 +13,10 @@
     },
     {
       "identifier": "http:default",
+      "comment": "The public origin only. The dev machine's LAN address is added by dev-lan.json, which tauri.dev.conf.json enables for `npm run tauri:dev` and `npm run tauri:android:dev` — never for a release build.",
       "allow": [
         {
-          "url": "http://192.168.50.29:*"
+          "url": "https://ourdriveway.com"
         },
         {
           "url": "https://tiles.openfreemap.org"

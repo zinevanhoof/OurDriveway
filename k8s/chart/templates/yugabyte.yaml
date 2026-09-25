@@ -41,13 +41,15 @@ spec:
   clusterIP: None
   selector:
     app.kubernetes.io/name: yugabyte
+  # YSQL only. The yugabyted UI (15433) has no login of its own, so it is not on the
+  # Service. `kubectl port-forward` cannot reach it either: yugabyted binds the pod IP
+  # only, never 127.0.0.1, which is where port-forward connects. From inside the pod:
+  #   kubectl exec -n ourdriveway yugabyte-0 -- bash -c 'curl -s http://$(hostname -i):15433/'
+  #   kubectl exec -it -n ourdriveway yugabyte-0 -- bash -c 'bin/ysqlsh -h $(hostname -i)'
   ports:
     - name: ysql
       port: 5433
       targetPort: ysql
-    - name: ui
-      port: 15433
-      targetPort: ui
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -67,6 +69,7 @@ spec:
         app.kubernetes.io/name: yugabyte
     spec:
       terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
       containers:
         - name: yugabyte
           image: {{ .Values.yugabyte.image }}
@@ -78,6 +81,12 @@ spec:
             - start
             - --background=false
             - --advertise_address=$(POD_NAME).yugabyte.$(POD_NAMESPACE).svc.cluster.local
+            # **Must name the `data` volumeMount below.** Without it yugabyted writes to
+            # `$HOME/var`, and this image runs as root — so every tablet went to
+            # /root/var in the container's writable layer while the PVC at
+            # /home/yugabyte/var stayed empty, and a pod restart was total data loss.
+            # docker/docker-compose-dev.yml found and fixed the same trap.
+            - --base_dir=/home/yugabyte/var
             {{- with .Values.yugabyte.tserverFlags }}
             - --tserver_flags={{ . }}
             {{- end }}

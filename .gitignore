@@ -4,6 +4,11 @@
 CLAUDE.md
 *.env
 .env.*
+# The frontend's two mode files hold only values that are inlined into the public bundle
+# anyway — the API origin and a Stripe *publishable* sandbox key — and the CI image build
+# needs .env.production, so these two are committed. Never put a secret in them.
+!apps/frontend/.env.development
+!apps/frontend/.env.production
 /uploads
 # Vendored Helm subchart tarballs. Chart.lock IS committed — it pins the
 # resolved NATS version, so `helm dependency update` is reproducible.

@@ -65,6 +65,8 @@ impl UserService {
                 "Email already registered",
                 "An account with that email already exists.",
             ))?;
+        // Returned before Argon2 below — see the note in `authenticate`.
+        drop(read);
 
         // `app_user_email_idx UNIQUE` is what sees the *concurrent* duplicate — a
         // double-clicked button is enough. The read above cannot: both requests run it
@@ -91,7 +93,7 @@ impl UserService {
         // Beside the event rather than in it. Argon2 salts randomly, so this still
         // has to happen exactly once and on the write side — but the result belongs
         // in the row and nowhere else, least of all in a stream four services read.
-        let password_hash = password::hash(req.password.as_str())?;
+        let password_hash = password::hash(req.password.as_str()).await?;
         let registered = UserRegistered {
             user_id,
             first_name: req.first_name,
@@ -144,16 +146,21 @@ impl UserService {
     pub async fn authenticate(&self, req: LoginRequest) -> MyResult<User> {
         let mut read = db::conn(&self.db).await?;
         let found = UserRepository::find_by_email(&mut read, req.email.to_string()).await?;
+        // Back to the pool before Argon2, not after. Held across the hash, a login burst
+        // parks every pooled connection behind the CPU and the rest time out at 10s —
+        // measured: 20 connections, 50 concurrent logins, bb8 timeouts.
+        drop(read);
 
         // Verify even when no user matched, against a throwaway hash, so a missing
         // account and a wrong password take the same time to answer.
         let ok = match &found {
-            Some(u) => password::verify(&u.password, &req.password),
+            Some(u) => password::verify(&u.password, &req.password).await,
             None => {
                 password::verify(
                     "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$0000000000000000000000000000000000000000000",
                     &req.password,
-                );
+                )
+                .await;
                 false
             }
         };
@@ -492,7 +499,7 @@ impl UserService {
         // Hashed before the transaction opens. Argon2 is ~100ms of CPU by design and
         // `next_version!` holds `FOR UPDATE` on the row for the whole block —
         // hashing inside would serialise every other write to this user behind it.
-        let password_hash = password::hash(req.password.as_str())?;
+        let password_hash = password::hash(req.password.as_str()).await?;
 
         let mut conn = db::conn(&self.db).await?;
 
@@ -589,6 +596,8 @@ impl UserService {
         let existing = UserRepository::find_by_id(&mut read, *uid)
             .await?
             .context_not_found(("Not Found", "Could not find user"))?;
+        // Returned before either Argon2 call below — see the note in `authenticate`.
+        drop(read);
         let user_uuid = existing.id;
 
         // Destructured rather than read through `req`, so a field added to
@@ -632,11 +641,12 @@ impl UserService {
                     "Enter your current password to set a new one.",
                 ))?;
                 password::verify(&existing.password, current)
+                    .await
                     .context_unauthorized(("Unauthorized", "Incorrect password"))?;
 
                 (
                     UserEvent::PasswordChanged(UserPasswordChanged { user_id: user_uuid }),
-                    Some(password::hash(new_password.as_str())?),
+                    Some(password::hash(new_password.as_str()).await?),
                 )
             }
 
@@ -662,6 +672,7 @@ impl UserService {
                     ))?;
 
                     password::verify(&existing.password, current)
+                        .await
                         .context_unauthorized(("Unauthorized", "Incorrect password"))?;
 
                     // Same as signup: the unique index is the real guard, this only

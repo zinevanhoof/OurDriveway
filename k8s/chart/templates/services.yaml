@@ -53,7 +53,18 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: {{ $name }}-service
+        {{- /* What templates/network-policy.yaml admits to the database and the broker.
+               Set from the same flags that decide whether the pod gets the URL at all. */}}
+        {{- if $needsDb }}
+        ourdriveway.com/db-client: "true"
+        {{- end }}
+        {{- if $needsNats }}
+        ourdriveway.com/nats-client: "true"
+        {{- end }}
     spec:
+      # No service here talks to the Kubernetes API, so no pod carries a token for it —
+      # one less credential to lift out of a compromised container.
+      automountServiceAccountToken: false
       {{- if or $needsNats $needsDb }}
       initContainers:
         {{/*
@@ -130,19 +141,30 @@ spec:
               value: "postgres://yugabyte:$(YSQL_PASSWORD)@yugabyte:5433/{{ $name }}"
             {{- end }}
             {{- if $needsNats }}
+            # Same shape as DATABASE_URL: a `$(VAR)` reference, expanded at container
+            # start, so the pod spec never holds the password. bus::connect lifts the
+            # credentials back out of the URL — async-nats ignores them in place.
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: NATS_PASSWORD
             - name: NATS_URL
-              value: "nats://{{ $.Release.Name }}-nats:4222"
+              value: "nats://{{ $.Values.natsUser }}:$(NATS_PASSWORD)@{{ $.Release.Name }}-nats:4222"
             {{- end }}
             {{- range $k, $v := $svc.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
-          # JWT_SECRET for every service, plus LOCATIONIQ_API_KEY, the R2 credentials
-          # and the Stripe keys. See secrets.env.example. YSQL_PASSWORD is also in
-          # here, but is named explicitly above because DATABASE_URL interpolates it.
-          envFrom:
-            - secretRef:
-                name: {{ $.Values.secretName }}
+            # Only the keys this service's `Config` reads — the `secrets` list in
+            # values.yaml. Never the whole secret: see the note there.
+            {{- range $key := $svc.secrets }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: {{ $key }}
+            {{- end }}
           # /readyz means "my projections have caught up", so this is what keeps a
           # pod that is still catching up out of the Service's endpoint list.
           #
@@ -165,6 +187,7 @@ spec:
               path: /healthz
               port: http
             periodSeconds: 10
+          resources: {{- toYaml ($svc.resources | default $.Values.serviceResources) | nindent 12 }}
 ---
 apiVersion: v1
 kind: Service

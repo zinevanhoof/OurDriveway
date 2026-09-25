@@ -19,17 +19,18 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 export const native = isTauri();
 
 // reqwest can't resolve a relative URL and rejects the `tauri://` scheme a bundled
-// build loads from, so native needs an absolute base. Both native and web route
-// through Caddy, so the base is Caddy's origin.
-// ponytail: hardcoded to match the rest of the app. If the host ever needs to vary,
-// this one const is the single place to add a VITE_API_URL fallback.
-const apiBase = "http://192.168.50.29";
+// build loads from, so native needs an absolute base: the public origin in a release
+// build, Caddy on the LAN under `tauri dev`. Picked by Vite's mode — .env.production
+// or .env.development — so the same code ships to both.
+const apiBase: string | undefined = import.meta.env.VITE_API_BASE;
 
 // Replace window.fetch once, at startup, so every caller (king.ts REST + urql) stays
 // on plain relative-URL fetch and is routed correctly without knowing about Tauri.
 // Web is left untouched: relative URLs resolve same-origin against Caddy.
 export function installNativeFetch() {
   if (!native) return;
+  // Loud at startup rather than as every request failing to resolve later.
+  if (!apiBase) throw new Error("VITE_API_BASE is not set for this build mode");
 
   // The real webview fetch — Tauri's own IPC rides window.fetch and must keep using it.
   const browserFetch = window.fetch.bind(window);

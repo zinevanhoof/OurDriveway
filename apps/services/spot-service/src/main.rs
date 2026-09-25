@@ -54,7 +54,7 @@ pub struct Config {
     /// `https://api.locationiq.com` everywhere real. Configurable only so the e2e suite
     /// can answer geocoding itself — see `e2e/src/fake.rs`.
     pub locationiq_base_url: String,
-    /// Where listing photos are served from, e.g. `https://images.ourdriveway.com`.
+    /// Where listing photos are served from, e.g. `https://assets.ourdriveway.com`.
     ///
     /// Read only to VALIDATE: the images a host sends back must be URLs
     /// media-service minted on this origin, or a listing could point its photos at

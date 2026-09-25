@@ -16,6 +16,7 @@ spec:
       labels:
         app.kubernetes.io/name: frontend
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: caddy
           image: {{ .Values.registry }}/ourdriveway-frontend:{{ .Values.tag }}

@@ -29,7 +29,12 @@ imagePullPolicy: Always
 #
 # Must also be reachable FROM STRIPE, not just from a browser: listing photos go onto a
 # Checkout Session and Stripe may fetch them server-side.
-mediaBase: &mediaBase https://images.ourdriveway.example.com
+mediaBase: &mediaBase https://assets.ourdriveway.com
+
+# The one NATS account every service connects as. Its password is NATS_PASSWORD in
+# k8s/secrets.env. An anchor for the same reason as mediaBase: the broker's
+# `authorization` block below and every service's NATS_URL must name the same user.
+natsUser: &natsUser ourdriveway
 
 # SECONDS. How long after a booking ends its money counts as settled — one day.
 #
@@ -49,8 +54,28 @@ settlementSecs: &settlementSecs "86400"
 # ourdriveway-<name>-service, the database name is <name> (and so is its directory
 # under migrations/, which the migrator embeds), and the ingress path is /api/<name>.
 # Rename one and all three follow.
+#
+# `secrets` is the allowlist of keys this service gets from `app-secrets` — exactly the
+# secret fields its `Config` reads, and nothing else. It used to be the whole secret via
+# `envFrom`, so every pod held the Stripe key, the R2 credentials and the database
+# password whether it used them or not; one compromised pod was every credential. A key
+# missing from a list crashes that service at boot, since `Config` has no defaults.
+# YSQL_PASSWORD and NATS_PASSWORD are not listed: services.yaml wires them into
+# DATABASE_URL and NATS_URL itself, per the `db` and `nats` flags.
+#
+# `resources` overrides `serviceResources` below for one service.
 services:
   user:
+    secrets: [JWT_SECRET, EMAIL_TOKEN_SECRET]
+    # The one service with a real memory appetite: Argon2 takes 19 MiB per concurrent
+    # hash, and there are at most one per CPU (see src/auth/password.rs). 85 MiB peak
+    # measured at 200 concurrent logins on 4 cores; the limit leaves room for 8.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
     env:
       # Validates that a submitted avatar is on our origin.
       MEDIA_BASE: *mediaBase
@@ -58,8 +83,13 @@ services:
       JWT_EXPIRATION: "15"
       # DAYS — Duration::days.
       REFRESH_TOKEN_EXPIRATION: "15"
-  booking: {}
+      # `Secure` on the refresh cookie. Always true here: the only way in is HTTPS
+      # through Cloudflare. The dev .env sets false for plain HTTP on the LAN.
+      COOKIE_SECURE: "true"
+  booking:
+    secrets: [JWT_SECRET]
   spot:
+    secrets: [JWT_SECRET, LOCATIONIQ_API_KEY]
     env:
       # Validates that a host's submitted listing photos are on our origin — without
       # it a listing could point its photos at any host. See shared/src/media.rs.
@@ -67,11 +97,13 @@ services:
       # Only the e2e suite points this elsewhere, at its fake.
       LOCATIONIQ_BASE_URL: https://api.locationiq.com
   view:
+    secrets: [JWT_SECRET]
     env:
       # The read side of the same rule — see the anchor above. This one decides whether
       # the wallet calls a host's income available or pending.
       SETTLEMENT_SECS: *settlementSecs
   payment:
+    secrets: [JWT_SECRET, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET]
     env:
       # The write side: what a withdrawal actually pays out. Not secret and better off
       # visible in review; the Stripe keys come from secrets.env instead.
@@ -85,6 +117,7 @@ services:
   media:
     db: false
     nats: false
+    secrets: [JWT_SECRET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY]
     env:
       # Not secret, and visible in review where it belongs. The credentials for
       # this bucket come from secrets.env instead.
@@ -107,6 +140,7 @@ services:
   notification:
     db: false
     api: false
+    secrets: [RESEND_API_KEY, EMAIL_TOKEN_SECRET]
     env:
       # Not secret and better off visible in review. RESEND_API_KEY and
       # EMAIL_TOKEN_SECRET come from secrets.env instead.
@@ -132,6 +166,19 @@ services:
       TEMPLATE_PASSWORD_RESET: password-reset
 
 replicas: 1
+
+# Every service unless it sets its own `resources`. Measured with prod values on a
+# 4-CPU / 8 GB k3d node: 2–4 MiB idle, and view-service peaked at 11 MiB serving
+# 5,000 requests/s. So a small request, and a memory limit that is generous against
+# that but still stops one leaking pod from taking the node. No CPU limit: throttling
+# a request mid-flight helps nobody on a box this size, and the request already sets
+# each pod's share when the CPUs are contended.
+serviceResources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
 
 # The authoritative store — see templates/yugabyte.yaml.
 #
@@ -210,7 +257,29 @@ nats:
   natsBox:
     enabled: false
 
+  # The password the `authorization` block below reads, from the same secret the
+  # services' NATS_URL is built from — so the two cannot drift. The name is spelled out
+  # because a subchart cannot read the parent's `secretName`; keep it equal to that.
+  container:
+    env:
+      NATS_PASSWORD:
+        valueFrom:
+          secretKeyRef:
+            name: app-secrets
+            key: NATS_PASSWORD
+
   config:
+    # No anonymous connections. Without this block anything that can reach :4222 can
+    # publish a `PaymentSucceeded` and have a booking confirmed. `<< $VAR >>` is the
+    # chart's syntax for an unquoted token in nats.conf, and `$NATS_PASSWORD` is then
+    # resolved from the environment by the server itself — the password never appears
+    # in the ConfigMap. The monitoring port (8222, the probes) stays unauthenticated;
+    # templates/network-policy.yaml closes it to every other pod, and the kubelet's
+    # probes still reach it from the node.
+    merge:
+      authorization:
+        user: *natsUser
+        password: << $NATS_PASSWORD >>
     jetstream:
       enabled: true
       # The one PVC in the whole deployment. Everything else is rebuilt from it.
