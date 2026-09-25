@@ -6,28 +6,26 @@
 pub mod await_version;
 pub mod connect;
 pub mod health;
-pub mod lease;
 pub mod outbox;
 pub mod projector;
-/// The two tables `bus` owns: `_outbox` and `_lease`.
+/// The one table `bus` owns: `_outbox`.
 ///
 /// **Generated**, by the bus pass in `scripts/print-schema.sh` — the doc lives here rather
 /// than in the file because `print-schema` would overwrite it there.
 ///
-/// Every service database has an identical copy of both, created five times over by
-/// `migrations/<svc>/0001_init/up.sql`, because every service runs its own outbox relay
-/// and its own leader election. They are deliberately kept OUT of `shared::schema` (see
-/// the filter in `diesel.toml`): [`outbox::enqueue`] is generic over whichever database
-/// its caller holds, so it cannot name a per-service type — and with these declared only
-/// here, `bus::schema::_outbox` is the only one that exists. That is what makes "services
-/// reach the outbox through `bus`" a compiler rule rather than a convention.
+/// Each of the four write-side databases has an identical copy, created by
+/// `migrations/<svc>/0001_init/up.sql`, because every service runs its own outbox relay.
+/// It is deliberately kept OUT of `shared::schema` (see the filter in `diesel.toml`):
+/// [`outbox::enqueue`] is generic over whichever database its caller holds, so it cannot
+/// name a per-service type — and with this declared only here, `bus::schema::_outbox` is
+/// the only one that exists. That is what makes "services reach the outbox through `bus`"
+/// a compiler rule rather than a convention.
 ///
-/// The generation pass reads all five databases and refuses to write if they disagree,
-/// which is the one thing five copies of the same migration can get wrong.
+/// The generation pass reads every write-side database and refuses to write if they
+/// disagree, which is the one thing four copies of the same migration can get wrong.
 ///
-/// No hand-written `allow_tables_to_appear_in_same_query!` decision survives here — the
-/// CLI emits one for the pair. Neither table is ever joined to anything, so it permits a
-/// query nobody writes.
+/// `_lease` was here too, for the elected outbox relay. Ordering moved into the data
+/// (`projector::decide`), so every replica relays and there is no election left.
 pub mod schema;
 pub mod service;
 pub mod worker;
@@ -37,7 +35,6 @@ pub mod worker;
 pub use await_version::{AWAIT_VERSION, AwaitVersions};
 pub use connect::{connect, ensure_streams};
 pub use health::Readiness;
-pub use lease::elect;
 pub use projector::{Projector, Tx};
 pub use worker::Worker;
 

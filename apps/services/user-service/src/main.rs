@@ -70,7 +70,7 @@ bus::version_reader! {
     /// The two aggregates this service stores. Anything else a client echoes back is
     /// `Unavailable` — nothing here to wait for, so the request proceeds rather than
     /// spending the timeout on a table this database does not have.
-    fn version_of;
+    fn version_of, version_of_at;
     "user" => shared::schema::user::app_user,
     "refresh_token" => shared::schema::user::refresh_token,
 }
@@ -115,15 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // "is NATS reachable" — which still matters, because the outbox relay needs it.
     let readiness = bus::Readiness::new(js.client().clone(), &[]);
 
-    // For the outbox relay, which is now the only thing here that must run on
-    // exactly one instance. There are no projectors left to elect for: this
-    // service writes its own rows inside the request's transaction, and the event
-    // goes into `_outbox` in that same transaction.
-    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
-
     // Carries every USERS and SESSIONS event this service commits. No longer
     // scaffolding — this is the only path by which those events reach NATS.
-    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone()));
 
     let state = AppState {
         user_service: Arc::new(UserService { db: db.clone() }),
@@ -142,11 +136,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // user who cannot log in yet is exactly who needs these.
         .route("/api/user/email/verify", post(route::email::verify))
         .route("/api/user/email/resend", post(route::email::resend))
+        // The same bargain, for the other link this system mails. Deliberately not
+        // under `session/`: these two have no cookie and must not be scoped to the
+        // path one is sent on. `PATCH /api/user` remains the *authenticated*
+        // change-password form — these are for someone who cannot log in.
+        .route("/api/user/password/forgot", post(route::password::forgot))
+        .route("/api/user/password/reset", post(route::password::reset))
         // The authenticated user themselves — which one is the JWT's business, so
         // there is no id in the path and nothing to scope under.
         // PATCH is also the change-password form: same record, and the service
         // decides from the body which event that becomes.
-        .route("/api/user", patch(route::user::update_user));
+        .route("/api/user", patch(route::user::update_user))
+        .route(
+            "/api/user/notifications/seen",
+            post(route::user::notifications_seen),
+        )
+        .route(
+            "/api/user/notifications/{kind}/{subject_id}/dismiss",
+            post(route::user::dismiss_notification),
+        );
 
     // No GraphQL proxy here any more: every client read is served by
     // view-service from the combined projection. This database is private to

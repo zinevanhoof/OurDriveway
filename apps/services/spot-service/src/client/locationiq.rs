@@ -34,7 +34,7 @@ fn client() -> &'static reqwest::Client {
 pub async fn autocomplete(query: &str) -> MyResult<Vec<AddressSuggestResponse>> {
     let key = CONFIG.locationiq_api_key.as_str();
     let resp = client()
-        .get("https://api.locationiq.com/v1/autocomplete")
+        .get(format!("{}/v1/autocomplete", CONFIG.locationiq_base_url))
         .query(&[
             ("key", key),
             ("q", query),
@@ -69,8 +69,10 @@ pub async fn autocomplete(query: &str) -> MyResult<Vec<AddressSuggestResponse>> 
 /// coordinates are never read.
 pub async fn geocode(address: &str) -> MyResult<Option<(f64, f64)>> {
     let key = CONFIG.locationiq_api_key.as_str();
+    // Was hardcoded to `us1.locationiq.com`, the US region host, while autocomplete used
+    // `api.` — one LOCATIONIQ_BASE_URL now serves both.
     let resp = client()
-        .get("https://us1.locationiq.com/v1/search")
+        .get(format!("{}/v1/search", CONFIG.locationiq_base_url))
         .query(&[
             ("key", key),
             ("q", address),

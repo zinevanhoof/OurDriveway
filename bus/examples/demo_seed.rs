@@ -1,5 +1,12 @@
 //! Demo data for recording the README videos: six people and twenty driveways in
-//! Hasselt, with three months of bookings, payments, a refund and payouts behind them.
+//! Hasselt, with three months of bookings, payments, ratings, a refund and payouts behind
+//! them.
+//!
+//! **Every summary has something to show.** Each driveway has at least one completed,
+//! rated booking, so its manage-screen tiles, its public rating and its host's line on the
+//! detail sheet are all populated; every host has income both this month and last, so
+//! "vs last" has a percentage; one of Sam's driveways is paused, so "active" reads 2/3;
+//! and when run before 22:00 one of Sam's driveways is occupied right now.
 //!
 //!     docker compose -f docker/docker-compose-dev.yml up -d
 //!     scripts/migrate.sh
@@ -10,8 +17,8 @@
 //! pending balance and two payouts, and a renter with a history, a refund and a booking
 //! coming up. Every account below shares that password.
 //!
-//! **Rows only, then the services' own backfill.** Unlike `seed.rs`, this enqueues no
-//! events. It writes the authoritative rows into user-, spot-, booking- and
+//! **Rows only, then the services' own backfill.** This enqueues no events itself. It
+//! writes the authoritative rows into user-, spot-, booking- and
 //! payment-service's databases and then calls each one's `POST /internal/backfill`,
 //! which re-emits every row as the events that reproduce it — the same path a projection
 //! rebuild takes. So the event chains (a cancelled booking is Created, Confirmed,
@@ -41,7 +48,9 @@ use argon2::{
     Argon2, PasswordHasher,
     password_hash::{SaltString, rand_core::OsRng},
 };
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono::{
+    DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday,
+};
 use chrono_tz::Europe::Brussels;
 use diesel::{OptionalExtension, QueryDsl};
 use diesel_async::RunQueryDsl;
@@ -633,7 +642,341 @@ const BOOKINGS: &[BookingSeed] = &[
         booked_days_before: 2,
         fate: Fate::Confirmed,
     },
+    // ── So every driveway has a completed booking, and every host income both this
+    //    month and last — every summary tile and rating has something to show ──
+    //
+    // Weekday-only spots are safe to book on any offset: `open_day` moves a booking to
+    // the nearest day the spot is open. Evening slots sit inside "evenings and weekends"
+    // whichever day they land on. Every booking is after its spot was listed.
+    BookingSeed {
+        key: "b40",
+        spot: "havermarkt",
+        renter: "noah",
+        day: -40,
+        slots: &[("10:00", "14:00")],
+        booked_days_before: 3,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b41",
+        spot: "havermarkt",
+        renter: "jonas",
+        day: -6,
+        slots: &[("16:00", "19:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b42",
+        spot: "botermarkt",
+        renter: "emma",
+        day: -35,
+        slots: &[("09:00", "17:00")],
+        booked_days_before: 4,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b43",
+        spot: "botermarkt",
+        renter: "noah",
+        day: -9,
+        slots: &[("08:00", "12:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b44",
+        spot: "botermarkt",
+        renter: "sam",
+        day: 5,
+        slots: &[("09:00", "15:00")],
+        booked_days_before: 3,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b45",
+        spot: "kapelstraat",
+        renter: "noah",
+        day: -26,
+        slots: &[("11:00", "15:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b46",
+        spot: "kapelstraat",
+        renter: "jonas",
+        day: -4,
+        slots: &[("13:00", "18:00")],
+        booked_days_before: 1,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b47",
+        spot: "stationsplein",
+        renter: "emma",
+        day: -48,
+        slots: &[("06:30", "19:00")],
+        booked_days_before: 3,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b48",
+        spot: "dusartplein",
+        renter: "lina",
+        day: -14,
+        slots: &[("18:00", "23:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b49",
+        spot: "kanaalkom",
+        renter: "noah",
+        day: -22,
+        slots: &[("19:00", "22:00")],
+        booked_days_before: 3,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b50",
+        spot: "kanaalkom",
+        renter: "sam",
+        day: -3,
+        slots: &[("19:00", "22:30")],
+        booked_days_before: 1,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b51",
+        spot: "hoogstraat",
+        renter: "emma",
+        day: -19,
+        slots: &[("19:00", "22:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b52",
+        spot: "hoogstraat",
+        renter: "lotte",
+        day: -2,
+        slots: &[("19:30", "23:00")],
+        booked_days_before: 1,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b53",
+        spot: "bampslaan",
+        renter: "lotte",
+        day: -7,
+        slots: &[("08:00", "17:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b54",
+        spot: "kunstlaan",
+        renter: "emma",
+        day: -44,
+        slots: &[("19:00", "23:00")],
+        booked_days_before: 5,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b55",
+        spot: "kunstlaan",
+        renter: "lina",
+        day: -8,
+        slots: &[("19:30", "23:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b56",
+        spot: "corda",
+        renter: "noah",
+        day: -29,
+        slots: &[("08:00", "18:00")],
+        booked_days_before: 3,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b57",
+        spot: "corda",
+        renter: "lotte",
+        day: -11,
+        slots: &[("08:30", "17:30")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b58",
+        spot: "corda",
+        renter: "emma",
+        day: 2,
+        slots: &[("08:00", "16:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b59",
+        spot: "kuringen",
+        renter: "emma",
+        day: -21,
+        slots: &[("07:00", "12:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b60",
+        spot: "sint-truiden",
+        renter: "lina",
+        day: -20,
+        slots: &[("08:00", "17:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b61",
+        spot: "sint-truiden",
+        renter: "sam",
+        day: -6,
+        slots: &[("07:30", "12:30")],
+        booked_days_before: 1,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b62",
+        spot: "kiewit",
+        renter: "noah",
+        day: -9,
+        slots: &[("09:00", "13:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b63",
+        spot: "kiewit",
+        renter: "lotte",
+        day: 8,
+        slots: &[("10:00", "16:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b64",
+        spot: "roppesingel",
+        renter: "jonas",
+        day: -33,
+        slots: &[("08:00", "18:00")],
+        booked_days_before: 3,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b65",
+        spot: "roppesingel",
+        renter: "emma",
+        day: -13,
+        slots: &[("09:00", "15:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b66",
+        spot: "luikersteenweg",
+        renter: "noah",
+        day: -38,
+        slots: &[("08:00", "20:00")],
+        booked_days_before: 4,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b67",
+        spot: "salvator",
+        renter: "jonas",
+        day: -31,
+        slots: &[("10:00", "15:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b68",
+        spot: "genkersteenweg",
+        renter: "sam",
+        day: -12,
+        slots: &[("19:00", "22:00")],
+        booked_days_before: 2,
+        fate: Fate::Confirmed,
+    },
+    BookingSeed {
+        key: "b69",
+        spot: "genkersteenweg",
+        renter: "noah",
+        day: 3,
+        slots: &[("19:00", "23:00")],
+        booked_days_before: 1,
+        fate: Fate::Confirmed,
+    },
 ];
+
+/// `(booking key, stars)`: what the renter rated a booking that happened.
+///
+/// Most completed bookings are rated, so every driveway and every host has a rating to
+/// show. A few recent ones are left unrated, which is how real ratings trail. Checked
+/// below to name only confirmed bookings that are over — a rating on anything else would
+/// be dropped by the projectors anyway.
+const RATINGS: &[(&str, i32)] = &[
+    ("b01", 5),
+    ("b02", 4),
+    ("b03", 5),
+    ("b04", 4),
+    ("b05", 5),
+    ("b06", 3),
+    ("b07", 5),
+    ("b08", 4),
+    ("b20", 5),
+    ("b21", 4),
+    ("b22", 4),
+    ("b32", 4),
+    ("b33", 5),
+    ("b35", 5),
+    ("b40", 5),
+    ("b41", 4),
+    ("b42", 4),
+    ("b43", 5),
+    ("b45", 3),
+    ("b46", 5),
+    ("b47", 4),
+    ("b48", 5),
+    ("b49", 4),
+    ("b50", 5),
+    ("b51", 4),
+    ("b52", 5),
+    ("b53", 4),
+    ("b54", 5),
+    ("b55", 4),
+    ("b56", 3),
+    ("b57", 4),
+    ("b59", 5),
+    ("b60", 4),
+    ("b61", 5),
+    ("b62", 5),
+    ("b64", 4),
+    ("b65", 5),
+    ("b66", 4),
+    ("b67", 5),
+    ("b68", 4),
+];
+
+/// A listing its host has switched off, so "active parking spots" reads 2/3 for Sam.
+/// Its past bookings still count; it just takes no new ones.
+const PAUSED: &[&str] = &["kempische"];
+
+/// The driveway occupied while the demo is recorded: a two-hour booking starting on the
+/// current hour, today, so Sam's "booked right now" has something to count. Open around
+/// the clock, and nothing else is booked on it today.
+const LIVE: (&str, &str, &str) = ("b70", "zuivelmarkt", "lina");
 
 /// `(key, host, EUR cents, days ago)`. Kept below what the host had earned by then —
 /// checked below — so the balance never goes negative.
@@ -660,6 +1003,20 @@ fn stable(name: &str) -> Uuid {
 
 fn person(key: &str) -> Uuid {
     stable(&format!("user:{key}"))
+}
+
+/// The car a renter turns up in: their first plate, the one the booking form offers
+/// first. Everyone in [`PEOPLE`] has at least one, and a demo renter without a plate
+/// could not have made this booking on the real path either.
+fn plate(key: &str) -> String {
+    // `.iter().next()` rather than `.first()`: diesel's `FirstDsl` is in scope here and
+    // wins the method lookup on a slice.
+    PEOPLE
+        .iter()
+        .find(|(k, ..)| *k == key)
+        .and_then(|(.., plates)| plates.iter().next())
+        .unwrap_or_else(|| panic!("no person named {key}"))
+        .to_string()
 }
 
 fn spot_seed(key: &str) -> &'static SpotSeed {
@@ -698,6 +1055,49 @@ fn availability(hours: Hours) -> Availability {
         },
         single: Default::default(),
     }
+}
+
+/// A booking with its date settled and its slots owned — what the writing loop consumes.
+struct Plan {
+    key: &'static str,
+    spot: &'static SpotSeed,
+    renter: &'static str,
+    date: NaiveDate,
+    slots: Vec<(String, String)>,
+    booked_days_before: i64,
+    fate: Fate,
+}
+
+/// `today + day`, moved to the nearest date the spot is open for every slot — earlier
+/// for a past booking, later for a future one, so neither crosses today.
+///
+/// Dates move with the day the seed runs, so a fixed offset on a weekday-only driveway
+/// lands on a weekend some runs. This keeps the booking instead of failing the seed.
+fn open_day(hours: Hours, today: NaiveDate, day: i64, slots: &[(String, String)]) -> NaiveDate {
+    let step = if day < 0 { -1 } else { 1 };
+    (0..7)
+        .map(|shift| today + Duration::days(day + shift * step))
+        .find(|date| {
+            slots
+                .iter()
+                .all(|(start, end)| covers(hours, *date, (start, end)))
+        })
+        .unwrap_or_else(|| panic!("no day within a week is open for {slots:?}"))
+}
+
+/// Today's slot for [`LIVE`]: from the current hour for two hours, in Hasselt, capped at
+/// 23:30 when the driveway closes. `None` from 22:00, when too little of the day is left
+/// for a booking that is still happening while the demo is recorded.
+fn live_slot(now: DateTime<Utc>) -> Option<(String, String)> {
+    let hour = now.with_timezone(&Brussels).hour();
+    (hour < 22).then(|| {
+        let end = if hour + 2 >= 23 {
+            "23:30".to_string()
+        } else {
+            format!("{:02}:00", hour + 2)
+        };
+        (format!("{hour:02}:00"), end)
+    })
 }
 
 /// Whether the spot is open for the whole of `(start, end)` on `date`. Dates move with
@@ -840,9 +1240,9 @@ async fn main() -> Result<(), Error> {
                 first_name: first.to_string(),
                 last_name: last.to_string(),
                 email: format!("{key}@example.com"),
-                password_hash: password_hash.clone(),
             },
             1,
+            password_hash.clone(),
         );
         row.email_verified = true;
         row.license_plates = plates.iter().map(|p| p.to_string()).collect();
@@ -877,7 +1277,12 @@ async fn main() -> Result<(), Error> {
             availability: availability(s.hours),
             timezone: "Europe/Brussels".into(),
         };
-        let row = Spot::created(created, now - Duration::days(s.listed_days_ago), 1);
+        let mut row = Spot::created(created, now - Duration::days(s.listed_days_ago), 1);
+        if PAUSED.contains(&s.key) {
+            // Created, then switched off: the two events the backfill replays for it.
+            row.active = false;
+            row.version = 2;
+        }
         upsert!(&mut *spots, spot::table, spot::id, row);
     }
     println!("spots     {}", SPOTS.len());
@@ -886,16 +1291,55 @@ async fn main() -> Result<(), Error> {
     // Settled income per host, to hold the payouts to.
     let mut earned: HashMap<Uuid, i64> = HashMap::new();
 
-    for b in BOOKINGS {
-        let s = spot_seed(b.spot);
-        let date = today + Duration::days(b.day);
-        for &slot in b.slots {
+    // Every booking, with its date settled and its slots owned: the constant ones moved to
+    // a day their spot is open, plus the live one built from the clock.
+    let mut plans: Vec<Plan> = BOOKINGS
+        .iter()
+        .map(|b| {
+            let s = spot_seed(b.spot);
+            let slots: Vec<(String, String)> = b
+                .slots
+                .iter()
+                .map(|&(start, end)| (start.to_string(), end.to_string()))
+                .collect();
+            Plan {
+                key: b.key,
+                spot: s,
+                renter: b.renter,
+                date: open_day(s.hours, today, b.day, &slots),
+                slots,
+                booked_days_before: b.booked_days_before,
+                fate: b.fate,
+            }
+        })
+        .collect();
+
+    match live_slot(now) {
+        Some(slot) => {
+            let (key, spot, renter) = LIVE;
+            plans.push(Plan {
+                key,
+                spot: spot_seed(spot),
+                renter,
+                date: today,
+                slots: vec![slot],
+                booked_days_before: 1,
+                fate: Fate::Confirmed,
+            });
+        }
+        None => println!("note: too late in the day for a booking happening right now"),
+    }
+
+    let ratings: HashMap<&str, i32> = RATINGS.iter().copied().collect();
+
+    for b in &plans {
+        let s = b.spot;
+        let date = b.date;
+        for (start, end) in &b.slots {
             assert!(
-                covers(s.hours, date, slot),
-                "{} books {}–{} on {date}, outside {}'s hours",
+                covers(s.hours, date, (start, end)),
+                "{} books {start}–{end} on {date}, outside {}'s hours",
                 b.key,
-                slot.0,
-                slot.1,
                 s.key
             );
         }
@@ -903,19 +1347,34 @@ async fn main() -> Result<(), Error> {
         let minutes: i64 = b
             .slots
             .iter()
-            .map(|&(start, end)| (time(end) - time(start)).num_minutes())
+            .map(|(start, end)| (time(end) - time(start)).num_minutes())
             .sum();
         // The same arithmetic `create_booking` uses: truncating, in the renter's favour.
         let amount = minutes * s.price / 60;
-        let ends_at = local(date, b.slots.last().expect("a booking has slots").1);
+        let ends_at = local(date, &b.slots.last().expect("a booking has slots").1);
         // The evening before, never later than an hour ago — an upcoming booking was
         // still made in the past.
         let created_at = local(date - Duration::days(b.booked_days_before), "20:00")
             .min(now - Duration::hours(1));
 
-        // Versions are the length of each chain `replay::events` rebuilds from the row.
+        let rating = ratings.get(b.key).copied();
+        if let Some(stars) = rating {
+            assert!(
+                matches!(b.fate, Fate::Confirmed) && ends_at < now && (1..=5).contains(&stars),
+                "{} is rated {stars}, but only a confirmed booking that is over can be",
+                b.key
+            );
+        }
+
+        // Versions are the length of each chain `replay::events` rebuilds from the row:
+        // a rating is one more event after the confirmation.
         let (status, version, cancel_reason, release_reason) = match b.fate {
-            Fate::Confirmed => (booking_status::CONFIRMED, 2, None, None),
+            Fate::Confirmed => (
+                booking_status::CONFIRMED,
+                if rating.is_some() { 3 } else { 2 },
+                None,
+                None,
+            ),
             Fate::Cancelled { .. } => (
                 booking_status::CANCELLED,
                 3,
@@ -937,9 +1396,9 @@ async fn main() -> Result<(), Error> {
             date.format("%Y-%m-%d").to_string(),
             b.slots
                 .iter()
-                .map(|&(start, end)| TimeSlot {
-                    start: start.into(),
-                    end: end.into(),
+                .map(|(start, end)| TimeSlot {
+                    start: start.clone(),
+                    end: end.clone(),
                 })
                 .collect(),
         )]
@@ -957,6 +1416,7 @@ async fn main() -> Result<(), Error> {
                 host_id,
                 renter_id,
                 booked,
+                license_plate: plate(b.renter),
                 amount,
                 status: status.into(),
                 // Cleared by every transition out of `reserved`, as on the live path.
@@ -964,7 +1424,7 @@ async fn main() -> Result<(), Error> {
                 release_reason: release_reason.map(|r| r.as_str().to_string()),
                 cancel_reason: cancel_reason.map(|r| r.as_str().to_string()),
                 ends_at,
-                rating: None,
+                rating,
                 created_at,
             }
         );
@@ -974,7 +1434,7 @@ async fn main() -> Result<(), Error> {
             Fate::Confirmed => (payment_status::SUCCEEDED, 2, None),
             Fate::Cancelled { after_days } => {
                 let refunded_at = created_at + Duration::days(after_days);
-                let starts_at = local(date, b.slots[0].0);
+                let starts_at = local(date, &b.slots[0].0);
                 assert!(
                     refunded_at <= now && refunded_at < starts_at - Duration::hours(1),
                     "{} is refunded after the cancel deadline",
@@ -1011,7 +1471,7 @@ async fn main() -> Result<(), Error> {
             *earned.entry(host_id).or_default() += amount;
         }
     }
-    println!("bookings  {}", BOOKINGS.len());
+    println!("bookings  {} ({} rated)", plans.len(), RATINGS.len());
 
     // ── payouts ─────────────────────────────────────────────────────────────
     let mut paid_out: HashMap<Uuid, i64> = HashMap::new();

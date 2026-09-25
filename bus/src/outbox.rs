@@ -19,19 +19,26 @@
 //! ## Delivery
 //!
 //! At-least-once, deliberately. The relay publishes, then deletes the row; a crash
-//! between those two republishes on restart. Inside the stream's 120s
-//! `duplicate_window` that is discarded server-side. **Outside** it — a relay down
-//! for longer than two minutes — the event genuinely lands twice, and what absorbs
-//! it is the consumer side: idempotent UPSERT projectors, and workers that already
-//! carry provider idempotency keys. The dedupe window and the consumers cover
-//! different durations; do not read either as covering both.
+//! between those two republishes on restart. Inside the stream's `duplicate_window`
+//! — an hour, see `connect::ensure_streams` — that is discarded server-side, which
+//! covers a pod restart, a rollout and a node drain rather than only a stall. It was
+//! two minutes, and two minutes covered none of those.
+//!
+//! **Outside** it the event genuinely lands twice, and what absorbs it is the
+//! consumer side: the projector's version gate rolls back and acks anything at or
+//! below the version already stored, and workers carry provider idempotency keys.
+//! The dedupe window and the consumers cover different durations; do not read either
+//! as covering both.
 //!
 //! ## Ordering
 //!
-//! One relay per service, via [`crate::lease`]. Without it, two relays interleave
-//! and a booking's `reserved → confirmed → cancelled` can reach a consumer out of
-//! order — which matters, because the projector guards transitions with
-//! `WHERE status IN $from` and simply drops one that does not match.
+//! Not this module's problem. It used to be: one relay per service, elected through a
+//! lease row, because two relays interleaving could land a booking's `cancelled` before
+//! its `confirmed` and the projector's `WHERE status IN $from` guards drop a transition
+//! rather than reorder it.
+//!
+//! `bus::projector::decide` holds the order now, from the aggregate's stored version, so
+//! every replica relays and an event that arrives early is parked rather than applied.
 
 use std::time::Duration;
 
@@ -47,7 +54,6 @@ use shared::{
 };
 
 use crate::schema::_outbox;
-use tokio::sync::watch;
 use uuid::Uuid;
 
 /// How long the relay sleeps when it finds nothing to send.
@@ -89,6 +95,18 @@ pub struct Pending {
 /// is one row rather than two — the same property the `Nats-Msg-Id` dedupe gives
 /// on the way out, applied on the way in.
 ///
+/// **`DO NOTHING`, not `DO UPDATE`.** It used to overwrite the pending row's subject and
+/// payload, which is wrong whenever two enqueues share an id but differ in content — and
+/// they did. Event ids were deterministic in seven places and keyed on the *aggregate*
+/// rather than the event, so a second caller could replace a pending event with a
+/// different one at a different version: a payout's `PayoutPaid` overwritten by a
+/// `PayoutFailed`, or a v2 replaced by a v3 whose predecessor then never published.
+///
+/// Those ids are gone — every event now carries a v7 — so in practice this clause fires
+/// only for [`backfill`], where the same id means the same `@version:step` and therefore
+/// the same payload. First writer wins, and "one event id, one event" is true rather than
+/// hoped.
+///
 /// ## `created_at` is `time::now()`, not `envelope.occurred_at`
 ///
 /// [`drain`] orders by this column, so it is what decides publication order — and
@@ -103,9 +121,9 @@ pub struct Pending {
 /// row reads stale until its next real event. The `id` tiebreak does not help: a
 /// UUIDv7 comes off the same skewed clock.
 ///
-/// `now()` is evaluated inside the database, which every replica shares — the same
-/// reason `lease::acquire` evaluates expiry there rather than against a caller's
-/// clock. (Transaction-start time, not `clock_timestamp()`: two events enqueued in one
+/// `now()` is evaluated inside the database, which every replica shares rather than
+/// against a caller's clock, which they do not.
+/// (Transaction-start time, not `clock_timestamp()`: two events enqueued in one
 /// transaction then share a timestamp, which is exactly why [`drain`] breaks the tie
 /// on `id`.)
 ///
@@ -130,8 +148,7 @@ pub async fn enqueue<T: Serialize>(
             _outbox::payload.eq(&payload),
         ))
         .on_conflict(_outbox::id)
-        .do_update()
-        .set((_outbox::subject.eq(subject), _outbox::payload.eq(&payload)))
+        .do_nothing()
         .execute(conn)
         .await?;
     Ok(())
@@ -207,33 +224,40 @@ pub async fn backfill<T: Serialize>(
 /// the row is still there, so the next pass retries it, and stopping preserves
 /// order rather than skipping past a subject that is refusing writes.
 ///
-/// `leader` is re-checked between batches, and that is not belt-and-braces. This
-/// loops until the table is empty, which can be a long time behind a backlog, while
-/// the outer [`run`] only checks leadership between calls. A relay that stalled past
-/// the lease TTL, lost it, and then resumed would otherwise keep publishing a batch
-/// it read minutes ago — interleaving with the new leader's fresh one. Inside the
-/// stream's 120s `duplicate_window` the stale copies are discarded server-side and
-/// order survives; beyond it a stale v2 lands after v3 and the projection reads stale
-/// until that aggregate's next event.
+/// ## Every replica runs this
 ///
-/// This does not close the window entirely — a stall *inside* a single publish still
-/// gets one message out — but one message is bounded and a whole backlog is not.
-pub async fn drain(pool: &Db, js: &Context, leader: &watch::Receiver<bool>) -> MyResult<usize> {
+/// It used to be one, elected through a 30s lease row in `_lease`, and the lease was
+/// load-bearing rather than an optimisation: two relays interleaving could land an
+/// aggregate's v2 after its v3, and `set_version`'s `WHERE version < $v` held the
+/// version but not the columns, so the row read stale until that aggregate's next
+/// event.
+///
+/// `projector::decide` refuses an event that is not the next one now, so neither
+/// duplication nor reordering survives to the projection:
+///
+/// - **Duplicates** are discarded by `Nats-Msg-Id` against the stream's one-hour
+///   `duplicate_window`, and anything older than that is a `Decision::Skip`.
+/// - **Reordering** is a `Decision::Park` — handed back to JetStream and redelivered
+///   once the event before it has been applied.
+///
+/// So the relay needs no coordination at all, and the elected leader, its lease table,
+/// its TTL, its heartbeat and the ~30s handover on a rolling restart are gone.
+///
+/// Still deliberately NOT `FOR UPDATE SKIP LOCKED`, but for a different reason than
+/// before: a claim buys nothing here. Two relays reading the same batch publish the
+/// same event ids and the server drops the second copy, which costs a publish and no
+/// correctness. `SKIP LOCKED` would need the publishes inside a held transaction —
+/// 128 network round trips with 128 row locks open, and a mid-batch failure rolling
+/// back deletes that currently autocommit — and there is no evidence YSQL supports it
+/// anyway. Worth revisiting only if the duplicate publishes ever show up in a
+/// measurement.
+pub async fn drain(pool: &Db, js: &Context) -> MyResult<usize> {
     let mut sent = 0;
     loop {
-        if !*leader.borrow() {
-            return Ok(sent);
-        }
-
         // `created_at` then `id`: two events enqueued in the same transaction share a
         // timestamp (`now()` is transaction-start time), and the id breaks the tie
         // deterministically so a retry after a crash sends them in the same order as
         // the first attempt.
-        //
-        // Deliberately NOT `FOR UPDATE SKIP LOCKED`, which is the reflex for a queue
-        // table and would be wrong here: skipping locked rows lets a second relay take
-        // the *next* batch and publish it first, which is precisely the reordering the
-        // lease exists to prevent. Order matters more than throughput on this table.
         let mut conn = pool.get().await.map_err(|e| MyError::Pool(e.to_string()))?;
 
         let batch: Vec<Pending> = _outbox::table
@@ -262,37 +286,23 @@ pub async fn drain(pool: &Db, js: &Context, leader: &watch::Receiver<bool>) -> M
     }
 }
 
-/// Runs the relay for as long as this instance is the leader.
+/// Runs the relay. Spawn one per service, beside the projectors.
 ///
-/// Spawn one per service, beside the projectors, sharing the same
-/// [`crate::lease::elect`] handle — one election decides both, because both are "one
-/// runner per service" for the same reason.
-///
-/// A follower parks on `leader.changed()` and costs nothing at all; the election
-/// task is already paying the one query every ten seconds.
-pub async fn run(pool: Db, js: Context, mut leader: watch::Receiver<bool>) {
+/// Every replica runs one — see [`drain`] for why that needs no election.
+pub async fn run(pool: Db, js: Context) {
+    tracing::info!("outbox relay started");
     loop {
-        while !*leader.borrow() {
-            if leader.changed().await.is_err() {
-                return; // election task gone; so is the process
+        match drain(&pool, &js).await {
+            Ok(0) => tokio::time::sleep(IDLE).await,
+            Ok(n) => tracing::debug!(count = n, "relayed outbox events"),
+            Err(e) => {
+                // Never fatal. The rows are still there, so the next pass retries; a
+                // relay that gave up would strand every event the service has
+                // committed since.
+                tracing::error!(error = %e, "outbox drain failed; retrying");
+                tokio::time::sleep(IDLE).await;
             }
         }
-
-        tracing::info!("outbox relay started");
-        while *leader.borrow() {
-            match drain(&pool, &js, &leader).await {
-                Ok(0) => tokio::time::sleep(IDLE).await,
-                Ok(n) => tracing::debug!(count = n, "relayed outbox events"),
-                Err(e) => {
-                    // Never fatal. The rows are still there, so the next pass
-                    // retries; a relay that gave up would strand every event the
-                    // service has committed since.
-                    tracing::error!(error = %e, "outbox drain failed; retrying");
-                    tokio::time::sleep(IDLE).await;
-                }
-            }
-        }
-        tracing::info!("outbox relay stopped; no longer leader");
     }
 }
 

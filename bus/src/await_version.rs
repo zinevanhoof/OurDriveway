@@ -39,8 +39,10 @@ use std::time::Duration;
 use axum::{extract::Request, http::HeaderName, middleware::Next, response::Response};
 // Re-exported so `version_reader!` can name them without every service having to depend
 // on `futures` or import `shared::db::Db` for a signature the macro wrote.
+pub use diesel_async::AsyncPgConnection;
 pub use futures::future::BoxFuture;
 pub use shared::db::Db;
+pub use shared::error::myerror::MyResult;
 use shared::events::{parse_version, split_aggregate};
 use uuid::Uuid;
 
@@ -88,12 +90,35 @@ pub enum Applied {
 /// `shared::db::table_for`'s allowlist. Write one with [`version_reader!`].
 pub type VersionReader = for<'a> fn(&'a Db, &'a str, &'a Uuid) -> BoxFuture<'a, Applied>;
 
+/// The same question as [`VersionReader`], asked **on a caller's open transaction**.
+///
+/// [`crate::projector`] needs the stored version to decide whether an event is the next
+/// one, and that decision has to be made under the same lock as the apply that follows
+/// it — so it cannot go through [`VersionReader`], which checks out its own connection
+/// from the pool. A `FOR UPDATE` taken on a different connection is a lock taken in a
+/// different transaction, which protects nothing.
+///
+/// Two differences from [`VersionReader`], both because the caller is a projector rather
+/// than a request:
+///
+/// - the read takes `FOR UPDATE`, so two replicas applying consecutive events of one
+///   aggregate serialise against each other rather than both reading the same stored
+///   version and both deciding they are next;
+/// - a query error is `Err` rather than [`Applied::Unavailable`]. A request waiting on a
+///   header can shrug one off and serve slightly stale; a projector that cannot read the
+///   version must not guess and apply, so the lane stops.
+pub type VersionAt = for<'a> fn(
+    &'a mut AsyncPgConnection,
+    &'a str,
+    &'a Uuid,
+) -> BoxFuture<'a, MyResult<Applied>>;
+
 /// The database this service serves reads from — the same one its projectors
 /// write — and the service's own answer to "what version is this aggregate at?".
 #[derive(Clone)]
 pub struct AwaitVersions(pub Db, pub VersionReader);
 
-/// Writes a service's [`VersionReader`]: one arm per aggregate it stores.
+/// Writes a service's [`VersionReader`] **and** its [`VersionAt`], from one arm list.
 ///
 /// Each arm is a real diesel table from that service's own schema module, so the query is
 /// built by the DSL and the version comes back as a plain `i64` — no spliced table name,
@@ -103,9 +128,21 @@ pub struct AwaitVersions(pub Db, pub VersionReader);
 /// `booking:<id>@N` at every service gets from the ones that do not store bookings. That
 /// used to be a 42P01 from the database; it is an absent match arm now.
 ///
+/// ## Two functions, one list
+///
+/// The second name is the projector's: same aggregates, same tables, but reading on the
+/// caller's open transaction and with `FOR UPDATE`. They are generated together because
+/// the failure mode of letting them drift is silent — an aggregate present in one list
+/// and missing from the other is a projector that applies ungated while clients wait on a
+/// version it never gates, or the reverse. One list cannot disagree with itself.
+///
+/// The name is spelled out rather than derived (`version_of` → `version_of_at`) because
+/// `macro_rules!` cannot concatenate identifiers, and a `paste` dependency for one
+/// underscore is not worth it.
+///
 /// ```ignore
 /// bus::version_reader! {
-///     pub fn version_of;
+///     pub fn version_of, version_of_at;
 ///     "spot" => shared::schema::spot::spot,
 /// }
 /// ```
@@ -113,7 +150,7 @@ pub struct AwaitVersions(pub Db, pub VersionReader);
 macro_rules! version_reader {
     (
         $(#[$meta:meta])*
-        $vis:vis fn $name:ident;
+        $vis:vis fn $name:ident, $at:ident;
         $($aggregate:literal => $($table:ident)::+),+ $(,)?
     ) => {
         $(#[$meta])*
@@ -150,6 +187,62 @@ macro_rules! version_reader {
                         },
                     )+
                     _ => Applied::Unavailable,
+                }
+            })
+        }
+
+        /// The projector's half: the stored version, read on the caller's open
+        /// transaction and locked, so the decision that follows holds until it commits.
+        ///
+        /// See [`bus::await_version::VersionAt`] for why this cannot just call the
+        /// function above.
+        ///
+        /// [`bus::await_version::VersionAt`]: $crate::await_version::VersionAt
+        //
+        // Generated for every service, used only by the three that run projectors. The
+        // alternative is a second macro head for "reader only", which is two call shapes
+        // to keep in step for the sake of a warning.
+        #[allow(dead_code)]
+        $vis fn $at<'a>(
+            conn: &'a mut $crate::await_version::AsyncPgConnection,
+            aggregate: &'a str,
+            id: &'a ::uuid::Uuid,
+        ) -> $crate::await_version::BoxFuture<
+            'a,
+            $crate::await_version::MyResult<$crate::await_version::Applied>,
+        > {
+            // See the note on the imports in the function above.
+            use ::diesel::OptionalExtension as _;
+            use ::diesel::QueryDsl as _;
+            use ::diesel_async::RunQueryDsl as _;
+            use $crate::await_version::Applied;
+
+            ::std::boxed::Box::pin(async move {
+                match aggregate {
+                    $(
+                        $aggregate => match $($table)::+::table
+                            .find(id)
+                            .select($($table)::+::version)
+                            // The whole reason this function exists. Without it two
+                            // replicas applying an aggregate's v2 and v3 both read the
+                            // stored v1, both conclude they are next, and both apply.
+                            .for_update()
+                            .first::<i64>(&mut *conn)
+                            .await
+                            .optional()?
+                        {
+                            Some(version) => Ok(Applied::At(version)),
+                            // No row. The create case — and nothing to lock, which is
+                            // the one gap `FOR UPDATE` leaves: two applies of the same
+                            // new aggregate both see this. Benign, because both then
+                            // require version 1 and every create arm is an upsert.
+                            None => Ok(Applied::Pending),
+                        },
+                    )+
+                    // Not stored here. A projector never reaches this for an aggregate it
+                    // projects — the arm list covers them — so it means an event whose
+                    // aggregate this service does not keep, and there is nothing to gate.
+                    _ => Ok(Applied::Unavailable),
                 }
             })
         }

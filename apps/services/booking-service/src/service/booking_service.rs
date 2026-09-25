@@ -15,7 +15,7 @@ use shared::{
         booking_subject, format_version,
     },
     general_models::booking::Booked,
-    requests::booking::CreateBookingRequest,
+    requests::booking::{CreateBookingRequest, RateBookingRequest},
 };
 use uuid::Uuid;
 
@@ -95,6 +95,10 @@ impl BookingService {
         // The request spells the bare map — its garde rules are written against that —
         // so this is where it becomes the domain type.
         let requested = Booked::from(request.booked);
+        // Taken as the renter sent it. Nothing here checks it against their user
+        // record: this service has no mirror of one, and the plate is a statement
+        // about which car is coming rather than a claim to authorize.
+        let license_plate = request.license_plate;
 
         // The idempotency key. If an ack is lost after the transaction committed, a
         // client resubmitting the same form gets its booking back rather than a
@@ -147,10 +151,8 @@ impl BookingService {
                         "Unavailable",
                         "This spot is no longer accepting bookings.",
                     ))?;
-                    (host_id != *renter_id).context_conflict((
-                        "Not allowed",
-                        "You can't book your own spot.",
-                    ))?;
+                    (host_id != *renter_id)
+                        .context_conflict(("Not allowed", "You can't book your own spot."))?;
 
                     // Reads on a snapshot taken AFTER the lock was granted — which is what makes
                     // the loser of a race see the winner's booking here rather than a stale empty
@@ -180,6 +182,7 @@ impl BookingService {
                         host_id,
                         renter_id: *renter_id,
                         booked: requested.clone(),
+                        license_plate: license_plate.clone(),
                         amount_cents,
                         expires_at: Utc::now() + HOLD,
                         ends_at,
@@ -298,6 +301,57 @@ impl BookingService {
         .await
     }
 
+    /// The renter rates a booking that is over, once.
+    pub async fn rate(
+        &self,
+        renter_id: &Uuid,
+        booking_id: &Uuid,
+        request: RateBookingRequest,
+    ) -> MyResult<String> {
+        let mut conn = db::conn(&self.db).await?;
+        let booking = BookingRepository::find_by_id(&mut conn, *booking_id)
+            .await?
+            .context_not_found(NOT_FOUND)?;
+        authorize(&booking, renter_id, status::CONFIRMED)?;
+        (booking.ends_at <= Utc::now())
+            .context_conflict(("Not over yet", "A booking can be rated once it has ended."))?;
+
+        let (booking_id, rating) = (*booking_id, request.rating);
+        let version = conn
+            .transaction::<_, MyError, _>(|conn| {
+                async move {
+                    // The guarded update is the real check: two submits racing past the
+                    // read above still produce one rating.
+                    BookingRepository::rate(conn, booking_id, rating)
+                        .await?
+                        .context_conflict(("Already rated", "This booking has a rating already."))?;
+
+                    let version =
+                        shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
+                    shared::set_version!(
+                        conn,
+                        "booking",
+                        shared::schema::booking::booking,
+                        &booking_id,
+                        version
+                    )?;
+
+                    let envelope = Envelope::new(
+                        BookingEvent::Rated { booking_id, rating },
+                        Some(booking.renter_id),
+                        aggregate_id("booking", &booking_id),
+                        version,
+                    );
+                    outbox::enqueue(conn, &booking_subject(&booking.spot_id), &envelope).await?;
+                    Ok(format_version(&envelope.aggregate, envelope.version))
+                }
+                .scope_boxed()
+            })
+            .await?;
+
+        Ok(version)
+    }
+
     /// The shared tail of `release` and `cancel`: move the row, enqueue the event,
     /// commit.
     ///
@@ -325,11 +379,35 @@ impl BookingService {
         let version = conn
             .transaction::<_, MyError, _>(|conn| {
                 async move {
-                    let version = shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
+                    let version =
+                        shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
 
-                    BookingRepository::transition(conn, booking_id, to, from, release, cancel)
-                        .await?;
-                    shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking_id, version)?;
+                    let moved =
+                        BookingRepository::transition(conn, booking_id, to, from, release, cancel)
+                            .await?;
+
+                    // The booking is already out of `from` — a double-submitted cancel,
+                    // or the sweeper releasing the hold a moment before this landed.
+                    // Nothing changed, so no version is committed and no event is
+                    // published; the client is told to wait for the version that IS
+                    // stored rather than one nothing will ever carry.
+                    //
+                    // `version - 1` is exactly that: `next_version!` returns `stored + 1`
+                    // and nothing has been written since, under the `FOR UPDATE` it took.
+                    if !moved.applied() {
+                        return Ok(format_version(
+                            &aggregate_id("booking", &booking_id),
+                            version - 1,
+                        ));
+                    }
+
+                    shared::set_version!(
+                        conn,
+                        "booking",
+                        shared::schema::booking::booking,
+                        &booking_id,
+                        version
+                    )?;
 
                     let envelope = Envelope::new(
                         event,

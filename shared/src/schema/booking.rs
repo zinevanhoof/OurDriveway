@@ -8,6 +8,7 @@ diesel::table! {
         host_id -> Uuid,
         renter_id -> Uuid,
         booked -> Jsonb,
+        license_plate -> Text,
         amount -> Int8,
         status -> Text,
         hold_until -> Nullable<Timestamptz>,

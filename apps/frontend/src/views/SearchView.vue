@@ -1,8 +1,10 @@
-<script setup lang="ts">
-import LocationMap from '@/components/map/LocationMap.vue';
-</script>
+<!--
+  Deliberately empty.
 
+  The map is mounted by MobileLayout instead of by this route, so its GL context, style
+  and tiles are built once at boot and kept for the session — see the note there. This
+  route exists to *be* the Map tab; the map layer sits above it and shows through.
+-->
 <template>
-  <!-- Hasselt, Grote Markt — until the user's own location comes in. -->
-  <LocationMap class="h-full w-full" :lng="5.3378" :lat="50.9306" :zoom="13" />
+  <div />
 </template>

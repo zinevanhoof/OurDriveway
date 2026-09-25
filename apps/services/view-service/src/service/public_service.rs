@@ -1,12 +1,16 @@
 use chrono::Utc;
 use shared::{
     error::myerror::{ContextExt, MyResult},
-    responses::view::{NearbyResponse, PublicSpotResponse},
+    responses::view::{
+        NearbyResponse, PublicBookingResponse, PublicSpotResponse, SpotSummaryResponse,
+        UserSummaryResponse,
+    },
 };
 use uuid::Uuid;
 
-use crate::repository::{
-    booking_repository::ViewBookingRepository, spot_repository::ViewSpotRepository,
+use crate::{
+    policy,
+    repository::{booking_repository::ViewBookingRepository, spot_repository::ViewSpotRepository},
 };
 
 /// No relationship required — what any signed-in caller may read about a listing.
@@ -21,16 +25,9 @@ pub struct PublicService {
 }
 
 impl PublicService {
-    /// One active spot as a prospective renter sees it.
-    ///
-    /// The bookings that come with it are the availability answer and nothing else: which
-    /// slots are taken and until when, with no renter, no amount and no hold expiry. A host
-    /// looking at their own listing wants [`crate::service::host_service::HostService::spot`]
-    /// instead.
-    ///
-    /// **Two statements**, the second `belonging_to` the first — a join would repeat the
-    /// spot's `images`, `address` and `availability` once per booking. See the note in
-    /// `repository/mod.rs`.
+    /// One active spot as a prospective renter sees it. The spot only — its taken slots
+    /// are [`Self::spot_bookings`]. A host looking at their own listing wants
+    /// [`crate::service::host_service::HostService::spot`] instead.
     ///
     /// The caller is authenticated but not otherwise used: an inactive spot 404s for
     /// everyone here, including its host, because "public spot" is the whole question this
@@ -43,12 +40,62 @@ impl PublicService {
             .await?
             .context_not_found(("Not Found", "That spot doesn't exist."))?;
 
+        Ok(PublicSpotResponse::from(spot))
+    }
+
+    /// A person's reputation as a host: completed bookings on their spots, and their
+    /// rating.
+    ///
+    /// No 404 for an id that matches nobody — zeroes are the answer, and a 404 would turn
+    /// this into a way to ask whether a user exists.
+    pub async fn user_summary(&self, user_id: Uuid) -> MyResult<UserSummaryResponse> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let stats = ViewBookingRepository::stats_for_host(&mut conn, user_id, Utc::now()).await?;
+
+        Ok(UserSummaryResponse {
+            bookings: stats.bookings,
+            rating: policy::rating::average(stats.rating_sum, stats.ratings),
+            ratings: stats.ratings,
+        })
+    }
+
+    /// A spot's rating, for anyone. Zeroes rather than a 404 for a spot nobody has rated
+    /// — and not gated on `active`, so a renter looking at a paused spot they booked
+    /// still sees it.
+    pub async fn spot_summary(&self, spot_id: Uuid) -> MyResult<SpotSummaryResponse> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let stats = ViewBookingRepository::stats_for_spot(&mut conn, spot_id, Utc::now()).await?;
+
+        Ok(SpotSummaryResponse {
+            rating: policy::rating::average(stats.rating_sum, stats.ratings),
+            ratings: stats.ratings,
+        })
+    }
+
+    /// The availability answer for one active spot: which slots are taken and until when,
+    /// with no renter, no amount and no hold expiry.
+    ///
+    /// **Two statements**, and the first is the same read as [`Self::spot`]: an inactive
+    /// spot's slots 404 exactly like the spot, and the second statement is `belonging_to`
+    /// the row that read returned.
+    ///
+    /// Not paged: the booking form subtracts every future taken slot from the open hours,
+    /// and half of them would offer slots that are gone.
+    pub async fn spot_bookings(&self, spot_id: Uuid) -> MyResult<Vec<PublicBookingResponse>> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let spot = ViewSpotRepository::find_for_public(&mut conn, spot_id)
+            .await?
+            .context_not_found(("Not Found", "That spot doesn't exist."))?;
+
         // `Utc::now()` rather than a client-supplied `$now`. There is no reason to take the
         // instant from the caller when the server has one.
         let bookings =
             ViewBookingRepository::find_for_public_spot(&mut conn, &spot, Utc::now()).await?;
 
-        Ok(PublicSpotResponse::new(spot, bookings))
+        Ok(bookings.into_iter().map(Into::into).collect())
     }
 
     /// The map: spots within `meters` of a point.

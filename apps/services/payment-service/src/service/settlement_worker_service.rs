@@ -120,11 +120,12 @@ impl SettlementWorkerService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
 
                 // The row moves in the same transaction as the event. Guarded, so a
                 // redelivery that already applied is a no-op rather than a second refund.
-                match &event {
+                let settled = match &event {
                     PaymentEvent::Refunded {
                         refund_id,
                         refunded_at,
@@ -136,7 +137,7 @@ impl SettlementWorkerService {
                             &[status::SUCCEEDED],
                             PaymentPatch::refunded(refund_id.clone(), *refunded_at),
                         )
-                        .await?;
+                        .await?
                     }
                     PaymentEvent::SessionExpired { .. } => {
                         PaymentRepository::transition(
@@ -145,22 +146,35 @@ impl SettlementWorkerService {
                             &status::UNPAID,
                             PaymentPatch::expired(),
                         )
-                        .await?;
+                        .await?
                     }
                     // `decide` yields only the two above.
-                    _ => {}
-                }
-                shared::set_version!(conn, "payment", shared::schema::payment::payment, &payment_id, version)?;
+                    _ => db::Changed::No,
+                };
 
-                // Deterministic event id: a redelivery that gets this far — because the Stripe
-                // call succeeded but the commit did not — is discarded by the stream's
-                // duplicate window rather than recorded twice.
-                let mut envelope =
+                // Already refunded or already expired — the redelivery this guard exists
+                // for. It is a no-op for the row, and now for the version too: the
+                // version bump used to survive while its event was collapsed by the
+                // deterministic id below, leaving this payment gapped for good.
+                if !settled.applied() {
+                    return Ok(());
+                }
+
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::payment::payment,
+                    &payment_id,
+                    version
+                )?;
+
+                // A plain v7 event id. This used to be
+                // `v5("settle:{payment_id}:{booking.status}")`, so a redelivery reaching
+                // this far — the Stripe call succeeded but the commit did not — was
+                // discarded by the stream's duplicate window. The guard above ends that
+                // path before it gets here.
+                let envelope =
                     Envelope::new(event, None, aggregate_id("payment", &payment_id), version);
-                envelope.event_id = Uuid::new_v5(
-                    &Uuid::NAMESPACE_OID,
-                    format!("settle:{payment_id}:{}", booking.status).as_bytes(),
-                );
 
                 outbox::enqueue(conn, &payment_subject(booking_id), &envelope).await?;
                 Ok(())

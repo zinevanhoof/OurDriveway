@@ -336,6 +336,85 @@ impl WalletRepository {
         Ok(newest.into_iter().flatten().max())
     }
 
+    /// Everything a host's listings have earned: succeeded payments on bookings that are
+    /// still confirmed, settled or not.
+    ///
+    /// The earning half of [`Self::balance_for_host`] without its settlement cutoff — a
+    /// paid booking still to come counts. It is a display figure for the profile, not a
+    /// withdrawable one; that is `balance_for_host`.
+    pub async fn earned_for_host(conn: &mut AsyncPgConnection, host_id: Uuid) -> MyResult<i64> {
+        let earned: Option<i64> = payment::table
+            .inner_join(booking::table.on(booking::id.eq(payment::booking_id)))
+            .filter(
+                payment::host_id
+                    .eq(host_id)
+                    .and(payment::status.eq("succeeded"))
+                    .and(booking::status.eq("confirmed")),
+            )
+            .select(to_bigint(sum(payment::amount)))
+            .first(conn)
+            .await?;
+        Ok(earned.unwrap_or(0))
+    }
+
+    /// `(this month, last month)` of [`Self::earned_for_host`], dated by when the payment
+    /// was made — the same date the wallet files a charge under.
+    ///
+    /// One statement, two `FILTER`s, so the two months are read at the same moment.
+    /// `[last_start, this_start)` and `[this_start, this_end)` are half-open, from
+    /// `policy::wallet::bounds`.
+    pub async fn earned_by_month_for_host(
+        conn: &mut AsyncPgConnection,
+        host_id: Uuid,
+        last_start: DateTime<Utc>,
+        this_start: DateTime<Utc>,
+        this_end: DateTime<Utc>,
+    ) -> MyResult<(i64, i64)> {
+        let (this, last): (Option<i64>, Option<i64>) = payment::table
+            .inner_join(booking::table.on(booking::id.eq(payment::booking_id)))
+            .filter(
+                payment::host_id
+                    .eq(host_id)
+                    .and(payment::status.eq("succeeded"))
+                    .and(booking::status.eq("confirmed"))
+                    .and(payment::created_at.ge(last_start))
+                    .and(payment::created_at.lt(this_end)),
+            )
+            .select((
+                to_bigint(
+                    sum(payment::amount).aggregate_filter(payment::created_at.ge(this_start)),
+                ),
+                to_bigint(
+                    sum(payment::amount).aggregate_filter(payment::created_at.lt(this_start)),
+                ),
+            ))
+            .first(conn)
+            .await?;
+        Ok((this.unwrap_or(0), last.unwrap_or(0)))
+    }
+
+    /// [`Self::earned_for_host`] for one spot. `host_id` stays in the `WHERE` beside the
+    /// spot, so the figure is the caller's even if a spot id were passed in unchecked.
+    pub async fn earned_for_host_spot(
+        conn: &mut AsyncPgConnection,
+        host_id: Uuid,
+        spot_id: Uuid,
+    ) -> MyResult<i64> {
+        let earned: Option<i64> = payment::table
+            .inner_join(booking::table.on(booking::id.eq(payment::booking_id)))
+            .filter(
+                payment::host_id
+                    .eq(host_id)
+                    .and(booking::spot_id.eq(spot_id))
+                    .and(payment::status.eq("succeeded"))
+                    .and(booking::status.eq("confirmed")),
+            )
+            .select(to_bigint(sum(payment::amount)))
+            .first(conn)
+            .await?;
+        Ok(earned.unwrap_or(0))
+    }
+
     /// A host's money: what they have earned, what they have taken out, and what is
     /// still ripening.
     ///
@@ -404,11 +483,7 @@ impl WalletRepository {
         // over two databases: change one and change the other, or the figure beside the
         // withdraw button stops matching what the button will pay.
         let paid_out: Option<i64> = payout::table
-            .filter(
-                payout::host_id
-                    .eq(host_id)
-                    .and(payout::status.ne("failed")),
-            )
+            .filter(payout::host_id.eq(host_id).and(payout::status.ne("failed")))
             .select(to_bigint(sum(payout::amount)))
             .first(&mut *conn)
             .await?;

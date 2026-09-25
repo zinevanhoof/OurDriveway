@@ -30,7 +30,8 @@ pub struct UserPublicProjection {
 ///
 /// No `email_verified` and no password hash: neither is a column on the read model's
 /// `app_user` at all, which is the first thing deciding what can leak from a table every
-/// caller can read.
+/// caller can read. The hash could not arrive here even by accident now — no USERS
+/// event carries one.
 #[derive(Debug, Clone, Queryable, Selectable)]
 #[diesel(table_name = crate::schema::view::app_user)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -44,12 +45,12 @@ pub struct AccountProjection {
     pub email: String,
     /// Here rather than on [`UserPublicProjection`] only because no screen shows another
     /// person's plates. A host recognising the car on their driveway reads it off the
-    /// booking, not off a profile.
+    /// booking, not off the renter.
     pub license_plates: Vec<String>,
-    /// ISO 3166-1 alpha-2, `None` until the profile screen sets it.
+    /// ISO 3166-1 alpha-2, `None` until the edit screen sets it.
     ///
     /// Scoped like `email` and unlike `license_plates`: where somebody banks is nobody
-    /// else's business. It is projected at all because the profile form renders its
+    /// else's business. It is projected at all because the edit form renders its
     /// current value, and because the withdraw screen needs to know whether there is one
     /// before Stripe refuses to open an account without it.
     pub country: Option<String>,

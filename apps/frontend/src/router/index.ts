@@ -1,27 +1,45 @@
-import HomeView from "@/views/HomeView.vue";
 import { createWebHistory, createRouter } from "vue-router";
 import type { RouteLocationNormalized } from "vue-router";
-import type { Component } from "vue";
-import ProfileView from "@/views/ProfileView.vue";
-import SearchView from "@/views/SearchView.vue";
-import LoginView from "@/views/LoginView.vue";
 import { useAuthStore } from "@/stores/auth";
-import SpotsView from "@/views/SpotsView.vue";
-import MobileHomeHeader from "@/components/header/MobileHomeHeader.vue";
-import MobileProfileHeader from "@/components/header/MobileProfileHeader.vue";
-import AddSpotView from "@/views/AddSpotView.vue";
-import ManageSpotView from "@/views/ManageSpotView.vue";
-import EditSpotView from "@/views/EditSpotView.vue";
-import EditProfileView from "@/views/EditProfileView.vue";
-import ChangePasswordView from "@/views/ChangePasswordView.vue";
-import VerifyEmailView from "@/views/VerifyEmailView.vue";
-import CheckoutView from "@/views/CheckoutView.vue";
+import { trackNavDirection } from "./transition";
+
+import HomeView from "@/views/HomeView.vue";
+import SearchView from "@/views/SearchView.vue";
+import NotificationsView from "@/views/NotificationsView.vue";
+
+import LoginView from "@/views/auth/LoginView.vue";
+import SignupView from "@/views/auth/SignupView.vue";
+import VerifyEmailView from "@/views/auth/VerifyEmailView.vue";
+import ForgotPasswordView from "@/views/auth/ForgotPasswordView.vue";
+import ResetPasswordView from "@/views/auth/ResetPasswordView.vue";
+
+import MySpotsView from "@/views/spot/MySpotsView.vue";
+import AddSpotView from "@/views/spot/AddSpotView.vue";
+import EditSpotView from "@/views/spot/EditSpotView.vue";
+import ManageSpotView from "@/views/spot/ManageSpotView.vue";
+import SpotBookingsView from "@/views/spot/SpotBookingsView.vue";
+
+import MyBookingsView from "@/views/booking/MyBookingsView.vue";
+import BookSpotView from "@/views/booking/BookSpotView.vue";
+import CheckoutView from "@/views/booking/CheckoutView.vue";
+
 import WalletView from "@/views/wallet/WalletView.vue";
 import WalletWithdrawView from "@/views/wallet/WalletWithdrawView.vue";
 
+import ProfileView from "@/views/profile/ProfileView.vue";
+import EditProfileView from "@/views/profile/EditProfileView.vue";
+import ChangePasswordView from "@/views/profile/ChangePasswordView.vue";
+
 export type RouteMeta = {
-  header: Component | null;
   requiresAuth: boolean;
+  /**
+   * A navbar root. Two of these next to each other is a sideways move, so the page
+   * transition cross-fades instead of sliding — see `transition.ts`.
+   *
+   * Set it on the five paths `MobileNavbar` links to, and nothing else: a screen you
+   * pushed from a tab is not a tab.
+   */
+  tab?: boolean;
 };
 
 const routes = [
@@ -30,8 +48,8 @@ const routes = [
     name: "home",
     component: HomeView,
     meta: {
-      header: MobileHomeHeader,
       requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
   {
@@ -39,17 +57,37 @@ const routes = [
     name: "login",
     component: LoginView,
     meta: {
-      header: null,
       requiresAuth: false,
     } satisfies RouteMeta,
   },
   {
+    path: "/signup",
+    name: "signup",
+    component: SignupView,
+    meta: {
+      requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    // Host side only. `/bookings` is the renter's mirror of this — one screen each,
+    // because one screen with a tab per persona is two screens wearing a trenchcoat.
     path: "/spots",
     name: "spots",
-    component: SpotsView,
+    component: MySpotsView,
     meta: {
-      header: null,
       requiresAuth: true,
+      tab: true,
+    } satisfies RouteMeta,
+  },
+  {
+    // Renter side: the bookings this user made, not the ones made on their spots.
+    // Those are `/spot/:id/bookings`.
+    path: "/bookings",
+    name: "bookings",
+    component: MyBookingsView,
+    meta: {
+      requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
   {
@@ -57,7 +95,6 @@ const routes = [
     name: "spot-add",
     component: AddSpotView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -67,7 +104,26 @@ const routes = [
     component: ManageSpotView,
     props: true,
     meta: {
-      header: null,
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    // Every booking on one spot, paged, under an upcoming/past tab. The manage screen
+    // shows two of them and links here.
+    path: "/spot/:id/bookings",
+    name: "spot-bookings",
+    component: SpotBookingsView,
+    props: true,
+    meta: {
+      requiresAuth: true,
+    } satisfies RouteMeta,
+  },
+  {
+    // What the bell opens. Opening it marks everything seen.
+    path: "/notifications",
+    name: "notifications",
+    component: NotificationsView,
+    meta: {
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -77,7 +133,6 @@ const routes = [
     component: EditSpotView,
     props: true,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -86,8 +141,8 @@ const routes = [
     name: "wallet",
     component: WalletView,
     meta: {
-      header: null,
       requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
   {
@@ -99,7 +154,6 @@ const routes = [
       maxWithdraw: Number(route.params.maxWithdraw),
     }),
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -108,7 +162,6 @@ const routes = [
     name: "profile",
     component: ProfileView,
     meta: {
-      header: MobileProfileHeader,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -117,7 +170,6 @@ const routes = [
     name: "profile-edit",
     component: EditProfileView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -126,19 +178,54 @@ const routes = [
     name: "profile-password",
     component: ChangePasswordView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
   {
     // Reached from a link in an email, so it must work for someone who cannot log
     // in yet — being unverified is precisely why they can't.
-    path: "/verify",
+    path: "/verify-email",
     name: "verify-email",
     component: VerifyEmailView,
     meta: {
-      header: null,
       requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    // The same bargain as `/verify`, only more so: not being able to log in is the
+    // entire premise of both of these.
+    path: "/forgot-password",
+    name: "forgot-password",
+    component: ForgotPasswordView,
+    meta: {
+      requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    // This path is also built into the mailed link by notification-service
+    // (`reset_url`). The two spellings have to match exactly or every reset email
+    // in the wild lands on a 404.
+    path: "/reset-password",
+    name: "reset-password",
+    component: ResetPasswordView,
+    meta: {
+      requiresAuth: false,
+    } satisfies RouteMeta,
+  },
+  {
+    // Picking dates and slots on someone else's spot, then holding them. A route rather
+    // than a sheet over the map because it is a screen's worth of work with its own
+    // back-stack entry — and because it hands off to `/checkout`, so the two halves of
+    // booking are now both real URLs.
+    //
+    // Not under `/spot/:id/`: those are the host's own screens for a spot they own, and
+    // this is the renter's side.
+    path: "/book/:id",
+    name: "book",
+    component: BookSpotView,
+    props: true,
+    meta: {
+      requiresAuth: true,
     } satisfies RouteMeta,
   },
   {
@@ -151,7 +238,6 @@ const routes = [
     name: "checkout",
     component: CheckoutView,
     meta: {
-      header: null,
       requiresAuth: true,
     } satisfies RouteMeta,
   },
@@ -160,8 +246,8 @@ const routes = [
     name: "search",
     component: SearchView,
     meta: {
-      header: null,
       requiresAuth: true,
+      tab: true,
     } satisfies RouteMeta,
   },
 ];
@@ -171,10 +257,23 @@ export const router = createRouter({
   routes,
 });
 
+// After, not before: this has to see the history counter the navigation just wrote, and a
+// guard that redirects must not leave a direction behind for a navigation that never
+// happened. It runs before Vue flushes the new route, so the page renders knowing it.
+router.afterEach(trackNavDirection);
+
 router.beforeEach(async (to) => {
   const auth = useAuthStore();
 
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
     return { name: "login" };
+  }
+
+  // The mirror image: every public route is a way *into* a session — login,
+  // signup, and the three emailed-link screens — so with one already open there
+  // is nothing to do on them. Safe on a cold load from an email link, because
+  // `bootstrap` awaits the session refresh before installing the router.
+  if (!to.meta.requiresAuth && auth.isAuthenticated) {
+    return { name: "home" };
   }
 });

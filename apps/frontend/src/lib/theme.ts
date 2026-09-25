@@ -1,7 +1,7 @@
 /**
  * The app's own design tokens, in a form Stripe's SDKs accept.
  *
- * Both of Stripe's embedded surfaces — the Payment Element in `CheckoutComponent` and
+ * Both of Stripe's embedded surfaces — the Payment Element in `CheckoutView` and
  * Connect's components in the withdraw screen — are themed from the same CSS variables
  * the rest of the app uses, so they don't read as third-party panels dropped into the
  * page. Neither accepts the format those variables are actually in.
@@ -44,7 +44,7 @@ export function token(name: string): string {
  * Needed because **Connect's appearance API accepts pixel values only** and rejects
  * everything else with a console error, while our tokens are in `rem`: `--radius` is
  * `0.75rem`. (The Payment Element is more forgiving and takes the token as it stands,
- * which is why `CheckoutComponent` passes it through unconverted.)
+ * which is why `CheckoutView` passes it through unconverted.)
  *
  * `max` clamps, because Connect also caps some of these — `borderRadius` at 24px — and
  * a token that grows past the cap would be refused rather than reduced.

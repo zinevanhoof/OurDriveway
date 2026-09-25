@@ -9,9 +9,6 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --spacing-safe-top: env(safe-area-inset-top, 0px);
-  --spacing-safe-bottom: env(safe-area-inset-bottom, 0px);
-
   --font-sans: "Inter Variable", sans-serif;
   --font-heading: var(--font-sans);
   --color-sidebar-ring: var(--sidebar-ring);
@@ -55,9 +52,6 @@
 }
 
 :root {
-  --safe-top: env(safe-area-inset-top);
-  --safe-bottom: env(safe-area-inset-bottom);
-
   --background: oklch(0.976 0.005 265);
   --foreground: oklch(0.21 0.03 265);
   --card: oklch(1 0 0);
@@ -148,7 +142,96 @@
   }
 }
 
+/* Skeletons. `:data-loading="…"` on any element — a base component or plain HTML —
+   turns it and everything inside it into a skeleton of the real template, rendered
+   over placeholder data from `lib/placeholders.ts`. No second copy of a layout anywhere.
+
+   **`="true"`, never bare `[data-loading]`.** Vue removes an attribute only for
+   null/undefined: `:data-loading="false"` renders `data-loading="false"`, which a
+   presence selector matches — every screen stuck as a skeleton forever.
+
+   Deliberately outside every `@layer`: unlayered rules beat all layered ones, so a
+   child's own `text-foreground` or a badge's `bg-emerald-100` utility cannot show
+   through the mask. */
+:root {
+  /* Translucent rather than `--muted`: a solid near-white reads as grey on a white card
+     but as white on the primary balance card. A tint of the muted text colour reads as
+     muted on whatever it sits on. */
+  --skeleton: color-mix(in oklab, var(--muted-foreground) 22%, transparent);
+}
+[data-loading="true"] {
+  pointer-events: none;
+  user-select: none;
+}
+/* The bars: every text-bearing base component becomes a pulsing block its own size.
+   Only these lose their text. Plain labels in a masked row ("Directions", "Cancel")
+   are the same whatever loads, so they stay readable; put `data-loading` on the values
+   rather than on a card that also holds fixed labels. */
+:is([data-loading="true"], [data-loading="true"] *):is(
+    [data-slot="text"],
+    [data-slot="title"],
+    [data-slot="money"],
+    [data-slot="badge"]
+  ) {
+  @apply animate-pulse;
+  background-color: var(--skeleton);
+  color: transparent !important;
+  width: fit-content;
+  max-width: 100%;
+  /* Paint the glyph height, not the line box. The background would otherwise fill the
+     leading too, and two lines stacked with no gap between them touch as one block.
+     `clip-path` never affects layout, so the skeleton keeps the real text's height.
+     The rounding lives here rather than in `rounded-md`, which the clip would cut off.
+     ponytail: a Text that wraps becomes one tall bar; a repeating gradient per `1lh`
+     gives one bar per line if that ever looks wrong. */
+  clip-path: inset(calc((1lh - 1em) / 2) 0 round calc(var(--radius) - 2px));
+}
+/* A bar inside a bar — Money's suffix, a span in a Text — stays one bar, and a child
+   with its own colour class cannot show through it. */
+:is([data-loading="true"], [data-loading="true"] *):is(
+    [data-slot="text"],
+    [data-slot="title"],
+    [data-slot="money"],
+    [data-slot="badge"]
+  )
+  * {
+  color: transparent !important;
+  background: none;
+  animation: none;
+}
+/* Blocks: pictures and icon tiles keep their box and lose their content. Placeholder
+   images are a transparent pixel, so the muted background is what shows. */
+:is([data-loading="true"], [data-loading="true"] *):is(img, [data-slot="icon-box"], [data-slot="avatar"]) {
+  @apply animate-pulse;
+  background-color: var(--skeleton);
+}
+[data-loading="true"] :is(svg, [data-slot="avatar"] > *) {
+  visibility: hidden;
+}
+
+/* The infinite-scroll `<Sentinel>` takes up no space, whatever spacing its list uses.
+   `absolute` takes it out of flow, so a flex/grid `gap` does not count it; with no
+   top/bottom set it stays where it would have been, right after the last row. And
+   because `space-y-*` puts its margin on the element *before* the last child, that one
+   is zeroed here. Unlayered, so it beats the `space-y` utility. */
+[data-slot="sentinel"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin-top: -1px; /* inside the list's box, so it adds no scrollable overflow */
+}
+:has(+ [data-slot="sentinel"]) {
+  margin-block-end: 0;
+}
+
 @layer base {
+  /* Whatever holds a sentinel is its containing block. Without this an `absolute`
+     sentinel inside an `overflow-y-auto` list is placed against an ancestor *outside*
+     the scroller, and stops moving when the list scrolls — infinite scroll dead. In
+     `base` so a position utility on that element still wins. */
+  :has(> [data-slot="sentinel"]) {
+    position: relative;
+  }
   * {
     @apply border-border outline-ring/50;
   }

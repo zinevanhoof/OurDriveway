@@ -35,8 +35,9 @@ fn main() -> std::process::ExitCode {
             tracing::info!("all database migrations completed successfully");
             std::process::ExitCode::SUCCESS
         }
-        // One line, naming the database and the migration. Nothing after the failure is
-        // attempted and nothing already applied is rolled back — see `run_all`.
+        // The first failure in database order, naming the database and the migration —
+        // `run_all` has already logged every one. The other databases ran to completion,
+        // and nothing already applied is rolled back; see `run_all`.
         Err(e) => {
             tracing::error!(error = %e, "migration failed");
             std::process::ExitCode::FAILURE

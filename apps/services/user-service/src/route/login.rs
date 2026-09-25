@@ -24,5 +24,9 @@ pub async fn login(
     // 200 with the version in a header, not 202: the session exists and the token is
     // usable now. The header is what makes the *next* request wait for the SESSIONS
     // projection, which is why login carries one at all.
-    Ok((jar, [(X_VERSION, version)], Json(LoginResponse { access_token: jwt })))
+    Ok((
+        jar,
+        [(X_VERSION, version)],
+        Json(LoginResponse { access_token: jwt }),
+    ))
 }

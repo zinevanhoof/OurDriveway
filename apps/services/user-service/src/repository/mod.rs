@@ -26,8 +26,8 @@ pub mod user_repository;
 
 /// Round-trips both tables through a real YugabyteDB.
 ///
-/// `#[ignore]`d — needs the dev cluster on :5433 with `migrations/user` applied, and
-/// CI runs `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, so plain `cargo test --workspace` stays
+/// offline. CI brings the cluster up and runs these as a second step:
 ///
 /// ```sh
 /// docker compose -f docker/docker-compose-dev.yml up -d yugabyte
@@ -236,6 +236,93 @@ mod live_tests {
             .execute(&mut *conn(&pool).await)
             .await
             .unwrap();
+    }
+
+    /// A password reset ends every session on that account, and only that account.
+    ///
+    /// Scoped to one user is the property worth a live test — the statement has no
+    /// `id` in it, so a filter dropped in review would log out the whole system and
+    /// nothing in the type system would notice. The second call returning 0 pins the
+    /// `revoked = false` filter, which is what keeps a re-run from rewriting reasons
+    /// already recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn revoking_every_session_leaves_other_users_alone() {
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+
+        let sessions_for = async |db: &mut diesel_async::AsyncPgConnection| {
+            let user_id = Uuid::now_v7();
+            UserRepository::upsert(
+                db,
+                a_user(user_id, &format!("reset-{user_id}@example.test")),
+            )
+            .await
+            .unwrap();
+
+            let mut hashes = Vec::new();
+            for _ in 0..2 {
+                let token_id = Uuid::now_v7();
+                let token_hash = format!("hash-{token_id}");
+                RefreshTokenRepository::upsert(
+                    db,
+                    RefreshToken {
+                        id: token_id,
+                        user_id,
+                        token_hash: token_hash.clone(),
+                        jti: Uuid::now_v7(),
+                        created_at: Utc::now(),
+                        expires_at: Utc::now() + TimeDelta::days(30),
+                        revoked: false,
+                        revoked_reason: None,
+                    },
+                )
+                .await
+                .unwrap();
+                hashes.push(token_hash);
+            }
+            (user_id, hashes)
+        };
+
+        let (resetter, theirs) = sessions_for(db).await;
+        let (bystander, untouched) = sessions_for(db).await;
+
+        let ended = RefreshTokenRepository::revoke_all_for_user(db, resetter, "password reset")
+            .await
+            .unwrap();
+        assert_eq!(ended, 2, "both of this user's live sessions");
+
+        for hash in &theirs {
+            let got = RefreshTokenRepository::find_by_token_hash(db, hash.clone())
+                .await
+                .unwrap()
+                .expect("still a row, just a dead one");
+            assert!(got.revoked);
+            assert_eq!(got.revoked_reason.as_deref(), Some("password reset"));
+        }
+
+        for hash in &untouched {
+            let got = RefreshTokenRepository::find_by_token_hash(db, hash.clone())
+                .await
+                .unwrap()
+                .expect("another user's session");
+            assert!(!got.revoked, "a reset must not reach another account");
+        }
+
+        assert_eq!(
+            RefreshTokenRepository::revoke_all_for_user(db, resetter, "second call")
+                .await
+                .unwrap(),
+            0,
+            "already-revoked rows are skipped, so the first reason stands"
+        );
+
+        for user_id in [resetter, bystander] {
+            diesel::delete(app_user::table.find(user_id))
+                .execute(&mut *conn(&pool).await)
+                .await
+                .unwrap();
+        }
     }
 
     /// What the schema now promises in place of the hand-written link.

@@ -33,7 +33,7 @@ pub struct ConnectService {
 /// Three states because there are three different screens: an explanation and a button,
 /// a "we are checking your details" notice, and the withdraw form itself.
 pub enum ConnectStatus {
-    /// No connected account, and no country on the profile to open one with.
+    /// No connected account, and no country on the user to open one with.
     ///
     /// Its own state rather than a failure at the moment the host presses the button:
     /// Accounts v2 fixes `identity.country` permanently at creation, so it has to be
@@ -69,7 +69,7 @@ impl ConnectService {
         let mut read = db::conn(&self.db).await?;
         let Some(account_id) = ConnectAccountRepository::find(&mut read, host_id).await? else {
             // Only asked when there is no account yet. Once one exists the country is
-            // Stripe's and cannot be changed, so the profile's copy stops mattering.
+            // Stripe's and cannot be changed, so the user row's copy stops mattering.
             let mut read = db::conn(&self.db).await?;
             let has_country = HostMirrorRepository::find(&mut read, host_id)
                 .await?

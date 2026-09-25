@@ -29,6 +29,7 @@ pub fn events(booking: &Booking) -> Vec<BookingEvent> {
         host_id: booking.host_id,
         renter_id: booking.renter_id,
         booked: booking.booked.clone(),
+        license_plate: booking.license_plate.clone(),
         amount_cents: booking.amount,
         // Cleared when a booking settles, so a settled one has none to recover.
         // Harmless: the settlement that follows clears it again, and until then it
@@ -66,6 +67,14 @@ pub fn events(booking: &Booking) -> Vec<BookingEvent> {
         other => tracing::warn!(%booking_id, status = other, "unknown booking status"),
     }
 
+    // After the confirmation it needs: consumers only store a rating on a confirmed row.
+    // A rating on any other row is a corrupt one and is not replayed.
+    if booking.status == status::CONFIRMED
+        && let Some(rating) = booking.rating
+    {
+        events.push(BookingEvent::Rated { booking_id, rating });
+    }
+
     events
 }
 
@@ -83,6 +92,7 @@ mod tests {
             host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: Default::default(),
+            license_plate: "1-ABC-123".into(),
             amount: 500,
             status: status.to_string(),
             hold_until: None,
@@ -152,6 +162,30 @@ mod tests {
         ));
         // A hold is already in the state `Created` lands in.
         assert_eq!(events(&booking(status::RESERVED, None, None)).len(), 1);
+    }
+
+    /// A rating rides after the confirmation it needs, and only on a confirmed booking:
+    /// one left on a cancelled row is not replayed.
+    #[test]
+    fn a_rating_is_replayed_after_the_confirmation() {
+        let mut rated = booking(status::CONFIRMED, None, None);
+        rated.rating = Some(4);
+        assert!(matches!(
+            events(&rated).as_slice(),
+            [
+                BookingEvent::Created(_),
+                BookingEvent::Confirmed { .. },
+                BookingEvent::Rated { rating: 4, .. }
+            ]
+        ));
+
+        let mut cancelled = booking(status::CANCELLED, None, Some("by_renter"));
+        cancelled.rating = Some(4);
+        assert!(
+            !events(&cancelled)
+                .iter()
+                .any(|e| matches!(e, BookingEvent::Rated { .. }))
+        );
     }
 
     /// A hold that has settled has no `hold_until` left to re-emit. It must still

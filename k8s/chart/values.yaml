@@ -64,6 +64,8 @@ services:
       # Validates that a host's submitted listing photos are on our origin — without
       # it a listing could point its photos at any host. See shared/src/media.rs.
       MEDIA_BASE: *mediaBase
+      # Only the e2e suite points this elsewhere, at its fake.
+      LOCATIONIQ_BASE_URL: https://api.locationiq.com
   view:
     env:
       # The read side of the same rule — see the anchor above. This one decides whether
@@ -74,6 +76,8 @@ services:
       # The write side: what a withdrawal actually pays out. Not secret and better off
       # visible in review; the Stripe keys come from secrets.env instead.
       SETTLEMENT_SECS: *settlementSecs
+      # Only the e2e suite points this elsewhere, at its fake.
+      STRIPE_API_BASE: https://api.stripe.com
   # The one service that talks to neither a database nor the broker: it mints
   # presigned R2 upload URLs and holds nothing at all. Both flags off strips the
   # SurrealDB env, the schema and both init containers — see
@@ -119,8 +123,13 @@ services:
       # 24h. Long enough to survive a night's sleep, short enough that a link left
       # in an old inbox goes stale.
       VERIFY_TOKEN_TTL_SECS: "86400"
+      # 1h, not 24: a reset link sets a credential on an account that already
+      # exists, and whoever asked for it is at their keyboard now. Single-use as
+      # well — user-service refuses it once the password is set.
+      RESET_TOKEN_TTL_SECS: "3600"
       # Resend template alias, not the UUID — it survives editing the template.
       TEMPLATE_EMAIL_VERIFICATION: email-verification
+      TEMPLATE_PASSWORD_RESET: password-reset
 
 replicas: 1
 

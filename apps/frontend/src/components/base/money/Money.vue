@@ -21,6 +21,9 @@ import { Text, Title } from "../text"
  * threading it through here before that machinery exists would just be a second place to
  * update when it does.
  *
+ * `whitespace-nowrap`: a browser may break a line after a `/`, so a squeezed `$3.00 /hr`
+ * wrapped to `$3.00 /` with `hr` alone underneath.
+ *
  * Known limit: `tone` colours the amount, not the suffix, which is always muted. No call
  * site puts a suffix on a filled surface today; the one that does first will want a
  * `suffixTone` rather than a `class`, since `class` reaches the amount now.
@@ -41,7 +44,7 @@ const props = withDefaults(defineProps<{
 })
 
 // U+2212 MINUS SIGN, not a hyphen: it aligns with the digits at these weights, which is
-// why WalletComponent's local helper used it.
+// why WalletView's local helper used it.
 const label = computed(() =>
   props.signed
     ? `${props.cents >= 0 ? "+" : "−"}${formatCents(Math.abs(props.cents))}`
@@ -76,7 +79,7 @@ const resolvedTone = computed<TitleVariants["tone"]>(() => {
     :size="size"
     :weight="weight"
     :tone="resolvedTone"
-    :class="cn('inline-flex items-baseline gap-0.5', props.class)"
+    :class="cn('inline-flex items-baseline gap-0.5 whitespace-nowrap', props.class)"
   >
     {{ label }}
     <Text v-if="suffix" as="span">{{ suffix }}</Text>

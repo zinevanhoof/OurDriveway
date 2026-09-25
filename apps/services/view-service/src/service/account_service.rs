@@ -1,13 +1,18 @@
 use chrono::Utc;
 use shared::{
     error::myerror::{ContextExt, MyResult},
-    responses::view::{AccountResponse, WalletResponse, WalletTransactionResponse},
+    responses::view::{
+        AccountResponse, NotificationResponse, WalletResponse, WalletTransactionResponse,
+    },
 };
 use uuid::Uuid;
 
 use crate::{
     policy,
-    repository::{user_repository::ViewUserRepository, wallet_repository::WalletRepository},
+    repository::{
+        notification_repository::NotificationRepository, user_repository::ViewUserRepository,
+        wallet_repository::WalletRepository,
+    },
     service::settled_before,
 };
 
@@ -25,19 +30,38 @@ pub struct AccountService {
 }
 
 impl AccountService {
-    /// The caller's own profile, `email` included.
+    /// The caller's own user record, `email` included.
     ///
-    /// `profile` is `None` while the caller's own `UserRegistered` is still in flight. The
+    /// `user` is `None` while the caller's own `UserRegistered` is still in flight. The
     /// id comes from the claim regardless, so this never has to 404.
     pub async fn account(&self, user_id: Uuid) -> MyResult<AccountResponse> {
         let mut conn = shared::db::conn(&self.db).await?;
 
-        let profile = ViewUserRepository::find_for_account(&mut conn, user_id).await?;
+        let user = ViewUserRepository::find_for_account(&mut conn, user_id).await?;
 
         Ok(AccountResponse {
             id: user_id,
-            profile: profile.map(Into::into),
+            user: user.map(Into::into),
         })
+    }
+
+    /// The caller's open notifications, newest first, each marked seen or not against
+    /// when they last opened the list.
+    pub async fn notifications(&self, user_id: Uuid) -> MyResult<Vec<NotificationResponse>> {
+        let mut conn = shared::db::conn(&self.db).await?;
+
+        let seen_at = NotificationRepository::seen_at(&mut conn, user_id).await?;
+        let open =
+            NotificationRepository::find_open_for_account(&mut conn, user_id, Utc::now()).await?;
+
+        Ok(open
+            .into_iter()
+            .map(|n| NotificationResponse {
+                seen: seen_at.is_some_and(|s| n.visible_from <= s),
+                at: n.visible_from,
+                payload: n.data,
+            })
+            .collect())
     }
 
     /// One month of everything that moved the caller's money, newest first.
@@ -64,11 +88,7 @@ impl AccountService {
     ///   different rules.
     /// - `pending` compares the booking's end against the settlement cutoff, which the
     ///   statement has no other use for.
-    pub async fn wallet(
-        &self,
-        user_id: Uuid,
-        month: Option<String>,
-    ) -> MyResult<WalletResponse> {
+    pub async fn wallet(&self, user_id: Uuid, month: Option<String>) -> MyResult<WalletResponse> {
         let now = Utc::now();
         let month = month.unwrap_or_else(|| policy::wallet::label(now));
 

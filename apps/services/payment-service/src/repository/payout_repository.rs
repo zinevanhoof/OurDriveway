@@ -1,6 +1,7 @@
 use diesel::dsl::sum;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::db::Changed;
 use shared::diesel_ext::to_bigint;
 use shared::domain_models::payment::payout::status;
 use shared::domain_models::payment::{Payout, PayoutPatch};
@@ -45,12 +46,20 @@ impl PayoutRepository {
     /// **The binds are positional.** Both patchable text columns are
     /// `Option<String>`, so a swapped pair compiles and writes a transfer id into
     /// `failure_reason`.
+    ///
+    /// **[`Changed::No`] when the guard matched nothing** — the payout already left
+    /// `requested`, so this outcome lost the race and must not mint a version or publish.
+    /// Two concurrent deliveries of the same payout are the live case: the cheap status
+    /// pre-check in `PayoutWorkerService` runs outside the transaction and catches only
+    /// the sequential one. A version committed with no event behind it is a permanent gap
+    /// to `bus::projector::decide`. [`Changed`] is `#[must_use]`, so dropping the answer
+    /// does not compile.
     pub async fn transition(
         conn: &mut AsyncPgConnection,
         payout_id: Uuid,
         from: &[&str],
         patch: PayoutPatch,
-    ) -> MyResult<()> {
+    ) -> MyResult<Changed> {
         diesel::update(
             payout::table.find(payout_id).filter(
                 payout::status.eq_any(from.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
@@ -58,8 +67,9 @@ impl PayoutRepository {
         )
         .set(&patch)
         .execute(conn)
-        .await?;
-        Ok(())
+        .await
+        .map(Changed::from_rows)
+        .map_err(Into::into)
     }
 
     /// Every payout, for `PaymentService::backfill`.

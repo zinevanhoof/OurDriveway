@@ -13,5 +13,13 @@
 //! nobody would notice — an off-by-one on a month boundary or a withdrawal counted as
 //! spending. Both are arithmetic, so both are testable with nothing running.
 
+//! `page` and `bookings` are the smallest: which window of a list, and — for a booking
+//! list — which tab and statuses. A few lines of arithmetic that decide which rows a
+//! caller sees, which is the same argument as the other two.
+
+pub mod bookings;
 pub mod geo;
+pub mod occupancy;
+pub mod page;
+pub mod rating;
 pub mod wallet;

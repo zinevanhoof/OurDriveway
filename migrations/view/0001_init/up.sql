@@ -109,6 +109,10 @@ CREATE TABLE booking (
     host_id       uuid        NOT NULL,
     renter_id      uuid        NOT NULL,
     booked         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    -- The car that will park. Read by both parties: the host has to recognise what
+    -- turns up on the driveway, the renter has to know what they said they would bring.
+    -- Never by a stranger — the public projection does not select it.
+    license_plate  text        NOT NULL,
     amount         bigint      NOT NULL,          -- EUR cents
     status         text        NOT NULL
                    CHECK (status IN ('reserved','confirmed','released','completed','cancelled')),
@@ -151,19 +155,5 @@ CREATE TABLE payout (
 -- The history list: a host's own withdrawals, newest first.
 CREATE INDEX payout_host ON payout (host_id, created_at);
 
--- ─── leader election ────────────────────────────────────────────────────────
-CREATE TABLE _lease (
-    name       text PRIMARY KEY,
-    holder     text        NOT NULL,
-    expires_at timestamptz NOT NULL
-);
-
--- ─── transactional outbox ───────────────────────────────────────────────────
-CREATE TABLE _outbox (
-    id         uuid PRIMARY KEY,
-    subject    text        NOT NULL,
-    payload    text        NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX _outbox_order ON _outbox (created_at ASC, id ASC);
+-- No `_outbox`, unlike the four write-side databases: view-service publishes nothing, so
+-- it runs no outbox relay.

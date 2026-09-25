@@ -1,7 +1,11 @@
 import type { Address, Availability } from "@/types/domain/spot";
-import type { HostBookingResponse } from "./HostBookingResponse";
 
-/** `GET /api/view/host/spots/{id}` — one spot as its host sees it. */
+/**
+ * `GET /api/view/host/spots` and `/host/spots/{id}` — a spot as its host sees it.
+ *
+ * No bookings: the rows are `/host/spots/{id}/bookings` and the taken slots
+ * `/host/spots/{id}/booked`.
+ */
 export type HostSpotResponse = {
   id: string;
   title: string;
@@ -9,10 +13,17 @@ export type HostSpotResponse = {
   /** EUR cents. */
   pricePerHour: number;
   images: string[];
-  /** The live switch. An inactive spot resolves here and nowhere else. */
+  /** The live switch. False is a paused listing, which looks identical otherwise. */
   active: boolean;
   address: Address;
   availability: Availability;
   timezone: string;
-  bookings: HostBookingResponse[];
+};
+
+/** `GET /api/view/host/spots?limit=&offset=` — one window of the host's own listings. */
+export type HostSpotsPageResponse = {
+  spots: HostSpotResponse[];
+  /** Null at the end of the list. */
+  nextOffset: number | null;
+  total: number;
 };

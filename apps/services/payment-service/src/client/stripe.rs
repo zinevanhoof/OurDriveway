@@ -13,7 +13,9 @@ use shared::error::myerror::{ContextExt, MyError, MyResult};
 // `StripeRequest` is imported for its `customize()` method, which is what carries an
 // idempotency key onto a request — it is a trait method, not an inherent one.
 use shared::{general_models::booking::Booked, rpc::spot::SpotCard};
-use stripe::{Client, IdempotencyKey, RequestStrategy, StripeError, StripeRequest};
+use stripe::{
+    Client, ClientBuilder, IdempotencyKey, RequestStrategy, StripeError, StripeRequest,
+};
 use stripe_checkout::checkout_session::{
     CreateCheckoutSession, CreateCheckoutSessionLineItems, CreateCheckoutSessionLineItemsPriceData,
     CreateCheckoutSessionPaymentIntentData, ExpireCheckoutSession, ProductData,
@@ -76,10 +78,11 @@ const SESSION_GRACE_MINUTES: i64 = 30;
 /// assumes — change it and re-read `AccountState`.
 const V2_VERSION: &str = "2026-08-26.dahlia";
 
-const V2_ACCOUNTS: &str = "https://api.stripe.com/v2/core/accounts";
-
 pub struct Stripe {
     client: Client,
+    /// `{STRIPE_API_BASE}/v2/core/accounts`. Built once from the same base the v1
+    /// client uses, so the two can never point at different Stripes.
+    v2_accounts: String,
     /// For the v2 calls, which `async-stripe` does not cover: the crate is generated
     /// from the v1 OpenAPI spec and has no `/v2/core/accounts` in it at all.
     ///
@@ -241,9 +244,16 @@ pub enum Outcome {
 }
 
 impl Stripe {
-    pub fn new(secret_key: &str) -> Self {
+    /// Panics on a malformed `api_base`, like a missing variable does: it is read once
+    /// at boot, and a process that cannot reach Stripe should not pass its health check.
+    pub fn new(secret_key: &str, api_base: &str) -> Self {
+        let api_base = api_base.trim_end_matches('/');
         Self {
-            client: Client::new(secret_key),
+            client: ClientBuilder::new(secret_key)
+                .url(format!("{api_base}/"))
+                .build()
+                .expect("STRIPE_API_BASE must be a valid URL"),
+            v2_accounts: format!("{api_base}/v2/core/accounts"),
             http: reqwest::Client::new(),
             secret_key: secret_key.to_string(),
         }
@@ -486,7 +496,7 @@ impl Stripe {
         let account: V2Account = self
             .v2(
                 self.http
-                    .post(V2_ACCOUNTS)
+                    .post(&self.v2_accounts)
                     .header("Idempotency-Key", format!("connect:v4:{host_id}"))
                     .json(&body),
                 "create connected account",
@@ -545,7 +555,10 @@ impl Stripe {
         //
         //     Query parameters with the [] array syntax are unsupported. Please
         //     provide exact indexes, i.e. value[0], value[1], etc.
-        let url = format!("{V2_ACCOUNTS}/{account_id}?include[0]=configuration.recipient");
+        let url = format!(
+            "{}/{account_id}?include[0]=configuration.recipient",
+            self.v2_accounts
+        );
         let account: V2Account = self
             .v2(self.http.get(url), "retrieve connected account")
             .await?;

@@ -7,7 +7,7 @@ import type { TimeSlot } from "@/types/domain/spot";
 type DateLike = { toString(): string; toDate(timeZone: string): Date };
 
 // getDay() index (0 = Sunday) → availability weekday key. Same convention as
-// MapSearchFilterComponent, so a date without specific slots falls back to the
+// MapSearchFilter, so a date without specific slots falls back to the
 // spot's recurring weekly hours.
 const WEEKDAY_KEYS = [
   "sunday",

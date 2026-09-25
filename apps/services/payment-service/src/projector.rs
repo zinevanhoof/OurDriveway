@@ -34,6 +34,7 @@ impl Projector for BookingProjector {
     /// JetStream for both at once, and it refuses — "deliver policy can not be
     /// updated" — leaving whichever lost the race permanently stalled.
     const DURABLE: &'static str = "payment-booking-mirror";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = BookingEvent;
 
     async fn apply(
@@ -45,47 +46,63 @@ impl Projector for BookingProjector {
     ) -> MyResult<()> {
         let booking_id = event.booking_id();
 
+        // `let _ =` on the three transitions below, and it is deliberate rather than
+        // noise. `transition` reports whether its guard matched because the *write-side*
+        // callers must act on it — minting a version for a row that did not move strands
+        // that version with no event behind it. A projector mints nothing: it applies the
+        // version the envelope already carries, so a refused transition is the ordinary
+        // idempotency of a redelivery and there is nothing to decide.
         match event {
             // A whole-row write, not a merge: BookingCreated is always the first event
             // for a booking and BOOKINGS never expires, so this row is only ever
             // created complete — which is also why nothing on this table is `Option`
             // except the genuinely optional columns.
             BookingEvent::Created(e) => {
-                BookingMirrorRepository::upsert(&mut *conn, BookingMirror::created(e)).await
+                BookingMirrorRepository::upsert(&mut *conn, BookingMirror::created(e)).await?;
             }
 
             BookingEvent::Confirmed { booking_id } => {
-                BookingMirrorRepository::transition(
+                let _ = BookingMirrorRepository::transition(
                     &mut *conn,
                     booking_id,
                     &[booking_status::RESERVED],
                     BookingMirrorPatch::status(booking_status::CONFIRMED),
                 )
-                .await
+                .await?;
             }
 
             BookingEvent::Released { booking_id, reason } => {
-                BookingMirrorRepository::transition(
+                let _ = BookingMirrorRepository::transition(
                     &mut *conn,
                     booking_id,
                     &[booking_status::RESERVED],
                     BookingMirrorPatch::released(reason),
                 )
-                .await
+                .await?;
             }
 
             BookingEvent::Cancelled { booking_id, reason } => {
-                BookingMirrorRepository::transition(
+                let _ = BookingMirrorRepository::transition(
                     &mut *conn,
                     booking_id,
                     &[booking_status::CONFIRMED],
                     BookingMirrorPatch::cancelled(reason),
                 )
-                .await
+                .await?;
             }
-        }?;
 
-        shared::set_version!(conn, "booking", shared::schema::payment::booking, &booking_id, version)
+            // A rating moves no money. Only the version below is recorded, so a worker
+            // waiting on this booking's version is not left waiting on a skipped event.
+            BookingEvent::Rated { .. } => {}
+        }
+
+        shared::set_version!(
+            conn,
+            "booking",
+            shared::schema::payment::booking,
+            &booking_id,
+            version
+        )
     }
 }
 
@@ -96,13 +113,15 @@ impl Projector for BookingProjector {
 /// being here — a value onboarding cannot proceed without must not depend on another
 /// service answering a request. See `migrations/payment/0004_host_mirror/up.sql`.
 ///
-/// Only two of the five USERS variants matter. A password change, an email
-/// verification and a resend request change nothing Stripe is ever told.
+/// Only two of the six USERS variants matter. A password change, an email
+/// verification and the two "send them a link" requests change nothing Stripe is
+/// ever told.
 pub struct UserProjector;
 
 impl Projector for UserProjector {
     const STREAM: &'static str = STREAM_USERS;
     const DURABLE: &'static str = "payment-host-mirror";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = UserEvent;
 
     async fn apply(
@@ -120,15 +139,16 @@ impl Projector for UserProjector {
             }
 
             // `None` is unchanged in the event and unchanged in the write — the same
-            // rule the profile form sends. A country arrives only this way: it is not
+            // rule the edit form sends. A country arrives only this way: it is not
             // asked for at signup.
             UserEvent::Updated(e) => {
                 HostMirrorRepository::patch(&mut *conn, &user_id, e.email, e.country).await
             }
 
-            // Deliberately ignored, and each for its own reason: a password hash must
-            // never reach this database, `EmailVerified` gates login rather than
-            // payouts, and `VerificationRequested` is notification-service's alone.
+            // Deliberately ignored, and each for its own reason: a password change
+            // is nothing a payout account can act on, `EmailVerified` gates login
+            // rather than payouts, and the two `*Requested` variants are
+            // notification-service's alone.
             _ => Ok(()),
         }?;
 
@@ -142,7 +162,13 @@ impl Projector for UserProjector {
         // line and a client's `user:<id>@N` version spell — while `host` is where this
         // service happens to keep it. They differ here exactly as `user`/`app_user` do
         // everywhere else.
-        shared::set_version!(conn, "user", shared::schema::payment::host, &user_id, version)
+        shared::set_version!(
+            conn,
+            "user",
+            shared::schema::payment::host,
+            &user_id,
+            version
+        )
     }
 }
 

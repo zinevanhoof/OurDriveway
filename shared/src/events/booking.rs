@@ -47,6 +47,13 @@ pub enum BookingEvent {
         booking_id: Uuid,
         reason: CancelReason,
     },
+    /// The renter rated a booking that happened, 1 to 5.
+    ///
+    /// Only a confirmed booking can carry one, and every consumer guards on that the way
+    /// the transitions guard on status — a rating that lands on a row still `reserved`
+    /// matches nothing. Published by `BookingService::rate`, and replayed by the backfill
+    /// for rows that already have a rating.
+    Rated { booking_id: Uuid, rating: i32 },
 }
 
 /// Who withdrew a paid booking. The refund rules differ — a host who cancels owes
@@ -122,7 +129,8 @@ impl BookingEvent {
             Self::Created(e) => e.booking_id,
             Self::Confirmed { booking_id }
             | Self::Released { booking_id, .. }
-            | Self::Cancelled { booking_id, .. } => *booking_id,
+            | Self::Cancelled { booking_id, .. }
+            | Self::Rated { booking_id, .. } => *booking_id,
         }
     }
 }
@@ -145,6 +153,12 @@ pub struct BookingCreated {
     /// event assign it straight across. `Booked` is `#[serde(transparent)]`, so the JSON
     /// on the wire and in the log is unchanged by that.
     pub booked: Booked,
+    /// The car that will park, as the renter picked it on the booking form.
+    ///
+    /// Carried on the event rather than dereferenced from the renter when a reader
+    /// needs it: their plate list changes, and the car that took a slot on a given
+    /// day does not.
+    pub license_plate: String,
     /// EUR cents, computed server-side from the spot's price and the *authorised*
     /// minutes. The client's figure is display-only and never reaches this.
     pub amount_cents: i64,

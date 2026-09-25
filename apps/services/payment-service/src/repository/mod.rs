@@ -31,8 +31,8 @@ pub mod payout_repository;
 /// Round-trips each table through a real YugabyteDB, and proves a host cannot
 /// withdraw twice.
 ///
-/// `#[ignore]`d — needs the dev cluster on :5433, and CI runs
-/// `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, so plain `cargo test --workspace` stays
+/// offline. CI brings the cluster up and runs these as a second step:
 ///
 /// ```sh
 /// docker compose -f docker/docker-compose-dev.yml up -d yugabyte
@@ -49,6 +49,7 @@ mod live_tests {
     use diesel::prelude::*;
     use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, RunQueryDsl};
+    use shared::db::Changed;
     use shared::domain_models::booking::status as booking_status;
     use shared::domain_models::payment::payout::status as payout_status;
     use shared::domain_models::payment::{
@@ -172,14 +173,17 @@ mod live_tests {
 
         // `succeeded` sets status and intent together — the pairing the refund path
         // leans on, since it matches 'succeeded' and then needs the intent.
-        PaymentRepository::transition(
-            db,
-            id,
-            &status::UNPAID,
-            PaymentPatch::succeeded("pi_123".to_string()),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            PaymentRepository::transition(
+                db,
+                id,
+                &status::UNPAID,
+                PaymentPatch::succeeded("pi_123".to_string()),
+            )
+            .await
+            .unwrap(),
+            Changed::Yes
+        );
         let got = PaymentRepository::find_by_booking_id(db, booking_id)
             .await
             .unwrap()
@@ -191,14 +195,22 @@ mod live_tests {
 
         // Redelivery: no longer UNPAID, so the guard refuses. Money states only move
         // forwards, and this is what makes that true rather than hoped.
-        PaymentRepository::transition(
-            db,
-            id,
-            &status::UNPAID,
-            PaymentPatch::failed("card_declined".to_string()),
-        )
-        .await
-        .unwrap();
+        //
+        // The refusal must be *reported*, not merely performed: the caller mints a
+        // version before this and would otherwise commit it with no event behind it,
+        // which is the permanent gap `bus::projector::decide` parks on.
+        assert_eq!(
+            PaymentRepository::transition(
+                db,
+                id,
+                &status::UNPAID,
+                PaymentPatch::failed("card_declined".to_string()),
+            )
+            .await
+            .unwrap(),
+            Changed::No,
+            "a redelivered webhook must report that it changed nothing"
+        );
         let got = PaymentRepository::find_by_booking_id(db, booking_id)
             .await
             .unwrap()
@@ -241,7 +253,9 @@ mod live_tests {
         assert_eq!(got.booked, booked, "the jsonb column must round-trip");
         assert!(got.hold_until.is_some());
 
-        BookingMirrorRepository::transition(
+        // Dropped: the mirror is projector-side, so its answer has no caller that must
+        // act on it. See the note on `BookingMirrorRepository::transition`.
+        let _ = BookingMirrorRepository::transition(
             db,
             id,
             &[booking_status::RESERVED],
@@ -334,7 +348,6 @@ mod live_tests {
                 first_name: "Ada".to_string(),
                 last_name: "Lovelace".to_string(),
                 email: email.clone(),
-                password_hash: "$argon2id$vTEST".to_string(),
             }),
             1,
         )
@@ -347,7 +360,7 @@ mod live_tests {
         assert_eq!(host.email, email);
         assert_eq!(host.country, None, "signup never carries a country");
 
-        // The country arrives on a later profile edit and nothing else changes. This is
+        // The country arrives on a later user edit and nothing else changes. This is
         // the path a host actually takes before onboarding.
         apply(
             shared::events::user::UserEvent::Updated(UserUpdated {
@@ -386,7 +399,6 @@ mod live_tests {
                 first_name: "Ada".to_string(),
                 last_name: "Lovelace".to_string(),
                 email: email.clone(),
-                password_hash: "$argon2id$vTEST".to_string(),
             }),
             1,
         )
@@ -431,14 +443,17 @@ mod live_tests {
 
         // The refund mechanism, and there is no other one: a failed transfer stops
         // counting, and the balance goes back up because it is derived on every read.
-        PayoutRepository::transition(
-            db,
-            b,
-            &[payout_status::REQUESTED],
-            PayoutPatch::failed("balance_insufficient".to_string()),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            PayoutRepository::transition(
+                db,
+                b,
+                &[payout_status::REQUESTED],
+                PayoutPatch::failed("balance_insufficient".to_string()),
+            )
+            .await
+            .unwrap(),
+            Changed::Yes
+        );
         assert_eq!(
             PayoutRepository::total_for(db, &host_id).await.unwrap(),
             700,
@@ -446,14 +461,17 @@ mod live_tests {
         );
 
         // Paid still counts, and the transfer id is what a reconciliation would need.
-        PayoutRepository::transition(
-            db,
-            a,
-            &[payout_status::REQUESTED],
-            PayoutPatch::paid("tr_test".to_string()),
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            PayoutRepository::transition(
+                db,
+                a,
+                &[payout_status::REQUESTED],
+                PayoutPatch::paid("tr_test".to_string()),
+            )
+            .await
+            .unwrap(),
+            Changed::Yes
+        );
         let paid = PayoutRepository::find_by_id(db, a)
             .await
             .unwrap()
@@ -468,14 +486,22 @@ mod live_tests {
 
         // Redelivery: no longer `requested`, so the guard refuses and a second transfer
         // cannot overwrite the first's id.
-        PayoutRepository::transition(
-            db,
-            a,
-            &[payout_status::REQUESTED],
-            PayoutPatch::paid("tr_second".to_string()),
-        )
-        .await
-        .unwrap();
+        //
+        // This is the money path's version of the same contract: two concurrent payout
+        // deliveries both reach the transaction, and this refusal is how the loser learns
+        // it must publish nothing.
+        assert_eq!(
+            PayoutRepository::transition(
+                db,
+                a,
+                &[payout_status::REQUESTED],
+                PayoutPatch::paid("tr_second".to_string()),
+            )
+            .await
+            .unwrap(),
+            Changed::No,
+            "the losing payout delivery must report that it changed nothing"
+        );
         assert_eq!(
             PayoutRepository::find_by_id(db, a)
                 .await
@@ -517,7 +543,8 @@ mod live_tests {
         PaymentRepository::upsert(db, a_payment(payment_id, booking_id, host_id, cents))
             .await
             .unwrap();
-        PaymentRepository::transition(
+        // Seed helper: the row is freshly upserted, so this always applies.
+        let _ = PaymentRepository::transition(
             db,
             payment_id,
             &status::UNPAID,

@@ -29,7 +29,7 @@ bus::version_reader! {
     /// but no `payment`, echoing a payment's version returned immediately; it holds both,
     /// so a client that has just paid or just withdrawn waits for the projector rather
     /// than reading a wallet without the thing it did in it.
-    fn version_of;
+    fn version_of, version_of_at;
     "user" => shared::schema::view::app_user,
     "spot" => shared::schema::view::spot,
     "booking" => shared::schema::view::booking,
@@ -115,14 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // This process assumes its database exists and is current, and fails at connect
     // above if it does not.
 
-    // One pool for the whole process — four projectors × PARTITIONS lanes, the
-    // election, the relay, the handlers and the await layer all share it.
+    // One pool for the whole process — four projectors, the handlers and the await
+    // layer all share it.
     //
     // This used to be 4 × 16 connections plus three more, on the theory that an open
     // transaction blocks every other session on the socket. It did not, but a
     // `Surreal::clone` carried a replayed sign-in that `bus/examples/clone_cost`
-    // priced at +27.5ms per transaction. A pool has neither problem: a lane borrows a
-    // connection for one event's transaction and gives it straight back.
+    // priced at +27.5ms per transaction. A pool has neither problem: a projector
+    // borrows a connection for one event's transaction and gives it straight back.
     let await_db = db.clone();
 
     let js = bus::connect(&CONFIG.nats_url).await?;
@@ -132,15 +132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &[STREAM_USERS, STREAM_SPOTS, STREAM_BOOKINGS, STREAM_PAYMENTS],
     );
 
-    // For the outbox relay only. The projectors need no election: each partition is
-    // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
-    // event at a time *per partition* across every replica, in order — and different
-    // partitions are different aggregates, which have no order between them. The
-    // relay has no such backstop, so exactly one instance may run it.
-    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
-
-    // Four projectors, `PARTITIONS` lanes each, all on the one connection above.
-    // A transaction per event, on a session that lives only as long as it does.
+    // No leader election and no outbox relay: this service publishes nothing, and the
+    // projectors need no election — they share one durable consumer per stream, so each
+    // event is applied once by whichever replica picked it up, and `projector::decide`
+    // keeps one aggregate's events in version order without the transport doing it.
+    //
+    // Four projectors, all on the one pool above. A transaction per event.
     tokio::spawn(bus::projector::run(
         js.clone(),
         Arc::new(UserProjector),
@@ -166,11 +163,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         readiness.clone(),
     ));
 
-    // view-service publishes nothing today, so this relay has nothing to carry.
-    // Spawned anyway so every service has the same shape and a future event from
-    // the read model has somewhere to go.
-    tokio::spawn(bus::outbox::run(db.clone(), js, leader.clone()));
-
     // The GraphQL proxy is gone, and with it the security model it carried.
     //
     // `/api/view/graphql` reverse-proxied straight to SurrealDB with the client's own
@@ -184,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the rules and the two problems that came with the old arrangement (a denied field
     // nulling a whole GraphQL array, and VULN-001's indexed-equality oracle).
     //
-    // Ten endpoints in four namespaces, one predicate each — see `route/mod.rs`. The
+    // Four namespaces, one predicate each — see `route/mod.rs`. The
     // namespace is the authorization, so a route says who may read it in the same place
     // it says what it returns, and each namespace's reads are one service in `service/`.
     //
@@ -196,13 +188,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "/api/view/account",
             Router::new()
                 .route("/", get(route::account::account))
-                .route("/wallet", get(route::account::wallet)),
+                .route("/wallet", get(route::account::wallet))
+                .route("/notifications", get(route::account::notifications)),
         )
         .nest(
             "/api/view/host",
             Router::new()
                 .route("/spots", get(route::host::spots))
                 .route("/spots/{id}", get(route::host::spot))
+                .route("/spots/{id}/booked", get(route::host::booked))
+                .route("/spots/{id}/summary", get(route::host::spot_summary))
+                .route("/summary", get(route::host::summary))
+                .route("/spots/{id}/bookings", get(route::host::bookings))
                 .route("/balance", get(route::host::balance)),
         )
         .nest(
@@ -210,6 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Router::new()
                 // `/next` before `/{id}`: axum matches the literal segment first either
                 // way, but the ordering is what a reader checks.
+                .route("/spots/{id}", get(route::renter::spot))
                 .route("/bookings", get(route::renter::bookings))
                 .route("/bookings/next", get(route::renter::next))
                 .route("/bookings/{id}", get(route::renter::booking)),
@@ -218,7 +216,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "/api/view/public",
             Router::new()
                 .route("/spots/nearby", get(route::public::nearby))
-                .route("/spots/{id}", get(route::public::spot)),
+                .route("/spots/{id}", get(route::public::spot))
+                .route("/spots/{id}/bookings", get(route::public::spot_bookings))
+                .route("/spots/{id}/summary", get(route::public::spot_summary))
+                .route("/users/{id}/summary", get(route::public::user_summary)),
         )
         // Waits on the aggregate versions a client echoes back, against this
         // service's own database — see `bus::await_version`. Transport-level, so it is

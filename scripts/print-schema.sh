@@ -75,25 +75,29 @@ for db in user spot booking payment view; do
   mv "$tmp" "shared/src/schema/${db}.rs"
 done
 
-# ── bus's two tables, generated once ─────────────────────────────────────────
+# ── bus's table, generated once ──────────────────────────────────────────────
 #
-# `_lease` and `_outbox` are filtered out of the five service modules by diesel.toml and
-# generated here instead, so each table has exactly one declaration and it lives in the
-# crate that owns it. `--only-tables` REPLACES the config's `except_tables` rather than
-# combining with it, which is what lets one section serve both passes.
+# `_outbox` is filtered out of the five service modules by diesel.toml and generated here
+# instead, so the table has exactly one declaration and it lives in the crate that owns
+# it. `--only-tables` REPLACES the config's `except_tables` rather than combining with it,
+# which is what lets one section serve both passes.
 #
-# Every database has an identical copy of both, because every service runs its own outbox
-# relay and leader election — the tables are created five times over by
-# `migrations/<svc>/0001_init/up.sql`. So all five are read and compared: they must agree,
-# and if a migration ever drifts from its siblings this is the one place that notices.
-# That check is why this reads five databases to write one file.
-echo "print-schema: bus (_lease, _outbox)"
+# Every write-side database has an identical copy, because each of those services runs its
+# own outbox relay — the table is created four times over by
+# `migrations/<svc>/0001_init/up.sql`. `view` has none: it publishes nothing. So all four
+# are read and compared: they must agree, and if a migration ever drifts from its siblings
+# this is the one place that notices. That check is why this reads four databases to write
+# one file.
+#
+# `_lease` was generated here too, for the elected outbox relay. Ordering moved into the
+# data (`bus::projector::decide`), so every replica relays and the table is gone.
+echo "print-schema: bus (_outbox)"
 prev=""
-for db in user spot booking payment view; do
+for db in user spot booking payment; do
   tmp="$(mktemp)"
   diesel print-schema \
     --database-url "postgres://${USER_NAME}@${HOST}:${PORT}/${db}" \
-    --only-tables _lease _outbox \
+    --only-tables _outbox \
     > "$tmp"
   if [[ -n "$prev" ]] && ! diff -q "$prev" "$tmp" >/dev/null; then
     echo "bus tables differ between databases — a migration has drifted:" >&2

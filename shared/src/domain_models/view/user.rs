@@ -6,14 +6,14 @@ use crate::events::user::{UserRegistered, UserUpdated};
 /// The `app_user` table in the read model.
 ///
 /// Note what is **absent: no password hash, ever.** Every row here is readable by
-/// anyone — spot-host profiles have to resolve for everyone — so the projection is
+/// anyone — a spot's host has to resolve for everyone — so the projection is
 /// the first thing deciding what can possibly leak. `email` is the one sensitive
 /// field, and it is cut per-caller in the response type rather than filtered per-row.
 ///
 /// `email_verified` is absent for the same reason and is not an oversight: it is an
 /// authentication concern that stays in user-service's private projection. Adding it
 /// here would publish which addresses are unconfirmed to every client that can read
-/// a spot host's profile.
+/// a spot's host.
 #[derive(Clone, Debug, Queryable, Selectable, Insertable, AsChangeset)]
 #[diesel(table_name = crate::schema::view::app_user)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -41,10 +41,10 @@ pub struct ViewUser {
     /// Deliberately public: a host has to be able to recognise the car that turns up
     /// on their driveway, so this is not scoped the way `email` is.
     pub license_plates: Vec<String>,
-    /// ISO 3166-1 alpha-2, or `None` until the profile is filled in.
+    /// ISO 3166-1 alpha-2, or `None` until the user fills it in.
     ///
     /// Scoped like `email`, not like `license_plates`: it is cut per-caller in
-    /// [`crate::projections::user::HostViewUser`], so only the profile screen ever
+    /// [`crate::projections::user::HostViewUser`], so only the edit screen ever
     /// sees it. Where somebody banks is nobody else's business, and no screen but
     /// their own has a use for it.
     pub country: Option<String>,
@@ -85,7 +85,7 @@ impl ViewUser {
             profile_picture: None,
             email: e.email,
             license_plates: Vec::new(),
-            // Never carried by `Registered` — it is asked for on the profile screen,
+            // Never carried by `Registered` — it is asked for on the edit screen,
             // long after signup, and only by hosts.
             country: None,
         }

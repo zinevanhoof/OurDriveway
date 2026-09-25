@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::validation::require;
 
 /// An address the caller typed. One definition, four forms: signup, login, resend
-/// verification, and the profile edit.
+/// verification, and the user edit.
 #[derive(Clone, Debug, Deserialize, Validate)]
 #[serde(transparent)]
 #[garde(transparent)]
@@ -116,7 +116,7 @@ fn has_special(value: &str, _: &()) -> garde::Result {
 /// length: it is stored and sent **uppercase**, so two spellings of Belgium cannot
 /// end up in two rows. `parse` is the only way in, which is what makes that true.
 ///
-/// The country is only ever asked for on the profile screen, and only because
+/// The country is only ever asked for on the edit screen, and only because
 /// Stripe demands it before a connected account can receive money — it is fixed at
 /// account creation and cannot be changed afterwards, so a wrong one costs a host
 /// their payouts. Hence a value type, and not a free-text field.
@@ -153,7 +153,9 @@ pub(super) fn name_length(value: &String, _: &()) -> garde::Result {
     )
 }
 
-pub(super) fn plate_length(value: &String, _: &()) -> garde::Result {
+/// `pub(crate)`, unlike its neighbour: the booking form carries a plate too, and
+/// `requests::booking` validates it with this exact rule.
+pub(crate) fn plate_length(value: &String, _: &()) -> garde::Result {
     require(
         (1..=16).contains(&value.chars().count()),
         "Must be between 1 and 16 characters",

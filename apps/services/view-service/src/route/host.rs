@@ -10,34 +10,44 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 use shared::{
     error::myerror::MyResult,
     extractors::authed_jwt::AuthedJwt,
-    responses::view::{BalanceResponse, HostSpotListItemResponse, HostSpotResponse},
+    general_models::booking::Booked,
+    responses::view::{
+        BalanceResponse, HostBookingsPageResponse, HostSpotResponse, HostSpotSummaryResponse,
+        HostSpotsPageResponse, HostSummaryResponse,
+    },
 };
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{
+    AppState,
+    route::{BookingsQuery, PageQuery},
+};
 
-/// `GET /api/view/host/spots` — the caller's own listings, newest first.
+/// `GET /api/view/host/spots?limit=&offset=` — one window of the caller's own listings,
+/// newest first.
 ///
 /// Includes their inactive spots, which is what the live switch is for, and excludes their
 /// deleted ones.
 pub async fn spots(
     AuthedJwt { user_id, .. }: AuthedJwt,
     State(state): State<AppState>,
-) -> MyResult<Json<Vec<HostSpotListItemResponse>>> {
-    Ok(Json(state.host_service.spots(user_id).await?))
+    Query(q): Query<PageQuery>,
+) -> MyResult<Json<HostSpotsPageResponse>> {
+    Ok(Json(
+        state.host_service.spots(user_id, q.limit, q.offset).await?,
+    ))
 }
 
 /// `GET /api/view/host/spots/{id}` — one spot as its host sees it.
 ///
 /// Serves both the manage screen and the edit form. They differ in which fields they
-/// render, not in which they may read, so they are one route: the edit form needs the
-/// bookings to stop a host removing a slot someone has taken, and the manage screen needs
-/// the same rows with their renters attached.
+/// render, not in which they may read, so they are one route. No bookings: the rows are
+/// [`bookings`] and the taken slots [`booked`].
 ///
 /// A non-host gets 404, not 403 — a 403 would confirm the existence of a listing the
 /// caller is not allowed to see.
@@ -47,6 +57,64 @@ pub async fn spot(
     Path(spot_id): Path<Uuid>,
 ) -> MyResult<Json<HostSpotResponse>> {
     Ok(Json(state.host_service.spot(spot_id, user_id).await?))
+}
+
+/// `GET /api/view/host/summary` — the caller's totals as a host: spots, completed
+/// bookings, earned. The profile page's row.
+pub async fn summary(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+) -> MyResult<Json<HostSummaryResponse>> {
+    Ok(Json(state.host_service.summary(user_id).await?))
+}
+
+/// `GET /api/view/host/spots/{id}/summary` — how one of the caller's spots is doing:
+/// completed bookings, earned, rating. The manage screen's tiles.
+///
+/// Same 404-not-403 as [`spot`], from the same statement.
+pub async fn spot_summary(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+) -> MyResult<Json<HostSpotSummaryResponse>> {
+    Ok(Json(state.host_service.spot_summary(spot_id, user_id).await?))
+}
+
+/// `GET /api/view/host/spots/{id}/booked` — every slot still held on one spot, merged.
+///
+/// The edit form's warning before a host removes hours someone has taken. One map rather
+/// than the booking rows: it is one question, and it has to see every future slot at once,
+/// which the paged [`bookings`] would make it walk for.
+pub async fn booked(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+) -> MyResult<Json<Booked>> {
+    Ok(Json(state.host_service.booked(spot_id, user_id).await?))
+}
+
+/// `GET /api/view/host/spots/{id}/bookings?scope=&status=&limit=&offset=` — one window
+/// of one spot's bookings.
+///
+/// Both the manage screen's preview (`status=confirmed&limit=2`) and the paged screen
+/// behind it. It is a separate route from [`spot`] rather than a parameter on it because
+/// it is a separate read with a separate cache lifetime: a spot is edited rarely and its
+/// bookings change under it constantly.
+///
+/// Same 404-not-403 as [`spot`], and from the same statement — the ownership check is
+/// the first thing `spot_bookings` does.
+pub async fn bookings(
+    AuthedJwt { user_id, .. }: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+    Query(q): Query<BookingsQuery>,
+) -> MyResult<Json<HostBookingsPageResponse>> {
+    Ok(Json(
+        state
+            .host_service
+            .spot_bookings(spot_id, user_id, q.scope, q.status, q.limit, q.offset)
+            .await?,
+    ))
 }
 
 /// `GET /api/view/host/balance` — what the caller has earned, withdrawn and is waiting on.

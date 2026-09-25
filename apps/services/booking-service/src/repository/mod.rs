@@ -24,8 +24,8 @@ pub mod spot_mirror_repository;
 /// Round-trips both tables through a real YugabyteDB, and proves the reserve path
 /// cannot double-book.
 ///
-/// `#[ignore]`d — needs the dev cluster on :5433, and CI runs
-/// `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, so plain `cargo test --workspace` stays
+/// offline. CI brings the cluster up and runs these as a second step:
 ///
 /// ```sh
 /// docker compose -f docker/docker-compose-dev.yml up -d yugabyte
@@ -46,6 +46,7 @@ mod live_tests {
     use diesel::prelude::*;
     use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, RunQueryDsl};
+    use shared::db::Changed;
     use shared::domain_models::booking::{Booking, SpotMirrorPatch, status};
     use shared::general_models::booking::Booked;
     use shared::general_models::spot::{Availability, TimeSlot, WeeklyAvailability};
@@ -125,6 +126,7 @@ mod live_tests {
             host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: slots(),
+            license_plate: "1-ABC-123".into(),
             amount: 500,
             status: status::RESERVED.to_string(),
             hold_until: Some(Utc::now() + TimeDelta::minutes(10)),
@@ -134,6 +136,54 @@ mod live_tests {
             rating: None,
             created_at: Utc::now(),
         }
+    }
+
+    /// A rating lands once, and only on a confirmed booking: a hold cannot be rated and
+    /// a second submit cannot overwrite the first.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_rating_lands_once_and_only_on_a_confirmed_booking() {
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+        let id = Uuid::now_v7();
+        BookingRepository::upsert(db, a_booking(id, Uuid::now_v7(), Utc::now()))
+            .await
+            .unwrap();
+
+        assert!(
+            !BookingRepository::rate(db, id, 4).await.unwrap(),
+            "still a hold"
+        );
+
+        assert_eq!(
+            BookingRepository::transition(
+                db,
+                id,
+                status::CONFIRMED,
+                &[status::RESERVED],
+                None,
+                None
+            )
+            .await
+            .unwrap(),
+            Changed::Yes
+        );
+        assert!(BookingRepository::rate(db, id, 4).await.unwrap());
+        assert!(
+            !BookingRepository::rate(db, id, 1).await.unwrap(),
+            "already rated"
+        );
+
+        let got = BookingRepository::find_by_id(db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.rating, Some(4));
+
+        diesel::delete(booking::table.find(id))
+            .execute(db)
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -160,9 +210,20 @@ mod live_tests {
         assert_eq!(got.rating, None);
         assert!(got.hold_until.is_some());
 
-        BookingRepository::transition(db, id, status::CONFIRMED, &[status::RESERVED], None, None)
+        assert_eq!(
+            BookingRepository::transition(
+                db,
+                id,
+                status::CONFIRMED,
+                &[status::RESERVED],
+                None,
+                None
+            )
             .await
-            .unwrap();
+            .unwrap(),
+            Changed::Yes,
+            "a transition whose guard matches must report it"
+        );
 
         let got = BookingRepository::find_by_id(db, id)
             .await
@@ -179,7 +240,12 @@ mod live_tests {
         // Redelivery: already out of `reserved`, so the guard refuses and the row is
         // untouched — this is what stops a lapsed-hold event undoing a confirmation
         // that raced it. Matching nothing is a no-op, not an error.
-        BookingRepository::transition(
+        //
+        // And it must SAY so. The caller has to know, because a refused transition that
+        // still mints a version leaves that version committed with no event behind it —
+        // the permanent gap `bus::projector::decide` parks on. This assertion is the
+        // whole contract; everything above only checks the row did not move.
+        let refused = BookingRepository::transition(
             db,
             id,
             status::RELEASED,
@@ -189,6 +255,12 @@ mod live_tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            refused,
+            Changed::No,
+            "a refused transition must report it, not just decline to write"
+        );
+
         let got = BookingRepository::find_by_id(db, id)
             .await
             .unwrap()
@@ -203,9 +275,19 @@ mod live_tests {
         assert_eq!(taken, slots(), "a confirmed booking blocks its slots");
 
         // Released and cancelled free the slots again.
-        BookingRepository::transition(db, id, status::CANCELLED, &[status::CONFIRMED], None, None)
+        assert_eq!(
+            BookingRepository::transition(
+                db,
+                id,
+                status::CANCELLED,
+                &[status::CONFIRMED],
+                None,
+                None
+            )
             .await
-            .unwrap();
+            .unwrap(),
+            Changed::Yes
+        );
         let taken = BookingRepository::taken_for_spot(db, &spot_id, Utc::now())
             .await
             .unwrap();

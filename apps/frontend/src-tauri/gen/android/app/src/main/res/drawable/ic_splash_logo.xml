@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The splash screen's icon: the adaptive icon's foreground layer, as a vector.
+
+  Not `@mipmap/ic_launcher_foreground`, which is what this replaced. That is a 108dp
+  bitmap — 432px at xxxhdpi — and the splash draws its icon on a 240dp canvas, so it
+  arrived upscaled by more than two and looked soft next to the launcher icon, where
+  the same asset is scaled *down* to ~48dp.
+
+  A straight transcription of ourdriveway-logo/svg/android-adaptive-foreground.svg:
+  same 120-unit viewport, same 0.78 scale about the centre, so the composition is
+  identical to the bitmap it replaces and only the sampling changes. The SVG's three
+  `<rect rx>` car shapes are written out as arcs, which is the only notation
+  VectorDrawable lacks.
+
+  The outer group exists for the clip alone, and the scale lives on the inner one: a
+  `clip-path` is expressed in its own group's coordinates, so sharing a group with the
+  scale would shrink the clip along with the artwork. The driveway deliberately runs
+  past the bottom of the viewport, which is what the clip is for.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="240dp"
+    android:height="240dp"
+    android:viewportWidth="120"
+    android:viewportHeight="120">
+    <group>
+        <clip-path android:pathData="M0,0 H120 V120 H0 Z" />
+        <group
+            android:pivotX="60"
+            android:pivotY="60"
+            android:scaleX="0.78"
+            android:scaleY="0.78">
+            <!-- Roof -->
+            <path
+                android:pathData="M32,54 L60,30 L88,54"
+                android:strokeColor="#ffffff"
+                android:strokeWidth="10"
+                android:strokeLineCap="round"
+                android:strokeLineJoin="round" />
+            <!-- Driveway -->
+            <path
+                android:pathData="M52,62 L68,62 Q71,62 72,65 L120,190 L0,190 L48,65 Q49,62 52,62 Z"
+                android:fillColor="#ffffff" />
+            <!-- Car body: rect x=52.40 y=79.65 w=15.20 h=24.70 rx=5.70 -->
+            <path
+                android:pathData="M58.10,79.65 H61.90 A5.70,5.70 0 0 1 67.60,85.35 V98.65 A5.70,5.70 0 0 1 61.90,104.35 H58.10 A5.70,5.70 0 0 1 52.40,98.65 V85.35 A5.70,5.70 0 0 1 58.10,79.65 Z"
+                android:fillColor="#3d47d9" />
+            <!-- Windscreen: rect x=54.77 y=84.40 w=10.45 h=5.70 rx=1.90 -->
+            <path
+                android:pathData="M56.67,84.40 H63.32 A1.90,1.90 0 0 1 65.22,86.30 V88.20 A1.90,1.90 0 0 1 63.32,90.10 H56.67 A1.90,1.90 0 0 1 54.77,88.20 V86.30 A1.90,1.90 0 0 1 56.67,84.40 Z"
+                android:fillColor="#e5ebf9" />
+            <!-- Rear window: rect x=54.77 y=96.75 w=10.45 h=3.80 rx=1.42 -->
+            <path
+                android:pathData="M56.19,96.75 H63.80 A1.42,1.42 0 0 1 65.22,98.17 V99.13 A1.42,1.42 0 0 1 63.80,100.55 H56.19 A1.42,1.42 0 0 1 54.77,99.13 V98.17 A1.42,1.42 0 0 1 56.19,96.75 Z"
+                android:fillColor="#e5ebf9" />
+        </group>
+    </group>
+</vector>

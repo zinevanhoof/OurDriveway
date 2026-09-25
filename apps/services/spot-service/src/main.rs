@@ -23,7 +23,7 @@ bus::version_reader! {
     /// rows, and nothing else. Anything else a client echoes here — a booking it just
     /// made, say — is `Unavailable`, so the request proceeds instead of waiting two
     /// seconds for a table this database does not have.
-    fn version_of;
+    fn version_of, version_of_at;
     "spot" => shared::schema::spot::spot,
 }
 
@@ -51,6 +51,9 @@ pub struct Config {
     /// Verification only. This service mints no tokens; user-service does.
     pub jwt_secret: String,
     pub locationiq_api_key: String,
+    /// `https://api.locationiq.com` everywhere real. Configurable only so the e2e suite
+    /// can answer geocoding itself — see `e2e/src/fake.rs`.
+    pub locationiq_base_url: String,
     /// Where listing photos are served from, e.g. `https://images.ourdriveway.com`.
     ///
     /// Read only to VALIDATE: the images a host sends back must be URLs
@@ -66,6 +69,7 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     port: env::require_parsed("PORT"),
     jwt_secret: env::require("JWT_SECRET"),
     locationiq_api_key: env::require("LOCATIONIQ_API_KEY"),
+    locationiq_base_url: env::require("LOCATIONIQ_BASE_URL"),
     media_base: env::require("MEDIA_BASE"),
 });
 
@@ -111,15 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The projector is the only *writer* to `db`. The service reads a spot's host
     // before it publishes an edit — it still writes nothing, so the dual-write the
     // split avoids stays avoided.
-    //
-    // For the outbox relay, which is all this service runs off the bus — it has no
-    // projector and no worker, so there is nothing else here an election would gate.
-    // The relay has no backstop of its own, so exactly one instance may run it.
-    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
 
     // Carries every SPOTS event this service commits. This is now the only path by
     // which they reach NATS.
-    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone()));
 
     // Answers "what does spot 019fa… look like" for anyone who needs to *label* a spot
     // without becoming a consumer of SPOTS — payment-service, putting a title on a

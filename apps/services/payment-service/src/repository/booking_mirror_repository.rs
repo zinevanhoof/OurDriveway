@@ -1,5 +1,6 @@
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use shared::db::Changed;
 use shared::domain_models::payment::{BookingMirror, BookingMirrorPatch};
 use shared::error::myerror::MyResult;
 use shared::schema::payment::booking;
@@ -56,12 +57,18 @@ impl BookingMirrorRepository {
     /// The `SET` list deliberately omits `hold_until` from the patch, so the
     /// unconditional assignment is the only write to that column and the two cannot
     /// fight. The other three are every column [`BookingMirrorPatch`] carries.
+    ///
+    /// **[`Changed::No`] when the guard matched nothing**, reported for symmetry with the
+    /// three write-side `transition`s — but unlike them, every caller here may ignore it.
+    /// These are projector arms: they apply the version the envelope already carries
+    /// rather than minting one, so a refused transition is ordinary idempotency and there
+    /// is no version to strand. The callers drop it explicitly, with a comment saying so.
     pub async fn transition(
         conn: &mut AsyncPgConnection,
         booking_id: Uuid,
         from: &[&str],
         patch: BookingMirrorPatch,
-    ) -> MyResult<()> {
+    ) -> MyResult<Changed> {
         diesel::update(booking::table.find(booking_id).filter(
             booking::status.eq_any(from.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
         ))
@@ -78,7 +85,8 @@ impl BookingMirrorRepository {
             booking::hold_until.eq(None::<chrono::DateTime<chrono::Utc>>),
         ))
         .execute(conn)
-        .await?;
-        Ok(())
+        .await
+        .map(Changed::from_rows)
+        .map_err(Into::into)
     }
 }

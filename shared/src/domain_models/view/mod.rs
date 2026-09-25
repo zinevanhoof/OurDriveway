@@ -22,6 +22,7 @@
 //! same transaction — each model says which.
 
 pub mod booking;
+pub mod notification;
 pub mod payment;
 pub mod payout;
 pub mod spot;

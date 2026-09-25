@@ -63,7 +63,7 @@ pub struct User {
     /// Gates login. On the same row as the password hash deliberately — one
     /// lookup, and no way to check the credential without also holding the flag.
     pub email_verified: bool,
-    /// ISO 3166-1 alpha-2, uppercase. `None` until the profile is filled in, which
+    /// ISO 3166-1 alpha-2, uppercase. `None` until the user fills it in, which
     /// is most accounts: it is only needed to open a Stripe connected account, and
     /// only hosts ever do that.
     pub country: Option<String>,
@@ -79,14 +79,19 @@ impl User {
     ///
     /// The three columns the event does not carry are defaults of the model; they
     /// used to be literals in the projector's `CONTENT` block.
-    pub fn registered(e: UserRegistered, version: i64) -> Self {
+    ///
+    /// `password_hash` is a third argument rather than a field on the event, and
+    /// that is the whole reason the event no longer has one — see [`UserRegistered`].
+    /// Argon2 salts randomly, so it must still be hashed exactly once, on the write
+    /// side, before it reaches here.
+    pub fn registered(e: UserRegistered, version: i64, password_hash: String) -> Self {
         Self {
             id: e.user_id,
             version,
             first_name: e.first_name,
             last_name: e.last_name,
             email: e.email,
-            password: e.password_hash,
+            password: password_hash,
             profile_picture: None,
             license_plates: Vec::new(),
             email_verified: false,

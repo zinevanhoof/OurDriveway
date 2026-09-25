@@ -18,6 +18,11 @@ CREATE TABLE booking (
     -- is the folded, queryable half.
     booked         jsonb       NOT NULL DEFAULT '{}'::jsonb,
 
+    -- The car that will park, as the renter picked it at reserve time. Denormalized
+    -- rather than dereferenced: app_user.license_plates is a list that changes, and
+    -- the car that took a slot on a given day does not.
+    license_plate  text        NOT NULL,
+
     -- EUR cents. Matches spot.price_per_hour and view's booking.amount.
     amount         bigint      NOT NULL,
 
@@ -103,13 +108,6 @@ CREATE TABLE spot (
 --
 -- Measured on yugabytedb/yugabyte:2025.2.5.2-b5 before any of this was written:
 -- without the FOR UPDATE two racers both see zero bookings and both insert.
-
--- ─── leader election ────────────────────────────────────────────────────────
-CREATE TABLE _lease (
-    name       text PRIMARY KEY,
-    holder     text        NOT NULL,
-    expires_at timestamptz NOT NULL
-);
 
 -- ─── transactional outbox ───────────────────────────────────────────────────
 CREATE TABLE _outbox (

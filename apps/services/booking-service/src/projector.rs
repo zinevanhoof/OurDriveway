@@ -12,7 +12,6 @@ use shared::{
     },
     general_models::{booking::Booked, spot::Availability},
 };
-use uuid::Uuid;
 
 use crate::policy::availability;
 use crate::repository::{
@@ -36,6 +35,7 @@ pub struct SpotProjector;
 impl Projector for SpotProjector {
     const STREAM: &'static str = STREAM_SPOTS;
     const DURABLE: &'static str = "booking-spots";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = SpotEvent;
 
     async fn apply(
@@ -75,7 +75,13 @@ impl Projector for SpotProjector {
         // spot-service's version of this aggregate, as last applied here. The only
         // counter on this row now — `bookings_seq` used to sit beside it doing an
         // entirely different job.
-        shared::set_version!(conn, "spot", shared::schema::booking::spot, &spot_id, version)
+        shared::set_version!(
+            conn,
+            "spot",
+            shared::schema::booking::spot,
+            &spot_id,
+            version
+        )
     }
 }
 
@@ -129,7 +135,7 @@ impl SpotProjector {
             {
                 continue;
             }
-            Self::cancel(&mut *conn, &booking, at).await?;
+            Self::cancel(&mut *conn, &booking).await?;
         }
         Ok(())
     }
@@ -142,16 +148,15 @@ impl SpotProjector {
     /// now — so publishing alone left the authoritative booking `confirmed` while
     /// view-service and payment-service both showed it cancelled. Exactly the wrong
     /// way round.
-    async fn cancel(
-        conn: &mut AsyncPgConnection,
-        booking: &Booking,
-        at: DateTime<Utc>,
-    ) -> MyResult<()> {
+    /// No `at`: it existed only to key the deterministic event id on the SpotUpdated's
+    /// own timestamp, and that id is gone. The status guard below distinguishes a
+    /// redelivery from a later edit without needing a clock.
+    async fn cancel(conn: &mut AsyncPgConnection, booking: &Booking) -> MyResult<()> {
         let version = shared::next_version!(conn, shared::schema::booking::booking, &booking.id)?;
 
         // Scoped to `confirmed`, so a redelivered SpotUpdated is a no-op — the same
         // guard the projector arm used to carry.
-        BookingRepository::transition(
+        let cancelled = BookingRepository::transition(
             &mut *conn,
             booking.id,
             status::CANCELLED,
@@ -160,23 +165,38 @@ impl SpotProjector {
             Some(CancelReason::SpotUnavailable.as_str()),
         )
         .await?;
-        shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking.id, version)?;
+
+        // The no-op this guard exists for. It matters more here than elsewhere: `react`
+        // loops over every upcoming confirmed booking on the spot, so a redelivered
+        // SpotUpdated used to bump a version on *each* booking it had already cancelled,
+        // in one transaction — a gap per booking, each costing the full escape-hatch
+        // budget on every replay afterwards.
+        if !cancelled.applied() {
+            return Ok(());
+        }
+
+        shared::set_version!(
+            conn,
+            "booking",
+            shared::schema::booking::booking,
+            &booking.id,
+            version
+        )?;
 
         let event = BookingEvent::Cancelled {
             booking_id: booking.id,
             reason: CancelReason::SpotUnavailable,
         };
         // `actor_id: None` — the host acted on the spot, not on this booking.
-        let mut envelope =
-            Envelope::new(event, None, aggregate_id("booking", &booking.id), version);
-        // Deterministic, like the sweeper's: a redelivered SpotUpdated must
-        // not publish a second cancel for the same booking. Keyed on the event's own
-        // timestamp too, so a *later* edit that invalidates the same booking again
-        // is still its own event rather than being swallowed as a duplicate.
-        envelope.event_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_OID,
-            format!("spot-cancel:{}:{}", booking.id, at.timestamp_millis()).as_bytes(),
-        );
+        //
+        // A plain v7 event id. This used to be
+        // `v5("spot-cancel:{booking}:{at_millis}")`, so that a redelivered SpotUpdated
+        // could not publish a second cancel for the same booking — keyed on the event's
+        // own timestamp so a *later* edit invalidating the same booking was still its own
+        // event. The status guard above supersedes both halves: a redelivery finds the
+        // booking already `cancelled` and returns before reaching here, while a later
+        // edit finds it `confirmed` and proceeds.
+        let envelope = Envelope::new(event, None, aggregate_id("booking", &booking.id), version);
 
         tracing::info!(
             booking = %booking.id,
@@ -214,6 +234,7 @@ fn fits(availability: &Availability, booking: &Booking) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
     use shared::domain_models::booking::status;
     use shared::general_models::spot::{TimeSlot, WeeklyAvailability};
     use std::collections::HashMap;
@@ -233,6 +254,7 @@ mod tests {
             host_id: Uuid::now_v7(),
             renter_id: Uuid::now_v7(),
             booked: HashMap::from([(date.to_string(), slots)]).into(),
+            license_plate: "1-ABC-123".into(),
             amount: 500,
             status: status::CONFIRMED.into(),
             hold_until: None,

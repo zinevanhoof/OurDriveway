@@ -11,8 +11,8 @@ export { default as Surface } from "./Surface.vue";
  * evidence says there is no decision behind it:
  *
  *   radius  `rounded-md` is used 48 times against `rounded-lg` 14, and the 14 follow no
- *           rule — the same kind of panel is `rounded-md` in ManageSpotComponent and
- *           `rounded-lg` in CheckoutComponent.
+ *           rule — the same kind of panel is `rounded-md` in ManageSpotView and
+ *           `rounded-lg` in CheckoutView.
  *
  * **No default gap.** There was one — `gap-3`, on the grounds that it covered 8 of the
  * 10 rows with children side by side. Migrating the app disproved that: the rows did
@@ -51,7 +51,7 @@ export const surfaceVariants = cva("flex rounded-md", {
     // so there is no existing convention to stay compatible with. `text-left` is here
     // because the common case is `as="button"`, which would otherwise centre its text.
     interactive: {
-      true: "cursor-pointer text-left transition-colors active:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50",
+      true: "cursor-pointer text-left transition-colors active:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/15 disabled:pointer-events-none disabled:opacity-50",
       false: "",
     },
   },

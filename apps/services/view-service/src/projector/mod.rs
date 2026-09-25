@@ -9,6 +9,7 @@ use shared::{
         payment::payout::status as payout_status,
         view::{
             booking::{ViewBooking, ViewBookingPatch},
+            notification::kinds,
             payment::{ViewPayment, ViewPaymentPatch},
             payout::ViewPayout,
             spot::ViewSpotPatch,
@@ -23,7 +24,8 @@ use shared::{
 };
 
 use crate::repository::{
-    booking_repository::ViewBookingRepository, payment_repository::ViewPaymentRepository,
+    booking_repository::ViewBookingRepository,
+    notification_repository::NotificationRepository, payment_repository::ViewPaymentRepository,
     payout_repository::ViewPayoutRepository, spot_repository::ViewSpotRepository,
     user_repository::ViewUserRepository,
 };
@@ -41,13 +43,14 @@ pub struct UserProjector;
 impl Projector for UserProjector {
     const STREAM: &'static str = STREAM_USERS;
     const DURABLE: &'static str = "view-users";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = UserEvent;
 
     async fn apply(
         &self,
         conn: &mut AsyncPgConnection,
         event: UserEvent,
-        _at: DateTime<Utc>,
+        at: DateTime<Utc>,
         version: i64,
     ) -> MyResult<()> {
         let user_id = event.user_id();
@@ -65,21 +68,43 @@ impl Projector for UserProjector {
                 ViewUserRepository::patch(&mut *conn, user_id, ViewUserPatch::from(e)).await
             }
 
-            // Nothing to project — the hash never comes near this database.
+            // Nothing to project: the event is a bare marker, and there is no
+            // password anywhere near this database to update even if it weren't.
             UserEvent::PasswordChanged(_) => Ok(()),
 
             // Verification state is an authentication concern and stays in
             // user-service's private projection. This table is world-readable, so
             // `email_verified` here would publish which addresses are unconfirmed to
-            // every client that can read a spot host's profile.
-            UserEvent::EmailVerified { .. } | UserEvent::VerificationRequested(_) => Ok(()),
+            // every client that can read a spot's host.
+            //
+            // `PasswordResetRequested` is the same again, twice over: it is a
+            // message to notification-service, and it names an address that is
+            // about to receive a credential.
+            UserEvent::EmailVerified { .. }
+            | UserEvent::VerificationRequested(_)
+            | UserEvent::PasswordResetRequested(_) => Ok(()),
+
+            // The envelope's time is the watermark, so a replay lands on the same one.
+            UserEvent::NotificationsSeen { .. } => {
+                NotificationRepository::mark_seen(&mut *conn, user_id, at).await
+            }
+
+            UserEvent::NotificationDismissed {
+                kind, subject_id, ..
+            } => NotificationRepository::dismiss(&mut *conn, user_id, &kind, subject_id, at).await,
         }?;
 
         // After the match, so it runs for the arms that store nothing too. "Applied"
         // means *seen and decided about*, not *changed a column* — a version that
         // only advanced on writes would strand a client waiting on `user:<id>@2`
         // after an `EmailVerified` this table deliberately ignores.
-        shared::set_version!(conn, "user", shared::schema::view::app_user, &user_id, version)
+        shared::set_version!(
+            conn,
+            "user",
+            shared::schema::view::app_user,
+            &user_id,
+            version
+        )
     }
 }
 
@@ -88,6 +113,7 @@ pub struct SpotProjector;
 impl Projector for SpotProjector {
     const STREAM: &'static str = STREAM_SPOTS;
     const DURABLE: &'static str = "view-spots";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = SpotEvent;
 
     async fn apply(
@@ -134,6 +160,7 @@ pub struct BookingProjector;
 impl Projector for BookingProjector {
     const STREAM: &'static str = STREAM_BOOKINGS;
     const DURABLE: &'static str = "view-bookings";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = BookingEvent;
 
     async fn apply(
@@ -153,7 +180,13 @@ impl Projector for BookingProjector {
                 // no links for a second statement to restore.
                 ViewBookingRepository::upsert(&mut *conn, ViewBooking::created(e, at, version))
                     .await?;
-                shared::set_version!(conn, "booking", shared::schema::view::booking, &booking_id, version)
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
             }
 
             BookingEvent::Confirmed { booking_id } => {
@@ -164,7 +197,16 @@ impl Projector for BookingProjector {
                     ViewBookingPatch::confirmed(),
                 )
                 .await?;
-                shared::set_version!(conn, "booking", shared::schema::view::booking, &booking_id, version)
+                // The host's shows now. The renter's rating prompt is dated at the
+                // booking's end and shows up by itself then, with no timer to fire it.
+                NotificationRepository::insert_for_confirmed(&mut *conn, booking_id, at).await?;
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
             }
 
             BookingEvent::Released { booking_id, reason } => {
@@ -175,7 +217,13 @@ impl Projector for BookingProjector {
                     ViewBookingPatch::released(reason),
                 )
                 .await?;
-                shared::set_version!(conn, "booking", shared::schema::view::booking, &booking_id, version)
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
             }
 
             BookingEvent::Cancelled { booking_id, reason } => {
@@ -186,7 +234,35 @@ impl Projector for BookingProjector {
                     ViewBookingPatch::cancelled(reason),
                 )
                 .await?;
-                shared::set_version!(conn, "booking", shared::schema::view::booking, &booking_id, version)
+                // A booking that never happened cannot be rated, and is no longer news to
+                // its host.
+                NotificationRepository::handle(
+                    &mut *conn,
+                    booking_id,
+                    &[kinds::RATE_BOOKING, kinds::SPOT_BOOKED],
+                    at,
+                )
+                .await?;
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
+            }
+
+            BookingEvent::Rated { booking_id, rating } => {
+                ViewBookingRepository::rate(&mut *conn, booking_id, rating).await?;
+                NotificationRepository::handle(&mut *conn, booking_id, &[kinds::RATE_BOOKING], at)
+                    .await?;
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::view::booking,
+                    &booking_id,
+                    version
+                )
             }
         }
     }
@@ -209,6 +285,7 @@ pub struct PaymentProjector;
 impl Projector for PaymentProjector {
     const STREAM: &'static str = STREAM_PAYMENTS;
     const DURABLE: &'static str = "view-payments";
+    const VERSION_AT: bus::await_version::VersionAt = crate::version_of_at;
     type Event = PaymentEvent;
 
     async fn apply(
@@ -244,7 +321,13 @@ impl Projector for PaymentProjector {
                     },
                 )
                 .await?;
-                shared::set_version!(conn, "payout", shared::schema::view::payout, &payout_id, version)
+                shared::set_version!(
+                    conn,
+                    "payout",
+                    shared::schema::view::payout,
+                    &payout_id,
+                    version
+                )
             }
 
             // The worker's outcome. One column, and the row is certainly here: these
@@ -257,7 +340,13 @@ impl Projector for PaymentProjector {
             PaymentEvent::PayoutPaid { payout_id, .. } => {
                 ViewPayoutRepository::set_status(&mut *conn, payout_id, payout_status::PAID)
                     .await?;
-                shared::set_version!(conn, "payout", shared::schema::view::payout, &payout_id, version)
+                shared::set_version!(
+                    conn,
+                    "payout",
+                    shared::schema::view::payout,
+                    &payout_id,
+                    version
+                )
             }
 
             // A failed withdrawal leaves the row here, marked — the wallet's queries
@@ -267,13 +356,25 @@ impl Projector for PaymentProjector {
             PaymentEvent::PayoutFailed { payout_id, .. } => {
                 ViewPayoutRepository::set_status(&mut *conn, payout_id, payout_status::FAILED)
                     .await?;
-                shared::set_version!(conn, "payout", shared::schema::view::payout, &payout_id, version)
+                shared::set_version!(
+                    conn,
+                    "payout",
+                    shared::schema::view::payout,
+                    &payout_id,
+                    version
+                )
             }
 
             PaymentEvent::Created(e) => {
                 let payment_id = e.payment_id;
                 ViewPaymentRepository::upsert(&mut *conn, ViewPayment::created(e, version)).await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
 
             // The four transitions. Each is one patch and the version write, and the
@@ -290,7 +391,13 @@ impl Projector for PaymentProjector {
                     ViewPaymentPatch::succeeded(),
                 )
                 .await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
 
             PaymentEvent::Failed { payment_id, .. } => {
@@ -300,7 +407,13 @@ impl Projector for PaymentProjector {
                     ViewPaymentPatch::failed(),
                 )
                 .await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
 
             PaymentEvent::Refunded {
@@ -316,7 +429,13 @@ impl Projector for PaymentProjector {
                     ViewPaymentPatch::refunded(refunded_at),
                 )
                 .await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
 
             PaymentEvent::SessionExpired { payment_id, .. } => {
@@ -326,7 +445,13 @@ impl Projector for PaymentProjector {
                     ViewPaymentPatch::expired(),
                 )
                 .await?;
-                shared::set_version!(conn, "payment", shared::schema::view::payment, &payment_id, version)
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::view::payment,
+                    &payment_id,
+                    version
+                )
             }
         }
     }

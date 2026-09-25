@@ -36,16 +36,22 @@
 //! | `spot` | `find_for_public` | `public` | `id = $1 AND active` |
 //! | | `find_pins_for_public` | `public` | `active AND NOT deleted AND host_id <> $1` |
 //! | | `find_for_host` | `host` | `id = $1 AND host_id = $2` |
-//! | | `find_list_for_host` | `host` | `host_id = $1 AND NOT deleted` |
+//! | | `find_page_for_host` | `host` | `host_id = $1 AND NOT deleted` |
+//! | | `find_for_renter` | `renter` | `id = $1 AND EXISTS (booking WHERE spot_id = $1 AND renter_id = $2)` |
 //! | `booking` | `find_for_public_spot` | `public` | `spot_id = parent AND status IN ('reserved','confirmed')` |
-//! | | `find_for_host_spot` | `host` | `spot_id = parent` — ownership already proved |
-//! | | `find_list_for_renter` | `renter` | `renter_id = $1` |
+//! | | `find_booked_for_host_spot` | `host` | `spot_id = parent AND status IN ('reserved','confirmed')` — ownership already proved |
+//! | | `find_page_for_host_spot` | `host` | `spot_id = parent AND status IN ($statuses)` — same |
+//! | | `find_page_for_renter` | `renter` | `renter_id = $1 AND status IN ($statuses)` — joins its spot card, **the one exception** |
+//! | | `stats_for_host` | `host`, `public` | `host_id = $1` — one aggregate row |
+//! | | `stats_for_host_spot` | `host` | `spot_id = parent` — one aggregate row |
 //! | | `find_next_for_renter` | `renter` | `renter_id = $1 AND status = 'confirmed' AND ends_at > $2` |
 //! | | `find_for_renter` | `renter` | `id = $1 AND renter_id = $2` |
 //! | `payment` + `payout` | `wallet::find_month_for_account` | `account` | `host_id = $1 OR renter_id = $1`, as five separately-indexed branches |
 //! | | `wallet::find_previous_month_for_account` | `account` | the same, as four `max()`es |
 //! | | `wallet::balance_for_host` | `host` | `host_id = $1` |
+//! | | `wallet::earned_for_host`, `earned_for_host_spot` | `host` | `host_id = $1` (and `spot_id = $2`) |
 //! | `app_user` | `find_for_account` | `account` | `id = $1` — the verified claim picks the row |
+//! | `notification` | `find_open_for_account` | `account` | `user_id = $1 AND handled_at IS NULL AND visible_from <= $2` |
 //!
 //! The namespace column is not decoration: it is the route prefix the function is
 //! reachable through, and the two must not drift. A read whose `WHERE` does not match its
@@ -71,31 +77,18 @@
 //! (`shared::projections`): a public read does not select what it may not return, so
 //! there is nothing in flight to cut and no `Option` that means "denied".
 //!
-//! ## A parent and its children are two statements
+//! ## A spot and its bookings are separate routes
 //!
-//! `/public/spots/{id}` and `/host/spots/{id}` each read a spot and then the bookings on
-//! it, through `belonging_to`. **That is deliberate, not a missing join.** One join would
-//! repeat the spot's `images`, `address` and `availability` once per booking, and those
-//! are the expensive columns; two statements also give parent and children independent
-//! cache keys, so a booking landing invalidates the availability without refetching the
-//! listing.
+//! No response carries both. `/public/spots/{id}` and `/public/spots/{id}/bookings` are two
+//! requests, and so are `/host/spots/{id}` and `/host/spots/{id}/bookings`. A listing is
+//! edited rarely and the bookings on it change constantly, so they get independent cache
+//! keys, and a screen that needs only one of them fetches only that one.
 //!
-//! A single-statement form does exist and was built and verified during the diesel
-//! migration — a correlated `array_agg` over a row constructor, decoded through diesel's
-//! `Record<(…)>` type, fully typed. It is not used here for the reasons above.
-//!
-//! `belonging_to` rather than `spot_id.eq(id)` because the parent row is already in hand:
-//! the foreign key is read off the row the first statement authorised, so a second
-//! argument cannot name a spot that statement refused.
-//!
-//! ### `grouped_by` is the reassembly half, and has no caller
-//!
-//! It is the tool for a *list* of parents each with children —
-//! `children.grouped_by(&parents)` gives `Vec<Vec<Child>>` aligned with `parents`, to be
-//! zipped. No endpoint here returns that shape: `/host/spots` renders no bookings. When
-//! one appears it is one line, and the fallible `try_grouped_by` is the one to reach for —
-//! it surfaces orphans instead of dropping them, and this read model has no foreign keys,
-//! so a child whose parent has not been projected yet is expected rather than corrupt.
+//! The booking routes still read the spot first and then the bookings `belonging_to` it.
+//! That first statement is the gate — `active` for the public, `host_id = caller` for the
+//! host — and `belonging_to` reads the foreign key off the row it authorised, so a second
+//! argument cannot name a spot that statement refused. The renter's routes have no such
+//! parent: `renter_id = caller` is in each statement's own `WHERE`.
 //!
 //! ### `BoxableExpression` is not used
 //!
@@ -107,6 +100,7 @@
 //! these.
 
 pub mod booking_repository;
+pub mod notification_repository;
 pub mod payment_repository;
 pub mod payout_repository;
 pub mod spot_repository;
@@ -115,8 +109,8 @@ pub mod wallet_repository;
 
 /// Round-trips the read model through a real YugabyteDB.
 ///
-/// `#[ignore]`d — needs the dev cluster on :5433, and CI runs
-/// `cargo test --workspace` with no database:
+/// `#[ignore]`d — needs the dev cluster on :5433, so plain `cargo test --workspace` stays
+/// offline. CI brings the cluster up and runs these as a second step:
 ///
 /// ```sh
 /// docker compose -f docker/docker-compose-dev.yml up -d yugabyte
@@ -149,10 +143,12 @@ mod live_tests {
     use shared::events::spot::SpotCreated;
     use shared::general_models::booking::Booked;
     use shared::general_models::spot::{Address, Availability, TimeSlot, WeeklyAvailability};
-    use shared::schema::view::{app_user, booking, payment, payout, spot};
+    use shared::domain_models::view::notification::{NotificationPayload, kinds};
+    use shared::schema::view::{app_user, booking, notification, payment, payout, spot};
     use uuid::Uuid;
 
     use super::booking_repository::ViewBookingRepository;
+    use super::notification_repository::NotificationRepository;
     use super::spot_repository::ViewSpotRepository;
     use super::user_repository::ViewUserRepository;
 
@@ -403,6 +399,7 @@ mod live_tests {
                 host_id,
                 renter_id,
                 booked: Booked::new(),
+                license_plate: "1-ABC-123".into(),
                 amount: 500,
                 status: status::RESERVED.to_string(),
                 hold_until: Some(at),
@@ -457,6 +454,112 @@ mod live_tests {
             .unwrap();
     }
 
+    /// A confirmation tells the host at once and the renter at the booking's end. Each
+    /// is gone for good once handled or dismissed — a replayed `Confirmed` must not
+    /// bring either back.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_confirmed_booking_notifies_the_host_now_and_the_renter_at_the_end() {
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+        let (renter_id, host_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now();
+        ViewUserRepository::upsert(db, a_user(renter_id)).await.unwrap();
+
+        let confirmed = |ends_at| ViewBooking {
+            id: Uuid::now_v7(),
+            version: 1,
+            spot_id: Uuid::now_v7(),
+            host_id,
+            renter_id,
+            booked: Booked::new(),
+            license_plate: "1-ABC-123".into(),
+            amount: 500,
+            status: status::CONFIRMED.to_string(),
+            hold_until: None,
+            release_reason: None,
+            cancel_reason: None,
+            rating: None,
+            ends_at,
+            created_at: now,
+        };
+        let (past, future) = (
+            confirmed(now - chrono::Duration::hours(1)),
+            confirmed(now + chrono::Duration::hours(1)),
+        );
+        for b in [&past, &future] {
+            ViewBookingRepository::upsert(db, b.clone()).await.unwrap();
+            NotificationRepository::insert_for_confirmed(db, b.id, now).await.unwrap();
+        }
+        // Redelivered `Confirmed`: still one row.
+        NotificationRepository::insert_for_confirmed(db, past.id, now).await.unwrap();
+
+        // The host hears about both bookings at once, with the renter's name.
+        let hosts = NotificationRepository::find_open_for_account(db, host_id, now)
+            .await
+            .unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert!(hosts.iter().all(|n| matches!(
+            &n.data,
+            NotificationPayload::SpotBooked { renter_name: Some(name), .. } if name == "Ada"
+        )));
+
+        // A dismissal only ever reaches the dismisser's own row.
+        NotificationRepository::dismiss(db, renter_id, kinds::SPOT_BOOKED, past.id, now)
+            .await
+            .unwrap();
+        NotificationRepository::dismiss(db, host_id, kinds::SPOT_BOOKED, future.id, now)
+            .await
+            .unwrap();
+        let hosts = NotificationRepository::find_open_for_account(db, host_id, now)
+            .await
+            .unwrap();
+        assert_eq!(hosts.len(), 1, "the renter could not dismiss the host's");
+        assert_eq!(hosts[0].subject_id, past.id);
+
+        let open = NotificationRepository::find_open_for_account(db, renter_id, now)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1, "the future booking is not over yet");
+        assert_eq!(open[0].subject_id, past.id);
+        assert_eq!(
+            NotificationRepository::seen_at(db, renter_id).await.unwrap(),
+            None
+        );
+
+        // Forward only: an older watermark applied late changes nothing.
+        NotificationRepository::mark_seen(db, renter_id, now).await.unwrap();
+        NotificationRepository::mark_seen(db, renter_id, now - chrono::Duration::days(1))
+            .await
+            .unwrap();
+        let seen = NotificationRepository::seen_at(db, renter_id).await.unwrap();
+        assert_eq!(seen.map(|s| s.timestamp_micros()), Some(now.timestamp_micros()));
+
+        NotificationRepository::handle(db, past.id, &[kinds::RATE_BOOKING], now)
+            .await
+            .unwrap();
+        NotificationRepository::insert_for_confirmed(db, past.id, now).await.unwrap();
+        assert!(
+            NotificationRepository::find_open_for_account(db, renter_id, now)
+                .await
+                .unwrap()
+                .is_empty(),
+            "handled stays handled, even through a replay"
+        );
+
+        for b in [&past, &future] {
+            diesel::delete(notification::table.filter(notification::subject_id.eq(b.id)))
+                .execute(db)
+                .await
+                .unwrap();
+            diesel::delete(booking::table.find(b.id)).execute(db).await.unwrap();
+        }
+        diesel::delete(app_user::table.find(renter_id))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
     /// What the three deleted link tests were trying to buy, and what
     /// `Option::<T>::as_select()` now has to deliver.
     ///
@@ -491,6 +594,7 @@ mod live_tests {
                 host_id,
                 renter_id,
                 booked: Booked::new(),
+                license_plate: "1-ABC-123".into(),
                 amount: 500,
                 status: status::RESERVED.to_string(),
                 hold_until: None,
@@ -504,16 +608,19 @@ mod live_tests {
         .await
         .unwrap();
 
-        // The renter's read LEFT JOINs, so the booking comes back with its spot
+        // The renter's reads LEFT JOIN the spot card (the one exception to spots and
+        // bookings being separate reads), so the booking comes back with its spot
         // unresolved rather than not coming back at all.
-        let mine = ViewBookingRepository::find_list_for_renter(db, renter_id)
-            .await
-            .unwrap();
+        //
+        // `at - 1s`, because this booking's `ends_at` **is** `at`.
+        let before = at - chrono::Duration::seconds(1);
+        let statuses = &crate::policy::bookings::STATUSES;
+        let mine =
+            ViewBookingRepository::find_page_for_renter(db, renter_id, before, false, statuses, 20, 0)
+                .await
+                .unwrap();
         assert_eq!(mine.len(), 1, "the booking must still be returned");
-        assert!(
-            mine[0].spot.is_none(),
-            "an unprojected spot is an absent join"
-        );
+        assert!(mine[0].spot.is_none(), "an unprojected spot is an absent join");
         assert!(
             ViewBookingRepository::find_for_renter(db, booking_id, renter_id)
                 .await
@@ -522,7 +629,7 @@ mod live_tests {
             "…and the by-id read is the same join, so it must not drop the row either"
         );
 
-        // The targets arrive. Nothing revisits the booking, and the joins resolve
+        // The targets arrive. Nothing revisits the booking, and the reads resolve
         // themselves — which is the property the old `link_refs`/`backfill_links` pair
         // spent four methods and three tests approximating.
         ViewUserRepository::upsert(db, a_user(renter_id))
@@ -536,13 +643,23 @@ mod live_tests {
         .await
         .unwrap();
 
-        let mine = ViewBookingRepository::find_list_for_renter(db, renter_id)
-            .await
-            .unwrap();
+        let mine =
+            ViewBookingRepository::find_page_for_renter(db, renter_id, before, false, statuses, 20, 0)
+                .await
+                .unwrap();
         let card = mine[0].spot.as_ref().expect("the spot resolves now");
         assert_eq!(card.title, "Driveway");
         assert_eq!(card.id, spot_id);
         assert_eq!(card.timezone, "Europe/Brussels");
+
+        let spot_page = ViewSpotRepository::find_for_renter(db, spot_id, renter_id)
+            .await
+            .unwrap()
+            .expect("its renter reads the whole spot");
+        assert!(
+            spot_page.host.is_none(),
+            "a host who has not been projected is an absent join"
+        );
 
         // The other absent join, on the host's side of the same booking. It needs the
         // spot to exist, because the parent read is what the children belong to — which
@@ -554,10 +671,17 @@ mod live_tests {
         // `at - 1s`, because this booking's `ends_at` **is** `at` and the host read is
         // `ends_at > now`. Passing `at` would return nothing and the assertion below would
         // fail on an index rather than on the join it is about.
-        let host_rows =
-            ViewBookingRepository::find_for_host_spot(db, &spot, at - chrono::Duration::seconds(1))
-                .await
-                .unwrap();
+        let host_rows = ViewBookingRepository::find_page_for_host_spot(
+            db,
+            &spot,
+            at - chrono::Duration::seconds(1),
+            false,
+            &crate::policy::bookings::STATUSES,
+            20,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             host_rows[0]
                 .renter
@@ -584,7 +708,7 @@ mod live_tests {
     // `a_missing_alias_fails_loudly` is deleted rather than ported.
     //
     // It guarded `MaybeJoined`'s one dangerous edge: it turned a `ColumnDecode` into
-    // `None`, so a statement that forgot its `AS user_*` would have hidden every profile
+    // `None`, so a statement that forgot its `AS user_*` would have hidden every person
     // on every page with nothing in the logs. There is no aliasing left to forget —
     // diesel matches the select clause by position and checks it against the FROM at
     // compile time — so the failure this proved was loud cannot be written.
@@ -727,6 +851,7 @@ mod live_tests {
                 host_id: host,
                 renter_id: renter,
                 booked: Booked::new(),
+                license_plate: "1-ABC-123".into(),
                 amount: 4200,
                 status: status::RESERVED.to_string(),
                 hold_until: Some(at),
@@ -782,12 +907,37 @@ mod live_tests {
             .await
             .unwrap()
             .expect("its host may read it");
-        let owned = ViewBookingRepository::find_for_host_spot(db, &host_spot, at)
-            .await
-            .unwrap();
+        let all = &crate::policy::bookings::STATUSES;
+        let owned =
+            ViewBookingRepository::find_page_for_host_spot(db, &host_spot, at, false, all, 20, 0)
+                .await
+                .unwrap();
         assert_eq!(owned.len(), 1);
         assert_eq!(owned[0].amount, 4200, "the host sees the amount");
         assert!(owned[0].renter.is_some(), "the host sees the renter");
+        assert_eq!(
+            ViewBookingRepository::find_booked_for_host_spot(db, &host_spot, at)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a held slot is on the edit form's map"
+        );
+        assert!(
+            ViewBookingRepository::find_page_for_host_spot(
+                db,
+                &host_spot,
+                at,
+                false,
+                &["cancelled"],
+                20,
+                0
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "a status filter leaves out the rows it did not name"
+        );
 
         // A released booking stops blocking, so it leaves the availability answer.
         ViewBookingRepository::settle(
@@ -805,13 +955,35 @@ mod live_tests {
                 .is_empty(),
             "a released booking must not block a slot"
         );
-        assert_eq!(
-            ViewBookingRepository::find_for_host_spot(db, &host_spot, at)
+        assert!(
+            ViewBookingRepository::find_booked_for_host_spot(db, &host_spot, at)
                 .await
                 .unwrap()
-                .len(),
+                .is_empty(),
+            "…nor the edit form's map"
+        );
+
+        // The paged list takes a `HostSpotProjection`, and the only way to hold one is
+        // `find_for_host`, which a stranger is refused further down.
+        let page =
+            ViewBookingRepository::find_page_for_host_spot(db, &host_spot, at, false, all, 20, 0)
+                .await
+                .unwrap();
+        assert_eq!(
+            page.len(),
             1,
-            "…but the host keeps it, which is the history the manage screen shows"
+            "…but the host keeps it, which is the history the bookings screen shows"
+        );
+        assert_eq!(
+            page[0].license_plate, "1-ABC-123",
+            "the host is told which car to expect"
+        );
+        assert_eq!(
+            ViewBookingRepository::count_for_host_spot(db, &host_spot, at, false, all)
+                .await
+                .unwrap(),
+            1,
+            "and the count agrees with the page under it"
         );
 
         // ── renter: by id, the renter and nobody else ────────────────────────
@@ -834,6 +1006,63 @@ mod live_tests {
             .expect("its renter may read it");
         assert_eq!(detail.amount, 4200);
         assert_eq!(detail.id, booking_id);
+
+        // ── renter: their bookings, and the spots those are on ───────────────
+        //
+        // The booking is `released` by now. It still opens its spot — a lapsed hold's
+        // renter may look at where it was.
+        assert!(
+            ViewSpotRepository::find_for_renter(db, spot_id, renter)
+                .await
+                .unwrap()
+                .is_some(),
+            "a renter reads a spot they have a booking on"
+        );
+        for outsider in [stranger, host] {
+            assert!(
+                ViewSpotRepository::find_for_renter(db, spot_id, outsider)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "nobody else reads it through the renter namespace, its host included"
+            );
+            assert!(
+                ViewBookingRepository::find_page_for_renter(db, outsider, at, false, all, 20, 0)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "and nobody else's bookings are on their page"
+            );
+        }
+        assert_eq!(
+            ViewBookingRepository::find_page_for_renter(db, renter, at, false, all, 20, 0)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the renter's own booking is on theirs"
+        );
+        assert_eq!(
+            ViewBookingRepository::count_for_renter(db, renter, at, false, all)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            ViewBookingRepository::find_page_for_renter(
+                db,
+                renter,
+                at,
+                false,
+                &["reserved", "confirmed", "cancelled"],
+                20,
+                0
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "a released hold is left off when the list asks without it"
+        );
 
         // ── renter: the next-up card is one confirmed, unfinished row ────────
         //
@@ -884,12 +1113,20 @@ mod live_tests {
             .await
             .unwrap();
         assert!(
-            !ViewSpotRepository::find_list_for_host(db, host)
+            !ViewSpotRepository::find_page_for_host(db, host, 50, 0)
                 .await
                 .unwrap()
                 .iter()
                 .any(|s| s.id == spot_id),
             "a deleted spot must not appear in its host's list"
+        );
+        assert_eq!(ViewSpotRepository::count_for_host(db, host).await.unwrap(), 0);
+        assert!(
+            ViewSpotRepository::find_for_renter(db, spot_id, renter)
+                .await
+                .unwrap()
+                .is_some(),
+            "a renter still reads a paused, deleted spot they booked"
         );
         assert!(
             ViewSpotRepository::find_for_host(db, spot_id, host)
@@ -908,6 +1145,307 @@ mod live_tests {
             .await
             .unwrap();
         diesel::delete(app_user::table.find(renter))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    /// The host's paged list, walked: every booking once, in the tab's order, with no
+    /// row appearing on two pages and none missing between them.
+    ///
+    /// Offset paging is right until an off-by-one makes it wrong, and the failure is
+    /// quiet — a list that silently skips its 21st booking looks like a list of twenty.
+    /// So the walk is the assertion, with a limit of 2 standing in for the real page
+    /// size: what matters is that `offset` advances by exactly what came back.
+    ///
+    /// The tabs are the other half. `upcoming` and `past` split on the same instant and
+    /// order in opposite directions, so a booking belongs to exactly one of them and the
+    /// two together are the whole history.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn the_hosts_paged_list_walks_every_booking_once() {
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+
+        let (host, renter) = (Uuid::now_v7(), Uuid::now_v7());
+        let spot_id = Uuid::now_v7();
+        let at = Utc::now();
+
+        ViewSpotRepository::merge(
+            db,
+            spot_id,
+            ViewSpotPatch::created(spot_created(spot_id, host), at),
+        )
+        .await
+        .unwrap();
+
+        // Three still to come and two over, each an hour apart so the order is a fact
+        // about the data rather than about insertion.
+        let hours = [3, 2, 1, -1, -2];
+        let ids: Vec<Uuid> = hours.iter().map(|_| Uuid::now_v7()).collect();
+        for (id, h) in ids.iter().zip(hours) {
+            ViewBookingRepository::upsert(
+                db,
+                ViewBooking {
+                    id: *id,
+                    version: 1,
+                    spot_id,
+                    host_id: host,
+                    renter_id: renter,
+                    booked: Booked::new(),
+                    license_plate: "1-ABC-123".into(),
+                    amount: 500,
+                    status: status::CONFIRMED.to_string(),
+                    hold_until: None,
+                    release_reason: None,
+                    cancel_reason: None,
+                    rating: None,
+                    ends_at: at + chrono::TimeDelta::hours(h),
+                    created_at: at,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let spot = ViewSpotRepository::find_for_host(db, spot_id, host)
+            .await
+            .unwrap()
+            .expect("its host may read it");
+
+        let all = &crate::policy::bookings::STATUSES;
+        assert_eq!(
+            ViewBookingRepository::count_for_host_spot(db, &spot, at, false, all)
+                .await
+                .unwrap(),
+            3,
+            "three are still to come"
+        );
+        assert_eq!(
+            ViewBookingRepository::count_for_host_spot(db, &spot, at, true, all)
+                .await
+                .unwrap(),
+            2,
+            "and the two that are over are the other tab, not nowhere"
+        );
+
+        // Walk `upcoming` two at a time: pages of 2, 2 and then nothing.
+        let mut walked = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = ViewBookingRepository::find_page_for_host_spot(
+                db, &spot, at, false, all, 2, offset,
+            )
+            .await
+            .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            offset += page.len() as i64;
+            walked.extend(page.into_iter().map(|b| b.id));
+        }
+
+        // ids[2] ends soonest (+1h), then ids[1] (+2h), then ids[0] (+3h).
+        assert_eq!(
+            walked,
+            vec![ids[2], ids[1], ids[0]],
+            "soonest first, each booking exactly once across the pages"
+        );
+
+        let past = ViewBookingRepository::find_page_for_host_spot(db, &spot, at, true, all, 20, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            past.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![ids[3], ids[4]],
+            "what is over reads most recent first, and holds nothing from the other tab"
+        );
+
+        // The renter's side of the same five bookings: the same split and the same orders.
+        let renters_upcoming =
+            ViewBookingRepository::find_page_for_renter(db, renter, at, false, all, 20, 0)
+                .await
+                .unwrap();
+        assert_eq!(
+            renters_upcoming.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![ids[2], ids[1], ids[0]],
+            "the renter's page reads soonest first too"
+        );
+        assert_eq!(
+            ViewBookingRepository::count_for_renter(db, renter, at, true, all)
+                .await
+                .unwrap(),
+            2
+        );
+
+        for id in &ids {
+            diesel::delete(booking::table.find(id))
+                .execute(db)
+                .await
+                .unwrap();
+        }
+        diesel::delete(spot::table.find(spot_id))
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    /// A host's summary figures: only completed confirmed bookings count as bookings,
+    /// earned counts every succeeded payment on a still-confirmed booking (upcoming
+    /// included), and the spot's figures agree with the host's when it is their only one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_hosts_summary_counts_completed_bookings_and_confirmed_earnings() {
+        use super::payment_repository::ViewPaymentRepository;
+        use super::wallet_repository::WalletRepository;
+        use shared::domain_models::view::ViewPayment;
+
+        let pool = db().await;
+        let db = &mut *conn(&pool).await;
+        let (host, renter) = (Uuid::now_v7(), Uuid::now_v7());
+        let spot_id = Uuid::now_v7();
+        let at = Utc::now();
+
+        ViewSpotRepository::merge(
+            db,
+            spot_id,
+            ViewSpotPatch::created(spot_created(spot_id, host), at),
+        )
+        .await
+        .unwrap();
+
+        // Past and confirmed: a booking, and its money. Future and confirmed: money, not
+        // yet a booking. Past and cancelled: neither.
+        let rows = [
+            (Uuid::now_v7(), status::CONFIRMED, -2, 1_000),
+            (Uuid::now_v7(), status::CONFIRMED, 2, 300),
+            (Uuid::now_v7(), status::CANCELLED, -3, 5_000),
+        ];
+        for (id, booking_status, hours, amount) in rows {
+            ViewBookingRepository::upsert(
+                db,
+                ViewBooking {
+                    id,
+                    version: 1,
+                    spot_id,
+                    host_id: host,
+                    renter_id: renter,
+                    booked: Booked::new(),
+                    license_plate: "1-ABC-123".into(),
+                    amount,
+                    status: booking_status.to_string(),
+                    hold_until: None,
+                    release_reason: None,
+                    cancel_reason: None,
+                    rating: None,
+                    ends_at: at + chrono::TimeDelta::hours(hours),
+                    created_at: at,
+                },
+            )
+            .await
+            .unwrap();
+            ViewPaymentRepository::upsert(
+                db,
+                ViewPayment {
+                    id,
+                    version: 1,
+                    booking_id: id,
+                    host_id: host,
+                    renter_id: renter,
+                    amount,
+                    status: shared::domain_models::payment::status::SUCCEEDED.to_string(),
+                    created_at: at,
+                    refunded_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let stats = ViewBookingRepository::stats_for_host(db, host, at).await.unwrap();
+        assert_eq!(stats.bookings, 1, "only the confirmed booking that is over counts");
+        assert_eq!(stats.ratings, 0);
+        assert_eq!(stats.rating_sum, None, "nobody has rated, so there is no sum");
+
+        // `Rated` lands on a confirmed booking and nowhere else.
+        let (past_confirmed, _, _, _) = rows[0];
+        let (past_cancelled, _, _, _) = rows[2];
+        ViewBookingRepository::rate(db, past_confirmed, 5).await.unwrap();
+        ViewBookingRepository::rate(db, past_cancelled, 1).await.unwrap();
+        let rated = ViewBookingRepository::stats_for_host(db, host, at).await.unwrap();
+        assert_eq!(
+            (rated.rating_sum, rated.ratings),
+            (Some(5), 1),
+            "the rating on the cancelled booking matched no row"
+        );
+        assert_eq!(
+            WalletRepository::earned_for_host(db, host).await.unwrap(),
+            1_300,
+            "earned is every paid booking still confirmed, the upcoming one included"
+        );
+        assert_eq!(ViewSpotRepository::count_for_host(db, host).await.unwrap(), 1);
+        assert_eq!(
+            ViewSpotRepository::counts_for_host(db, host).await.unwrap(),
+            (1, 1),
+            "one listing, and it is live"
+        );
+
+        // All three payments were made `at`, so this month holds the two still confirmed
+        // and last month nothing.
+        let (this_start, this_end) =
+            crate::policy::wallet::bounds(&crate::policy::wallet::label(at)).unwrap();
+        let (last_start, _) = crate::policy::wallet::bounds(&crate::policy::wallet::label(
+            this_start - chrono::Duration::seconds(1),
+        ))
+        .unwrap();
+        assert_eq!(
+            WalletRepository::earned_by_month_for_host(db, host, last_start, this_start, this_end)
+                .await
+                .unwrap(),
+            (1_300, 0)
+        );
+
+        // "Booked right now" is folded from the unfinished confirmed bookings: only the
+        // future one here, carrying its spot's zone.
+        let unfinished = ViewBookingRepository::find_unfinished_for_host(db, host, at)
+            .await
+            .unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].0, spot_id);
+        assert_eq!(unfinished[0].2, "Europe/Brussels");
+
+        let spot = ViewSpotRepository::find_for_host(db, spot_id, host)
+            .await
+            .unwrap()
+            .expect("its host may read it");
+        let spot_stats = ViewBookingRepository::stats_for_host_spot(db, &spot, at)
+            .await
+            .unwrap();
+        assert_eq!(spot_stats.bookings, 1, "the only spot agrees with its host");
+        assert_eq!(
+            WalletRepository::earned_for_host_spot(db, host, spot_id)
+                .await
+                .unwrap(),
+            1_300
+        );
+        assert_eq!(
+            WalletRepository::earned_for_host_spot(db, renter, spot_id)
+                .await
+                .unwrap(),
+            0,
+            "a spot's earnings are its host's, not anyone who names the spot"
+        );
+
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+        diesel::delete(payment::table.filter(payment::id.eq_any(&ids)))
+            .execute(db)
+            .await
+            .unwrap();
+        diesel::delete(booking::table.filter(booking::id.eq_any(&ids)))
+            .execute(db)
+            .await
+            .unwrap();
+        diesel::delete(spot::table.find(spot_id))
             .execute(db)
             .await
             .unwrap();
@@ -965,6 +1503,7 @@ mod live_tests {
                 host_id: host,
                 renter_id: renter,
                 booked: Booked::new(),
+                license_plate: "1-ABC-123".into(),
                 amount: 2_000,
                 status: status::CONFIRMED.to_string(),
                 hold_until: None,

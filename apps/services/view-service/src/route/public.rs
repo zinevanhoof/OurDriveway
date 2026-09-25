@@ -13,7 +13,10 @@ use serde::Deserialize;
 use shared::{
     error::myerror::MyResult,
     extractors::authed_jwt::AuthedJwt,
-    responses::view::{NearbyResponse, PublicSpotResponse},
+    responses::view::{
+        NearbyResponse, PublicBookingResponse, PublicSpotResponse, SpotSummaryResponse,
+        UserSummaryResponse,
+    },
 };
 use uuid::Uuid;
 
@@ -21,9 +24,8 @@ use crate::AppState;
 
 /// `GET /api/view/public/spots/{id}` — one active spot as a prospective renter sees it.
 ///
-/// The bookings that come with it are the availability answer and nothing else: which
-/// slots are taken and until when, with no renter, no amount and no hold expiry. A host
-/// looking at their own listing wants `/host/spots/{id}` instead.
+/// The spot only. A host looking at their own listing wants `/host/spots/{id}` instead,
+/// and a renter looking at one they booked `/renter/spots/{id}`.
 ///
 /// The caller is authenticated but not otherwise used: an inactive spot 404s for everyone
 /// here, including its host, because "public spot" is the whole question this route
@@ -34,6 +36,40 @@ pub async fn spot(
     Path(spot_id): Path<Uuid>,
 ) -> MyResult<Json<PublicSpotResponse>> {
     Ok(Json(state.public_service.spot(spot_id).await?))
+}
+
+/// `GET /api/view/public/spots/{id}/summary` — a spot's rating, for anyone.
+pub async fn spot_summary(
+    _: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+) -> MyResult<Json<SpotSummaryResponse>> {
+    Ok(Json(state.public_service.spot_summary(spot_id).await?))
+}
+
+/// `GET /api/view/public/users/{id}/summary` — a person's reputation as a host.
+///
+/// Completed bookings on their spots and their rating, for the line under a host's name.
+/// Zeroes for someone who has never hosted, and for an id that matches nobody.
+pub async fn user_summary(
+    _: AuthedJwt,
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+) -> MyResult<Json<UserSummaryResponse>> {
+    Ok(Json(state.public_service.user_summary(user_id).await?))
+}
+
+/// `GET /api/view/public/spots/{id}/bookings` — the taken slots on one active spot.
+///
+/// The availability answer and nothing else: which slots are taken and until when, with
+/// no renter, no amount and no hold expiry. Read by the booking form when it opens, so
+/// the picker subtracts what is taken *now* rather than whatever the detail sheet loaded.
+pub async fn spot_bookings(
+    _: AuthedJwt,
+    State(state): State<AppState>,
+    Path(spot_id): Path<Uuid>,
+) -> MyResult<Json<Vec<PublicBookingResponse>>> {
+    Ok(Json(state.public_service.spot_bookings(spot_id).await?))
 }
 
 /// Query for [`nearby`].

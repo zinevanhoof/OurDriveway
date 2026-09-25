@@ -2,9 +2,16 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + Vue + Typescript App</title>
+    <link rel="icon" type="image/svg+xml" href="/ourdriveway-icon.svg" />
+    <!-- `user-scalable=no` pins the page at 1:1. This is browser/compositor zoom only —
+         MapLibre runs its own gestures against the camera, so pinching the map still
+         zooms the map, and in fact does so more reliably with the page zoom out of the
+         way. Note this also removes pinch-to-zoom as an accessibility affordance. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>OurDriveway</title>
   </head>
 
   <body>

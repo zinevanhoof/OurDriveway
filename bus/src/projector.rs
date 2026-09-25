@@ -7,13 +7,14 @@ use async_nats::jetstream::{
 use chrono::{DateTime, Utc};
 use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use shared::db::Db;
 use shared::{
     error::myerror::{MyError, MyResult},
-    events::{Envelope, PARTITIONS, domain_of, partition_filter},
+    events::{Envelope, domain_of, stream_filter},
 };
 
+use crate::await_version::{Applied, VersionAt};
 use crate::health::Readiness;
 
 /// Applies a stream's events to this instance's own database.
@@ -53,6 +54,17 @@ pub trait Projector: Send + Sync + 'static {
     /// The event enum carried by this stream's envelopes.
     type Event: serde::de::DeserializeOwned + Send;
 
+    /// This service's `version_of_at`, from its `bus::version_reader!`.
+    ///
+    /// [`Tx::apply`] calls it to read the target aggregate's stored version under the
+    /// same lock and the same transaction as the apply that may follow — which is what
+    /// lets this projector refuse an event that is not the next one. See [`decide`].
+    ///
+    /// A `const` on the trait rather than a field on [`Tx`] because every projector in a
+    /// service shares the one generated function, and the aggregate it is asked about is
+    /// the envelope's rather than anything this impl chooses.
+    const VERSION_AT: VersionAt;
+
     /// Apply one decoded event inside an open transaction. Must be idempotent.
     ///
     /// `at` is the envelope's `occurred_at` — the only clock an implementation may
@@ -84,6 +96,109 @@ pub trait Projector: Send + Sync + 'static {
         at: DateTime<Utc>,
         version: i64,
     ) -> impl Future<Output = MyResult<()>> + Send;
+}
+
+/// How long a parked event waits before JetStream hands it back.
+///
+/// Short, and paired with a high [`MAX_GAP_WAIT`] rather than the other way round. Four
+/// budgets sit on top of this one and three of them are small:
+///
+/// - `await_version::TIMEOUT` is **2s**. A client that echoes `booking:<id>@3` while v3
+///   is parked waits out its whole budget and is served stale, so a park has to be much
+///   shorter than one round of it to be invisible.
+/// - payment-service's `BookingWorker` waits **5s** for its own mirror
+///   (`PROJECTION_WAIT`) before deciding whether to move money.
+/// - Readiness is a one-way latch (`health::Readiness::mark_caught_up`), so a park can
+///   delay a replica joining rotation but cannot 503 one already in it. Still, a cold
+///   consumer over a stream whose early history has aged out pays this per aggregate.
+/// - The gap actually being gated against is two relays publishing out of order, which
+///   is milliseconds.
+///
+/// So: 200ms × 30 ≈ 6s of cover. Deliberately not `worker`'s 30s × 5 — that is a retry
+/// policy for a failing side effect, and this is a wait for a message already in flight.
+const NAK_DELAY: Duration = Duration::from_millis(200);
+
+/// How many deliveries a gap gets before it is applied anyway.
+///
+/// **One legitimate source of gaps is left, and it is why the hatch stays:** the streams
+/// expire (seven days), so a consumer created after an aggregate's early events aged out
+/// sees its first event at version 5 on a row that is empty or behind. Nothing is wrong,
+/// there is simply no earlier event to wait for, and `POST /internal/backfill` is what
+/// repairs it.
+///
+/// This used to list two more, both of which the codebase manufactured: two replicas
+/// sweeping one booking, and `SpotProjector::cancel`. Each minted a version, committed it
+/// for a guarded `UPDATE` that had matched nothing, and enqueued an event that a
+/// deterministic id then collapsed — leaving a version with no event behind it, for ever.
+/// The guards report their row count now and those callers return before committing
+/// anything, so a gap is no longer something this system produces on its own.
+///
+/// With the hatch, this is strictly better than what it replaces: it waits ~6s for the
+/// gap to close and otherwise does exactly what `set_version!` did on its own — log at
+/// error and apply.
+/// `i64` to match `message::Info::delivered`, which is signed because the protocol says
+/// so rather than because a delivery count can be negative.
+const MAX_GAP_WAIT: i64 = 30;
+
+/// What to do with one event, given what the target row already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// The next event for this aggregate, or one there is no basis to refuse. Apply it
+    /// and ack.
+    Apply,
+    /// Already applied — a redelivery, or a duplicate published outside the stream's
+    /// `duplicate_window`. Ack without applying.
+    Skip,
+    /// An event from the aggregate's future: the one before it has not been applied
+    /// here. Nak it and let JetStream bring it back once the gap has had time to close.
+    Park,
+}
+
+/// Whether an event is the next one for its aggregate.
+///
+/// **This is where ordering lives now.** It used to be a property of the transport — one
+/// relay, elected by `bus::lease`, and one ordered lane per partition with
+/// `max_ack_pending: 1` — and both of those existed for nothing else. Ordering is a
+/// property of the data instead: every row carries the gapless per-aggregate version its
+/// owning service assigned inside the writing transaction, so "is this next?" is a
+/// question the projection can answer about itself, and an event that arrives early is
+/// handed back to JetStream rather than applied out of order.
+///
+/// That is also the answer to "where do I buffer it?" — nowhere. A Nak'd message is held
+/// by the server, durably, shared across replicas, and redelivered on a timer. An
+/// in-memory park queue would be a worse copy of it that dies with the pod.
+///
+/// Pure, and the reason it is: every branch below is otherwise silent. `Skip` and `Park`
+/// write nothing and log nothing in the ordinary case, which is exactly the kind of rule
+/// that rots undetected without a table of assertions against it.
+///
+/// - `backfill` bypasses everything. `outbox::backfill` re-emits an aggregate's whole
+///   chain — `Created`, `Confirmed`, `Cancelled` — **all carrying the same version**,
+///   because the chain exists to satisfy the downstream `WHERE status IN [...]` guards
+///   rather than to describe a version history. Gated, steps two and three would be
+///   `Skip`ped and a rebuilt projection would leave every cancelled booking `reserved`.
+/// - [`Applied::Unavailable`] is not a fault: it means this database does not store the
+///   aggregate, so there is no version to be next to and nothing to refuse.
+/// - [`Applied::Pending`] is a row that does not exist. Only a create belongs there.
+/// - `incoming <= stored` is a redelivery or a duplicate, which is the common case after
+///   a relay restart and must stay cheap.
+fn decide(stored: Applied, incoming: i64, delivered: i64, backfill: bool) -> Decision {
+    if backfill {
+        return Decision::Apply;
+    }
+
+    match stored {
+        Applied::Unavailable => Decision::Apply,
+        // `<= 1` rather than `== 1` so a version below the first one a create can carry
+        // is applied rather than parked for ever against a row that will never exist.
+        Applied::Pending if incoming <= 1 => Decision::Apply,
+        Applied::At(stored) if incoming == stored + 1 => Decision::Apply,
+        Applied::At(stored) if incoming <= stored => Decision::Skip,
+        // Everything left is a gap: a non-create on a missing row, or a version more
+        // than one above what is stored.
+        _ if delivered >= MAX_GAP_WAIT => Decision::Apply,
+        _ => Decision::Park,
+    }
 }
 
 /// Drives a [`Projector`], owning the two things the inner type is then unable to get
@@ -132,7 +247,14 @@ impl<P: Projector> Tx<P> {
     /// `&self` — there is no parked client left to protect. The lane still applies
     /// strictly one event at a time, but that is the consumer's `max_ack_pending: 1`
     /// rather than anything this type owns.
-    async fn apply(&self, payload: &[u8], seq: u64) -> MyResult<()> {
+    ///
+    /// Returns what the lane should do with the message. The version gate ([`decide`])
+    /// runs **inside** the transaction and **before** the apply, so the `FOR UPDATE` it
+    /// takes on the aggregate's row is still held when the apply writes — which is what
+    /// stops two replicas both reading an aggregate at v1 and both concluding they hold
+    /// its v2. A `Skip` or a `Park` writes nothing, so its transaction is read-only and
+    /// commits rather than rolling back; committing is what releases the lock.
+    async fn apply(&self, payload: &[u8], seq: u64, delivered: i64) -> MyResult<Decision> {
         let envelope: Envelope<P::Event> = serde_json::from_slice(payload).map_err(|e| {
             shared::error::myerror::MyError::Bus(format!("decode {} at seq {seq}: {e}", P::STREAM))
         })?;
@@ -152,6 +274,19 @@ impl<P: Projector> Tx<P> {
         let version = envelope.version;
         let projector = self.projector.clone();
         let payload = envelope.payload;
+        let backfill = envelope.backfill;
+
+        // `"booking:019f…"` -> `("booking", <uuid>)`. Every publisher builds this from
+        // the real aggregate rather than from the subject key, which is why the gate can
+        // use it: `bookings.spot.<spot_id>` carries `booking:<id>`, and
+        // `payments.payout.<host_id>` carries `payout:<id>`.
+        //
+        // An envelope whose aggregate does not parse is not a reason to stop — there is
+        // simply nothing to gate on, so it takes the path an aggregate this database does
+        // not store takes.
+        let aggregate = shared::events::split_aggregate(&envelope.aggregate)
+            .map(|(table, id)| (table.to_string(), id));
+        let name = envelope.aggregate;
 
         // `transaction` owns the begin, the commit and the rollback: returning `Err`
         // from the closure rolls back, returning `Ok` commits. That replaces the
@@ -160,10 +295,42 @@ impl<P: Projector> Tx<P> {
         //
         // `scope_boxed` is required by the signature, which cannot be generic over an
         // arbitrary future without boxing it (rustc#100013, cited in diesel-async).
-        conn.transaction::<(), shared::error::myerror::MyError, _>(|conn| {
-            async move { projector.apply(conn, payload, at, version).await }.scope_boxed()
-        })
-        .await
+        let decision = conn
+            .transaction::<Decision, shared::error::myerror::MyError, _>(|conn| {
+                async move {
+                    let stored = match &aggregate {
+                        Some((table, id)) => (P::VERSION_AT)(conn, table, id).await?,
+                        None => Applied::Unavailable,
+                    };
+
+                    let decision = decide(stored, version, delivered, backfill);
+
+                    // The escape hatch fired: this is a gap that did not close in
+                    // `MAX_GAP_WAIT` redeliveries. Same error `set_version!` used to log
+                    // on its own, minus every case that was really just an event
+                    // arriving early — those are a `Park` now and never get here.
+                    if decision == Decision::Apply && !backfill && delivered >= MAX_GAP_WAIT {
+                        tracing::error!(
+                            stream = P::STREAM,
+                            aggregate = %name,
+                            stored = ?stored,
+                            got = version,
+                            delivered,
+                            "version gap did not close: applying anyway, projection may be incomplete"
+                        );
+                    }
+
+                    if decision == Decision::Apply {
+                        projector.apply(conn, payload, at, version).await?;
+                    }
+
+                    Ok(decision)
+                }
+                .scope_boxed()
+            })
+            .await?;
+
+        Ok(decision)
     }
 }
 
@@ -174,21 +341,12 @@ impl<P: Projector> Tx<P> {
 /// nobody wants.
 const ACK_WAIT: Duration = Duration::from_secs(30);
 
-/// How often readiness is refreshed from the consumers' own state.
+/// How often readiness is refreshed from the consumer's own state.
 ///
-/// One second rather than the 250ms this was when there was a single consumer per
-/// stream: one tick now costs `PARTITIONS` `consumer.info()` round trips, so the old
-/// interval would have put ~64 requests a second on the broker per projector for a
-/// number `/readyz` reads at human speed.
-const POLL: Duration = Duration::from_secs(1);
-
-/// One partition's durable name: `("view-users", 7)` -> `"view-users-p07"`.
-///
-/// Zero-padded so `nats consumer report` lists them in order rather than
-/// `p0, p1, p10, p11, p2`. Hyphens because a durable name may not contain a `.`.
-pub fn durable_name(prefix: &str, partition: u8) -> String {
-    format!("{prefix}-p{partition:02}")
-}
+/// Back to 250ms. It was raised to a second when a tick cost `PARTITIONS`
+/// `consumer.info()` round trips — ~64 requests a second per projector, for a number
+/// `/readyz` reads at human speed. One consumer per stream makes it one request again.
+const POLL: Duration = Duration::from_millis(250);
 
 /// Runs a projector until every lane has stopped. Spawn one per stream.
 ///
@@ -201,40 +359,35 @@ pub fn durable_name(prefix: &str, partition: u8) -> String {
 /// ## Ordered per aggregate, concurrent across them
 ///
 /// Every replica of a service shares one database, so applying the same event on
-/// all of them would be N writers racing every row. The consumers are therefore
-/// **durable and shared** — the replicas pull from one cursor per partition, so each
-/// event is applied exactly once by whichever replica picked it up.
+/// all of them would be N writers racing every row. The consumer is therefore
+/// **durable and shared** — every replica pulls from one cursor, so each event is
+/// applied exactly once by whichever replica picked it up.
 ///
 /// Work-sharing normally costs ordering, which this projection cannot afford:
 /// downstream guards read `WHERE status IN $from` and *drop* a transition that
-/// arrives before the state it expects. `max_ack_pending: 1` is what buys it back —
-/// JetStream will not deliver the next message until the current one is acked.
+/// arrives before the state it expects. [`decide`] is what buys it back, and it buys
+/// it from the data rather than from the transport — an event whose predecessor is
+/// not applied here yet is handed back to JetStream instead of being applied early.
 ///
-/// That setting used to sit on **one** consumer per stream, which serialised the
-/// whole stream: a booking for one spot blocked every unrelated user, spot and
-/// payout behind it, and no number of replicas moved that. It now sits on one
-/// consumer per partition, and NATS assigns the partition from the subject on
-/// ingest (`shared::events::partition_transform`). Same aggregate → same subject →
-/// same lane → still strictly ordered. Different aggregates → usually different
-/// lanes → concurrent.
+/// That job used to belong to `max_ack_pending: 1` across `PARTITIONS` consumers:
+/// sixteen ordered lanes per stream, each withholding its next message until the last
+/// was acked, so a service projecting four streams held sixty-four consumers open and
+/// paid a round trip per event. The ceiling was sixteen concurrent applies per stream
+/// *across the whole deployment*, no matter how many replicas ran. One consumer with a
+/// real in-flight window replaces all of it, and the aggregate's version decides the
+/// order.
 ///
 /// ## What this is not
 ///
-/// Not an ownership protocol. Every replica opens all [`PARTITIONS`] lanes and a
-/// partition's durable hands its one in-flight message to whichever puller asked
-/// first, so partitions distribute themselves and a dead replica's lane is picked up
-/// by another after `ACK_WAIT` with nothing to coordinate. Consumer pinning would add
-/// affinity and, per Synadia's own writeup, still not exclusivity — and
-/// `PriorityPolicy::PinnedClient` is unimplemented in async-nats 0.50 regardless.
-///
-/// The ceiling this buys is `PARTITIONS` concurrent applies **per stream, across the
-/// whole deployment** — not per replica. Replicas buy availability; the partition
-/// count buys throughput.
+/// Not an ownership protocol. Every replica pulls from the same durable and JetStream
+/// hands each message to whichever puller asked first, so work distributes itself and
+/// a dead replica's in-flight messages are picked up by another after `ACK_WAIT` with
+/// nothing to coordinate.
 pub async fn run<P: Projector>(js: Context, projector: Arc<P>, db: Db, readiness: Arc<Readiness>) {
-    // Up front, so a projector that cannot declare its consumers fails here, once,
-    // rather than sixteen times inside sixteen tasks.
-    let consumers = match lane_consumers::<P>(&js).await {
-        Ok(consumers) => consumers,
+    // Up front, so a projector that cannot declare its consumer fails here rather than
+    // inside the apply loop.
+    let consumer = match stream_consumer::<P>(&js).await {
+        Ok(consumer) => consumer,
         Err(e) => {
             tracing::error!(stream = P::STREAM, durable = P::DURABLE, error = %e, "projector could not start");
             readiness.mark_failed(P::STREAM);
@@ -242,56 +395,30 @@ pub async fn run<P: Projector>(js: Context, projector: Arc<P>, db: Db, readiness
         }
     };
 
-    // Readiness is reported from the consumers rather than from this instance's own
+    // Readiness is reported from the consumer rather than from this instance's own
     // progress. With the events shared out between replicas, "how far have *I* got"
     // is not a fact about the database any more.
-    tokio::spawn(report_readiness::<P>(consumers.clone(), readiness.clone()));
+    tokio::spawn(report_readiness::<P>(consumer.clone(), readiness.clone()));
 
     tracing::info!(
         stream = P::STREAM,
         durable = P::DURABLE,
-        lanes = PARTITIONS,
+        concurrency = APPLY_CONCURRENCY,
         "projecting"
     );
 
-    let mut lanes = tokio::task::JoinSet::new();
-    for (partition, consumer) in consumers.into_iter().enumerate() {
-        // Every lane gets a handle on the same pool — a refcount bump each. A lane
-        // holds a connection only for the length of one event's transaction, so
-        // sixteen lanes do not mean sixteen connections held open.
-        let tx = Tx::new(projector.clone(), db.clone());
-        lanes.spawn(async move { (partition as u8, lane::<P>(consumer, tx).await) });
-    }
-
-    // Deliberately does not abort the survivors. A wedged lane is one partition's
-    // problem: its messages go unacked and another replica's lane picks them up,
-    // while the other fifteen keep applying aggregates that have nothing to do with
-    // it. `/readyz` is already 503, so this instance serves no reads either way —
-    // stopping the healthy lanes too would only widen the outage.
-    while let Some(joined) = lanes.join_next().await {
-        match joined {
-            Ok((partition, Err(e))) => {
-                tracing::error!(stream = P::STREAM, durable = P::DURABLE, partition, error = %e, "lane stopped");
-                readiness.mark_failed(P::STREAM);
-            }
-            Ok((partition, Ok(()))) => {
-                tracing::error!(stream = P::STREAM, partition, "lane ended without error");
-                readiness.mark_failed(P::STREAM);
-            }
-            Err(e) => {
-                tracing::error!(stream = P::STREAM, error = %e, "lane panicked");
-                readiness.mark_failed(P::STREAM);
-            }
+    let tx = Tx::new(projector, db);
+    match lane::<P>(consumer, tx).await {
+        Err(e) => {
+            tracing::error!(stream = P::STREAM, durable = P::DURABLE, error = %e, "projector stopped")
         }
+        Ok(()) => tracing::error!(stream = P::STREAM, "projector ended without error"),
     }
+    readiness.mark_failed(P::STREAM);
 }
 
-/// Declares one durable consumer per partition, in order.
-///
-/// Done up front rather than inside each lane so that [`report_readiness`] has every
-/// consumer to poll from its first tick, and so a bad `P::STREAM` fails once at boot
-/// instead of sixteen times in sixteen tasks.
-async fn lane_consumers<P: Projector>(js: &Context) -> MyResult<Vec<PullConsumer>> {
+/// Declares this projector's one durable consumer.
+async fn stream_consumer<P: Projector>(js: &Context) -> MyResult<PullConsumer> {
     let domain = domain_of(P::STREAM)
         .ok_or_else(|| bus_err(format!("{} is not in shared::events::STREAMS", P::STREAM)))?;
 
@@ -300,47 +427,76 @@ async fn lane_consumers<P: Projector>(js: &Context) -> MyResult<Vec<PullConsumer
         .await
         .map_err(|e| bus_err(format!("get stream {}: {e}", P::STREAM)))?;
 
-    let mut consumers = Vec::with_capacity(PARTITIONS as usize);
-    for partition in 0..PARTITIONS {
-        let durable = durable_name(P::DURABLE, partition);
-        consumers.push(
-            stream
-                .get_or_create_consumer(&durable, consumer_config(&durable, domain, partition))
-                .await
-                .map_err(|e| bus_err(format!("create consumer {durable}: {e}")))?,
-        );
-    }
-    Ok(consumers)
+    stream
+        .get_or_create_consumer(P::DURABLE, consumer_config(P::DURABLE, domain))
+        .await
+        .map_err(|e| bus_err(format!("create consumer {}: {e}", P::DURABLE)))
 }
 
-/// One ordered lane. Applies and acks, strictly one message at a time.
+/// How many events this replica applies at once.
 ///
-/// Unchanged from the single-consumer loop this replaced, which is the point: the
-/// ordering guarantee is the consumer's `max_ack_pending: 1`, so partitioning is a
-/// matter of how many of these run rather than of what any one of them does.
+/// Bounded by the connection pool rather than by the broker: `shared::db` builds one
+/// pool per process and view-service runs four projectors on it, so this many times
+/// four is the standing demand for connections from projectors alone, before a single
+/// request handler asks for one. A pool timeout surfaces as `MyError::Pool`, stops the
+/// projector and 503s the pod, so the cheap failure is being too low.
+///
+/// Ordering does not constrain it. Two events for one aggregate applied concurrently
+/// serialise on the `FOR UPDATE` [`Projector::VERSION_AT`] takes, and the loser reads
+/// the winner's version and parks.
+const APPLY_CONCURRENCY: usize = 4;
+
+/// Applies and acks. Ordering comes from [`decide`], not from this loop.
+///
+/// `for_each_concurrent` rather than a `while let`: with the gate holding the order,
+/// a sequential loop would make one replica apply one event at a time — strictly worse
+/// than the sixteen lanes it replaces. The bound is [`APPLY_CONCURRENCY`].
+///
+/// Deliberately **not** grouped by aggregate. A keyed scheduler is the in-memory park
+/// queue this design exists to avoid, wearing a different hat; the `FOR UPDATE` in the
+/// gate already is the grouping, and it works across replicas rather than within one.
 async fn lane<P: Projector>(consumer: PullConsumer, projector: Tx<P>) -> MyResult<()> {
-    let mut messages = consumer
+    let messages = consumer
         .messages()
         .await
         .map_err(|e| bus_err(format!("consume: {e}")))?;
 
-    while let Some(msg) = messages.next().await {
-        let msg = msg.map_err(|e| bus_err(format!("next message: {e}")))?;
-        let seq = msg
-            .info()
-            .map_err(|e| bus_err(format!("message info: {e}")))?
-            .stream_sequence;
+    messages
+        .map(|msg| msg.map_err(|e| bus_err(format!("next message: {e}"))))
+        .try_for_each_concurrent(APPLY_CONCURRENCY, |msg| {
+            let projector = &projector;
+            async move {
+                let info = msg
+                    .info()
+                    .map_err(|e| bus_err(format!("message info: {e}")))?;
+                let (seq, delivered) = (info.stream_sequence, info.delivered);
 
-        projector.apply(&msg.payload, seq).await?;
+                match projector.apply(&msg.payload, seq, delivered).await? {
+                    // Only after the transaction committed. A crash in this gap leaves
+                    // the message unacked, so it is redelivered and reapplied — which is
+                    // safe precisely because every `apply` is idempotent, and is the
+                    // reason there is no longer a cursor to keep in step with the rows.
+                    //
+                    // `Skip` acks for the same reason it did not apply: the version it
+                    // carries is already stored, so redelivering it for ever would
+                    // achieve nothing.
+                    Decision::Apply | Decision::Skip => msg
+                        .ack()
+                        .await
+                        .map_err(|e| bus_err(format!("ack {seq}: {e}")))?,
 
-        // Only after the transaction committed. A crash in this gap leaves the
-        // message unacked, so it is redelivered and reapplied — which is safe
-        // precisely because every `apply` is idempotent, and is the reason there
-        // is no longer a cursor to keep in step with the rows.
-        msg.ack()
-            .await
-            .map_err(|e| bus_err(format!("ack {seq}: {e}")))?;
-    }
+                    // Hand it back and let the server hold it. This is the whole of the
+                    // "buffer it until the versions line up" mechanism — durable, shared
+                    // across replicas, and already built.
+                    Decision::Park => msg
+                        .ack_with(async_nats::jetstream::AckKind::Nak(Some(NAK_DELAY)))
+                        .await
+                        .map_err(|e| bus_err(format!("nak {seq}: {e}")))?,
+                }
+                Ok(())
+            }
+        })
+        .await?;
 
     Err(bus_err("message stream ended".to_string()))
 }
@@ -355,25 +511,19 @@ async fn lane<P: Projector>(consumer: PullConsumer, projector: Tx<P>) -> MyResul
 /// `ack_floor.stream_sequence` from the one consumer; with sixteen cursors per stream
 /// that number has no single value, and its only reader now asks a better question —
 /// see `bus::await_version::reached`.
-async fn report_readiness<P: Projector>(consumers: Vec<PullConsumer>, readiness: Arc<Readiness>) {
-    let mut consumers = consumers;
+async fn report_readiness<P: Projector>(consumer: PullConsumer, readiness: Arc<Readiness>) {
+    let mut consumer = consumer;
     loop {
-        let mut all_drained = true;
-        for consumer in &mut consumers {
-            match consumer.info().await {
-                // Not "sequence >= the head I saw at boot" — that number is this
-                // instance's guess, and on a shared consumer it can be reached by
-                // someone else's work or never reached at all if the head message
-                // has since been deleted.
-                Ok(info) => all_drained &= info.num_pending == 0 && info.num_ack_pending == 0,
-                Err(e) => {
-                    tracing::debug!(stream = P::STREAM, error = %e, "consumer info failed");
-                    all_drained = false;
-                }
+        match consumer.info().await {
+            // Not "sequence >= the head I saw at boot" — that number is this
+            // instance's guess, and on a shared consumer it can be reached by
+            // someone else's work or never reached at all if the head message
+            // has since been deleted.
+            Ok(info) if info.num_pending == 0 && info.num_ack_pending == 0 => {
+                readiness.mark_caught_up(P::STREAM)
             }
-        }
-        if all_drained {
-            readiness.mark_caught_up(P::STREAM);
+            Ok(_) => {}
+            Err(e) => tracing::debug!(stream = P::STREAM, error = %e, "consumer info failed"),
         }
         tokio::time::sleep(POLL).await;
     }
@@ -381,17 +531,13 @@ async fn report_readiness<P: Projector>(consumers: Vec<PullConsumer>, readiness:
 
 /// Split out so the settings that define this primitive can be asserted without a
 /// broker. Four of the five are silent when wrong.
-fn consumer_config(
-    durable: &str,
-    domain: &str,
-    partition: u8,
-) -> async_nats::jetstream::consumer::pull::Config {
+fn consumer_config(durable: &str, domain: &str) -> async_nats::jetstream::consumer::pull::Config {
     async_nats::jetstream::consumer::pull::Config {
         durable_name: Some(durable.to_string()),
-        // This lane's partition and nothing else. NATS put the partition token there
-        // on ingest; this is the only thing in the codebase that reads it, and it
-        // reads it as a string.
-        filter_subject: partition_filter(domain, partition),
+        // The whole bounded context. This was one consumer per partition filtering
+        // `<domain>.7.>`, sixteen of them, and the partitioning existed only to claw
+        // back the concurrency `max_ack_pending: 1` gave away.
+        filter_subject: stream_filter(domain),
         // Honoured only when the consumer is first created; afterwards the stored
         // position wins. `All` is what makes a brand-new projection build itself
         // from the whole log — the opposite of a `Worker`, which starts at `New`
@@ -399,11 +545,20 @@ fn consumer_config(
         deliver_policy: DeliverPolicy::All,
         ack_policy: AckPolicy::Explicit,
         ack_wait: ACK_WAIT,
-        // The ordering guarantee, now scoped to one partition. Without it the
-        // replicas pull concurrently and a `Confirmed` can be applied before its
-        // `Created`, which the downstream `WHERE status IN $from` guards do not
-        // reorder — they drop it.
-        max_ack_pending: 1,
+        // **This used to be 1, and that was the ordering guarantee.** One unacked
+        // message per consumer meant the server withheld the next one until the last
+        // was acked, which serialised applies across every replica — a round trip per
+        // event, and sixteen consumers per stream to get any concurrency back.
+        //
+        // [`decide`] holds the ordering now, so the transport does not have to. Raising
+        // this is not merely an optimisation either: with 1, a Nak'd message stays the
+        // single message in flight and is redelivered ahead of everything else, so the
+        // event that would close the gap can never arrive and the park livelocks until
+        // the escape hatch fires. The gate and this number are one change.
+        //
+        // 64 rather than something larger: it is the in-flight window, and every
+        // message in it can be mid-apply holding a pool connection.
+        max_ack_pending: 64,
         ..Default::default()
     }
 }
@@ -413,29 +568,28 @@ mod tests {
     use super::*;
 
     /// Guards the settings that make this safe on a shared database, all of which
-    /// fail silently: without `max_ack_pending: 1` events apply out of order and
-    /// transitions vanish; without a `durable_name` every replica gets every event
-    /// and they race each other over every row; without `filter_subject` every lane
-    /// consumes every partition, which is fan-out wearing a partition's name.
+    /// fail silently: without a `durable_name` every replica gets every event and they
+    /// race each other over every row; with `max_ack_pending: 1` a parked event is the
+    /// only message in flight and the event that would close its gap can never arrive;
+    /// with the wrong `filter_subject` the consumer sits at zero pending for ever.
     #[test]
-    fn the_consumer_is_durable_partitioned_and_strictly_ordered() {
-        let durable = durable_name("view-bookings", 7);
-        let config = consumer_config(&durable, "bookings", 7);
+    fn the_consumer_is_durable_shared_and_has_a_real_window() {
+        let config = consumer_config("view-bookings", "bookings");
 
         assert_eq!(
             config.durable_name.as_deref(),
-            Some("view-bookings-p07"),
+            Some("view-bookings"),
             "an ephemeral consumer makes this fan-out: every replica applies every event"
         );
         assert_eq!(
-            config.filter_subject, "bookings.7.>",
-            "an unfiltered lane consumes every partition, so all sixteen would apply \
-             every event and race each other over every row"
+            config.filter_subject, "bookings.>",
+            "the whole bounded context; a narrower filter silently consumes nothing"
         );
-        assert_eq!(
-            config.max_ack_pending, 1,
-            "more than one in flight lets a Confirmed overtake its Created, and the \
-             downstream status guards drop it rather than reorder it"
+        assert!(
+            config.max_ack_pending > 1,
+            "with one in flight, a Nak'd event is redelivered ahead of everything else \
+             and the event that would close its gap never arrives — the park livelocks \
+             until the escape hatch fires"
         );
         assert!(
             matches!(config.deliver_policy, DeliverPolicy::All),
@@ -443,36 +597,67 @@ mod tests {
         );
     }
 
-    /// Two lanes must never claim the same message, and the set must cover the
-    /// stream. Both hold only if the names and the filters agree partition for
-    /// partition — a `-p7`/`bookings.8.>` pair would be silent in every other test.
+    /// The in-flight window may exceed the apply concurrency — that is what keeps the
+    /// pulling ahead of the applying — but the concurrency must not exceed the window,
+    /// which would be slots that can never be filled.
     #[test]
-    fn lanes_are_distinct_and_cover_the_stream() {
-        let configs: Vec<_> = (0..PARTITIONS)
-            .map(|p| consumer_config(&durable_name("view-bookings", p), "bookings", p))
-            .collect();
+    fn the_window_is_at_least_the_apply_concurrency() {
+        let config = consumer_config("view-bookings", "bookings");
+        assert!(config.max_ack_pending as usize >= APPLY_CONCURRENCY);
+    }
 
-        let mut durables: Vec<_> = configs
-            .iter()
-            .map(|c| c.durable_name.clone().expect("durable"))
-            .collect();
-        durables.sort();
-        durables.dedup();
-        assert_eq!(durables.len(), PARTITIONS as usize, "durable names collide");
+    /// The ordering rule, branch by branch.
+    ///
+    /// This table is the reason [`decide`] is a pure function. Two of its three verdicts
+    /// write nothing and log nothing — a `Skip` looks exactly like an apply that happened
+    /// to change no columns, and a `Park` looks exactly like a quiet lane — so a wrong
+    /// branch here is invisible everywhere else until a projection is silently short an
+    /// event.
+    #[test]
+    fn only_the_next_version_applies() {
+        use Applied::{At, Pending, Unavailable};
+        use Decision::{Apply, Park, Skip};
 
-        let mut filters: Vec<_> = configs.iter().map(|c| c.filter_subject.clone()).collect();
-        filters.sort();
-        filters.dedup();
-        assert_eq!(filters.len(), PARTITIONS as usize, "filters collide");
+        // The ordinary path.
+        assert_eq!(decide(Pending, 1, 1, false), Apply, "the create");
+        assert_eq!(decide(At(3), 4, 1, false), Apply, "the next event");
 
-        // Zero-padded name, unpadded subject token. They are not the same string and
-        // it would be easy to "fix" that into a lane filtering `bookings.07.>`,
-        // which matches nothing NATS ever writes.
+        // Already applied. The common case after a relay restart republishes its tail,
+        // and it must stay cheap rather than becoming a redelivery loop.
+        assert_eq!(decide(At(3), 3, 1, false), Skip, "a redelivery");
+        assert_eq!(decide(At(3), 2, 1, false), Skip, "an out-of-order duplicate");
+
+        // Early. This is the whole point: v5 on a row at v3 means v4 has not been
+        // applied here yet, so it goes back to the server rather than landing on top.
+        assert_eq!(decide(At(3), 5, 1, false), Park, "one missing");
+        assert_eq!(decide(Pending, 4, 1, false), Park, "a non-create on no row");
+
+        // The escape hatch. A gap that survives this many deliveries is not an event in
+        // flight — it is one that was never published — so it degrades to exactly what
+        // `set_version!` did before the gate existed.
+        assert_eq!(decide(At(3), 5, MAX_GAP_WAIT, false), Apply, "gap gave up");
         assert_eq!(
-            configs[7].durable_name.as_deref(),
-            Some("view-bookings-p07")
+            decide(At(3), 5, MAX_GAP_WAIT - 1, false),
+            Park,
+            "one delivery short of the budget still waits"
         );
-        assert_eq!(configs[7].filter_subject, "bookings.7.>");
+
+        // Backfill re-emits a whole chain at ONE version — `Created`, `Confirmed`,
+        // `Cancelled` all at v7 — because the chain exists to satisfy the downstream
+        // status guards, not to describe a version history. Gated, steps two and three
+        // would `Skip` and a rebuilt projection would leave the booking `reserved`.
+        assert_eq!(decide(At(7), 7, 1, true), Apply, "backfill step two");
+        assert_eq!(decide(At(9), 7, 1, true), Apply, "backfill onto a newer row");
+        assert_eq!(decide(Pending, 7, 1, true), Apply, "backfill onto no row");
+
+        // Nothing to be next to: this database does not store the aggregate, or the
+        // envelope's `aggregate` did not parse. Neither is a fault and neither is a
+        // reason to hold the message.
+        assert_eq!(decide(Unavailable, 9, 1, false), Apply, "not stored here");
+
+        // A version at or below the first one a create can carry must not park against
+        // a row that will never exist.
+        assert_eq!(decide(Pending, 0, 1, false), Apply, "version zero");
     }
 
     /// Every stream a projector can name has to resolve to a subject domain, or
@@ -502,7 +687,7 @@ fn bus_err(msg: String) -> MyError {
 /// ```
 ///
 /// `#[ignore]`d and pointed at the dev stack, like the `live_tests` modules in the
-/// service repositories — CI has no broker.
+/// service repositories — CI brings the stack up and runs them after the unit tests.
 ///
 /// **They run on the real SESSIONS stream**, which is the one stream nothing in this
 /// codebase consumes, so a test's events cannot wake a real projector or worker. Each
@@ -513,7 +698,7 @@ fn bus_err(msg: String) -> MyError {
 #[cfg(test)]
 mod live_tests {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         sync::Mutex,
         time::Instant,
     };
@@ -526,10 +711,15 @@ mod live_tests {
     use super::*;
 
     const NATS: &str = "nats://127.0.0.1:4222";
-    const URL: &str = "postgres://yugabyte@127.0.0.1:5433/view";
-    /// Any database with a connection; the scratch table is created below.
-    // The database name is part of `URL` above now, rather than a separate argument to
-    // `connect` — one `DATABASE_URL` per service replaced addr/user/pass/db.
+    /// `yugabyte`, the maintenance database every cluster has from its first boot.
+    ///
+    /// It was `view`, and that only worked on a machine where something had already
+    /// created `view`. These tests migrate nothing — they need a connection and their own
+    /// scratch table — so on a fresh cluster (CI) nobody had, and the pool, which
+    /// connects lazily, reported the missing database as a 10s timeout on the first
+    /// `get()` in every test. A database that always exists needs no ordering against
+    /// whichever test binary happens to create the service databases first.
+    const URL: &str = "postgres://yugabyte@127.0.0.1:5433/yugabyte";
     /// Written by these tests alone, and defined up front — sixteen lanes creating it
     /// implicitly would all write the same table-definition key and take a TiKV write
     /// conflict. An earlier spike learned that the hard way.
@@ -537,10 +727,9 @@ mod live_tests {
     /// **Two leading underscores on purpose.** It is never dropped — the eight live tests
     /// run concurrently, so a teardown in any one of them would pull the table out from
     /// under the others, which is the same race `define_scratch_table` retries around.
-    /// So it survives the run and would be picked up by `scripts/print-schema.sh` as if
-    /// it were a real table. `diesel print-schema` skips `__%` (its table listing filters
-    /// `NOT LIKE '\_\_%'`), which is the same reason `__diesel_schema_migrations` needs no
-    /// entry in `diesel.toml`.
+    /// It lives in `yugabyte` now, which `scripts/print-schema.sh` never reads; the prefix
+    /// stays because a dev cluster may still have one in `view` from before, and
+    /// `diesel print-schema` skips `__%` (its table listing filters `NOT LIKE '\_\_%'`).
     const TABLE: &str = "__bus_livetest";
 
     /// How long a recorded apply holds its lane open.
@@ -685,15 +874,99 @@ mod live_tests {
         }
     }
 
+    /// The test lanes' [`VersionAt`] — the one hand-written one in the codebase.
+    ///
+    /// Every real service gets this from `bus::version_reader!`, against tables its own
+    /// schema module declares. The scratch table has no schema module (and deliberately
+    /// no entry in `table_for`'s allowlist, for the reason `record` spells out), so the
+    /// gate's read is written out here the same way `record`'s two writes are.
+    ///
+    /// Reached only for this lane's **own** aggregate — [`recorder!`] wraps it with the
+    /// `Unavailable` arm that turns every other lane's events away first.
+    fn scratch_version_at<'a>(
+        conn: &'a mut AsyncPgConnection,
+        _aggregate: &'a str,
+        id: &'a Uuid,
+    ) -> futures::future::BoxFuture<'a, MyResult<crate::await_version::Applied>> {
+        use crate::await_version::Applied as Stored;
+        use diesel::OptionalExtension as _;
+        use diesel_async::RunQueryDsl as _;
+
+        Box::pin(async move {
+            #[derive(diesel::QueryableByName)]
+            struct Row {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                version: i64,
+            }
+
+            let row: Option<Row> =
+                diesel::sql_query(format!("SELECT version FROM {TABLE} WHERE id = $1 FOR UPDATE"))
+                    .bind::<diesel::sql_types::Uuid, _>(*id)
+                    .get_result(conn)
+                    .await
+                    .optional()?;
+
+            Ok(match row {
+                Some(row) => Stored::At(row.version),
+                None => Stored::Pending,
+            })
+        })
+    }
+
     /// `Projector` carries its durable name as an associated const, so one test's
     /// lanes are one type. This mints them.
     macro_rules! recorder {
         ($name:ident, $durable:literal) => {
             struct $name(Arc<Recorder>);
 
+            impl $name {
+                /// This lane's [`VersionAt`], and the **`Unavailable` arm is what keeps
+                /// these tests independent of each other.**
+                ///
+                /// Every test here shares one stream and one scratch table, and a
+                /// consumer's filter is the whole bounded context — so each lane sees
+                /// every other test's events, and always has. That was free while a
+                /// foreign event simply applied and was dropped by `record`. It stopped
+                /// being free when the version gate arrived: a foreign key's row is in
+                /// the shared table at whatever version *its owning test* has reached,
+                /// so a lane replaying someone else's stream position can read it
+                /// mid-flight and call it a gap. That is a `Nak`, and a Nak'd message
+                /// holds JetStream's `ack_floor` — the contiguous acked prefix — so one
+                /// test's transient state became another test's stalled cursor.
+                ///
+                /// Honest about what this is: a coupling removed on the merits, **not a
+                /// proven fix for a specific flake**. `restart_resumes_from_durable_state`
+                /// failed intermittently in full-workspace runs; by the time this was
+                /// written it had stopped reproducing, and it passes with this arm
+                /// disabled too. So this closes a real and demonstrable path — a test's
+                /// timing depending on what its neighbours happen to be doing — without
+                /// any claim to have closed that one.
+                ///
+                /// It is how a real service already behaves, not a test trick:
+                /// `version_reader!` answers `Unavailable` for an aggregate it does not
+                /// store, and `decide` applies it ungated rather than judging a version
+                /// it has no business knowing. view-service does exactly this for every
+                /// aggregate it does not project. Each lane here owns its aggregate name
+                /// the same way.
+                fn version_at<'a>(
+                    conn: &'a mut AsyncPgConnection,
+                    aggregate: &'a str,
+                    id: &'a Uuid,
+                ) -> futures::future::BoxFuture<'a, MyResult<crate::await_version::Applied>>
+                {
+                    if aggregate != $durable {
+                        return Box::pin(async {
+                            Ok(crate::await_version::Applied::Unavailable)
+                        });
+                    }
+                    scratch_version_at(conn, aggregate, id)
+                }
+            }
+
             impl Projector for $name {
                 const STREAM: &'static str = STREAM_SESSIONS;
                 const DURABLE: &'static str = $durable;
+                const VERSION_AT: crate::await_version::VersionAt = $name::version_at;
                 /// `Value`, not a real event enum: these lanes also see whatever else
                 /// is on SESSIONS, and a decode failure stops a lane.
                 type Event = serde_json::Value;
@@ -713,12 +986,13 @@ mod live_tests {
 
     recorder!(OrderLanes, "bus-lt-order");
     recorder!(ConcurrentLanes, "bus-lt-concurrent");
-    recorder!(SerialLanes, "bus-lt-serial");
     recorder!(RedeliveryLanes, "bus-lt-redelivery");
     recorder!(FailoverLanes, "bus-lt-failover");
     recorder!(RestartLanes, "bus-lt-restart");
     recorder!(DuplicateLanes, "bus-lt-duplicate");
     recorder!(GapLanes, "bus-lt-gap");
+    recorder!(ParkLanes, "bus-lt-park");
+    recorder!(BackfillLanes, "bus-lt-backfill");
 
     /// Creates the scratch table, tolerating the race between concurrent tests.
     ///
@@ -763,15 +1037,50 @@ mod live_tests {
         js: Context,
         db: Db,
         readiness: Arc<Readiness>,
+        /// The aggregate name every event from this `Live` carries — the lane's own
+        /// `DURABLE`. See [`live`].
+        aggregate: &'static str,
     }
 
-    async fn live() -> Live {
+    /// Empties SESSIONS once per test binary, before any test publishes.
+    ///
+    /// These tests all run `DeliverPolicy::All` against the one stream nothing in the
+    /// codebase consumes, so each of them replays every earlier run's leftovers. That was
+    /// merely wasteful when a leftover was applied and filtered out. It is not any more:
+    /// `a_gap_that_never_closes…` deliberately leaves a key with a permanent version gap,
+    /// and SESSIONS keeps messages for 31 days — so every later consumer parks that key
+    /// for the full `NAK_DELAY × MAX_GAP_WAIT` budget, once per leftover, compounding run
+    /// over run until the slower tests time out.
+    ///
+    /// A `OnceCell` rather than a purge per test: every `live()` awaits the same cell, so
+    /// the purge is ordered before the first publish of the run rather than racing tests
+    /// that have already started.
+    async fn purge_once(js: &Context) {
+        static PURGED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        PURGED
+            .get_or_init(|| async {
+                js.get_stream(STREAM_SESSIONS)
+                    .await
+                    .expect("stream")
+                    .purge()
+                    .await
+                    .expect("purge SESSIONS");
+            })
+            .await;
+    }
+
+    /// `aggregate` is the lane's own `DURABLE`, and every event this publishes is stamped
+    /// with it. Pairs with the `Unavailable` arm in [`recorder!`]: each test's events name
+    /// an aggregate only that test's lane recognises, so the others apply them ungated and
+    /// `record` drops them, instead of parking on a version they cannot interpret.
+    async fn live(aggregate: &'static str) -> Live {
         shared::install_default_crypto_provider();
 
         let js = crate::connect(NATS)
             .await
             .expect("NATS on :4222 — docker compose -f docker/docker-compose-dev.yml up -d");
         crate::ensure_streams(&js).await.expect("declare streams");
+        purge_once(&js).await;
 
         let db = shared::db::connect(URL)
             .await
@@ -779,7 +1088,12 @@ mod live_tests {
         define_scratch_table(&db).await;
 
         let readiness = Readiness::new(js.client().clone(), &[STREAM_SESSIONS]);
-        Live { js, db, readiness }
+        Live {
+            js,
+            db,
+            readiness,
+            aggregate,
+        }
     }
 
     impl Live {
@@ -788,13 +1102,24 @@ mod live_tests {
         /// Same shape as `outbox::append`: the envelope encoded, `Nats-Msg-Id` set to
         /// the event id so the stream's `duplicate_window` can see a repeat.
         async fn publish(&self, key: Uuid, version: i64, event_id: Uuid) -> u64 {
+            self.publish_as(key, version, event_id, false).await
+        }
+
+        /// The same, flagged as a rebuild. `outbox::backfill` emits a whole chain at one
+        /// version, so this is the only way to produce several events that are all
+        /// legitimately "not the next one".
+        async fn publish_backfill(&self, key: Uuid, version: i64, event_id: Uuid) -> u64 {
+            self.publish_as(key, version, event_id, true).await
+        }
+
+        async fn publish_as(&self, key: Uuid, version: i64, event_id: Uuid, backfill: bool) -> u64 {
             let envelope = Envelope {
                 event_id,
-                aggregate: aggregate_id("session", &key),
+                aggregate: aggregate_id(self.aggregate, &key),
                 version,
                 occurred_at: Utc::now(),
                 actor_id: None,
-                backfill: false,
+                backfill,
                 // The aggregate again, in the payload: `Projector::apply` is handed
                 // the decoded event and not the envelope, so this is how a recorded
                 // apply knows which key it was for.
@@ -815,52 +1140,10 @@ mod live_tests {
                 .sequence
         }
 
-        /// Which partition NATS put a stored message in.
-        ///
-        /// Read back off the stream rather than computed. Recomputing the hash in Rust
-        /// is exactly what the server-side transform exists to avoid, and a test that
-        /// reimplemented it would agree with itself while disagreeing with NATS.
-        async fn partition_of(&self, sequence: u64) -> u8 {
-            let stored = self
-                .js
-                .get_stream(STREAM_SESSIONS)
-                .await
-                .expect("stream")
-                .get_raw_message(sequence)
-                .await
-                .expect("stored message")
-                .subject;
-
-            // `sessions.<partition>.user.<uuid>`
-            stored
-                .split('.')
-                .nth(1)
-                .and_then(|t| t.parse().ok())
-                .unwrap_or_else(|| panic!("no partition token in stored subject {stored}"))
-        }
-
-        /// Publishes `n` fresh keys and returns them grouped by partition.
-        async fn keys_by_partition(&self, n: usize) -> HashMap<u8, Vec<Uuid>> {
-            let mut by_partition: HashMap<u8, Vec<Uuid>> = HashMap::new();
-            for _ in 0..n {
-                let key = Uuid::now_v7();
-                let seq = self.publish(key, 1, Uuid::now_v7()).await;
-                by_partition
-                    .entry(self.partition_of(seq).await)
-                    .or_default()
-                    .push(key);
-            }
-            by_partition
-        }
-
-        /// Removes a test's lanes so `DeliverPolicy::All` is honoured on the next run.
-        async fn drop_lanes(&self, prefix: &str) {
+        /// Removes a test's consumer so `DeliverPolicy::All` is honoured on the next run.
+        async fn drop_lanes(&self, durable: &str) {
             let stream = self.js.get_stream(STREAM_SESSIONS).await.expect("stream");
-            for partition in 0..PARTITIONS {
-                let _ = stream
-                    .delete_consumer(&durable_name(prefix, partition))
-                    .await;
-            }
+            let _ = stream.delete_consumer(durable).await;
         }
 
         /// `applies` and `version` as stored, for the idempotence assertions.
@@ -911,7 +1194,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn same_key_stays_ordered() {
-        let live = live().await;
+        let live = live(OrderLanes::DURABLE).await;
         live.drop_lanes(OrderLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -955,25 +1238,22 @@ mod live_tests {
         live.drop_lanes(OrderLanes::DURABLE).await;
     }
 
-    /// Requirement 2. Aggregates in different partitions are applied at the same
-    /// time — which is the entire point of the change, and was impossible before it.
+    /// Requirement 2. Two aggregates are applied at the same time.
+    ///
+    /// **Any** two, now. This used to have to publish a dozen keys and ask NATS which
+    /// partition each had landed in, because two aggregates sharing one of sixteen lanes
+    /// were applied strictly one after the other — a real ceiling, and one that no number
+    /// of replicas moved. There are no lanes to share: concurrency is
+    /// [`APPLY_CONCURRENCY`] per replica and ordering is the version gate's job.
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn different_keys_run_concurrently() {
-        let live = live().await;
+        let live = live(ConcurrentLanes::DURABLE).await;
         live.drop_lanes(ConcurrentLanes::DURABLE).await;
 
-        // Publish first, then look up where NATS put them: with 16 partitions a
-        // dozen keys land in several, and this asserts against whichever two the
-        // server actually separated.
-        let by_partition = live.keys_by_partition(12).await;
-        let mut occupied: Vec<_> = by_partition.iter().filter(|(_, k)| !k.is_empty()).collect();
-        occupied.sort_by_key(|(p, _)| **p);
-        assert!(
-            occupied.len() >= 2,
-            "twelve keys landed in one partition — that is a broken transform, not luck"
-        );
-        let (left, right) = (occupied[0].1[0], occupied[1].1[0]);
+        let (left, right) = (Uuid::now_v7(), Uuid::now_v7());
+        live.publish(left, 1, Uuid::now_v7()).await;
+        live.publish(right, 1, Uuid::now_v7()).await;
 
         let recorder = Recorder::new(HOLD, [left, right]);
         let running = tokio::spawn(run(
@@ -995,57 +1275,10 @@ mod live_tests {
         );
         assert!(
             a.overlaps(&b),
-            "partitions {} and {} ran one after the other, so nothing was parallelised",
-            occupied[0].0,
-            occupied[1].0
+            "two unrelated aggregates ran one after the other, so nothing was parallelised"
         );
 
         live.drop_lanes(ConcurrentLanes::DURABLE).await;
-    }
-
-    /// Two aggregates that share a partition are still applied, and still one at a
-    /// time — the cost of a bounded partition count, asserted rather than assumed.
-    #[tokio::test]
-    #[ignore = "needs docker/docker-compose-dev.yml"]
-    async fn one_partition_stays_serial() {
-        let live = live().await;
-        live.drop_lanes(SerialLanes::DURABLE).await;
-
-        // 16 partitions, so a collision inside 24 keys is near-certain — but not
-        // guaranteed, and a test must not assert on luck.
-        let by_partition = live.keys_by_partition(24).await;
-        let Some((partition, keys)) = by_partition.iter().find(|(_, k)| k.len() >= 2) else {
-            eprintln!("no two of 24 keys shared a partition; nothing to assert");
-            live.drop_lanes(SerialLanes::DURABLE).await;
-            return;
-        };
-        let (first, second) = (keys[0], keys[1]);
-
-        let recorder = Recorder::new(HOLD, [first, second]);
-        let running = tokio::spawn(run(
-            live.js.clone(),
-            Arc::new(SerialLanes(recorder.clone())),
-            live.db.clone(),
-            live.readiness.clone(),
-        ));
-
-        until(Duration::from_secs(60), "both keys applied", || {
-            !recorder.applies(first).is_empty() && !recorder.applies(second).is_empty()
-        })
-        .await;
-        running.abort();
-
-        let (a, b) = (
-            recorder.applies(first).remove(0),
-            recorder.applies(second).remove(0),
-        );
-        assert!(
-            !a.overlaps(&b),
-            "partition {partition} had two aggregates in flight at once — \
-             max_ack_pending is not holding"
-        );
-
-        live.drop_lanes(SerialLanes::DURABLE).await;
     }
 
     /// Requirement 6. Work done, then a failure before the ack. JetStream redelivers
@@ -1053,7 +1286,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn redelivery_is_idempotent() {
-        let live = live().await;
+        let live = live(RedeliveryLanes::DURABLE).await;
         live.drop_lanes(RedeliveryLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1106,15 +1339,15 @@ mod live_tests {
         live.drop_lanes(RedeliveryLanes::DURABLE).await;
     }
 
-    /// Requirements 3 and 4. Two instances share the lanes; killing the one holding a
+    /// Requirements 3 and 4. Two instances share the durable; killing the one holding a
     /// message hands it to the other with nothing to coordinate.
     ///
     /// Slow by construction — the handover is `ACK_WAIT`, which is what makes it a
     /// failover rather than a graceful drain.
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml; takes ~ack_wait"]
-    async fn a_dead_instance_hands_its_partition_over() {
-        let live = live().await;
+    async fn a_dead_instance_hands_its_work_over() {
+        let live = live(FailoverLanes::DURABLE).await;
         live.drop_lanes(FailoverLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1167,7 +1400,7 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn restart_resumes_from_durable_state() {
-        let live = live().await;
+        let live = live(RestartLanes::DURABLE).await;
         live.drop_lanes(RestartLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1235,13 +1468,13 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
     async fn a_duplicate_event_is_discarded_by_the_stream() {
-        let live = live().await;
+        let live = live(DuplicateLanes::DURABLE).await;
         live.drop_lanes(DuplicateLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
-        // Same id, well inside the stream's 120s duplicate_window.
+        // Same id, well inside the stream's duplicate_window.
         let first = live.publish(key, 1, event_id).await;
         let second = live.publish(key, 1, event_id).await;
         assert_eq!(
@@ -1270,16 +1503,61 @@ mod live_tests {
         live.drop_lanes(DuplicateLanes::DURABLE).await;
     }
 
-    /// Requirement 7, the other half. A missing version is applied — but explicitly,
-    /// and the lane survives it.
+    /// **The one that replaced the transport's ordering guarantee.**
     ///
-    /// That it is *reported* is `shared::db::version_gap`'s unit test; that it does
-    /// not wedge the projection is this one. Both halves matter: a gap that stopped
-    /// the lane would turn an aged-out history into an outage.
+    /// v3 is published *before* v2 — which is exactly what two relays racing produce,
+    /// and what `bus::lease` used to exist to prevent. The lane must refuse v3 on a row
+    /// at v1, take v2 when it arrives, and apply v3 when JetStream brings it back.
+    ///
+    /// The old assertion here was `[1, 3, 4]`: the gap applied straight through and the
+    /// projection kept v3's columns on top of a row that never saw v2. This is the
+    /// inversion of that, and the whole reason the lease and the sixteen lanes can go.
     #[tokio::test]
     #[ignore = "needs docker/docker-compose-dev.yml"]
-    async fn a_version_gap_is_applied_and_does_not_wedge_the_lane() {
-        let live = live().await;
+    async fn an_event_that_arrives_early_is_parked_until_its_predecessor_lands() {
+        let live = live(ParkLanes::DURABLE).await;
+        live.drop_lanes(ParkLanes::DURABLE).await;
+
+        let key = Uuid::now_v7();
+        live.publish(key, 1, Uuid::now_v7()).await;
+        // Out of order on the wire, deliberately.
+        live.publish(key, 3, Uuid::now_v7()).await;
+        live.publish(key, 2, Uuid::now_v7()).await;
+
+        let recorder = Recorder::new(Duration::ZERO, [key]);
+        let running = tokio::spawn(run(
+            live.js.clone(),
+            Arc::new(ParkLanes(recorder.clone())),
+            live.db.clone(),
+            live.readiness.clone(),
+        ));
+        until(Duration::from_secs(30), "all three events", || {
+            recorder.applies(key).len() == 3
+        })
+        .await;
+        running.abort();
+
+        assert_eq!(
+            recorder.versions(key),
+            vec![1, 2, 3],
+            "applied in version order, not in publish order"
+        );
+        assert_eq!(live.row(key).await.map(|(_, version)| version), Some(3));
+
+        live.drop_lanes(ParkLanes::DURABLE).await;
+    }
+
+    /// The escape hatch. A gap that never closes must not wedge the aggregate for ever.
+    ///
+    /// v2 is genuinely never published — the shape an aged-out history takes, and the
+    /// shape two replicas sweeping one booking bake into the data permanently. After
+    /// `MAX_GAP_WAIT` deliveries the lane gives up waiting and applies, which is exactly
+    /// what happened before the gate existed. The budget is ~6s, so this is the slowest
+    /// test here by design.
+    #[tokio::test]
+    #[ignore = "needs docker/docker-compose-dev.yml"]
+    async fn a_gap_that_never_closes_is_applied_rather_than_wedging_the_lane() {
+        let live = live(GapLanes::DURABLE).await;
         live.drop_lanes(GapLanes::DURABLE).await;
 
         let key = Uuid::now_v7();
@@ -1294,7 +1572,7 @@ mod live_tests {
             live.db.clone(),
             live.readiness.clone(),
         ));
-        until(Duration::from_secs(30), "both events", || {
+        until(Duration::from_secs(60), "the gap to give up", || {
             recorder.applies(key).len() == 2
         })
         .await;
@@ -1315,5 +1593,48 @@ mod live_tests {
         );
 
         live.drop_lanes(GapLanes::DURABLE).await;
+    }
+
+    /// A rebuild bypasses the gate entirely.
+    ///
+    /// `outbox::backfill` re-emits an aggregate's whole chain — for a cancelled booking
+    /// that is `Created`, `Confirmed`, `Cancelled` — with **every event carrying the same
+    /// version**, because the chain exists to satisfy the downstream `WHERE status IN
+    /// [...]` guards rather than to describe a version history.
+    ///
+    /// Gated, the second and third would be `Skip`ped as duplicates and a rebuilt
+    /// projection would leave every cancelled booking sitting at `reserved`. Three
+    /// applies at one version is what says the bypass is still there.
+    #[tokio::test]
+    #[ignore = "needs docker/docker-compose-dev.yml"]
+    async fn a_backfill_chain_at_one_version_applies_every_step() {
+        let live = live(BackfillLanes::DURABLE).await;
+        live.drop_lanes(BackfillLanes::DURABLE).await;
+
+        let key = Uuid::now_v7();
+        for _ in 0..3 {
+            live.publish_backfill(key, 7, Uuid::now_v7()).await;
+        }
+
+        let recorder = Recorder::new(Duration::ZERO, [key]);
+        let running = tokio::spawn(run(
+            live.js.clone(),
+            Arc::new(BackfillLanes(recorder.clone())),
+            live.db.clone(),
+            live.readiness.clone(),
+        ));
+        until(Duration::from_secs(30), "the whole chain", || {
+            recorder.applies(key).len() == 3
+        })
+        .await;
+        running.abort();
+
+        assert_eq!(
+            recorder.versions(key),
+            vec![7, 7, 7],
+            "a gated backfill drops every step after the first"
+        );
+
+        live.drop_lanes(BackfillLanes::DURABLE).await;
     }
 }

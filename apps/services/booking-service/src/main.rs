@@ -20,7 +20,7 @@ bus::version_reader! {
     /// Its own bookings, plus the spot mirror it projects from SPOTS — a client that has
     /// just edited a spot and then reserves against it is waiting for that mirror, not for
     /// spot-service's copy.
-    fn version_of;
+    fn version_of, version_of_at;
     "booking" => shared::schema::booking::booking,
     "spot" => shared::schema::booking::spot,
 }
@@ -96,13 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `run` opens a transaction per event, applies and commits — so the projector
     // below cannot forget any of that, and `react`'s publishes sit inside the same
     // transaction as the projection write they precede.
-    // For the outbox relay only. The projectors need no election: each partition is
-    // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
-    // event at a time *per partition* across every replica, in order — and different
-    // partitions are different spots, which have no order between them. The relay has
-    // no such backstop, so exactly one instance may run it.
-    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
-
     tokio::spawn(bus::projector::run(
         js.clone(),
         // A host's edit can invalidate bookings, and withdrawing them is this
@@ -119,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Carries every BOOKINGS event this service commits — the only path by which
     // they reach NATS.
-    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone()));
 
     // Nothing else frees a lapsed hold — a `reserved` row blocks regardless of its
     // `hold_until`, by design. See sweeper.rs.
@@ -152,7 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api_router: Router<AppState> = Router::new()
         .route("/api/booking", post(route::booking::create_booking))
         .route("/api/booking/{id}", delete(route::booking::release))
-        .route("/api/booking/{id}/cancel", post(route::booking::cancel));
+        .route("/api/booking/{id}/cancel", post(route::booking::cancel))
+        .route("/api/booking/{id}/rating", post(route::booking::rate));
 
     let app = Router::new()
         .merge(api_router)

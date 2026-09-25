@@ -33,11 +33,11 @@ bus::version_reader! {
     ///
     /// `"user"` maps to `host` — this database has no `app_user`, only the two columns
     /// Stripe demands. It is a real wait now and it earns its place: a host sets their
-    /// country on their profile and then goes to onboard, and `ConnectService` reads that
+    /// country on their user record and then goes to onboard, and `ConnectService` reads that
     /// country from this mirror. Without the wait, onboarding can read the row before the
     /// USERS event lands and see no country — which is the one value Stripe fixes
     /// permanently at account creation.
-    fn version_of;
+    fn version_of, version_of_at;
     "payment" => shared::schema::payment::payment,
     "payout" => shared::schema::payment::payout,
     "booking" => shared::schema::payment::booking,
@@ -73,6 +73,9 @@ pub struct Config {
     /// (`stripe listen --print-secret`), which is *not* the same value as a dashboard
     /// endpoint's in production.
     pub stripe_webhook_secret: String,
+    /// `https://api.stripe.com` everywhere real. Configurable only so the e2e suite can
+    /// stand in for Stripe with a stateful fake — see `e2e/src/fake.rs`.
+    pub stripe_api_base: String,
     /// How long after a booking ends its money becomes withdrawable by the host.
     ///
     /// The one knob on the earnings rule. A renter cannot cancel inside an hour of the
@@ -91,6 +94,7 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     jwt_secret: env::require("JWT_SECRET"),
     stripe_secret_key: env::require("STRIPE_SECRET_KEY"),
     stripe_webhook_secret: env::require("STRIPE_WEBHOOK_SECRET"),
+    stripe_api_base: env::require("STRIPE_API_BASE"),
     settlement_secs: env::require_parsed("SETTLEMENT_SECS"),
 });
 
@@ -135,7 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `shared::rpc`, which says so itself.
     let readiness = bus::Readiness::new(js.client().clone(), &[STREAM_BOOKINGS, STREAM_USERS]);
 
-    let stripe = Arc::new(Stripe::new(&CONFIG.stripe_secret_key));
+    let stripe = Arc::new(Stripe::new(
+        &CONFIG.stripe_secret_key,
+        &CONFIG.stripe_api_base,
+    ));
     let settlement = Arc::new(SettlementWorkerService {
         db: db.clone(),
         stripe: stripe.clone(),
@@ -150,13 +157,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // The service writes `db` directly, inside each request's transaction. `run`
     // opens a transaction per event, applies and commits.
-    // For the outbox relay only. The projectors need no election: each partition is
-    // one durable consumer with `max_ack_pending: 1`, so JetStream hands out one
-    // event at a time *per partition* across every replica, in order — and different
-    // partitions are different bookings, which have no order between them. The relay
-    // has no such backstop, so exactly one instance may run it.
-    let leader = bus::lease::elect(db.clone(), bus::lease::instance_id());
-
     tokio::spawn(bus::projector::run(
         js.clone(),
         Arc::new(BookingProjector),
@@ -172,14 +172,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Carries every PAYMENTS event this service commits — the only path by which
     // they reach NATS.
-    tokio::spawn(bus::outbox::run(db.clone(), js.clone(), leader.clone()));
+    tokio::spawn(bus::outbox::run(db.clone(), js.clone()));
 
     // The refund side. Workers, not projectors — one refund per event across the whole
     // deployment, and no replay of history on a cold start.
     //
-    // Deliberately NOT partitioned. A worker performs a side effect and needs no
-    // order between events; partitioning it would cap refund throughput at
-    // `PARTITIONS` for nothing.
+    // A worker performs a side effect and needs no order between events at all — not
+    // even the per-aggregate order `projector::decide` enforces, which is why there is
+    // no version gate on this side.
     //
     // Only the BOOKINGS one holds a database handle, because only BOOKINGS is a
     // stream this service projects — it waits for its own mirror to include the event

@@ -25,6 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Started first and not waited on: a cold yugabyte takes most of a minute to
+      # initialise, which it can spend while the workspace compiles. Only the two
+      # services the tests need — caddy wants a built SPA, stripe-cli a real key.
+      - run: docker compose -f docker/docker-compose-dev.yml up -d nats yugabyte
+
       # A branch ref, not a tag — that's this action's documented usage
       # (@stable / @nightly / @1.89.0).
       - uses: dtolnay/rust-toolchain@stable
@@ -38,6 +43,23 @@ jobs:
       # No --exclude: src-tauri is its own workspace, so this can't reach the
       # Tauri crate (which would need webkit2gtk).
       - run: cargo test --workspace
+
+      # The binaries e2e/ spawns. Same profile and features as the line above, so
+      # every dependency is already built — this compiles the seven `main.rs` and links.
+      - run: cargo build --workspace --bins
+
+      - run: docker compose -f docker/docker-compose-dev.yml up -d --wait nats yugabyte
+
+      # Everything `#[ignore]`d because it needs the stack: the `live_tests` modules
+      # and e2e/, which boots the seven binaries above against it. No recompile.
+      - run: cargo test --workspace -- --ignored
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: target/debug/e2e-logs/
+          if-no-files-found: ignore
 
       - uses: actions/setup-node@v7
         with:

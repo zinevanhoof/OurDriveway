@@ -7,4 +7,14 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <!-- Painted behind the status and navigation bars, where the webview no longer
+         reaches. Matches the background token in main.css. -->
+    <color name="system_bars">#FFF5F7FB</color>
+    <!-- Under the navigation bar only, where MobileNavbar sits. Matches the card token,
+         which is what that bar is filled with. -->
+    <color name="navigation_bar">#FFFFFFFF</color>
+    <!-- The launcher icon's own blue, behind the splash icon. Same value as the
+         adaptive icon's background layer (ourdriveway-logo/svg/android-adaptive-background.svg)
+         and the `primary` token in main.css, so the splash and the app agree. -->
+    <color name="brand">#FF3D47D9</color>
 </resources>

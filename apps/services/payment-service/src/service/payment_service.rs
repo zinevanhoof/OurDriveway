@@ -179,22 +179,30 @@ impl PaymentService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
 
                 PaymentRepository::upsert(conn, Payment::created(created.clone(), version)).await?;
 
-                // Deterministic event id, so a resubmitted checkout is discarded by the
-                // stream's duplicate window instead of appended twice. The `_outbox` row is
-                // keyed by it too, so a retry inside this transaction is one row either way.
-                let mut envelope = Envelope::new(
+                // A plain v7 event id, and this is the one whose deterministic version was
+                // actively harmful rather than merely redundant.
+                //
+                // It was `v5("payment-created:{payment_id}")`, meant to collapse a
+                // resubmitted checkout. But the resume guard above only returns early
+                // while Stripe still hands back a `client_secret` — an expired session
+                // falls through, mints a genuinely new `session_id`, upserts, and bumps
+                // the version. That is a real change and its event must publish; under
+                // the old id the duplicate window swallowed it, leaving the payment row a
+                // version ahead of the stream for good.
+                //
+                // `payment_id` stays derived from the booking: that is an *entity* id, and
+                // it is what makes a resubmit upsert one row instead of tripping
+                // `payment_booking UNIQUE`. Naming a thing, not deduplicating an event.
+                let envelope = Envelope::new(
                     PaymentEvent::Created(created),
                     None,
                     aggregate_id("payment", &payment_id),
                     version,
-                );
-                envelope.event_id = Uuid::new_v5(
-                    &Uuid::NAMESPACE_OID,
-                    format!("payment-created:{payment_id}").as_bytes(),
                 );
 
                 outbox::enqueue(conn, &payment_subject(booking_id), &envelope).await?;
@@ -243,13 +251,19 @@ impl PaymentService {
     /// is withdrawn downstream and refunded by `settle_up`, which is one refund trigger
     /// rather than a decision made here with half the information.
     pub async fn record_webhook(&self, outcome: Outcome) -> MyResult<()> {
-        let (event, booking_id, dedupe, payment_id) = match outcome {
+        // No dedupe key any more. Each arm used to build one — `payment-succeeded:{id}`,
+        // `payment-failed:{id}:{reason}` — that became the envelope's event id, so a
+        // redelivered webhook was swallowed by the stream's duplicate window. The
+        // `[unpaid]` guard below reports the redelivery instead, before a version is
+        // committed. The `reason` in the failed key was the right instinct for the wrong
+        // layer: two genuine declines are two transitions, and the guard sees that.
+        let (event, booking_id, payment_id) = match outcome {
             Outcome::Succeeded {
                 booking_id,
                 intent_id,
             } => {
                 // Same derivation as `create_session` — that is the point: the webhook
-                // names the payment without reading it back.
+                // names the payment without reading it back. An *entity* id, and it stays.
                 let payment_id = Uuid::new_v5(
                     &Uuid::NAMESPACE_OID,
                     format!("payment:{booking_id}").as_bytes(),
@@ -261,7 +275,6 @@ impl PaymentService {
                         intent_id,
                     },
                     booking_id,
-                    format!("payment-succeeded:{payment_id}"),
                     payment_id,
                 )
             }
@@ -272,16 +285,12 @@ impl PaymentService {
                     format!("payment:{booking_id}").as_bytes(),
                 );
                 (
-                    // Keyed on the reason as well as the payment: a renter retrying a
-                    // declined card twice produces two genuine failures, and swallowing
-                    // the second as a duplicate would lose it.
                     PaymentEvent::Failed {
                         payment_id,
                         booking_id,
                         reason: reason.clone(),
                     },
                     booking_id,
-                    format!("payment-failed:{payment_id}:{reason}"),
                     payment_id,
                 )
             }
@@ -294,12 +303,13 @@ impl PaymentService {
 
         conn.transaction::<_, MyError, _>(|conn| {
             async move {
-                let version = shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
+                let version =
+                    shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
 
                 // `status = ANY(UNPAID)` is the guard that makes a redelivered webhook a
                 // no-op, and it runs in the same transaction as the event rather than a
                 // projector's moment later.
-                match &event {
+                let settled = match &event {
                     PaymentEvent::Succeeded { intent_id, .. } => {
                         PaymentRepository::transition(
                             conn,
@@ -307,7 +317,7 @@ impl PaymentService {
                             &status::UNPAID,
                             PaymentPatch::succeeded(intent_id.clone()),
                         )
-                        .await?;
+                        .await?
                     }
                     PaymentEvent::Failed { reason, .. } => {
                         PaymentRepository::transition(
@@ -316,17 +326,34 @@ impl PaymentService {
                             &status::UNPAID,
                             PaymentPatch::failed(reason.clone()),
                         )
-                        .await?;
+                        .await?
                     }
                     // `handle_webhook` builds only the two above.
-                    _ => {}
-                }
-                shared::set_version!(conn, "payment", shared::schema::payment::payment, &payment_id, version)?;
+                    _ => db::Changed::No,
+                };
 
-                // Same as above: the id is what makes a redelivered webhook a no-op.
-                let mut envelope =
+                // The payment already left `unpaid` — Stripe redelivering a webhook it
+                // has already had a 2xx for, which it does routinely. The money did not
+                // move a second time and neither should the version: committing one here
+                // with no event behind it is what left this aggregate permanently gapped.
+                if !settled.applied() {
+                    return Ok(());
+                }
+
+                shared::set_version!(
+                    conn,
+                    "payment",
+                    shared::schema::payment::payment,
+                    &payment_id,
+                    version
+                )?;
+
+                // A plain v7 event id. The `dedupe` key built by the caller used to become
+                // this event's id; the `[unpaid]` guard above is what makes a redelivered
+                // webhook a no-op now, and it does it before a version is committed rather
+                // than after.
+                let envelope =
                     Envelope::new(event, None, aggregate_id("payment", &payment_id), version);
-                envelope.event_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, dedupe.as_bytes());
 
                 outbox::enqueue(conn, &payment_subject(&booking_id), &envelope).await?;
                 Ok(())
@@ -431,7 +458,8 @@ impl PaymentService {
                         requested_at: Utc::now(),
                     };
 
-                    let payout_version = shared::next_version!(conn, shared::schema::payment::payout, &payout_id)?;
+                    let payout_version =
+                        shared::next_version!(conn, shared::schema::payment::payout, &payout_id)?;
                     PayoutRepository::upsert(
                         conn,
                         Payout::requested(&requested, payout_version).ok_or_else(|| {
