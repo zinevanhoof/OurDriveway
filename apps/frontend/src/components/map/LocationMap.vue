@@ -1,8 +1,18 @@
 <script setup lang="ts">
 import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import { onMounted, onBeforeUnmount, ref, computed, watch, h, render } from "vue";
-import maplibregl from "maplibre-gl";
+// A namespace import: maplibre-gl 6 ships no default export.
+import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+// v6 moved the web worker into its own file, and left to itself MapLibre looks for it at
+// /assets/maplibre-gl-worker.mjs — which Vite never emits, so the SPA fallback answered
+// with index.html and the browser refused it as a script. `?worker&url` makes Vite emit
+// the worker (and its sibling maplibre-gl-shared.mjs; plain `?url` misses that one) and
+// hands back its real URL. Per https://maplibre.org/maplibre-gl-js/docs/ (Vite tab).
+import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
+
+// Module scope: once, before any map is constructed.
+maplibregl.setWorkerUrl(workerUrl);
 import { clusterPins, type MapSpot, type PinData } from "@/lib/mapPins";
 import { toast } from "vue-sonner";
 import { fetchSpotsNear } from "@/api/viewApi";
@@ -282,9 +292,13 @@ onMounted(async () => {
 
   });
   // Liberty's vector tiles reference a few POI icons its sprite doesn't ship
-  // (e.g. sports_centre). Feed a transparent 1×1 for those so MapLibre stops
+  // (e.g. sports_centre, office). Feed a transparent 1×1 for those so MapLibre stops
   // warning — the POI just shows no icon, which is the case regardless.
-  map.on("styleimagemissing", ({ id }) => {
+  //
+  // A resolver, not the `styleimagemissing` event it replaced in maplibre-gl 6: the
+  // event now fires only after the image is already treated as missing, so an
+  // `addImage` there came too late to stop the warning.
+  map.setMissingStyleImageResolver((id) => {
     if (!map!.hasImage(id)) {
       map!.addImage(id, { width: 1, height: 1, data: new Uint8Array(4) });
     }

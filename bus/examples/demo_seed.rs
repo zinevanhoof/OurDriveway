@@ -8,34 +8,37 @@
 //! "vs last" has a percentage; one of Sam's driveways is paused, so "active" reads 2/3;
 //! and when run before 22:00 one of Sam's driveways is occupied right now.
 //!
+//!     docker compose -f docker/docker-compose-dev.yml down -v
 //!     docker compose -f docker/docker-compose-dev.yml up -d
 //!     scripts/migrate.sh
-//!     # start all seven services, then:
 //!     cargo build --workspace --all-targets && ./target/debug/examples/demo_seed
+//!     # only now start the seven services
 //!
 //! Log in as `sam@example.com` / `Demo1234!` — a host with three driveways, income, a
 //! pending balance and two payouts, and a renter with a history, a refund and a booking
 //! coming up. Every account below shares that password.
 //!
-//! **Rows only, then the services' own backfill.** This enqueues no events itself. It
-//! writes the authoritative rows into user-, spot-, booking- and
-//! payment-service's databases and then calls each one's `POST /internal/backfill`,
-//! which re-emits every row as the events that reproduce it — the same path a projection
-//! rebuild takes. So the event chains (a cancelled booking is Created, Confirmed,
-//! Cancelled; a refunded payment is Created then Refunded) are derived by the services
-//! that own them, not restated here to drift.
+//! **Rows and their events, before any service runs.** Each row is written together with
+//! the chain of events that produced it — a cancelled booking is Created, Confirmed,
+//! Cancelled at versions 1, 2, 3 — into the owning service's `_outbox`, and the row's
+//! version is the chain's length. The seed then relays every outbox to NATS itself.
+//! When the services start, their projectors (`DeliverPolicy::All`) build the read model
+//! and every mirror from that history, the same way a projection rebuild does.
 //!
-//! That also makes the history inert. Backfilled envelopes carry `backfill: true`, and
-//! `bus::worker` acks those without running a handler: no verification emails, no Stripe
-//! refunds against the fake `pi_test_demo_…` intents, no transfers for the seeded
-//! payouts. Projectors apply them like any other event.
+//! **That ordering is what makes the history inert.** Workers are created with
+//! `DeliverPolicy::New`, so a worker consumer that does not exist yet when the events
+//! land never sees them: no verification emails, no Stripe refunds against the fake
+//! `pi_test_demo_…` intents, no transfers for the seeded payouts. So the seed refuses to
+//! run once the streams exist, because that means the services, and their workers, have
+//! already started.
 //!
 //! **Run it once, on a fresh stack.** Dates are relative to today, so a re-run on a later
 //! day would move rows the read model has already seen at the same version, and the
 //! projectors would keep the old copy. It refuses to run twice; reset the stack instead.
 //!
-//! **Don't cancel a seeded booking on camera.** A live cancel is not a backfill: it wakes
-//! the settlement worker, which asks Stripe to refund an intent that does not exist.
+//! **Don't cancel a seeded booking on camera.** A live cancel is new, so the workers do
+//! see it: it wakes the settlement worker, which asks Stripe to refund an intent that
+//! does not exist.
 //! Cancel something booked during the recording.
 //!
 //! Coordinates are placed by hand along the named streets — close enough for a map, not
@@ -53,14 +56,20 @@ use chrono::{
 };
 use chrono_tz::Europe::Brussels;
 use diesel::{OptionalExtension, QueryDsl};
-use diesel_async::RunQueryDsl;
-use serde::Deserialize;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use serde::Serialize;
 use shared::domain_models::booking::{Booking, status as booking_status};
 use shared::domain_models::payment::{Payment, Payout, payout, status as payment_status};
 use shared::domain_models::spot::Spot;
 use shared::domain_models::user::User;
-use shared::events::booking::{CancelReason, ReleaseReason};
-use shared::events::{spot::SpotCreated, user::UserRegistered};
+use shared::events::booking::{BookingCreated, BookingEvent, CancelReason, ReleaseReason};
+use shared::events::payment::{PaymentCreated, PaymentEvent};
+use shared::events::spot::{SpotCreated, SpotEvent, SpotUpdated};
+use shared::events::user::{UserEvent, UserRegistered, UserUpdated};
+use shared::events::{
+    Envelope, aggregate_id, booking_subject, payment_subject, payout_subject, spot_subject,
+    user_subject,
+};
 use shared::general_models::booking::Booked;
 use shared::general_models::spot::{Address, Availability, TimeSlot, WeeklyAvailability};
 use shared::schema::{booking::booking, payment::payment, payment::payout as payout_table};
@@ -983,6 +992,32 @@ const LIVE: (&str, &str, &str) = ("b70", "zuivelmarkt", "lina");
 const PAYOUTS: &[(&str, &str, i64, i64)] = &[("p1", "sam", 4_000, 45), ("p2", "sam", 2_500, 14)];
 
 /// Upserts a whole row, keyed on its primary key.
+/// Enqueues an aggregate's history into its service's `_outbox`, one event per version
+/// starting at 1, each dated when it happened in the story. Returns the last version,
+/// which is what the row must carry: the projectors gate on it, and the next live event
+/// on this aggregate will be that plus one.
+async fn emit<T: Serialize>(
+    conn: &mut AsyncPgConnection,
+    subject: &str,
+    aggregate: String,
+    chain: Vec<(DateTime<Utc>, T)>,
+) -> Result<i64, Error> {
+    let mut version = 0;
+    for (occurred_at, payload) in chain {
+        version += 1;
+        let envelope = Envelope {
+            event_id: Uuid::now_v7(),
+            aggregate: aggregate.clone(),
+            version,
+            occurred_at,
+            actor_id: None,
+            payload,
+        };
+        bus::outbox::enqueue(conn, subject, &envelope).await?;
+    }
+    Ok(version)
+}
+
 macro_rules! upsert {
     ($conn:expr, $table:expr, $id:expr, $row:expr) => {{
         let row = $row;
@@ -1195,22 +1230,16 @@ async fn main() -> Result<(), Error> {
             + "/"
             + name
     };
-    let mut users = shared::db::connect(&db_url("user"))
-        .await?
-        .get_owned()
-        .await?;
-    let mut spots = shared::db::connect(&db_url("spot"))
-        .await?
-        .get_owned()
-        .await?;
-    let mut bookings = shared::db::connect(&db_url("booking"))
-        .await?
-        .get_owned()
-        .await?;
-    let mut payments = shared::db::connect(&db_url("payment"))
-        .await?
-        .get_owned()
-        .await?;
+    // The pools as well as a connection from each: the relay at the end drains from the
+    // pool.
+    let user_db = shared::db::connect(&db_url("user")).await?;
+    let spot_db = shared::db::connect(&db_url("spot")).await?;
+    let booking_db = shared::db::connect(&db_url("booking")).await?;
+    let payment_db = shared::db::connect(&db_url("payment")).await?;
+    let mut users = user_db.get_owned().await?;
+    let mut spots = spot_db.get_owned().await?;
+    let mut bookings = booking_db.get_owned().await?;
+    let mut payments = payment_db.get_owned().await?;
 
     let already = app_user::table
         .find(person("sam"))
@@ -1221,9 +1250,27 @@ async fn main() -> Result<(), Error> {
     if already.is_some() {
         return Err("the demo data is already there. It runs once per fresh stack: \
                     `docker compose -f docker/docker-compose-dev.yml down -v`, up, \
-                    scripts/migrate.sh, start the services, then run this again. To only \
-                    re-send the events: curl -XPOST localhost:<3000|3001|3002|3006>/internal/backfill"
+                    scripts/migrate.sh, then this, then start the services."
             .into());
+    }
+
+    // Every service declares the streams on boot, so a stream that exists means a
+    // service has run and its workers' consumers exist. They would act on this history:
+    // mails to the demo addresses, and Stripe calls against the fake ids.
+    let js = bus::connect(
+        &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
+    )
+    .await?;
+    for (stream, ..) in shared::events::STREAMS {
+        if js.get_stream(*stream).await.is_ok() {
+            return Err(format!(
+                "NATS already has the {stream} stream, so the services have run on this \
+                 stack and their workers would act on the seeded history. Seed a fresh \
+                 stack before starting any service: `docker compose -f \
+                 docker/docker-compose-dev.yml down -v`, up, scripts/migrate.sh, then this."
+            )
+            .into());
+        }
     }
 
     let now = Utc::now();
@@ -1234,20 +1281,42 @@ async fn main() -> Result<(), Error> {
     let password_hash = hash(PASSWORD);
     for (i, (key, first, last, plates)) in PEOPLE.iter().enumerate() {
         let id = person(key);
-        let mut row = User::registered(
-            UserRegistered {
-                user_id: id,
-                first_name: first.to_string(),
-                last_name: last.to_string(),
-                email: format!("{key}@example.com"),
-            },
-            1,
-            password_hash.clone(),
-        );
+        let registered = UserRegistered {
+            user_id: id,
+            first_name: first.to_string(),
+            last_name: last.to_string(),
+            email: format!("{key}@example.com"),
+        };
+        let mut row = User::registered(registered.clone(), 1, password_hash.clone());
         row.email_verified = true;
         row.license_plates = plates.iter().map(|p| p.to_string()).collect();
         row.country = Some("BE".into());
         row.profile_picture = AVATARS.get(i).map(|url| url.to_string());
+
+        // Signed up, then filled in the profile. No `EmailVerified`: nothing downstream
+        // projects it, and the row already says verified. No `VerificationRequested`
+        // either — it is a mail, and it is the one a worker would send.
+        row.version = emit(
+            &mut *users,
+            &user_subject(&id),
+            aggregate_id("user", &id),
+            vec![
+                (now, UserEvent::Registered(registered)),
+                (
+                    now,
+                    UserEvent::Updated(UserUpdated {
+                        user_id: id,
+                        first_name: None,
+                        last_name: None,
+                        email: None,
+                        profile_picture: row.profile_picture.clone(),
+                        license_plates: Some(row.license_plates.clone()),
+                        country: row.country.clone(),
+                    }),
+                ),
+            ],
+        )
+        .await?;
         upsert!(&mut *users, app_user::table, app_user::id, row);
     }
     println!("people    {}", PEOPLE.len());
@@ -1277,12 +1346,33 @@ async fn main() -> Result<(), Error> {
             availability: availability(s.hours),
             timezone: "Europe/Brussels".into(),
         };
-        let mut row = Spot::created(created, now - Duration::days(s.listed_days_ago), 1);
+        let spot_id = created.spot_id;
+        let listed_at = now - Duration::days(s.listed_days_ago);
+        let mut row = Spot::created(created.clone(), listed_at, 1);
+        let mut chain = vec![(listed_at, SpotEvent::Created(created))];
         if PAUSED.contains(&s.key) {
-            // Created, then switched off: the two events the backfill replays for it.
+            // Created, then switched off — the shape the manage screen's toggle sends.
             row.active = false;
-            row.version = 2;
+            chain.push((
+                listed_at,
+                SpotEvent::Updated(SpotUpdated {
+                    spot_id,
+                    title: None,
+                    description: None,
+                    price_per_hour_cents: None,
+                    images: None,
+                    availability: None,
+                    active: Some(false),
+                }),
+            ));
         }
+        row.version = emit(
+            &mut *spots,
+            &spot_subject(&spot_id),
+            aggregate_id("spot", &spot_id),
+            chain,
+        )
+        .await?;
         upsert!(&mut *spots, spot::table, spot::id, row);
     }
     println!("spots     {}", SPOTS.len());
@@ -1366,30 +1456,8 @@ async fn main() -> Result<(), Error> {
             );
         }
 
-        // Versions are the length of each chain `replay::events` rebuilds from the row:
-        // a rating is one more event after the confirmation.
-        let (status, version, cancel_reason, release_reason) = match b.fate {
-            Fate::Confirmed => (
-                booking_status::CONFIRMED,
-                if rating.is_some() { 3 } else { 2 },
-                None,
-                None,
-            ),
-            Fate::Cancelled { .. } => (
-                booking_status::CANCELLED,
-                3,
-                Some(CancelReason::ByRenter),
-                None,
-            ),
-            Fate::Abandoned => (
-                booking_status::RELEASED,
-                2,
-                None,
-                Some(ReleaseReason::Abandoned),
-            ),
-        };
-
         let booking_id = stable(&format!("booking:{}", b.key));
+        let spot_id = stable(&format!("spot:{}", s.key));
         let host_id = person(s.host);
         let renter_id = person(b.renter);
         let booked: Booked = [(
@@ -1405,6 +1473,74 @@ async fn main() -> Result<(), Error> {
         .into_iter()
         .collect();
 
+        // Checkout is paid two minutes after the hold, and an unpaid hold lapses after
+        // booking-service's fifteen.
+        let paid_at = created_at + Duration::minutes(2);
+        let refunded_at = match b.fate {
+            Fate::Cancelled { after_days } => {
+                let refunded_at = created_at + Duration::days(after_days);
+                let starts_at = local(date, &b.slots[0].0);
+                assert!(
+                    refunded_at <= now && refunded_at < starts_at - Duration::hours(1),
+                    "{} is refunded after the cancel deadline",
+                    b.key
+                );
+                Some(refunded_at)
+            }
+            _ => None,
+        };
+
+        // The path the booking took. Every consumer guards its transitions with
+        // `WHERE status IN [...]`, so a cancellation needs the confirmation before it, and
+        // a rating lands only on a confirmed row.
+        let mut chain = vec![(
+            created_at,
+            BookingEvent::Created(BookingCreated {
+                booking_id,
+                spot_id,
+                host_id,
+                renter_id,
+                booked: booked.clone(),
+                license_plate: plate(b.renter),
+                amount_cents: amount,
+                expires_at: created_at + Duration::minutes(15),
+                ends_at,
+            }),
+        )];
+        let (status, cancel_reason, release_reason) = match b.fate {
+            Fate::Confirmed => {
+                chain.push((paid_at, BookingEvent::Confirmed { booking_id }));
+                if let Some(rating) = rating {
+                    chain.push((ends_at, BookingEvent::Rated { booking_id, rating }));
+                }
+                (booking_status::CONFIRMED, None, None)
+            }
+            Fate::Cancelled { .. } => {
+                let reason = CancelReason::ByRenter;
+                chain.push((paid_at, BookingEvent::Confirmed { booking_id }));
+                chain.push((
+                    refunded_at.expect("a cancelled booking is refunded"),
+                    BookingEvent::Cancelled { booking_id, reason },
+                ));
+                (booking_status::CANCELLED, Some(reason), None)
+            }
+            Fate::Abandoned => {
+                let reason = ReleaseReason::Abandoned;
+                chain.push((
+                    created_at + Duration::minutes(15),
+                    BookingEvent::Released { booking_id, reason },
+                ));
+                (booking_status::RELEASED, None, Some(reason))
+            }
+        };
+        let version = emit(
+            &mut *bookings,
+            &booking_subject(&spot_id),
+            aggregate_id("booking", &booking_id),
+            chain,
+        )
+        .await?;
+
         upsert!(
             &mut *bookings,
             booking::table,
@@ -1412,7 +1548,7 @@ async fn main() -> Result<(), Error> {
             Booking {
                 id: booking_id,
                 version,
-                spot_id: stable(&format!("spot:{}", s.key)),
+                spot_id,
                 host_id,
                 renter_id,
                 booked,
@@ -1430,40 +1566,78 @@ async fn main() -> Result<(), Error> {
         );
 
         // An abandoned checkout never paid, so it has no payment to show.
-        let (paid_status, payment_version, refunded_at) = match b.fate {
-            Fate::Confirmed => (payment_status::SUCCEEDED, 2, None),
-            Fate::Cancelled { after_days } => {
-                let refunded_at = created_at + Duration::days(after_days);
-                let starts_at = local(date, &b.slots[0].0);
-                assert!(
-                    refunded_at <= now && refunded_at < starts_at - Duration::hours(1),
-                    "{} is refunded after the cancel deadline",
-                    b.key
-                );
-                (payment_status::REFUNDED, 3, Some(refunded_at))
-            }
-            Fate::Abandoned => continue,
-        };
+        if matches!(b.fate, Fate::Abandoned) {
+            continue;
+        }
 
         let payment_id = stable(&format!("payment:{}", b.key));
+        let intent_id = fake_stripe("pi", &payment_id);
+        let refund_id = refunded_at.map(|_| fake_stripe("re", &payment_id));
+        let mut chain = vec![
+            (
+                paid_at,
+                PaymentEvent::Created(PaymentCreated {
+                    payment_id,
+                    booking_id,
+                    host_id,
+                    renter_id,
+                    session_id: fake_stripe("cs", &payment_id),
+                    amount_cents: amount,
+                    created_at: paid_at,
+                }),
+            ),
+            (
+                paid_at,
+                PaymentEvent::Succeeded {
+                    payment_id,
+                    booking_id,
+                    intent_id: intent_id.clone(),
+                },
+            ),
+        ];
+        if let (Some(refunded_at), Some(refund_id)) = (refunded_at, refund_id.clone()) {
+            chain.push((
+                refunded_at,
+                PaymentEvent::Refunded {
+                    payment_id,
+                    booking_id,
+                    refund_id,
+                    amount_cents: amount,
+                    refunded_at,
+                },
+            ));
+        }
+        let paid_status = if refunded_at.is_some() {
+            payment_status::REFUNDED
+        } else {
+            payment_status::SUCCEEDED
+        };
+        let version = emit(
+            &mut *payments,
+            &payment_subject(&booking_id),
+            aggregate_id("payment", &payment_id),
+            chain,
+        )
+        .await?;
+
         upsert!(
             &mut *payments,
             payment::table,
             payment::id,
             Payment {
                 id: payment_id,
-                version: payment_version,
+                version,
                 booking_id,
                 host_id,
                 renter_id,
                 amount_cents: amount,
                 session_id: fake_stripe("cs", &payment_id),
-                intent_id: Some(fake_stripe("pi", &payment_id)),
+                intent_id: Some(intent_id),
                 status: paid_status.into(),
-                refund_id: refunded_at.map(|_| fake_stripe("re", &payment_id)),
+                refund_id,
                 refunded_at,
                 failure_reason: None,
-                created_at: created_at + Duration::minutes(2),
+                created_at: paid_at,
             }
         );
 
@@ -1480,20 +1654,50 @@ async fn main() -> Result<(), Error> {
         let host_id = person(host);
         *paid_out.entry(host_id).or_default() += cents;
 
+        let requested_at = now - Duration::days(days_ago);
+        let transfer_id = fake_stripe("tr", &id);
+        // Requested, then paid. Keyed by host, like the live path: that subject is what
+        // serialises one host's withdrawals.
+        let version = emit(
+            &mut *payments,
+            &payout_subject(&host_id),
+            aggregate_id("payout", &id),
+            vec![
+                (
+                    requested_at,
+                    PaymentEvent::PayoutRequested {
+                        payout_id: id,
+                        host_id,
+                        amount_cents: cents,
+                        requested_at,
+                    },
+                ),
+                (
+                    requested_at,
+                    PaymentEvent::PayoutPaid {
+                        payout_id: id,
+                        host_id,
+                        transfer_id: transfer_id.clone(),
+                        paid_at: requested_at,
+                    },
+                ),
+            ],
+        )
+        .await?;
+
         upsert!(
             &mut *payments,
             payout_table::table,
             payout_table::id,
             Payout {
                 id,
-                // Requested, then paid.
-                version: 2,
+                version,
                 host_id,
                 amount_cents: cents,
                 status: payout::status::PAID.into(),
-                transfer_id: Some(fake_stripe("tr", &id)),
+                transfer_id: Some(transfer_id),
                 failure_reason: None,
-                created_at: now - Duration::days(days_ago),
+                created_at: requested_at,
             }
         );
     }
@@ -1507,46 +1711,20 @@ async fn main() -> Result<(), Error> {
     println!("payouts   {}", PAYOUTS.len());
 
     // ── events ──────────────────────────────────────────────────────────────
-    // Each writing service re-emits its rows. The read model and every mirror build
-    // themselves from those, the same way a projection rebuild does.
-    #[derive(Deserialize)]
-    struct Backfilled {
-        events: usize,
-    }
-
-    let client = reqwest::Client::new();
-    let mut missed = vec![];
-    for (service, port) in [
-        ("user-service", 3000),
-        ("spot-service", 3002),
-        ("booking-service", 3001),
-        ("payment-service", 3006),
+    // What each service's relay would do on boot, done here instead, so the history is
+    // in the streams before any worker consumer exists.
+    bus::ensure_streams(&js).await?;
+    for (service, pool) in [
+        ("user-service", &user_db),
+        ("spot-service", &spot_db),
+        ("booking-service", &booking_db),
+        ("payment-service", &payment_db),
     ] {
-        let url = format!("http://localhost:{port}/internal/backfill");
-        match client
-            .post(&url)
-            .send()
-            .await
-            .and_then(|res| res.error_for_status())
-        {
-            Ok(res) => println!(
-                "{service:<16} re-emitted {} events",
-                res.json::<Backfilled>().await?.events
-            ),
-            Err(e) => {
-                println!("{service:<16} unreachable: {e}");
-                missed.push(url);
-            }
-        }
+        let sent = bus::outbox::drain(pool, &js).await?;
+        println!("{service:<16} published {sent} events");
     }
 
-    if !missed.is_empty() {
-        println!("\nThe rows are written, but some services were not running. Start them, then:");
-        for url in missed {
-            println!("  curl -XPOST {url}");
-        }
-    }
-
-    println!("\nlog in as sam@example.com / {PASSWORD} (every demo account shares it)");
+    println!("\nnow start the services; the read model builds itself from the streams");
+    println!("log in as sam@example.com / {PASSWORD} (every demo account shares it)");
     Ok(())
 }

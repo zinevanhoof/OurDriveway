@@ -6,7 +6,7 @@ frontend's Caddy, a debug pod, anything a future chart installs — could dial Y
 5433 and NATS on 4222 and only the password stood in the way. With them, the ports are
 closed at the network layer to everything but the pods that actually need them.
 
-The admitted pods carry a label, set in services.yaml and migrator-job.yaml from the same
+The admitted pods carry a label, set in backends.yaml and migrator-job.yaml from the same
 `db` / `nats` flags that decide whether a pod gets the connection URL at all — so a pod
 is let in exactly when it is given the credentials, and the two cannot drift:
 

@@ -998,7 +998,6 @@ dependencies = [
  "diesel-async",
  "dotenvy",
  "futures",
- "reqwest",
  "serde",
  "serde_json",
  "shared",

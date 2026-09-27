@@ -5,22 +5,26 @@
 # is SameSite=Strict, so splitting the API onto another host silently breaks
 # login and nothing else.
 #
+# Three Ingress objects on that one host, because a Traefik middleware attaches per
+# Ingress and the three halves want different rate limits (templates/rate-limit.yaml):
+#
+#   ourdriveway       /                 the SPA — no limit: a page load is a burst of
+#                                       assets, and Cloudflare caches them anyway
+#   ourdriveway-api   /api/<service>    the general per-IP limit
+#   ourdriveway-auth  six exact paths   the strict per-IP limit, on the endpoints that
+#                                       cost an Argon2 hash or send an email
+#
+# Traefik ranks routers by the length of the rule string. That makes every /api prefix
+# win over `/` on its own, but NOT the auth paths over `/api/user`: ``Path(`/api/user/login`)``
+# and ``PathPrefix(`/api/user`)`` are the same length, the tie went to the prefix, and
+# logins sailed past the strict limit. Measured, and fixed with an explicit priority on
+# the auth Ingress rather than by leaning on string lengths.
+#
 # Note these are `Prefix`, not the glob Caddy used. `/api/spot` therefore matches
 # both `POST /api/spot` and `/api/spot/address/suggest` — the old
 # `handle /api/spot/*` matched only the latter and quietly served the SPA's
 # index.html in response to spot creation.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: ourdriveway
-  {{- with .Values.ingress.annotations }}
-  # Empty by default. Nothing this app needs depends on a specific controller any
-  # more — the upload ceiling moved into spot-service, where it holds regardless
-  # of what is proxying. Put controller-specific tuning here if you ever need it.
-  annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-spec:
+{{- define "ourdriveway.ingressSpec" }}
   ingressClassName: {{ .Values.ingress.className }}
   {{- if .Values.ingress.tls.enabled }}
   # TLS terminates here, not in Caddy. Android release builds block cleartext, so
@@ -30,8 +34,55 @@ spec:
         - {{ .Values.ingress.host }}
       secretName: {{ .Values.ingress.tls.secretName }}
   {{- end }}
+{{- end }}
+{{- /* Empty host: match any Host header — how the local cluster answers on the LAN IP,
+       which an Ingress host cannot be. */}}
+{{- define "ourdriveway.ingressHost" }}
+      {{- with .Values.ingress.host }}
+      host: {{ . }}
+      {{- end }}
+{{- end }}
+{{- define "ourdriveway.ingressAnnotations" }}
+  {{- $annotations := deepCopy (.root.Values.ingress.annotations | default dict) }}
+  {{- if and .root.Values.rateLimit.enabled .middleware }}
+  {{- $_ := set $annotations "traefik.ingress.kubernetes.io/router.middlewares" (printf "%s-%s@kubernetescrd" .root.Release.Namespace .middleware) }}
+  {{- end }}
+  {{- with .priority }}
+  {{- $_ := set $annotations "traefik.ingress.kubernetes.io/router.priority" . }}
+  {{- end }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ourdriveway
+  {{- include "ourdriveway.ingressAnnotations" (dict "root" . "middleware" "") }}
+spec:
+  {{- include "ourdriveway.ingressSpec" . }}
   rules:
-    - host: {{ .Values.ingress.host }}
+    - {{- include "ourdriveway.ingressHost" . }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ourdriveway-api
+  {{- include "ourdriveway.ingressAnnotations" (dict "root" . "middleware" "api-rate-limit") }}
+spec:
+  {{- include "ourdriveway.ingressSpec" . }}
+  rules:
+    - {{- include "ourdriveway.ingressHost" . }}
       http:
         paths:
           {{- range $name, $svc := .Values.services }}
@@ -45,12 +96,28 @@ spec:
                   number: {{ $.Values.port }}
           {{- end }}
           {{- end }}
-          # Last, and shortest: the controller matches longest prefix first, so
-          # every /api/* rule above wins before the SPA catch-all.
-          - path: /
-            pathType: Prefix
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ourdriveway-auth
+  {{- /* Above any rule-length priority these paths could tie with — see the header. */}}
+  {{- include "ourdriveway.ingressAnnotations" (dict "root" . "middleware" "auth-rate-limit" "priority" "1000") }}
+spec:
+  {{- include "ourdriveway.ingressSpec" . }}
+  rules:
+    - {{- include "ourdriveway.ingressHost" . }}
+      http:
+        paths:
+          # Each is either an Argon2 hash (~35ms of a CPU, the cheapest way to load this
+          # box) or an email to someone's inbox. Everything else under /api/user —
+          # session refresh, profile edits — stays on the general limit.
+          {{- range $path := list "login" "signup" "password/forgot" "password/reset" "email/resend" "email/verify" }}
+          - path: /api/user/{{ $path }}
+            pathType: Exact
             backend:
               service:
-                name: frontend
+                name: user-service
                 port:
-                  number: 80
+                  number: {{ $.Values.port }}
+          {{- end }}

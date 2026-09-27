@@ -88,8 +88,7 @@ pub struct Pending {
 /// Callers pass their open transaction as `&mut *tx` rather than a pooled connection,
 /// because being in the caller's transaction is the entire point: if their write rolls
 /// back, so does this, and no event is ever published for a change that did not
-/// happen. The signature is `impl PgExecutor<'_>`, which admits both — `backfill`
-/// below is the one caller that legitimately passes the pool.
+/// happen.
 ///
 /// The record id is the envelope's `event_id`, so enqueuing the same event twice
 /// is one row rather than two — the same property the `Nats-Msg-Id` dedupe gives
@@ -102,10 +101,8 @@ pub struct Pending {
 /// different one at a different version: a payout's `PayoutPaid` overwritten by a
 /// `PayoutFailed`, or a v2 replaced by a v3 whose predecessor then never published.
 ///
-/// Those ids are gone — every event now carries a v7 — so in practice this clause fires
-/// only for [`backfill`], where the same id means the same `@version:step` and therefore
-/// the same payload. First writer wins, and "one event id, one event" is true rather than
-/// hoped.
+/// Those ids are gone — every event now carries a v7 — so in practice this clause never
+/// fires. First writer wins, and "one event id, one event" is true rather than hoped.
 ///
 /// ## `created_at` is `time::now()`, not `envelope.occurred_at`
 ///
@@ -152,70 +149,6 @@ pub async fn enqueue<T: Serialize>(
         .execute(conn)
         .await?;
     Ok(())
-}
-
-/// Re-emits one aggregate's current state as the events that reproduce it.
-///
-/// This is the rebuild path, and it exists because the streams expire now
-/// (`shared::events::STREAMS`). Replaying history is no longer possible and no
-/// longer needed — TiKV is durable — but a projection can still be *wrong*: a
-/// projector bug, a new denormalized column, a restore from a stale backup. When
-/// that happens, this walks what the owning service actually has and enqueues the
-/// events for it, so the re-derive runs through the same projectors as live traffic
-/// instead of a one-off script that duplicates their denormalization rules.
-///
-/// Takes the pool rather than a transaction, unlike [`enqueue`]: there is no
-/// accompanying write to be atomic with, and a whole-table backfill in one transaction
-/// would be a write set the size of the table. Each row is its own statement, and a
-/// run that dies half way is resumed by running it again.
-///
-/// Event ids are derived from `<aggregate>@<version>:<step>`, so a second run writes
-/// the same `_outbox` rows and — inside the stream's `duplicate_window` — publishes
-/// once. `backfill` is set on every envelope; see [`Envelope::backfill`] for the one
-/// consumer that must honour it.
-///
-/// `events` carries its own timestamps because a chain is not simultaneous: a spot's
-/// `Created` must land with the row's `created_at`, or view-service's copy claims the
-/// listing appeared the day the backfill ran.
-///
-/// ponytail: safe against a projection that is behind or empty, which is the case it
-/// is for. Run against one that is *ahead* — or racing a live write to the same
-/// aggregate — and the older content can land on top of newer: `set_version`'s
-/// `WHERE version < $v` holds the version back but not the columns, so the row reads
-/// stale until its next real event. Compare versions inside each projector if this
-/// ever needs to be safe concurrently.
-pub async fn backfill<T: Serialize>(
-    pool: &Db,
-    subject: &str,
-    aggregate: &str,
-    version: i64,
-    events: impl IntoIterator<Item = (DateTime<Utc>, T)>,
-) -> MyResult<usize> {
-    let mut sent = 0;
-    for (step, (occurred_at, payload)) in events.into_iter().enumerate() {
-        let envelope = Envelope {
-            event_id: Uuid::new_v5(
-                &Uuid::NAMESPACE_OID,
-                format!("backfill:{aggregate}@{version}:{step}").as_bytes(),
-            ),
-            aggregate: aggregate.to_string(),
-            version,
-            occurred_at,
-            // Nobody caused this. The original actor is not recoverable from a row,
-            // and inventing one would put a lie in the log.
-            actor_id: None,
-            backfill: true,
-            payload,
-        };
-        // `backfill` holds the pool rather than a transaction — each row is its own
-        // statement and a partial backfill is safe to resume — so it checks out a
-        // connection per event. `enqueue` itself takes a connection precisely so its
-        // OTHER callers can hand it an open transaction.
-        let mut conn = pool.get().await.map_err(|e| MyError::Pool(e.to_string()))?;
-        enqueue(&mut conn, subject, &envelope).await?;
-        sent += 1;
-    }
-    Ok(sent)
 }
 
 /// Publishes everything pending, oldest first, until the table is empty.

@@ -1,14 +1,9 @@
 {{/*
-The one process that migrates. Every service Deployment assumes its schema already
-exists and none of them touch it.
+The one process that creates databases and migrates them. No service touches schema.
 
-WHY THIS EXISTS, given that a `create-databases` post-install hook was deliberately
-deleted once already (see deploy.sh and k8s/README.md): that removal was correct while
-the services used sqlx, because `sqlx::migrate` takes an advisory lock around the whole
-run, so every replica migrating at boot was safe. `diesel_migrations` takes no lock at
-all — each migration is wrapped in a transaction, but the run is not exclusive, so at
-`replicas: N` two pods would read the same pending set and both apply it. Centralising
-is what puts that guarantee back. See diesel-migration.md.
+Centralised because `diesel_migrations` takes no lock: each migration runs in a
+transaction, but the run is not exclusive, so at `replicas: N` two booting pods would
+read the same pending set and both apply it.
 
 `post-install,pre-upgrade`, NOT `pre-install`:
   * `pre-install` runs before ANY chart resource, so on a cold install the yugabyte
@@ -76,10 +71,10 @@ spec:
         - name: migrator
           image: {{ .Values.registry }}/ourdriveway-migrator:{{ .Values.tag }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
-          # One URL per database, interpolated from the same secret entry YugabyteDB
-          # itself reads, so the two cannot drift. `$(VAR)` is expanded by Kubernetes
-          # at container start, so `kubectl get pod -o yaml` shows the reference rather
-          # than the password — and the migrator never logs a URL, only a database name.
+          # One URL per database, from the same secret entry YugabyteDB reads. `$(VAR)` is
+          # expanded at container start, so the pod spec shows the reference, not the
+          # password — and the migrator logs database names, never URLs. Pure wiring, so
+          # it has no config file of its own.
           env:
             - name: YSQL_PASSWORD
               valueFrom:
@@ -90,10 +85,6 @@ spec:
             - name: {{ $db | upper }}_DATABASE_URL
               value: "postgres://yugabyte:$(YSQL_PASSWORD)@yugabyte:5433/{{ $db }}"
             {{- end }}
-          # No `envFrom`: the database password above is the only secret this reads,
-          # and it used to be handed every other one — Stripe, R2, Resend — besides.
-          # Set here though the app Deployments have none: a Job competing for an
-          # unbounded share while the cluster is mid-deploy is the wrong trade.
           resources:
             requests:
               cpu: 50m

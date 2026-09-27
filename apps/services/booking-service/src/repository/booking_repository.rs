@@ -30,18 +30,6 @@ impl BookingRepository {
             .optional()?)
     }
 
-    /// Every booking, for `BookingService::backfill`.
-    ///
-    /// ponytail: reads the whole table into memory in one pass, and this is the table
-    /// most likely to be the one that outgrows it. Page on `id` — `WHERE id > $after
-    /// ORDER BY id LIMIT $n` — when it does.
-    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<Booking>> {
-        Ok(booking::table
-            .select(Booking::as_select())
-            .load(conn)
-            .await?)
-    }
-
     /// Insert-or-replace the whole row, keyed by its own id.
     ///
     /// Idempotent by construction, which is what lets a projector replay the same

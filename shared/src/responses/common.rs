@@ -1,7 +1,6 @@
 //! What more than one handler puts in a response.
 
 use axum::http::HeaderName;
-use serde::Serialize;
 
 /// Where a write's event landed, on the way back out.
 ///
@@ -21,15 +20,3 @@ use serde::Serialize;
 /// thread the version through a struct that had no other reason to exist. The client
 /// reads it once, in its fetch wrapper, instead of at every call site.
 pub const X_VERSION: HeaderName = HeaderName::from_static("x-version");
-
-/// What `POST /internal/backfill` answers: how many events it enqueued.
-///
-/// 200, not the 202 every other write answers with, and without [`X_VERSION`]. 202
-/// means "accepted, and the projections have not caught up", which is why it comes
-/// with a version to wait on. A backfill has no such version — it re-emits many
-/// aggregates at once. What it *can* say truthfully is that the work it was asked to
-/// do is finished: the events are in `_outbox` and the relay carries them from there.
-#[derive(Serialize)]
-pub struct BackfilledResponse {
-    pub events: usize,
-}

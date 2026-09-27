@@ -79,6 +79,10 @@ export class ApiError extends Error {
   get isConflict() {
     return this.status === 409;
   }
+  /** Refused by the ingress rate limiter, before any service saw the request. */
+  get isRateLimited() {
+    return this.status === 429;
+  }
   /** No response at all — offline, DNS, a refused socket. Never a server answer. */
   get isOffline() {
     return this.status === 0;
@@ -107,6 +111,11 @@ export class ApiError extends Error {
    * thrown out of the middle of the transport.
    */
   static async from(res: Response): Promise<ApiError> {
+    // Traefik answers this one itself (k8s/chart/templates/rate-limit.yaml): a
+    // plain-text body, so none of the parsing below would find a message, and over
+    // HTTP/2 `statusText` is empty — the user would get a blank error.
+    if (res.status === 429) return ApiError.rateLimited(res);
+
     const body: ValidationBody & DetailBody = await res
       .json()
       .catch(() => ({}) as ValidationBody & DetailBody);
@@ -115,6 +124,16 @@ export class ApiError extends Error {
     const detail = body.detail?.length ? body.detail : [title];
 
     return new ApiError(res.status, title, detail, body.errors ?? {});
+  }
+
+  /** A 429, worded from `Retry-After` (whole seconds) when Traefik sends it. */
+  static rateLimited(res: Response): ApiError {
+    const seconds = Number(res.headers.get("Retry-After"));
+    const wait =
+      Number.isFinite(seconds) && seconds > 0
+        ? `Try again in ${Math.ceil(seconds)} second${Math.ceil(seconds) === 1 ? "" : "s"}.`
+        : "Try again in a moment.";
+    return new ApiError(429, "Too many attempts", [`Too many attempts. ${wait}`], {});
   }
 
   /** `fetch` itself rejected — there is no response to read a status off. */

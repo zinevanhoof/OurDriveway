@@ -14,12 +14,11 @@ use crate::{
 /// to authorize and price a booking server-side.
 ///
 /// **Every SPOTS-owned column is `Option`**, and still is even though the BOOKINGS
-/// side no longer writes this table at all. The reason changed rather than
-/// disappeared: the streams expire after seven days, so a consumer built later can
-/// legitimately see a `SpotUpdated` for a spot whose `SpotCreated` has already aged
-/// out, and `merge` would create a partial row from it. Reserve rejects a spot whose
-/// availability is absent, so the gap fails closed rather than booking against
-/// nothing.
+/// side no longer writes this table at all. The streams no longer expire, so a
+/// `SpotUpdated` should never arrive without its `SpotCreated`. If one does anyway
+/// (a lost event, applied through the projector's gap hatch), `merge` creates a partial
+/// row, and reserve rejects a spot whose availability is absent. So the gap fails
+/// closed rather than booking against nothing.
 ///
 /// ## `bookings_seq` is gone
 ///

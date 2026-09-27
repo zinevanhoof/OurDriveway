@@ -1,119 +1,130 @@
 # Deploying OurDriveway on Kubernetes
 
-Plain Helm. No Kustomize — `kubectl kustomize` / `kubectl apply -k` uses kubectl's
-embedded copy, which omits `--enable-helm` and `--load-restrictor`, so it can
-neither inflate a chart nor read `schemas/` from outside `k8s/`. Helm covers
-everything we wanted Kustomize for anyway: `--set-file` crosses the chart
-boundary and values files replace overlays.
+Plain Helm, one chart, one directory per environment.
 
 ```
 k8s/
-  chart/              the chart — every backend is data in values.yaml,
-                      one template in templates/services.yaml;
-                      storage is yugabyte.yaml, and that is all of it
-  values-local.yaml   dev cluster: no TLS, 1 replica each
-  values-prod.yaml    TLS, 2 replicas
-  deploy.sh
-  secrets.env.example
+  deploy.sh                the whole deploy: validates, creates Secret + ConfigMaps, runs Helm
+  secrets.env.example      the template for every environment's secrets.env
+  chart/
+    values.yaml            chart defaults — no env values, only shape
+    templates/
+      backends.yaml        every service: Deployment + Service, from `services` in values
+      frontend.yaml        Caddy serving the SPA
+      ingress.yaml         the one host: / → frontend, /api/<name> → <name>-service
+      rate-limit.yaml      Traefik middlewares the ingress attaches
+      migrator-job.yaml    Helm hook: creates and migrates every database
+      yugabyte.yaml        the database, single node
+      network-policy.yaml  who may reach YSQL and NATS
+  environments/
+    local/  prod/
+      values.yaml          chart overrides for this environment
+      config/<svc>.env     non-secret config, one file per service (committed)
+      secrets.env          secrets (gitignored)
 ```
+
+## Configuration
+
+**Every environment variable a service reads lives in a file, never in the chart** —
+the same split as `apps/services/<svc>/.env`, one file per service:
+
+| Where | What | Becomes |
+|---|---|---|
+| `environments/<env>/config/<svc>.env` | non-secret config (URLs, TTLs, bucket, limits) | ConfigMap `<svc>-service-config` |
+| `environments/<env>/secrets.env` | credentials | Secret `ourdriveway-secrets`, one key at a time per the `secrets` lists in `chart/values.yaml` |
+| `chart/templates/backends.yaml` | `PORT`, `DATABASE_URL`, `NATS_URL` | wiring the chart owns, built from the Secret's passwords |
+
+Together those are exactly each service's `Config` struct. Config has no defaults, so a
+missing variable crashes the pod at startup (`kubectl logs` names it).
+
+`deploy.sh` refuses to touch the cluster when:
+
+- `secrets.env` has a key missing, empty or not in `secrets.env.example`;
+- a generated secret is short, not alphanumeric, or equal to another;
+- two environments' config files declare different keys (so one cannot quietly miss a
+  variable the other sets);
+- a config value is quoted (`kubectl --from-env-file` keeps quotes as part of the value) or empty;
+- `MEDIA_BASE` differs between user, spot and media, or `SETTLEMENT_SECS` between payment
+  and view — those must agree byte for byte.
+
+Adding a variable: add it to the service's `Config`, its dev `.env`, and
+`environments/*/config/<svc>.env`. A new secret additionally goes in
+`secrets.env.example`, every `secrets.env`, and the service's `secrets` list in
+`chart/values.yaml`.
+
+Changing either file and re-running `deploy.sh` rolls the backends: it passes a hash of
+the environment's config and secrets to the chart as a pod annotation. YugabyteDB and NATS
+are not rolled by it — and `YSQL_PASSWORD` only takes effect at the database's first boot,
+so rotating it means changing the role's password in YSQL too.
+
+The Secret is created by kubectl rather than templated because Helm stores every rendered
+value in its release secret and prints it back with `helm get values`.
 
 ## Once
 
 ```sh
 helm repo add nats https://nats-io.github.io/k8s/helm/charts/
 helm dependency update k8s/chart          # vendors the NATS subchart
-cp k8s/secrets.env.example k8s/secrets.env && $EDITOR k8s/secrets.env
+cp k8s/secrets.env.example k8s/environments/local/secrets.env
+$EDITOR k8s/environments/local/secrets.env
 ```
 
-No minimum Kubernetes version beyond what the API objects here need. The old
-**≥ 1.29** floor was for the native sidecar that ordered a per-pod SurrealDB ahead
-of the app; there are no sidecars left, only plain init containers.
+Upgrading a cluster deployed before the rename: `kubectl delete secret app-secrets -n
+ourdriveway` once the new release is up.
 
 ## TLS
 
-The chart references a `ourdriveway-tls` Secret when `ingress.tls.enabled` is on,
-but deliberately does not create it — a certificate is not something a chart
-should mint.
+The chart references a `ourdriveway-tls` Secret when `ingress.tls.enabled` is on, but
+does not create it — a certificate is not something a chart should mint.
 
-Behind Cloudflare, the cheapest option by a wide margin is a **Cloudflare Origin
-CA** certificate: free, valid 15 years, trusted only by Cloudflare, issued from
-the dashboard under SSL/TLS → Origin Server.
+Behind Cloudflare, use a **Cloudflare Origin CA** certificate: free, valid 15 years,
+trusted only by Cloudflare, issued under SSL/TLS → Origin Server.
 
 ```sh
 kubectl create secret tls ourdriveway-tls \
   --cert=origin.pem --key=origin.key -n ourdriveway
 ```
 
-Set the Cloudflare SSL/TLS mode to **Full (strict)**. No cert-manager, no ACME
-resolver, no HTTP-01 challenge, no renewal job. Without Cloudflare, Traefik's own
-ACME resolver or cert-manager are the alternatives, and both cost more moving
-parts than this.
+Set Cloudflare's SSL/TLS mode to **Full (strict)**. Then:
 
-Two things that come with putting Cloudflare in front:
-
-- **Lock the origin down.** Cloudflare only proxies HTTP(S) on standard ports, so
-  restrict the VPS firewall to Cloudflare's published IP ranges on 80/443.
-  Otherwise anyone who learns the server's address bypasses the proxy entirely
-  and the Origin CA cert — which no browser trusts — starts throwing warnings.
-- **Client IPs arrive in headers, not the connection.** Every request appears to
-  come from Cloudflare unless Traefik is told to trust `X-Forwarded-For` from
-  those ranges (`forwardedHeaders.trustedIPs`). Nothing here rate-limits by IP
-  today, so this only matters once something does — but logs are wrong until
-  it's set.
+- **Lock the origin down.** Restrict the VPS firewall to Cloudflare's IP ranges on
+  80/443. Otherwise anyone who learns the address bypasses the proxy, sees a cert no
+  browser trusts, and can forge `CF-Connecting-IP` to dodge the rate limits.
+- **Client IPs arrive in headers.** Rate limiting reads `CF-Connecting-IP`
+  (`rateLimit.sourceHeader` in prod); logs show Cloudflare's addresses unless Traefik's
+  `forwardedHeaders.trustedIPs` is set to those ranges.
 
 ## A local cluster
 
-k3d, because it *is* k3s in Docker: same distribution and same bundled Traefik as
-a VPS, so local and production run the same ingress controller rather than two
-that differ in exactly the details that bite you.
+k3d is k3s in Docker: same distribution and same bundled Traefik as the VPS.
 
 ```sh
-# 1. k3d (see https://k3d.io). Traefik comes with it — nothing else to install.
 k3d cluster create ourdriveway -p "80:80@loadbalancer" -p "443:443@loadbalancer"
 
-# 2. Your own images. ghcr only has what CI published from main, so build the
-#    working tree and hand the results straight to the cluster.
+# Your own images. Skip this to run what CI last published from main.
 docker buildx bake --load
 for i in user-service booking-service spot-service view-service media-service \
          notification-service payment-service migrator frontend; do
   k3d image import ghcr.io/zinevanhoof/ourdriveway-$i:latest -c ourdriveway
 done
 
-# 3. Deploy, and resolve the host.
 k8s/deploy.sh local
-echo "127.0.0.1 ourdriveway.local" | sudo tee -a /etc/hosts
 ```
 
-Then http://ourdriveway.local. `kubectl get pods -n ourdriveway -w` while it comes
-up, and expect it in this order: `yugabyte` → the services, each creating and
-migrating its own database. Two stages where there used to be five. A pod stuck in
-`Init` is waiting, not broken; `kubectl logs <pod> -c <init-container>` says what
-for.
+Then http://localhost here, or http://192.168.50.29 (this machine's LAN IP) from a phone.
+The local Ingress has no host, so it answers on any address. Local config differs from
+prod in what plain HTTP on a LAN needs: `COOKIE_SECURE=false`, the `ourdriveway-dev`
+bucket and its public URL, and `APP_BASE_URL` on the LAN IP so emailed links open on a
+phone — change it in `environments/local/config/notification.env` if the IP moves.
+`environments/local/values.yaml` also caps YugabyteDB's memory, which otherwise sizes
+itself to the whole machine.
 
-**A restart on a cold install is still possible, for a smaller reason than it used
-to be.** The init container dials `yugabyte:5433` through a *headless* Service,
-which does no readiness filtering, so it proves something is listening rather than
-that the cluster is serving. A service that starts in that window fails at
-`connect` and is fine on the retry. What no longer causes it is a missing database
-— the service creates its own — so this is now only about the cluster being up,
-not about anything having run before it. A deliberate trade against ordering every
-service behind a second gate; see the note in `templates/services.yaml`.
-
-`values-local.yaml` caps the tserver's memory. Untuned, YugabyteDB sizes itself to
-the machine, and a k3d cluster shares that machine with your build. Production
-leaves the caps empty and lets it have the node.
-
-Skip step 2 to run the last images CI published instead — they pull fine, they
-are just whatever was last merged to `main`.
+`kubectl get pods -n ourdriveway -w` while it comes up: `yugabyte`, then the services. A
+pod in `Init` is waiting (`kubectl logs <pod> -c <init-container>` says for what). On a
+**first** install a service may restart once: its init container proves YugabyteDB is
+listening, not that the migrator has created its database yet, and the retry succeeds.
 
 Teardown: `k3d cluster delete ourdriveway`.
-
-### Why not ingress-nginx
-
-It was retired; `github.com/kubernetes-sigs/ingress-nginx` now 404s, though its
-Helm index is still served. Nothing in this chart depends on a specific
-controller any more — `ingress.annotations` is empty, and the upload ceiling that
-used to be an nginx annotation now lives in spot-service as `MAX_UPLOAD_BYTES`.
 
 ## Deploy
 
@@ -121,170 +132,100 @@ used to be an nginx annotation now lives in spot-service as `MAX_UPLOAD_BYTES`.
 k8s/deploy.sh local      # or: k8s/deploy.sh prod
 ```
 
-The script creates the namespace, applies the Secret from `k8s/secrets.env`, and
-runs `helm upgrade --install`. Extra arguments are passed through, so
-`k8s/deploy.sh prod --dry-run` works. Point `ourdriveway.local` at your ingress
-controller's IP in `/etc/hosts`.
+Extra arguments go to Helm, so `k8s/deploy.sh prod --dry-run` works.
 
-It used to carry five `--set-file` flags, one per schema, because Helm templates
-cannot read files outside the chart and the `.surql` schemas lived in `schemas/`.
-**Schemas are not files any more.** They are embedded in the `migrator` image with
-`diesel_migrations::embed_migrations!` — that deleted the ConfigMap, the
-`--set-file` plumbing, and the import Job.
+**Migrations** are `chart/templates/migrator-job.yaml`, a `post-install,pre-upgrade` Helm
+hook: Helm waits for it and fails the release before any pod rolls if it fails. One Job,
+not every replica at boot, because `diesel_migrations` takes no lock. It is not
+`pre-install` because on a cold install the yugabyte StatefulSet would not exist yet —
+which is also why a first install can see the one restart above.
 
-**Migrations are a central step again, and `CREATE DATABASE` with them.** Both live
-in `k8s/chart/templates/migrator-job.yaml`, a Helm hook Job; no service Deployment
-touches schema.
+## Routing and load balancing
 
-This reverses what was here before, and the reason is the move from sqlx to diesel
-rather than a change of mind. Boot-time migration in every replica was safe *because*
-`sqlx::migrate` takes an advisory lock around the run. `diesel_migrations` takes no
-lock at all — each migration is wrapped in a transaction, but the run is not
-exclusive, so at `replicas: N` two pods would read the same pending set and both
-apply it. One Job is what puts that guarantee back.
+A ClusterIP Service fronts each backend and kube-proxy spreads connections across ready
+pods, so scaling is `replicas: N`. `readinessProbe: /readyz` keeps a pod that has not
+caught up on its projections out of rotation; for user, spot and payment, which project
+nothing, it only means NATS is reachable.
 
-The hook is `post-install,pre-upgrade`, not `pre-install`: `pre-install` runs before
-any chart resource, so on a cold install the yugabyte StatefulSet would not exist yet
-and the Job would wait out its deadline. The cost is a window on a **first** install
-only, where service pods start alongside the Job and crash-loop on `3D000` until
-their databases exist — bounded, self-healing, once per cluster.
-
-The migrator assumes the role in the URLs may create databases, which `yugabyte` may.
-
-The Secret is created by kubectl rather than templated, because Helm stores every
-value it renders in the release secret and hands them back to anyone who runs
-`helm get values` — no place for a signing key. The cost is that rotating it
-needs an explicit `kubectl rollout restart deployment -n ourdriveway`.
-
-## What load-balances what
-
-Nothing in Caddy any more. A ClusterIP Service sits in front of each service's
-pods and kube-proxy spreads connections across the ready ones, so scaling is
-`replicas: N` in a values file and nothing else. `readinessProbe: /readyz` keeps a
-pod that has not caught up out of that endpoint list — the job the old
-`health_uri /readyz` checks in the Caddyfile were doing, done a layer lower where
-it actually works.
-
-That probe answers much sooner than it used to. A pod no longer rebuilds a
-database before it can serve — its rows are already in the cluster — so what is left to
-wait for is a foreign projection, and user-, spot- and payment-service register no
-streams at all: `/readyz` there reduces to "is NATS reachable", which the outbox
-relay still needs.
-
-The Ingress owns all routing: one `/api/<name>` prefix per service that declares
-`api` (every one but notification), everything else to Caddy. One host, so the
-browser stays on one origin and the `SameSite=Strict` refresh cookie keeps working.
-
-One exception worth knowing: Stripe's webhook arrives at `/api/payment/webhook`
-through this same Ingress, and it is the only route in the system that carries no
-JWT. It authenticates by signature instead — see `route/webhook.rs`.
+The Ingress owns all routing on **one host**, so the `SameSite=Strict` refresh cookie
+works: `/api/<name>` to each service with an API (all but notification), everything else
+to the frontend. Stripe's webhook arrives at `/api/payment/webhook` through the same
+Ingress — the one route with no JWT; it authenticates by signature (`route/webhook.rs`).
 
 ## Where the state lives
 
 ```
 services  ──►  yugabyte (StatefulSet, one database per service)
    │                    ▲
-   └──►  NATS JetStream ─┘ integration events, 7 days (rebuild path)
+   └──►  NATS JetStream ─┘ integration events, kept forever (rebuild path)
 ```
-
-**YugabyteDB is the authoritative store, and the only thing here whose loss is
-data loss.** Everything else is derived from it or replaceable.
-
-Two layers where there were four. SurrealDB stored nothing itself and needed TiKV
-underneath it, which needed a placement driver underneath *that*; the schemas
-needed a fifth object to apply them. One process does all of it, and the schemas
-travel inside the service binaries.
-
-Before that it was arranged the other way round entirely: every service pod
-carried its own SurrealDB sidecar on an `emptyDir`, because `bus/src/projector.rs`
-gave each instance an *ephemeral* consumer that replayed the whole log into a
-private database and kept its cursor there — so `replicas: N` had to mean N
-databases, and the log was the source of truth. None of that holds: services write
-their own rows inside the request's transaction, projectors share durable
-consumers, and the log is a seven-day bus.
-
-### Projector throughput now scales with `replicas`
-
-Each projector holds **one durable consumer per stream**, shared by every replica.
-JetStream hands each message to whichever replica pulled first, so work distributes
-itself — nothing assigns, nothing rebalances, and a dead replica's in-flight
-messages are redelivered to another after `ack_wait`. Each replica applies up to
-`bus::projector::APPLY_CONCURRENCY` events at a time.
-
-Ordering does not come from the transport. `bus::projector::decide` reads the target
-aggregate's stored `version` under `FOR UPDATE` in the same transaction as the apply,
-applies only the next one, acks anything already stored, and `Nak`s anything from the
-aggregate's future so the server redelivers it after the gap closes.
-
-**This replaced 16 partitions per stream.** NATS used to assign a lane from the
-subject on ingest, and a projector ran one durable per lane with
-`max_ack_pending: 1`. That gave strict per-key order, but at a hard ceiling of 16
-concurrent applies per stream *across the whole deployment however many pods ran* —
-and 64 open consumers in view-service, which runs four projectors. Adding pods now
-raises projection throughput; it did not before.
-
-Two operational notes went with it:
-
-- **Changing the partition count needed the streams drained first** — every `-pNN`
-  durable at 0 pending — because stored messages keep the subject they were written
-  with, so a key that moved lanes had its history split across two independently
-  ordered consumers. There are no lanes to move between.
-- **The connection bill is bounded by `APPLY_CONCURRENCY` × projectors**, not by a
-  lane count. `max_size` in `shared/src/db.rs` is the ceiling, and a pool timeout
-  surfaces as `MyError::Pool`, stops the projector and 503s the pod — so that
-  headroom is the part to watch.
-
-Two consequences worth knowing:
-
-- **`docker compose down -v` / deleting the `yugabyte` PVC is data loss**, not a
-  replay. There is no log to rebuild from any more.
-- **Kubernetes ≥ 1.29 is no longer required.** That floor existed for the native
-  sidecar (`initContainer` + `restartPolicy: Always`) that ordered SurrealDB ahead
-  of the app inside one pod. Every init container in this chart is now a plain one.
-
-### The PVCs
 
 | Volume | Holds | Losing it |
 |---|---|---|
 | `yugabyte` | every service database and the read model | **data loss** |
-| NATS | up to 7 days of undelivered events | consumers miss what they had not read; re-derive with the backfill below |
+| NATS | every event on USERS, SPOTS, BOOKINGS, PAYMENTS (SESSIONS: 31 days) | no data loss, but projections can no longer be rebuilt |
+
+**YugabyteDB is authoritative.** The log rebuilds projections, not the owning services'
+rows — they hold things no event carries (password hashes) — so deleting the `yugabyte`
+PVC is data loss, not a replay.
+
+The NATS PVC grows forever: the four event streams have no `max_age` or `max_bytes`
+(`shared::events::STREAMS`). When it fills, publishes are refused and every outbox holds
+its rows and retries — writes still commit, projections stop. Watch it and resize first.
+
+### Projectors
+
+Each projector holds **one durable consumer per stream**, shared by every replica, so
+throughput scales with `replicas`. Each replica applies up to
+`bus::projector::APPLY_CONCURRENCY` events at once. Ordering comes from the data, not the
+transport: `bus::projector::decide` reads the aggregate's stored `version` under
+`FOR UPDATE`, applies only the next one, acks what is already stored, and `Nak`s events
+from the future so they are redelivered once the gap closes.
+
+The database connection bill is `APPLY_CONCURRENCY` × projectors. `max_size` in
+`shared/src/db.rs` is the ceiling; a pool timeout stops the projector and 503s the pod.
 
 ### Rebuilding a projection
 
-view-service's database is durable but **not authoritative** — it is derived from
-user, spot, booking and payment, and if it ever disagrees with them they are right.
-Each of those exposes an internal re-emit of its current state:
+view-service's database is derived from user, spot, booking and payment; if it disagrees
+with them, they are right. Rebuild it by replaying:
 
-```sh
-kubectl exec -n ourdriveway deploy/user-service -- \
-  curl -sf -XPOST localhost/internal/backfill
-```
+1. `kubectl scale -n ourdriveway deploy/view-service --replicas=0`
+2. Empty every table in the `view` database except diesel's migration bookkeeping, or drop
+   the database and let the migrator job recreate it.
+3. Delete its four durable consumers:
+   ```sh
+   PASS=$(kubectl get secret -n ourdriveway ourdriveway-secrets -o jsonpath='{.data.NATS_PASSWORD}' | base64 -d)
+   kubectl run -n ourdriveway --rm -it nats-box --image=natsio/nats-box \
+     --labels=ourdriveway.com/nats-client=true \
+     --env="NATS_URL=nats://ourdriveway:$PASS@ourdriveway-nats:4222" -- sh -c '
+       sleep 5
+       for pair in USERS:view-users SPOTS:view-spots BOOKINGS:view-bookings PAYMENTS:view-payments; do
+         nats consumer rm "${pair%%:*}" "${pair##*:}" -f
+       done'
+   ```
+   The label gets the pod past `network-policy.yaml`; the `sleep` gives k3s time to admit
+   its IP.
+4. Scale back up. Each projector recreates its consumer from sequence 1, and `/readyz`
+   stays 503 until the replay has caught up.
 
-`/internal/backfill` is outside `/api`, which is what keeps it off the ingress —
-the Ingress routes `/api/<service>` and sends everything else to the SPA, so
-nothing outside the cluster can reach it. Note it is *unauthenticated inside* the
-cluster; see the handler's doc comment.
-
-Re-running one inside an hour is a no-op by design: backfill event ids are
-deterministic and land inside the stream's `duplicate_window`.
+The same works for `payment-booking-mirror`, `payment-host-mirror` and `booking-spots`.
+**Never delete a worker's durable** (`notification-users`, `booking-payments`,
+`payment-bookings`, `payment-payments`): it is recreated at `DeliverPolicy::New` and
+silently skips whatever was pending.
 
 ## Known ceilings
 
-- **Single YugabyteDB node.** One copy of the authoritative data — fine for a
-  demo, a data-loss risk in production. This is **not** a `replicas: 3` away, and
-  the template says so: multi-node needs `--join` and a replication factor, which
-  is a different template. Do that before anything real lives here, and add a
-  backup story (`ysql_dump`, or YugabyteDB's own snapshots); nothing in this
-  repository has ever needed one before.
-- **The database is reachable from every pod in the namespace.** `YSQL_PASSWORD`
-  in `app-secrets` is the only control; a NetworkPolicy admitting just the service
-  pods is the next rung. Unchanged in substance from the SurrealDB arrangement —
-  the credential is one key now instead of two.
-- **Single NATS node.** Set `nats.config.cluster.enabled` and three replicas the
-  day an outage would mean losing undelivered events rather than downtime.
-- **No resource limits, only requests.** Enough to schedule sensibly, not enough
-  to stop a runaway pod from starving a node.
-- **The log is no longer a ledger.** `STREAM_PAYMENTS` used to keep every money
-  event forever; it expires after seven days now and that record lives in the
-  `payment` and `payout` tables. An *independent* audit trail, if wanted, has to be
-  built as one rather than recovered by turning retention off.
+- **Single YugabyteDB node**, one copy of the authoritative data, and no backup story.
+  Multi-node needs `--join` and a replication factor — a different template, not
+  `replicas: 3`. Add it and a backup (`ysql_dump` or YugabyteDB snapshots) before
+  anything real lives here.
+- **Single NATS node** holding the only rebuild source. Set `nats.config.cluster.enabled`
+  with three replicas, or back up the PVC, before that matters.
+- **Every event ever published must keep decoding.** A replay reads the whole history, so
+  an incompatible event change breaks the next rebuild, not the next deploy. Add fields
+  with `#[serde(default)]`; never rename or remove one.
+- **The log is not a ledger.** The record of charges and refunds is the `payment` and
+  `payout` tables; if they disagree with `STREAM_PAYMENTS`, the tables are right.
+- **NetworkPolicy needs a CNI that enforces it.** k3s does; on any other cluster check
+  before counting on `network-policy.yaml`.

@@ -29,4 +29,41 @@
 		try_files {path} /index.html
 		file_server
 	}
+
+	# Security headers for the SPA. The API's JSON responses do not need them — they are
+	# never rendered as a document. HSTS is set in Cloudflare (SSL/TLS → Edge
+	# Certificates), which is the layer that actually terminates the browser's TLS.
+	header {
+		# Never sniff a JSON or image response into something executable.
+		X-Content-Type-Options "nosniff"
+		# Full URL to our own origin, only the origin to anyone else — a spot or booking
+		# id in a path stays ours.
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Geolocation is the one powerful feature the map uses.
+		Permissions-Policy "geolocation=(self), camera=(), microphone=(), payment=(self \"https://js.stripe.com\")"
+
+		# ENFORCED. A missing origin here silently breaks a Stripe frame or the map, so
+		# anything new that loads from elsewhere needs its entry below — and the same
+		# change in docker/Caddyfile-dev, where it shows up first. `frame-ancestors 'none'`
+		# stops the site being framed for clickjacking; `base-uri` and `object-src` close
+		# two classic injection routes.
+		#
+		# What each origin is for:
+		#   js.stripe.com, *.js.stripe.com, hooks.stripe.com   Stripe.js and its frames
+		#   connect-js.stripe.com                              embedded Connect onboarding
+		#   api.stripe.com                                     Stripe's API
+		#   https: in img-src                                  any image over TLS. Stripe
+		#                                                      re-hosts line-item photos behind
+		#                                                      undocumented proxies (CloudFront,
+		#                                                      Fastly camo) that it swaps freely,
+		#                                                      so a host list keeps breaking the
+		#                                                      checkout photo. Images cannot run
+		#                                                      code; the cost is tracking pixels.
+		#   tiles.openfreemap.org                              map style, tiles, sprites, glyphs
+		#   fonts.googleapis.com / fonts.gstatic.com           Inter (src/main.css)
+		#   *.r2.cloudflarestorage.com                         the presigned photo PUT
+		#   blob: in worker-src                                MapLibre's web worker
+		#   'unsafe-inline' in style-src                       Vue/reka/motion inline styles
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://js.stripe.com https://*.js.stripe.com https://connect-js.stripe.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self' https://api.stripe.com https://tiles.openfreemap.org https://*.r2.cloudflarestorage.com; frame-src https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com https://connect-js.stripe.com; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'"
+	}
 }

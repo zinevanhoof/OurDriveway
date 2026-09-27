@@ -72,18 +72,6 @@ impl PayoutRepository {
         .map_err(Into::into)
     }
 
-    /// Every payout, for `PaymentService::backfill`.
-    ///
-    /// Payouts and not payments: view-service projects `PayoutRequested` and
-    /// deliberately nothing else off PAYMENTS — what a renter was charged is this
-    /// service's to answer — so the payment table has no downstream projection to
-    /// rebuild.
-    ///
-    /// ponytail: whole table in one pass, same ceiling and same fix as the others.
-    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<Payout>> {
-        Ok(payout::table.select(Payout::as_select()).load(conn).await?)
-    }
-
     /// Everything this host has already withdrawn **or is withdrawing**.
     ///
     /// A sum, so it never fetches the rows to add up one column in Rust.

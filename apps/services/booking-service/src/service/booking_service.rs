@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::policy::{
     access::{NOT_FOUND, authorize},
     availability::{self, Rejection},
-    replay, schedule,
+    schedule,
 };
 use crate::repository::{
     booking_repository::BookingRepository, spot_mirror_repository::SpotMirrorRepository,
@@ -424,44 +424,6 @@ impl BookingService {
             .await?;
 
         Ok(version)
-    }
-
-    /// Re-emits every booking as the events that reproduce its current row, for a
-    /// consumer that needs rebuilding. See [`outbox::backfill`] for what this is and
-    /// is not.
-    ///
-    /// One to three events each: a booking's state is reached by a *chain*, and
-    /// [`replay::events`] is what knows which one — including why a lone `Cancelled`
-    /// would land on nothing.
-    ///
-    /// This is the stream with side effects on the other end. payment-service's
-    /// worker wakes on the two terminal events and calls `settle_up`, which decides
-    /// from the payment's *current* status rather than from the event that woke it —
-    /// so a booking already refunded yields no second refund. That is a property of
-    /// `settle_up`, not of the backfill; check it still holds before adding a
-    /// consumer that reacts to these directly.
-    pub async fn backfill(&self) -> MyResult<usize> {
-        let mut sent = 0;
-
-        let mut read = db::conn(&self.db).await?;
-        for booking in BookingRepository::all(&mut read).await? {
-            // One timestamp for the whole chain. Unlike a spot's, a booking's row
-            // keeps no record of when it settled — `created_at` is the only clock
-            // there is, and nothing downstream stores a settlement time anyway.
-            let at = booking.created_at.clone().into();
-
-            sent += outbox::backfill(
-                &self.db,
-                &booking_subject(&booking.spot_id),
-                &aggregate_id("booking", &booking.id),
-                booking.version,
-                replay::events(&booking).into_iter().map(|e| (at, e)),
-            )
-            .await?;
-        }
-
-        tracing::info!(events = sent, "bookings backfilled");
-        Ok(sent)
     }
 }
 

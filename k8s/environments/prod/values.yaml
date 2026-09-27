@@ -1,0 +1,32 @@
+# Production: a 4-CPU / 8 GB VPS behind Cloudflare. Everything not set here is the chart
+# default. Set `tag` to a commit sha to pin a release or a rollback.
+tag: latest
+
+replicas: 2
+
+rateLimit:
+  # The visitor's address as Cloudflare reports it. Trustworthy only while the VPS firewall
+  # admits 80/443 from Cloudflare's ranges alone — see templates/rate-limit.yaml.
+  sourceHeader: CF-Connecting-IP
+
+ingress:
+  host: ourdriveway.com
+  tls:
+    enabled: true
+
+# Measured on a k3d node limited to this VPS's size: ~1.9 GB idle for the whole node,
+# peaking near 3 GB under 200 concurrent logins or 5,000 reads/s.
+#
+# Deliberately no Kubernetes memory limit: YSQL backends are separate processes outside
+# these caps, and an OOM kill takes down the only copy of the data. The caps bound it; the
+# chart's 2Gi request reserves its floor.
+yugabyte:
+  tserverFlags: "memory_limit_hard_bytes=2684354560,yb_num_shards_per_tserver=1"
+  masterFlags: "memory_limit_hard_bytes=536870912"
+
+nats:
+  config:
+    jetstream:
+      fileStore:
+        pvc:
+          size: 20Gi

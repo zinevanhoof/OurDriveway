@@ -35,18 +35,6 @@ impl UserWorkerService {
     /// Sends whatever this event deserves, keyed on the event id so a redelivery is
     /// recognised by the provider rather than sent twice.
     pub async fn notify(&self, envelope: &Envelope<UserEvent>) -> MyResult<()> {
-        // The one place in the codebase that reads this flag, and the reason it
-        // exists. A backfill re-emits `Registered` for every account so a projection
-        // can be rebuilt from current state — harmless for a database, and a fresh
-        // verification email to every user on the system if it reached here.
-        //
-        // Guarded here rather than in the worker so that anything else this service
-        // grows is covered by the same check: sending mail is what must not repeat,
-        // not consuming the event.
-        if envelope.backfill {
-            return Ok(());
-        }
-
         // The version travels with the event rather than being read from anywhere:
         // this service owns no database, and the reset token has to bind to the
         // version the *request* assigned, not to whatever the row says by the time

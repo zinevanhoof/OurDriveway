@@ -1,178 +1,77 @@
-# The backends differ in some extra env and in which of two dependencies they
-# have. Everything else about them is identical, so they are data here and one
-# template in templates/services.yaml — not five near-copies that drift the first
-# time a probe changes.
+# Chart defaults. Each environment overrides these in k8s/environments/<env>/values.yaml.
+#
+# No environment variables live here. A service's config is k8s/environments/<env>/config/
+# <name>.env, its secrets are k8s/environments/<env>/secrets.env, and deploy.sh turns both
+# into cluster objects before running Helm. The only env the chart writes itself is the
+# wiring it owns: PORT, DATABASE_URL and NATS_URL.
 registry: ghcr.io/zinevanhoof
 
-# Every service listens on 80 in a container. Locally they need distinct ports to
-# share one host (3000-3004, in each service's .env); here each one has its own
-# Service and DNS name, so there is nothing left to disambiguate.
-port: 80
-
-# Overridden per-environment by values-local.yaml / values-prod.yaml. Set this to
-# a commit sha to pin a release or a rollback.
+# Set to a commit sha to pin a release or a rollback; CI pushes one per merge to main.
 tag: latest
 
-# Kubernetes defaults this to Always whenever the tag is `latest`, which is right
-# for a deployed environment and wrong on a laptop: it would re-pull the last
-# image CI published and quietly discard the one you just built and imported into
-# k3d. values-local.yaml sets IfNotPresent for exactly that reason.
+# Kubernetes' default for `latest`. Right for a deployed environment, wrong on a laptop,
+# where it would discard the image you just imported into k3d — local sets IfNotPresent.
 imagePullPolicy: Always
 
-# Where uploaded images are SERVED from — not S3_ENDPOINT, which is the R2 API.
-#
-# One value, aliased into the three services that need it, because they must agree
-# byte for byte: media mints image URLs on this origin, spot and user validate that a
-# client-submitted image is on it. A mismatch rejects every upload on the way back in.
-# An anchor rather than three copies precisely because "these must be identical" is a
-# correctness requirement, not a convention.
-#
-# Must also be reachable FROM STRIPE, not just from a browser: listing photos go onto a
-# Checkout Session and Stripe may fetch them server-side.
-mediaBase: &mediaBase https://assets.ourdriveway.com
+# Every backend listens on this inside its container, behind its own Service.
+port: 80
 
-# The one NATS account every service connects as. Its password is NATS_PASSWORD in
-# k8s/secrets.env. An anchor for the same reason as mediaBase: the broker's
-# `authorization` block below and every service's NATS_URL must name the same user.
+# Default for every backend; one can set its own `replicas`.
+replicas: 1
+
+# The one NATS account every service connects as; its password is NATS_PASSWORD. Anchored
+# because the broker's `authorization` block below must name the same user as NATS_URL.
 natsUser: &natsUser ourdriveway
 
-# SECONDS. How long after a booking ends its money counts as settled — one day.
-#
-# Aliased into two services for the same reason as mediaBase: they must agree. payment
-# decides what `POST /api/payment/payout` actually hands over; view decides what the
-# wallet SHOWS as available rather than pending. Two different numbers means a balance
-# that offers money the withdraw endpoint refuses, or hides money it would have paid.
-#
-# A renter cannot cancel inside an hour of the start and the host-side withdrawal only
-# touches bookings that haven't ended, so a confirmed booking with a past `ends_at` is
-# already safe to pay out today. This is the margin that keeps it safe if those rules
-# are ever relaxed. Both `.env` files set 0 so a payout is testable locally without
-# waiting a day.
-settlementSecs: &settlementSecs "86400"
+# Created by deploy.sh, never templated: Helm keeps every rendered value in its release
+# secret and prints it back with `helm get values`. The NATS subchart cannot read this key,
+# so `nats.container.env` below spells the name out again — keep the two equal.
+secretName: ourdriveway-secrets
 
-# Keys are load-bearing three times over: the image is
-# ourdriveway-<name>-service, the database name is <name> (and so is its directory
-# under migrations/, which the migrator embeds), and the ingress path is /api/<name>.
-# Rename one and all three follow.
+# The backends. The key is load-bearing three times: the image is
+# ourdriveway-<name>-service, the database is <name>, and the ingress path is /api/<name>.
 #
-# `secrets` is the allowlist of keys this service gets from `app-secrets` — exactly the
-# secret fields its `Config` reads, and nothing else. It used to be the whole secret via
-# `envFrom`, so every pod held the Stripe key, the R2 credentials and the database
-# password whether it used them or not; one compromised pod was every credential. A key
-# missing from a list crashes that service at boot, since `Config` has no defaults.
-# YSQL_PASSWORD and NATS_PASSWORD are not listed: services.yaml wires them into
-# DATABASE_URL and NATS_URL itself, per the `db` and `nats` flags.
-#
-# `resources` overrides `serviceResources` below for one service.
+#   secrets    the keys this service gets from the Secret — exactly what its Config reads,
+#              never the whole Secret, so one compromised pod is not every credential.
+#              YSQL_PASSWORD and NATS_PASSWORD are not listed: the chart wires them into
+#              DATABASE_URL and NATS_URL.
+#   db: false  no database: no DATABASE_URL, no wait-for-yugabyte
+#   nats: false  no broker: no NATS_URL, no wait-for-nats
+#   api: false   no ingress path
+#   resources  overrides `serviceResources` for this one service
 services:
   user:
     secrets: [JWT_SECRET, EMAIL_TOKEN_SECRET]
-    # The one service with a real memory appetite: Argon2 takes 19 MiB per concurrent
-    # hash, and there are at most one per CPU (see src/auth/password.rs). 85 MiB peak
-    # measured at 200 concurrent logins on 4 cores; the limit leaves room for 8.
+    # Argon2 takes 19 MiB per concurrent hash, at most one per CPU. 85 MiB peak measured
+    # at 200 concurrent logins on 4 cores; the limit leaves room for 8.
     resources:
       requests:
         cpu: 100m
         memory: 64Mi
       limits:
         memory: 256Mi
-    env:
-      # Validates that a submitted avatar is on our origin.
-      MEDIA_BASE: *mediaBase
-      # MINUTES — user_service.rs does Duration::minutes on this.
-      JWT_EXPIRATION: "15"
-      # DAYS — Duration::days.
-      REFRESH_TOKEN_EXPIRATION: "15"
-      # `Secure` on the refresh cookie. Always true here: the only way in is HTTPS
-      # through Cloudflare. The dev .env sets false for plain HTTP on the LAN.
-      COOKIE_SECURE: "true"
   booking:
     secrets: [JWT_SECRET]
   spot:
     secrets: [JWT_SECRET, LOCATIONIQ_API_KEY]
-    env:
-      # Validates that a host's submitted listing photos are on our origin — without
-      # it a listing could point its photos at any host. See shared/src/media.rs.
-      MEDIA_BASE: *mediaBase
-      # Only the e2e suite points this elsewhere, at its fake.
-      LOCATIONIQ_BASE_URL: https://api.locationiq.com
   view:
     secrets: [JWT_SECRET]
-    env:
-      # The read side of the same rule — see the anchor above. This one decides whether
-      # the wallet calls a host's income available or pending.
-      SETTLEMENT_SECS: *settlementSecs
   payment:
     secrets: [JWT_SECRET, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET]
-    env:
-      # The write side: what a withdrawal actually pays out. Not secret and better off
-      # visible in review; the Stripe keys come from secrets.env instead.
-      SETTLEMENT_SECS: *settlementSecs
-      # Only the e2e suite points this elsewhere, at its fake.
-      STRIPE_API_BASE: https://api.stripe.com
-  # The one service that talks to neither a database nor the broker: it mints
-  # presigned R2 upload URLs and holds nothing at all. Both flags off strips the
-  # SurrealDB env, the schema and both init containers — see
-  # templates/services.yaml.
+  # Mints presigned R2 upload URLs and holds nothing.
   media:
     db: false
     nats: false
     secrets: [JWT_SECRET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY]
-    env:
-      # Not secret, and visible in review where it belongs. The credentials for
-      # this bucket come from secrets.env instead.
-      # The origin this service stamps onto every URL it mints. Distinct from
-      # S3_ENDPOINT above: that is where bytes are PUT, this is where they are read.
-      MEDIA_BASE: *mediaBase
-      S3_ENDPOINT: https://REPLACE-ME.r2.cloudflarestorage.com
-      S3_BUCKET: ourdriveway
-      # R2 has one region and it is called `auto`. Still signed, so it must match.
-      S3_REGION: auto
-      # Seconds a minted upload URL stays usable.
-      PRESIGN_EXPIRY_SECS: "900"
-      # Per-image ceiling in bytes (20 MiB), signed into the URL so it holds no
-      # matter what is proxying in front of the service.
-      MAX_UPLOAD_BYTES: "20971520"
-  # No database like media, but it does consume the log — its consumer cursor
-  # lives in NATS rather than in a projection, which is why it needs no SurrealDB
-  # and no schema. `api: false` keeps it off the ingress: it exposes only /healthz
-  # and /readyz, so there is nothing outside the cluster should be able to reach.
+  # Consumes the log, its cursor lives in NATS. Exposes only health, so no ingress.
   notification:
     db: false
     api: false
     secrets: [RESEND_API_KEY, EMAIL_TOKEN_SECRET]
-    env:
-      # Not secret and better off visible in review. RESEND_API_KEY and
-      # EMAIL_TOKEN_SECRET come from secrets.env instead.
-      #
-      # Master switch. "false" keeps the pod running and consuming — it just sends
-      # nothing. Quoted like VERIFY_TOKEN_TTL_SECS below: the template renders every
-      # value through `| quote`, so a bare YAML bool would work too, but writing the
-      # string makes it obvious this reaches Rust as text that must read exactly
-      # `true` or `false`.
-      NOTIFICATIONS_ENABLED: "true"
-      MAIL_FROM: OurDriveway <noreply@mail.ourdriveway.com>
-      APP_BASE_URL: https://ourdriveway.com
-      COMPANY_NAME: OurDriveway
-      # 24h. Long enough to survive a night's sleep, short enough that a link left
-      # in an old inbox goes stale.
-      VERIFY_TOKEN_TTL_SECS: "86400"
-      # 1h, not 24: a reset link sets a credential on an account that already
-      # exists, and whoever asked for it is at their keyboard now. Single-use as
-      # well — user-service refuses it once the password is set.
-      RESET_TOKEN_TTL_SECS: "3600"
-      # Resend template alias, not the UUID — it survives editing the template.
-      TEMPLATE_EMAIL_VERIFICATION: email-verification
-      TEMPLATE_PASSWORD_RESET: password-reset
 
-replicas: 1
-
-# Every service unless it sets its own `resources`. Measured with prod values on a
-# 4-CPU / 8 GB k3d node: 2–4 MiB idle, and view-service peaked at 11 MiB serving
-# 5,000 requests/s. So a small request, and a memory limit that is generous against
-# that but still stops one leaking pod from taking the node. No CPU limit: throttling
-# a request mid-flight helps nobody on a box this size, and the request already sets
-# each pod's share when the CPUs are contended.
+# Measured on a 4-CPU / 8 GB k3d node: 2–4 MiB idle, view-service peaked at 11 MiB at
+# 5,000 req/s. The memory limit stops one leaking pod from taking the node. No CPU limit:
+# throttling mid-request helps nobody, and the request already sets each pod's share.
 serviceResources:
   requests:
     cpu: 10m
@@ -180,114 +79,92 @@ serviceResources:
   limits:
     memory: 128Mi
 
-# The authoritative store — see templates/yugabyte.yaml.
-#
-# This one block replaced three: a `surrealdb` query engine, a `tikv` store under it,
-# and a `pd` placement driver under that. And a `curlImage`, which existed because the
-# distroless SurrealDB image had no shell to run the schema-import loop in, and because
-# PD and TiKV had no app image to borrow for their init containers.
-#
-# `storage` is the one thing in this chart whose loss is data loss rather than a
-# rebuild. Everything else derives from it: every service database, the read model, and
-# the seven days of events in NATS.
+# The authoritative store — see templates/yugabyte.yaml. Its PVC is the one thing here
+# whose loss is data loss.
 yugabyte:
-  # **>= 2025.2, and started through `yugabyted`.** That pair is what enables Read
-  # Committed, which booking-service's reserve path depends on to not double-book —
-  # see the header of templates/yugabyte.yaml. This is a correctness constraint, not a
-  # preference. Keep it in step with docker/docker-compose-dev.yml.
+  # >= 2025.2 and started through `yugabyted`: that pair enables Read Committed, which
+  # booking-service's reserve path needs to not double-book. A correctness constraint.
+  # Keep in step with docker/docker-compose-dev.yml.
   image: yugabytedb/yugabyte:2026.1.1.2-b9
   storage: 20Gi
   resources:
     requests:
       cpu: 500m
       memory: 2Gi
-  # Untuned, a tserver sizes itself to the node — right on a node it does not share,
-  # wrong on a k3d cluster sharing a laptop with a cargo build. `values-local.yaml`
-  # overrides these; production leaves them empty and lets it have the machine.
+  # Untuned, a tserver sizes itself to the whole node. Each environment caps it.
   tserverFlags: ""
   masterFlags: ""
-  # No `replicas` key, deliberately. This template is single-node — multi-node needs
-  # `--join` and a replication factor, which is a different template, and a knob here
-  # would make three replicas look like a supported option when it is not.
-
-# Created outside this chart, by deploy.sh, from the gitignored k8s/secrets.env.
-# Deliberately not templated: Helm stores every rendered value in the release
-# secret and prints them back with `helm get values`, so a chart is a poor place
-# to put a signing key — and the database password is now in there too, as
-# YSQL_PASSWORD. Rotating it needs a `kubectl rollout restart`.
-#
-# The NAME still has to be here, though — `secretKeyRef.name` and `secretRef.name`
-# in services.yaml, yugabyte.yaml and migrator-job.yaml all read it, and while this
-# key was missing they rendered an empty name and every pod failed admission. It must
-# match the secret deploy.sh creates.
-secretName: app-secrets
+  # No `replicas`: this template is single-node. Multi-node needs `--join` and a
+  # replication factor, which is a different template, not a knob.
 
 frontend:
-  # Caddy serving the built SPA and nothing else — all routing lives in the
-  # Ingress now. Tauri builds ignore this entirely; they ship the SPA locally.
+  # Caddy serving the built SPA and nothing else; routing is the Ingress's.
   replicas: 1
 
 ingress:
-  # Traefik, because k3s ships it: one less thing to install on the VPS, and the
-  # local cluster can run the same controller as production.
-  #
-  # It is also the surviving option. `kubernetes-sigs/ingress-nginx` was retired
-  # and the GitHub repository now 404s — its Helm index is still served, but that
-  # is not something to build on.
+  # Traefik, because k3s ships it — local and production run the same controller.
   className: traefik
-  # Controller-specific annotations, if you ever need any. Deliberately empty:
-  # this app's only such dependency was nginx's proxy-body-size, and nothing
-  # image-sized passes through the ingress at all any more — the browser PUTs
-  # photos straight to R2, capped by a signature media-service mints.
+  # Controller-specific annotations, if ever needed. The rate-limit and priority ones are
+  # added by templates/ingress.yaml.
   annotations: {}
-  # One host for the SPA and the API. Not cosmetic: the refresh cookie is
-  # SameSite=Strict, so the moment /api lives on another origin, login breaks.
-  host: ourdriveway.local
+  # One host for the SPA and the API: the refresh cookie is SameSite=Strict, so the moment
+  # /api lives on another origin, login breaks. Empty matches any host.
+  host: ""
   tls:
     enabled: false
+    # Created by hand, not by this chart — see k8s/README.md.
     secretName: ourdriveway-tls
 
-# Subchart values. `helm show values nats/nats` is the authority if these keys
-# ever move.
+# Per-client limits at Traefik — see templates/rate-limit.yaml for how a client is
+# identified, templates/ingress.yaml for which paths get which limit.
+rateLimit:
+  enabled: true
+  # Empty: the connection address, which behind k3s is a node address shared by every
+  # visitor. Prod sets CF-Connecting-IP.
+  sourceHeader: ""
+  # Everything under /api: only bites something scripted.
+  api:
+    average: 20
+    period: 1s
+    burst: 60
+  # login, signup, password forgot/reset, email resend/verify — each an Argon2 hash or an
+  # email. Ten quick tries, then 5 a minute.
+  auth:
+    average: 5
+    period: 1m
+    burst: 10
+
+# Subchart values. `helm show values nats/nats` is the authority if these keys move.
 nats:
-  # A `nats` CLI in a Deployment that runs `sleep infinity`, plus its own Secret.
-  # Purely a debug shell for poking at streams by hand; nothing in the data path
-  # touches it, and `kubectl run --rm -it --image=natsio/nats-box` gets you the
-  # same thing on the rare occasion you want it.
+  # A debug shell nothing uses; `kubectl run --rm -it --image=natsio/nats-box` when needed.
   natsBox:
     enabled: false
 
-  # The password the `authorization` block below reads, from the same secret the
-  # services' NATS_URL is built from — so the two cannot drift. The name is spelled out
-  # because a subchart cannot read the parent's `secretName`; keep it equal to that.
+  # Read by the `authorization` block below. Must name `secretName` above.
   container:
     env:
       NATS_PASSWORD:
         valueFrom:
           secretKeyRef:
-            name: app-secrets
+            name: ourdriveway-secrets
             key: NATS_PASSWORD
 
   config:
-    # No anonymous connections. Without this block anything that can reach :4222 can
-    # publish a `PaymentSucceeded` and have a booking confirmed. `<< $VAR >>` is the
-    # chart's syntax for an unquoted token in nats.conf, and `$NATS_PASSWORD` is then
-    # resolved from the environment by the server itself — the password never appears
-    # in the ConfigMap. The monitoring port (8222, the probes) stays unauthenticated;
-    # templates/network-policy.yaml closes it to every other pod, and the kubelet's
-    # probes still reach it from the node.
+    # No anonymous connections: otherwise anything reaching :4222 could publish a
+    # PaymentSucceeded. `<< $VAR >>` is the chart's unquoted-token syntax, and the server
+    # resolves $NATS_PASSWORD from its environment, so the password never lands in the
+    # ConfigMap. Monitoring (8222) stays open to probes only — see network-policy.yaml.
     merge:
       authorization:
         user: *natsUser
         password: << $NATS_PASSWORD >>
     jetstream:
       enabled: true
-      # The one PVC in the whole deployment. Everything else is rebuilt from it.
+      # Event streams are kept forever: this PVC is what projections rebuild from.
       fileStore:
         enabled: true
         pvc:
           size: 5Gi
     cluster:
-      # One node. Three (odd, for quorum) the day losing this pod means losing
-      # data rather than taking an outage.
+      # Three nodes (odd, for quorum) the day losing this pod matters.
       enabled: false

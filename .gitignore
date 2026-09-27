@@ -9,6 +9,9 @@ CLAUDE.md
 # needs .env.production, so these two are committed. Never put a secret in them.
 !apps/frontend/.env.development
 !apps/frontend/.env.production
+# Kubernetes non-secret config, one file per service. Secrets sit beside it in
+# secrets.env, which stays ignored.
+!k8s/environments/*/config/*.env
 /uploads
 # Vendored Helm subchart tarballs. Chart.lock IS committed — it pins the
 # resolved NATS version, so `helm dependency update` is reproducible.
@@ -18,3 +21,5 @@ k8s/chart/charts/
 
 /driveway-pictures
 /ourdriveway-logo
+# Local planning notes, not part of the repo.
+/ANDROID_APP_LINKS_PLAN.md

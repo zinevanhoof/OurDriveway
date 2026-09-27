@@ -12,6 +12,7 @@ diesel::table! {
         password -> Text,
         license_plates -> Array<Text>,
         country -> Nullable<Text>,
+        mail_requested_at -> Nullable<Timestamptz>,
     }
 }
 

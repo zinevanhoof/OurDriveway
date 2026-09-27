@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::{
     CONFIG,
     auth::password,
+    policy,
     repository::{
         refresh_token_repository::RefreshTokenRepository, user_repository::UserRepository,
     },
@@ -275,9 +276,8 @@ impl UserService {
     /// an endpoint that needs no credentials at all — the same reason `revoke`
     /// shrugs at an unknown token.
     ///
-    // ponytail: no rate limit. One event per request, and the event is what costs
-    // money to deliver. Add a per-user cooldown (last-sent timestamp on the row,
-    // checked here) if this ever gets pointed at.
+    // Rate limited per account — one mail per `policy::mail::COOLDOWN` — and per IP at
+    // the ingress (k8s/chart/templates/rate-limit.yaml).
     pub async fn resend_verification(&self, req: ResendVerificationRequest) -> MyResult<()> {
         let mut read = db::conn(&self.db).await?;
         let Some(user) = UserRepository::find_by_email(&mut read, req.email.to_string()).await?
@@ -301,6 +301,17 @@ impl UserService {
             async move {
                 let version =
                     shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
+
+                // Under the row lock `next_version!` just took, so two requests racing for
+                // the same account cannot both see an old send. Suppressed is `Ok(())` —
+                // the same answer as a send, see `policy::mail`.
+                let now = Utc::now();
+                let last = UserRepository::mail_requested_at(conn, user.id).await?;
+                if !policy::mail::may_send(last, now) {
+                    return Ok(());
+                }
+                UserRepository::set_mail_requested_at(conn, user.id, now).await?;
+
                 shared::set_version!(
                     conn,
                     "user",
@@ -408,12 +419,10 @@ impl UserService {
     /// mandatory here even though no row changes: without it the row never
     /// reaches the version the token names and every link is born dead.
     ///
-    // ponytail: no rate limit, same as `resend_verification` — but this is the
-    // endpoint that actually gets pointed at, and each request is a mail to a real
-    // inbox that reads as phishing when it wasn't asked for. Add a per-user
-    // cooldown (last-sent timestamp on the row, checked here) before this is
-    // public. Note the frontend hides its own button after one send, which covers
-    // the double-click but nothing deliberate.
+    // Rate limited like `resend_verification`, and it matters more here: this is the
+    // endpoint that gets pointed at, and an unasked-for reset mail reads as phishing.
+    // The frontend hiding its button after one send only covers the double-click; the
+    // per-account cooldown below and the per-IP limit at the ingress cover the rest.
     pub async fn forgot_password(&self, req: ForgotPasswordRequest) -> MyResult<()> {
         let mut read = db::conn(&self.db).await?;
         let Some(user) = UserRepository::find_by_email(&mut read, req.email.to_string()).await?
@@ -432,6 +441,16 @@ impl UserService {
             async move {
                 let version =
                     shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
+
+                // Same cooldown and the same column as `resend_verification`: the limit is
+                // on mail to this address, whichever form asked for it.
+                let now = Utc::now();
+                let last = UserRepository::mail_requested_at(conn, user.id).await?;
+                if !policy::mail::may_send(last, now) {
+                    return Ok(());
+                }
+                UserRepository::set_mail_requested_at(conn, user.id, now).await?;
+
                 shared::set_version!(
                     conn,
                     "user",
@@ -782,76 +801,6 @@ impl UserService {
             .await?;
 
         Ok(version)
-    }
-
-    /// Re-emits every user as the events that reproduce their current row, for a
-    /// consumer that needs rebuilding. See [`outbox::backfill`] for what this is and
-    /// is not.
-    ///
-    /// Two events each, and both are needed. `Registered` is the only variant
-    /// view-service will create a row from, and it deliberately lands with no
-    /// picture and no plates because a fresh signup has neither — so `Updated` puts
-    /// back whatever the account has changed since.
-    ///
-    /// `EmailVerified` is not among them and is not an omission: nothing downstream
-    /// projects it. Verification stays in this service's own row, which is the thing
-    /// being read here rather than rebuilt. `VerificationRequested` and
-    /// `PasswordResetRequested` are left out for a much louder reason — both are a
-    /// mail, and re-emitting either would send one to every account on the system.
-    /// A reset mail would additionally hand every one of them a live credential.
-    /// `Envelope::backfill` is the real backstop, checked in
-    /// notification-service's `notify`; this list is what stops anyone reaching
-    /// for it in the first place.
-    ///
-    /// `PasswordChanged` is likewise absent, and now trivially so: it carries no
-    /// password, so there is nothing about it to reproduce. This used to publish
-    /// every account's Argon2 hash onto STREAM_USERS in one burst — the single worst
-    /// consequence of a field nothing downstream ever read.
-    pub async fn backfill(&self) -> MyResult<usize> {
-        let mut sent = 0;
-
-        let mut read = db::conn(&self.db).await?;
-        for user in UserRepository::all(&mut read).await? {
-            let user_id = user.id;
-
-            let registered = UserRegistered {
-                user_id,
-                first_name: user.first_name,
-                last_name: user.last_name,
-                email: user.email,
-            };
-            let updated = UserUpdated {
-                user_id,
-                // The three `Registered` above already carries. `None` is "leave
-                // alone", so re-stating them would only be a chance to disagree.
-                first_name: None,
-                last_name: None,
-                email: None,
-                profile_picture: user.profile_picture,
-                license_plates: Some(user.license_plates),
-                country: user.country,
-            };
-
-            // This table keeps no timestamp of its own and nothing downstream stores
-            // one off a USERS event, so there is no original clock to recover here —
-            // unlike spots and bookings, whose rows carry theirs.
-            let now = Utc::now();
-
-            sent += outbox::backfill(
-                &self.db,
-                &user_subject(&user_id),
-                &aggregate_id("user", &user_id),
-                user.version,
-                [
-                    (now, UserEvent::Registered(registered)),
-                    (now, UserEvent::Updated(updated)),
-                ],
-            )
-            .await?;
-        }
-
-        tracing::info!(events = sent, "users backfilled");
-        Ok(sent)
     }
 }
 

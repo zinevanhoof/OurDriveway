@@ -64,4 +64,10 @@
 		try_files {path} /index.html
 		file_server
 	}
+
+	# The production policy from apps/frontend/Caddyfile, ENFORCED here as it is there,
+	# so a missing origin breaks on the LAN before it breaks in production.
+	# Keep it identical to production, or a page that works here stops meaning anything
+	# there.
+	header Content-Security-Policy "default-src 'self'; script-src 'self' https://js.stripe.com https://*.js.stripe.com https://connect-js.stripe.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self' https://api.stripe.com https://tiles.openfreemap.org https://*.r2.cloudflarestorage.com; frame-src https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com https://connect-js.stripe.com; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'"
 }

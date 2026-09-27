@@ -252,9 +252,9 @@ async fn every_database_keeps_its_own_ledger() {
     .await
     .unwrap();
 
-    // `user` has two migrations, `spot` has one. Same count in both would mean one
+    // `user` has three migrations, `spot` has one. Same count in both would mean one
     // ledger, or one source applied twice.
-    assert_eq!(applied_count(a.name).await, 2, "user's history");
+    assert_eq!(applied_count(a.name).await, 3, "user's history");
     assert_eq!(applied_count(b_name).await, 1, "spot's history");
 
     drop_database(a.name).await;

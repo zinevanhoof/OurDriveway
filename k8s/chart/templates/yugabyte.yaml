@@ -1,21 +1,10 @@
 {{/*
-YugabyteDB: the authoritative store, and the only stateful thing in this chart.
+YugabyteDB: the authoritative store. Schema is migrator-job.yaml's.
 
-It replaced four templates — tikv.yaml, surrealdb.yaml, schemas.yaml and
-schema-import.yaml. SurrealDB needed a separate distributed store underneath it (TiKV,
-which needed a placement driver of its own) and a separate pass to apply the schemas.
-This is all of that in one process. The schema pass did not disappear — it moved to
-migrator-job.yaml, one Job with the diesel migrations embedded in it, which is the only
-thing in the cluster that touches schema.
-
-⚠ SINGLE NODE. `yugabyted start` with one replica is right for this chart's scale and
-wrong for anything that must survive losing a node: there is one copy of every tablet.
-Multi-node is `replicas: 3` plus `--join`, and it is a different template — do not read
-this one as production-shaped just because it is a StatefulSet.
-
-A StatefulSet and not a Deployment, unlike the SurrealDB it replaces: that one stored
-nothing and was disposable, this one holds the data. Stable identity and a
-volumeClaimTemplate are the point.
+⚠ SINGLE NODE. Right for this chart's scale, wrong for anything that must survive losing
+a node: there is one copy of every tablet. Multi-node is `replicas: 3` plus `--join`, and
+it is a different template — do not read this one as production-shaped just because it is
+a StatefulSet.
 
 ## The version is a correctness constraint
 
@@ -74,8 +63,7 @@ spec:
         - name: yugabyte
           image: {{ .Values.yugabyte.image }}
           # `--advertise_address` must be the stable DNS name, not 0.0.0.0: it is what
-          # the cluster records as this node's location and hands back to clients. The
-          # same mistake the old PD `--advertise-client-urls` note warned about.
+          # the cluster records as this node's location and hands back to clients.
           command: ["bin/yugabyted"]
           args:
             - start
@@ -125,8 +113,7 @@ spec:
           # The startup probe is what makes the other two safe. A cold first boot
           # initialises the cluster before anything listens, and a liveness probe with
           # no start delay spends that whole window collecting failures and then kills
-          # a container that was seconds from being fine — the same trap the SurrealDB
-          # template documented from a real install.
+          # a container that was seconds from being fine.
           startupProbe:
             exec:
               command: ["bin/yugabyted", "status"]

@@ -257,10 +257,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             bus::AwaitVersions(await_db, version_of),
             bus::await_version::await_version,
         ))
-        // After the layer, deliberately — a backfill is not a client read and has
-        // no version to wait on. Not under `/api` either, which is what keeps it
-        // off the ingress; see `route::payment::backfill`.
-        .route("/internal/backfill", post(route::payment::backfill))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

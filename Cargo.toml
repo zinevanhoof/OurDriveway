@@ -38,7 +38,7 @@ serde_json = "1.0.150"
 # force `libpq5` into all seven images. diesel-async speaks the wire protocol through
 # tokio-postgres, so only the backend's SQL and type layer is needed here.
 #
-# TLS is deliberately absent: k8s/chart/templates/services.yaml connects with no
+# TLS is deliberately absent: k8s/chart/templates/backends.yaml connects with no
 # `sslmode`, so tokio-postgres uses NoTls. The aws-lc-rs rustls provider that
 # `shared::install_default_crypto_provider` installs stays for outbound HTTPS (Stripe,
 # Resend, R2) and jsonwebtoken only.

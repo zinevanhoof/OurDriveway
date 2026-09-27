@@ -236,8 +236,9 @@ themselves. In dev it is `scripts/migrate.sh`; in Kubernetes it is a Helm hook J
 ### Events on NATS JetStream
 
 There is **one stream per bounded context** — `USERS`, `SESSIONS`, `SPOTS`, `BOOKINGS`,
-`PAYMENTS`. Each keeps seven days of events, except `SESSIONS`, which keeps 31 — as long
-as a refresh token lives. Every event travels in a shared **envelope**
+`PAYMENTS`. The four event streams keep everything, because replaying them is how a
+projection is rebuilt; `SESSIONS` keeps 31 days, as long as a refresh token lives.
+Every event travels in a shared **envelope**
 (`shared/src/events/`) carrying an event id, the actor, when it happened, the aggregate
 it belongs to, and that aggregate's **version**.
 
@@ -583,8 +584,9 @@ that commit exist in the registry. Rolling the cluster onto them is still a deli
 
 ### The cluster
 
-Production is **Kubernetes with plain Helm**: one chart, `values-local.yaml` for a k3d
-cluster and `values-prod.yaml` for a VPS behind Cloudflare.
+Production is **Kubernetes with plain Helm**: one chart and one directory per environment
+under `k8s/environments/` — `local` for a k3d cluster, `prod` for a VPS behind Cloudflare —
+each holding the chart overrides, one config `.env` per service, and the secrets.
 
 ```sh
 docker buildx bake              # build every image
@@ -598,9 +600,9 @@ k8s/deploy.sh local             # or: k8s/deploy.sh prod
   CORS unnecessary.
 - The migrator runs as a Helm hook Job, after the first install and before every
   upgrade. No service Deployment touches schema.
-- `/internal/backfill` on each writing service re-emits its current state, so a
-  projection can be rebuilt. It is outside `/api` and therefore unreachable from outside
-  the cluster.
+- A projection is rebuilt by emptying its tables and deleting its durable consumers, so
+  its projectors replay the streams from the start. Nothing is re-published, so no worker
+  reacts.
 
 [`k8s/README.md`](k8s/README.md) covers TLS, a local k3d cluster, what load-balances what,
 where state lives, and rebuilding projections in detail.
@@ -633,15 +635,17 @@ written down so the gaps are known rather than hidden.
 - **Single-node YugabyteDB, with no backups.** One copy of the authoritative data. A real
   cluster needs `--join`, a replication factor and a backup story (`ysql_dump` or
   snapshots). This is not just `replicas: 3` in a values file.
-- **Single-node NATS.** An outage loses undelivered events rather than just causing
-  downtime. JetStream clustering needs switching on.
+- **Single-node NATS, and it holds the only rebuild source.** Losing its volume loses
+  no data, since YugabyteDB is authoritative, but no projection can be rebuilt after it.
+  The volume also grows for ever, so it needs watching. JetStream clustering needs
+  switching on.
 - **No resource limits, only requests**, and **no NetworkPolicy**. Every pod in the
   namespace can reach the database, guarded only by its password.
-- **`/internal/backfill` is unauthenticated inside the cluster.** It is off the ingress,
-  but anything that can reach the pod can trigger a re-emit.
 - **No rate limiting.** Nothing throttles by IP or by user yet.
-- **The event log is a bus with limited retention, not an audit trail.** Money records live in the
-  `payment` and `payout` tables; an independent ledger would have to be built as one.
+- **The event log is kept forever but is not an audit trail.** Money records live in the
+  `payment` and `payout` tables, and if the two disagree the tables are right.
+- **Every event ever published has to keep decoding**, because a rebuild replays all of
+  them. Event types can only grow defaulted fields.
 - **The frontend is mid-refactor** onto a set of shared base components, and the native
   (Tauri/Android) build is less exercised than the web one.
 - **The architecture is still moving.** Expect breaking changes to schemas, events and
@@ -714,9 +718,6 @@ what the fix is.
     the spots that pass the filter;
   - a way to **open a group**: either zooming in until it splits, or a small endpoint
     that lists the spots inside one bucket.
-
-- [ ] **Page the backfills.** `/internal/backfill` reads each table into memory in one
-      pass. Fine at this size, but it should page on `id`.
 
 ### Features
 

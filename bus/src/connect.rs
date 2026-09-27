@@ -45,15 +45,6 @@ fn split_credentials(url: &str) -> MyResult<(String, Option<(String, String)>)> 
     Ok((address, credentials))
 }
 
-/// Per-stream ceiling on disk. The second half of a retention limit, and the half
-/// that holds when the first one doesn't: `max_age` bounds a *normal* week, this
-/// bounds a bug — a loop that republishes, or a relay that never deletes.
-///
-/// Old messages are discarded to stay under it, which is the right failure for an
-/// integration bus and would have been the wrong one while the log was
-/// authoritative. That is the trade the whole of step 5 makes.
-const MAX_BYTES: i64 = 1024 * 1024 * 1024;
-
 /// Declares the streams. Safe to call from every instance concurrently and on every
 /// boot.
 ///
@@ -90,13 +81,14 @@ pub async fn ensure_streams(js: &Context) -> MyResult<()> {
         js.create_or_update_stream(Config {
             name: (*name).to_string(),
             subjects: vec![shared::events::stream_filter(domain)],
-            // File storage, still — a week of events outlives any single node's
-            // memory and a consumer that was down overnight must find them. Not
-            // because the stream is the source of truth; TiKV is.
+            // File storage: the whole history is what a projection rebuilds from.
             storage: jetstream::stream::StorageType::File,
             retention: jetstream::stream::RetentionPolicy::Limits,
             max_age: *max_age,
-            max_bytes: MAX_BYTES,
+            // No `max_bytes`. A byte ceiling would discard the oldest events, which
+            // are exactly what a rebuild needs. When the disk fills, JetStream refuses
+            // new publishes instead; the outbox keeps those rows and retries, so
+            // nothing is lost, only delayed.
             // Publishers set Nats-Msg-Id to the event id, so a retried publish
             // within this window is discarded instead of duplicating the event.
             //

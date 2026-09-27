@@ -29,8 +29,7 @@ pub struct Spot {
     /// detector for an out-of-order event — see `shared::events::Envelope`.
     ///
     /// On the model rather than only in the schema so a whole-row write carries it,
-    /// and so a read can answer "which version is this" — which is what a backfill
-    /// re-emitting current state has to stamp on the events it raises.
+    /// and so a read can answer "which version is this".
     pub version: i64,
     /// A plain uuid column, not a record link — see `spot_host` in
     /// `schemas/spot-schema.surql`, and the note there about why this is set by
