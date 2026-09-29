@@ -54,7 +54,7 @@ spec:
         and bash's /dev/tcp — no second image to pin.
 
         Enough for NATS, whose Service only routes to ready endpoints. Weaker for the
-        headless yugabyte Service, which proves only a listener; on a first install the
+        headless `db` Service, which proves only a listener; on a first install the
         migrator Job runs alongside these pods, so a service can still fail once with
         3D000 and be fine on the retry. It turns the common case into a wait, not a
         guarantee.
@@ -70,14 +70,14 @@ spec:
             - 'until : </dev/tcp/{{ $.Release.Name }}-nats/4222; do echo "waiting for nats"; sleep 2; done'
         {{- end }}
         {{- if $needsDb }}
-        - name: wait-for-yugabyte
+        - name: wait-for-db
           image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
           imagePullPolicy: {{ $.Values.imagePullPolicy }}
           command:
             - bash
             - -c
-            # 5433, not 5432 — YSQL does not listen on the PostgreSQL default.
-            - 'until : </dev/tcp/yugabyte/5433; do echo "waiting for yugabyte"; sleep 2; done'
+            # 5433 for either database — see templates/postgres.yaml.
+            - 'until : </dev/tcp/db/5433; do echo "waiting for the database"; sleep 2; done'
         {{- end }}
       {{- end }}
       containers:
@@ -97,14 +97,14 @@ spec:
               value: {{ $.Values.port | quote }}
             {{- if $needsDb }}
             # The password is a `$(VAR)` reference, expanded at container start, so
-            # `kubectl get pod -o yaml` never shows it. Same secret entry YugabyteDB reads.
+            # `kubectl get pod -o yaml` never shows it. Same secret entry the database reads.
             - name: YSQL_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ $.Values.secretName }}
                   key: YSQL_PASSWORD
             - name: DATABASE_URL
-              value: "postgres://yugabyte:$(YSQL_PASSWORD)@yugabyte:5433/{{ $name }}"
+              value: "postgres://yugabyte:$(YSQL_PASSWORD)@db:5433/{{ $name }}"
             {{- end }}
             {{- if $needsNats }}
             # Same shape. bus::connect lifts the credentials back out of the URL.

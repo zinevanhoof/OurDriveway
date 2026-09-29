@@ -10,10 +10,9 @@ the service never sees the request.
 
   set (prod: CF-Connecting-IP)
       Cloudflare writes the visitor's address into that header on every request it
-      proxies. Only trustworthy because the VPS firewall admits 80/443 from
-      Cloudflare's ranges alone — reachable directly, anyone could send their own
-      value and get a fresh bucket per request. That lockdown is what makes this
-      header mean anything.
+      proxies. Only trustworthy because nothing but Cloudflare can connect: prod
+      requires its client certificate (tls-option.yaml). Reachable directly, anyone
+      could send their own value and get a fresh bucket per request.
 
   empty (local)
       The connection's remote address. Behind k3s's service load balancer that is a

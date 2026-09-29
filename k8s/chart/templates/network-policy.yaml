@@ -19,7 +19,8 @@ to the cluster: yugabyted's UI (15433), the master and tserver ports (7000/7100/
 the kubelet's httpGet to NATS comes from the node, which k3s's policy controller admits.
 Operators are unaffected, because neither route below crosses the pod network: `kubectl
 port-forward` for NATS monitoring, `kubectl exec` into yugabyte-0 for YSQL and its UI
-(yugabyted binds the pod IP only, so port-forward cannot reach it — see yugabyte.yaml).
+(yugabyted binds the pod IP only, so port-forward cannot reach it — see yugabyte.yaml),
+or into postgres-0 for psql.
 
 New pods wait a few seconds: k3s's controller adds a pod's IP to the allow rule shortly
 after it starts, so a connection made in the first moments is dropped. The services
@@ -36,11 +37,12 @@ that on any other cluster before counting on them.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: yugabyte-clients
+  name: db-clients
 spec:
+  # YugabyteDB or PostgreSQL, whichever `database` picked — both listen on 5433.
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: yugabyte
+      app.kubernetes.io/component: database
   policyTypes: [Ingress]
   ingress:
     - from:

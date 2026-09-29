@@ -5,14 +5,19 @@ tag: latest
 replicas: 2
 
 rateLimit:
-  # The visitor's address as Cloudflare reports it. Trustworthy only while the VPS firewall
-  # admits 80/443 from Cloudflare's ranges alone — see templates/rate-limit.yaml.
+  # The visitor's address as Cloudflare reports it. Trustworthy because only Cloudflare can
+  # connect at all — originPull below; see templates/rate-limit.yaml.
   sourceHeader: CF-Connecting-IP
 
 ingress:
   host: ourdriveway.com
   tls:
     enabled: true
+    originPull: true
+
+# PostgreSQL on the small box. The yugabyte block below stays so `database: yugabyte` is
+# a one-line switch back (onto an empty store — see chart/values.yaml).
+database: postgres
 
 # Measured on a k3d node limited to this VPS's size: ~1.9 GB idle for the whole node,
 # peaking near 3 GB under 200 concurrent logins or 5,000 reads/s.

@@ -8,8 +8,6 @@
 //
 //   docker buildx bake --load             # local, tags :local
 //   TAG=abc123 docker buildx bake --push   # CI
-// Matches the `${TAG:-latest}` default in docker-compose-prod.yml, so a local
-// `bake --load` followed by a plain `docker compose up` lines up with no env var.
 // CI overrides this with the commit sha; the promote step moves :latest to it.
 variable "TAG" {
   default = "latest"

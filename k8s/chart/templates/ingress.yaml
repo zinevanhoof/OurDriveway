@@ -47,6 +47,14 @@
   {{- if and .root.Values.rateLimit.enabled .middleware }}
   {{- $_ := set $annotations "traefik.ingress.kubernetes.io/router.middlewares" (printf "%s-%s@kubernetescrd" .root.Release.Namespace .middleware) }}
   {{- end }}
+  {{- if .root.Values.ingress.tls.enabled }}
+  {{- /* HTTPS only. Were :80 routed too, a direct request there would skip the client
+         certificate check in tls-option.yaml. */}}
+  {{- $_ := set $annotations "traefik.ingress.kubernetes.io/router.entrypoints" "websecure" }}
+  {{- if .root.Values.ingress.tls.originPull }}
+  {{- $_ := set $annotations "traefik.ingress.kubernetes.io/router.tls.options" (printf "%s-cloudflare-aop@kubernetescrd" .root.Release.Namespace) }}
+  {{- end }}
+  {{- end }}
   {{- with .priority }}
   {{- $_ := set $annotations "traefik.ingress.kubernetes.io/router.priority" . }}
   {{- end }}

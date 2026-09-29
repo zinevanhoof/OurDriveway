@@ -6,6 +6,7 @@ Plain Helm, one chart, one directory per environment.
 k8s/
   deploy.sh                the whole deploy: validates, creates Secret + ConfigMaps, runs Helm
   secrets.env.example      the template for every environment's secrets.env
+  traefik-config.yaml      k3s's Traefik access logs with the visitor's IP (once per cluster)
   chart/
     values.yaml            chart defaults — no env values, only shape
     templates/
@@ -13,8 +14,10 @@ k8s/
       frontend.yaml        Caddy serving the SPA
       ingress.yaml         the one host: / → frontend, /api/<name> → <name>-service
       rate-limit.yaml      Traefik middlewares the ingress attaches
+      tls-option.yaml      Cloudflare Authenticated Origin Pulls (mTLS)
       migrator-job.yaml    Helm hook: creates and migrates every database
-      yugabyte.yaml        the database, single node
+      yugabyte.yaml        the database when `database: yugabyte`, single node
+      postgres.yaml        the database when `database: postgres`, single node
       network-policy.yaml  who may reach YSQL and NATS
   environments/
     local/  prod/
@@ -85,14 +88,27 @@ kubectl create secret tls ourdriveway-tls \
   --cert=origin.pem --key=origin.key -n ourdriveway
 ```
 
-Set Cloudflare's SSL/TLS mode to **Full (strict)**. Then:
+Set Cloudflare's SSL/TLS mode to **Full (strict)** and turn on **Authenticated Origin
+Pulls** (SSL/TLS → Origin Server). Prod requires Cloudflare's client certificate on
+every connection (`ingress.tls.originPull`, `chart/templates/tls-option.yaml`), which
+needs Cloudflare's origin-pull CA
+([authenticated_origin_pull_ca.pem](https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem)):
 
-- **Lock the origin down.** Restrict the VPS firewall to Cloudflare's IP ranges on
-  80/443. Otherwise anyone who learns the address bypasses the proxy, sees a cert no
-  browser trusts, and can forge `CF-Connecting-IP` to dodge the rate limits.
-- **Client IPs arrive in headers.** Rate limiting reads `CF-Connecting-IP`
-  (`rateLimit.sourceHeader` in prod); logs show Cloudflare's addresses unless Traefik's
-  `forwardedHeaders.trustedIPs` is set to those ranges.
+```sh
+kubectl create secret generic cloudflare-aop-ca \
+  --from-file=ca.crt=authenticated_origin_pull_ca.pem -n ourdriveway
+kubectl apply -f k8s/traefik-config.yaml     # once per cluster, see below
+```
+
+- **Only Cloudflare gets in.** A connection without Cloudflare's certificate fails the
+  handshake, and every Ingress is on `websecure` only, so :80 routes nothing. That is also
+  what makes `CF-Connecting-IP`, which rate limiting reads, impossible to forge.
+- **Client IPs are `CF-Connecting-IP`.** Everything that needs the visitor reads that
+  header — the rate limits, and any backend that ever wants it (`X-Forwarded-For` and
+  `X-Real-IP` hold Cloudflare's or a node's address). `traefik-config.yaml` puts it in
+  Traefik's access logs (`kubectl logs -n kube-system deploy/traefik`); it is a
+  HelmChartConfig for k3s's bundled Traefik, so cluster-wide and not part of the chart.
+  Absent on the local cluster, which has no Cloudflare in front.
 
 ## A local cluster
 
@@ -152,21 +168,38 @@ works: `/api/<name>` to each service with an API (all but notification), everyth
 to the frontend. Stripe's webhook arrives at `/api/payment/webhook` through the same
 Ingress — the one route with no JWT; it authenticates by signature (`route/webhook.rs`).
 
+## YugabyteDB or PostgreSQL
+
+`database` in the values picks one; local runs `yugabyte`, prod `postgres` — the VPS
+gets a database at a tenth of the memory, and the same images still run unchanged on
+YugabyteDB. Nothing but the chart knows which: both are the `db` Service on 5433, with
+the `yugabyte` role and maintenance database (the Postgres pod creates both at first
+boot), so every `DATABASE_URL` and the migrator are identical. The services speak plain
+PostgreSQL — no Yugabyte-only SQL in the migrations — and the Read Committed behaviour
+booking needs is PostgreSQL's default.
+
+Switching an existing environment starts from an **empty** store: the old StatefulSet
+and its PVC are left behind and nothing is copied across. Delete the old PVC
+(`data-yugabyte-0` or `data-postgres-0`) once you no longer want it.
+
+CI and the dev compose file test against YugabyteDB only; PostgreSQL is proven by prod
+running on it.
+
 ## Where the state lives
 
 ```
-services  ──►  yugabyte (StatefulSet, one database per service)
+services  ──►  db: yugabyte or postgres (StatefulSet, one database per service)
    │                    ▲
    └──►  NATS JetStream ─┘ integration events, kept forever (rebuild path)
 ```
 
 | Volume | Holds | Losing it |
 |---|---|---|
-| `yugabyte` | every service database and the read model | **data loss** |
+| `data-yugabyte-0` / `data-postgres-0` | every service database and the read model | **data loss** |
 | NATS | every event on USERS, SPOTS, BOOKINGS, PAYMENTS (SESSIONS: 31 days) | no data loss, but projections can no longer be rebuilt |
 
-**YugabyteDB is authoritative.** The log rebuilds projections, not the owning services'
-rows — they hold things no event carries (password hashes) — so deleting the `yugabyte`
+**The database is authoritative.** The log rebuilds projections, not the owning services'
+rows — they hold things no event carries (password hashes) — so deleting the database's
 PVC is data loss, not a replay.
 
 The NATS PVC grows forever: the four event streams have no `max_age` or `max_bytes`
@@ -216,10 +249,10 @@ silently skips whatever was pending.
 
 ## Known ceilings
 
-- **Single YugabyteDB node**, one copy of the authoritative data, and no backup story.
-  Multi-node needs `--join` and a replication factor — a different template, not
-  `replicas: 3`. Add it and a backup (`ysql_dump` or YugabyteDB snapshots) before
-  anything real lives here.
+- **Single database node**, one copy of the authoritative data, and no backup story.
+  Multi-node YugabyteDB needs `--join` and a replication factor — a different template,
+  not `replicas: 3`; PostgreSQL has no multi-node story here at all. Add a backup
+  (`pg_dump`/`ysql_dump`, or YugabyteDB snapshots) before anything real lives here.
 - **Single NATS node** holding the only rebuild source. Set `nats.config.cluster.enabled`
   with three replicas, or back up the PVC, before that matters.
 - **Every event ever published must keep decoding.** A replay reads the whole history, so

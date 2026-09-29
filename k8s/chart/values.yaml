@@ -79,8 +79,26 @@ serviceResources:
   limits:
     memory: 128Mi
 
-# The authoritative store — see templates/yugabyte.yaml. Its PVC is the one thing here
-# whose loss is data loss.
+# The authoritative store: `yugabyte` or `postgres`. Both sit behind the `db` Service on
+# 5433 with the same role and databases, so this is the only thing that changes — see
+# templates/postgres.yaml. Its PVC is the one thing here whose loss is data loss, and
+# switching starts from an empty store: nothing is migrated across.
+database: yugabyte
+
+postgres:
+  # The major is pinned, minors float: a minor bump is a drop-in. Never the bare `alpine`
+  # tag — the data lives in /var/lib/postgresql/<major>/, so a new major finds no data
+  # there, initialises an EMPTY database beside the real one, and the app carries on.
+  # Moving to 19 is a pg_upgrade or a dump and restore, done on purpose.
+  image: postgres:18-alpine
+  storage: 20Gi
+  maxConnections: 250
+  # No memory limit, for yugabyte's reason: an OOM kill takes down the only copy.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
 yugabyte:
   # >= 2025.2 and started through `yugabyted`: that pair enables Read Committed, which
   # booking-service's reserve path needs to not double-book. A correctness constraint.
@@ -114,6 +132,10 @@ ingress:
     enabled: false
     # Created by hand, not by this chart — see k8s/README.md.
     secretName: ourdriveway-tls
+    # Require Cloudflare's client certificate on every connection — templates/tls-option.yaml.
+    originPull: false
+    # Created by hand, holds Cloudflare's origin-pull CA under the key ca.crt.
+    originPullCaSecret: cloudflare-aop-ca
 
 # Per-client limits at Traefik — see templates/rate-limit.yaml for how a client is
 # identified, templates/ingress.yaml for which paths get which limit.

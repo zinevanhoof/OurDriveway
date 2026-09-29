@@ -6,7 +6,7 @@ transaction, but the run is not exclusive, so at `replicas: N` two booting pods 
 read the same pending set and both apply it.
 
 `post-install,pre-upgrade`, NOT `pre-install`:
-  * `pre-install` runs before ANY chart resource, so on a cold install the yugabyte
+  * `pre-install` runs before ANY chart resource, so on a cold install the database
     StatefulSet would not exist yet and this would wait out activeDeadlineSeconds.
   * `post-install` runs once the cluster is up, which is the only ordering that can
     work the first time.
@@ -56,22 +56,22 @@ spec:
       restartPolicy: Never
       automountServiceAccountToken: false
       initContainers:
-        # Same /dev/tcp wait the services use. The yugabyte Service is headless, so
+        # Same /dev/tcp wait the services use. The `db` Service is headless, so
         # this proves a listener, not readiness — the connect in the migrator is what
-        # actually blocks until YSQL answers.
-        - name: wait-for-yugabyte
+        # actually blocks until the database answers.
+        - name: wait-for-db
           image: {{ .Values.registry }}/ourdriveway-migrator:{{ .Values.tag }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           command:
             - bash
             - -c
-            # 5433, not 5432 — YSQL does not listen on the PostgreSQL default.
-            - 'until : </dev/tcp/yugabyte/5433; do echo "waiting for yugabyte"; sleep 2; done'
+            # 5433 for either database — see templates/postgres.yaml.
+            - 'until : </dev/tcp/db/5433; do echo "waiting for the database"; sleep 2; done'
       containers:
         - name: migrator
           image: {{ .Values.registry }}/ourdriveway-migrator:{{ .Values.tag }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
-          # One URL per database, from the same secret entry YugabyteDB reads. `$(VAR)` is
+          # One URL per database, from the same secret entry the database reads. `$(VAR)` is
           # expanded at container start, so the pod spec shows the reference, not the
           # password — and the migrator logs database names, never URLs. Pure wiring, so
           # it has no config file of its own.
@@ -83,7 +83,7 @@ spec:
                   key: YSQL_PASSWORD
             {{- range $db := list "user" "spot" "booking" "payment" "view" }}
             - name: {{ $db | upper }}_DATABASE_URL
-              value: "postgres://yugabyte:$(YSQL_PASSWORD)@yugabyte:5433/{{ $db }}"
+              value: "postgres://yugabyte:$(YSQL_PASSWORD)@db:5433/{{ $db }}"
             {{- end }}
           resources:
             requests:
