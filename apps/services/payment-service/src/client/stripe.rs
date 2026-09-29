@@ -266,8 +266,8 @@ impl Stripe {
     /// matter, because it is what gets charged.
     ///
     /// `return_url` **is** the client's, and is the only client-supplied value on this
-    /// call. It has to be: only the client knows whether it is the web build returning
-    /// to its own origin or the Tauri build returning to a `ourdriveway://` deep link.
+    /// call. It has to be: only the client knows which site it belongs to, the web build's
+    /// own origin or the one the Tauri build talks to.
     /// Why that is not the open redirect it looks like is argued where the field is
     /// declared — see `shared::requests::payment::CreateSessionRequest`.
     ///

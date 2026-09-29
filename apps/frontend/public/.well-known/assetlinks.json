@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.gromit.our_driveway",
+      "sha256_cert_fingerprints": [
+        "76:77:0F:2D:27:53:ED:93:0E:D6:E3:11:B2:FB:4A:54:22:F2:45:10:B3:57:98:37:D9:D7:18:0E:C8:04:58:D8"
+      ]
+    }
+  }
+]

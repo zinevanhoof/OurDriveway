@@ -66,7 +66,7 @@ let actions: StripeCheckoutLoadActionsSuccess | null = null;
 
 // A redirect payment leaves this page entirely — the webview navigates to the bank and the
 // SPA is destroyed. Nothing is held across it, and nothing needs to be: Stripe returns to
-// `checkout/return.html`, which bounces through the app's own scheme back to this route,
+// the website's `/checkout`, which in the app `catch_deep_link` turns back into this route,
 // and `load()` rebuilds everything from the session id. See `returnUrl` in api/paymentApi.ts
 // and `catch_deep_link` in src-tauri/src/lib.rs.
 

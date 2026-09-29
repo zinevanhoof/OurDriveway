@@ -127,49 +127,36 @@ declare global {
 }
 
 /**
- * Brings the app back after a redirect payment.
+ * Opens the app on the screen a link to the website names.
  *
- * Bancontact and iDEAL leave for the customer's bank, and Stripe's `return_url` would
- * otherwise land in the system browser — where this app has no session at all, because
- * `installNativeFetch` keeps the refresh cookie in reqwest's jar inside the Tauri process.
- * A `ourdriveway://checkout?session_id=…` link routes the return here instead.
+ * The emailed links (`/verify-email`, `/reset-password`) and a bank's return after a
+ * redirect payment (`/checkout?session_id=…`) are the website's own URLs. Tapped in a mail
+ * or bank app with this app installed, Android hands them here as App Links (declared in
+ * tauri.conf.json, verified against `/.well-known/assetlinks.json`), and the path and
+ * query are exactly the in-app route — the app and the site share their routes.
  *
- * The incoming URL carries the same path and query the web build would have navigated to,
- * so this only has to hand them to the router — checkout needs nothing else, which is the
- * whole point of the session id being its only handle.
+ * Two ways in: `getCurrent()` for the link that launched a closed app, which is how a mail
+ * link usually arrives, and `onOpenUrl` for one that arrives while it runs. The same URL
+ * navigated to *inside* the webview never gets here: `catch_deep_link` in
+ * src-tauri/src/lib.rs catches that one.
  *
- * Only fires when the payment actually left the app. While the redirect stays inside the
- * webview, the scheme never reaches the OS (ERR_UNKNOWN_URL_SCHEME) and nothing arrives
- * here — see the note on `returnUrl` in api/paymentApi.ts.
- *
- * Native only. `isTauri()` is false on the web, where the redirect simply comes back to
- * the origin it left.
+ * Native only. `isTauri()` is false on the web, where the link simply opens the site.
  */
 async function installDeepLinks() {
   if (!native) return;
 
-  const { onOpenUrl } = await import("@tauri-apps/plugin-deep-link");
-  await onOpenUrl((urls) => {
-    for (const raw of urls) {
-      try {
-        const url = new URL(raw);
-        // `ourdriveway://checkout?session_id=…` parses with "checkout" as the *host*, not
-        // the path — a custom scheme has no authority — so both have to be joined back
-        // together before the router sees it.
-        //
-        // The collapse is not decoration: written with three slashes
-        // (`ourdriveway:///checkout`) the host is empty and the pathname carries the whole
-        // path, which would otherwise produce `//checkout` and fail to match any route.
-        // Accepting both spellings means a malformed return URL degrades to working.
-        const path = `/${url.host}${url.pathname}`
-          .replace(/\/{2,}/g, "/")
-          .replace(/(.)\/$/, "$1");
-        router.push({ path, query: Object.fromEntries(url.searchParams) });
-      } catch {
-        // A malformed link is not worth breaking startup over.
-      }
+  const route = (raw: string) => {
+    try {
+      const url = new URL(raw);
+      router.push({ path: url.pathname, query: Object.fromEntries(url.searchParams) });
+    } catch {
+      // A malformed link is not worth breaking startup over.
     }
-  });
+  };
+
+  const { getCurrent, onOpenUrl } = await import("@tauri-apps/plugin-deep-link");
+  (await getCurrent())?.forEach(route);
+  await onOpenUrl((urls) => urls.forEach(route));
 }
 
 bootstrap();

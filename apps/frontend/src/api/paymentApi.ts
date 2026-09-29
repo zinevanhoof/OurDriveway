@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 
 import { get, post } from "./client";
-import { native } from "./http";
+import { webOrigin } from "./http";
 import { viewKeys } from "./keys";
 import type { AccountSessionResponse } from "@/types/responses/payment/AccountSessionResponse";
 import type { ConnectStatusResponse } from "@/types/responses/payment/ConnectStatusResponse";
@@ -18,26 +18,15 @@ import type { SessionStateResponse } from "@/types/responses/payment/SessionStat
  * `{CHECKOUT_SESSION_ID}` is a literal: Stripe substitutes the real id when it redirects,
  * which is how `/checkout` gets the only handle it needs.
  *
- * Native returns to `checkout/return.html`, a static page that opens the app's
- * `ourdriveway://` scheme, rather than naming that scheme here. Two layers of Stripe
- * disagree about custom schemes: `POST /v1/checkout/sessions` stores one without
- * complaint, but Stripe.js rejects it at confirm time with "invalid returnUrl". Only the
- * http(s) form survives both.
- *
- * The origin is always the page's own, on both platforms. On native the whole redirect runs
- * *inside* the webview — the bank, Stripe and that return page all load there — and
- * `catch_deep_link` in `src-tauri/src/lib.rs` turns the `ourdriveway://` hop into an in-app
- * navigation. The webview can always reach its own origin: the dev machine's LAN address
- * under `tauri android dev`, `http://tauri.localhost` in a release build.
- *
- * It used to be pinned by `VITE_APP_ORIGIN`, set to `http://localhost:1420` for dev. On a
- * phone that is the phone itself, so the return page never loaded and checkout hung after
- * the bank step.
+ * The same URL on both platforms: the website's `/checkout`. On native the redirect runs
+ * inside the webview, and `catch_deep_link` in `src-tauri/src/lib.rs` turns the return into
+ * the app's own `/checkout`; if it ends in a bank app instead, the URL comes back in as an
+ * App Link (`installDeepLinks` in main.ts). It used to go through a `checkout/return.html`
+ * page and an `ourdriveway://` scheme, because Stripe.js refuses a custom-scheme
+ * `return_url` at confirm time.
  */
 function returnUrl(): string {
-  const path = native ? "/checkout/return.html" : "/checkout";
-
-  return `${window.location.origin}${path}?session_id={CHECKOUT_SESSION_ID}`;
+  return `${webOrigin()}/checkout?session_id={CHECKOUT_SESSION_ID}`;
 }
 
 /**
