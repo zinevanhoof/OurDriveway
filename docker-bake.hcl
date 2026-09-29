@@ -8,8 +8,6 @@
 //
 //   docker buildx bake --load             # local, tags :local
 //   TAG=abc123 docker buildx bake --push   # CI
-// Matches the `${TAG:-latest}` default in docker-compose-prod.yml, so a local
-// `bake --load` followed by a plain `docker compose up` lines up with no env var.
 // CI overrides this with the commit sha; the promote step moves :latest to it.
 variable "TAG" {
   default = "latest"
@@ -22,7 +20,7 @@ variable "REGISTRY" {
 // `builder` is deliberately absent: it carries no tags and is never pushed, it
 // only exists to be consumed by the service targets.
 group "default" {
-  targets = ["user-service", "booking-service", "spot-service", "view-service", "media-service", "notification-service", "payment-service", "migrator", "frontend"]
+  targets = ["user-service", "booking-service", "spot-service", "view-service", "media-service", "notification-service", "payment-service", "migrator", "demo-reset", "frontend"]
 }
 
 target "builder" {
@@ -85,4 +83,12 @@ target "payment-service" {
 target "frontend" {
   dockerfile = "apps/frontend/Dockerfile"
   tags       = ["${REGISTRY}/ourdriveway-frontend:${TAG}"]
+}
+
+// The public demo's hourly reset (k8s/chart/templates/demo-reset.yaml): the migrator, the
+// demo seed and kubectl. Not a service either; it runs to completion.
+target "demo-reset" {
+  dockerfile = "docker/demo-reset.Dockerfile"
+  contexts   = { builder = "target:builder" }
+  tags       = ["${REGISTRY}/ourdriveway-demo-reset:${TAG}"]
 }

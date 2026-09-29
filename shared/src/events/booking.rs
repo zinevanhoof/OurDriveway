@@ -51,8 +51,7 @@ pub enum BookingEvent {
     ///
     /// Only a confirmed booking can carry one, and every consumer guards on that the way
     /// the transitions guard on status — a rating that lands on a row still `reserved`
-    /// matches nothing. Published by `BookingService::rate`, and replayed by the backfill
-    /// for rows that already have a rating.
+    /// matches nothing. Published by `BookingService::rate`.
     Rated { booking_id: Uuid, rating: i32 },
 }
 
@@ -75,20 +74,6 @@ impl CancelReason {
             Self::SpotUnavailable => "spot_unavailable",
         }
     }
-
-    /// The inverse, for reading the column back out of a row — which is what a
-    /// backfill does when it re-emits a cancellation from current state.
-    ///
-    /// Beside [`Self::as_str`] so the two cannot drift, and total rather than
-    /// `Option`: the schema asserts the set, so an unrecognised string is a
-    /// corrupted row, and defaulting a *renter's* cancellation onto the host is the
-    /// safer way to be wrong — it is the reason that owes a full refund.
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "by_renter" => Self::ByRenter,
-            _ => Self::SpotUnavailable,
-        }
-    }
 }
 
 /// Why a hold ended without becoming a booking. Costs nothing to carry and it's
@@ -108,16 +93,6 @@ impl ReleaseReason {
         match self {
             Self::Abandoned => "abandoned",
             Self::Expired => "expired",
-        }
-    }
-
-    /// The inverse, for the same reason as [`CancelReason::parse`]. Neither answer
-    /// costs anyone money here — this is the difference between "you backed out"
-    /// and "your hold ran out" in a renter's history.
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "abandoned" => Self::Abandoned,
-            _ => Self::Expired,
         }
     }
 }
@@ -173,24 +148,4 @@ pub struct BookingCreated {
     /// it *and* know the zone. Folded once here instead, which is what lets both the
     /// host's and the renter's list filter on a single indexed field.
     pub ends_at: DateTime<Utc>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `as_str` writes the column, `parse` reads it back. They are two matches over
-    /// the same strings, so nothing but this stops one gaining a variant the other
-    /// does not — and the failure would be quiet: a backfilled cancellation
-    /// attributed to the wrong party, which is the difference between a full refund
-    /// and none.
-    #[test]
-    fn every_reason_round_trips_through_its_column() {
-        for reason in [CancelReason::ByRenter, CancelReason::SpotUnavailable] {
-            assert_eq!(CancelReason::parse(reason.as_str()), reason);
-        }
-        for reason in [ReleaseReason::Abandoned, ReleaseReason::Expired] {
-            assert_eq!(ReleaseReason::parse(reason.as_str()), reason);
-        }
-    }
 }

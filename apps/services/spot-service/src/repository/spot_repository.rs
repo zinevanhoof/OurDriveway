@@ -40,19 +40,6 @@ impl SpotRepository {
     // booking-service's *mirror* of this table, where reserve reads a spot it is not
     // versioning — see `SpotMirrorRepository`.
 
-    /// Every spot, deleted ones included, for `SpotService::backfill`.
-    ///
-    /// Deleted ones matter: their rows stay selectable so a renter's past bookings
-    /// keep resolving a title, so a rebuild that skipped them would leave exactly
-    /// those bookings unlabelled.
-    ///
-    /// ponytail: reads the whole table into memory in one pass. Fine for a
-    /// maintenance endpoint; page on `id` — `WHERE id > $after ORDER BY id LIMIT $n`
-    /// — if listings ever outgrow it.
-    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<Spot>> {
-        Ok(spot::table.select(Spot::as_select()).load(conn).await?)
-    }
-
     /// Insert-or-replace the whole row, keyed by its own id.
     ///
     /// Idempotent by construction, which is what lets the projector replay the same

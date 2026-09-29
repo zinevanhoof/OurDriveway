@@ -1,0 +1,182 @@
+{{/*
+The public demo: wipe everything and seed it again, every hour and once after install, so
+whatever a visitor breaks is gone by the next hour. `demo.enabled` in the values.
+
+**It deletes every account**, not just the demo ones: visitors who signed up with their
+own email lose theirs on the hour too. Keeping only theirs is not an option, because the
+read models are built from the event history and rows deleted under them would disagree
+with it. The landing page's tutorial says so.
+
+The sequence, all in one script so the services always come back:
+
+  1. scale every backend to 0 and wait for the pods to be gone
+  2. `demo_seed --reset`  drop the five databases, delete the streams and their consumers
+  3. `migrator`           create the databases again, empty
+  4. `demo_seed`          write the demo rows and publish their history
+  5. scale back up        to the chart's replica counts, from a trap, whatever failed
+
+The services must be down for 2 to 4: the seed's history has to be in the streams before
+any worker consumer exists (bus/examples/demo_seed.rs explains why), and a running
+service would recreate its consumers the moment the streams went. So the API is down for
+a minute or two each hour; the frontend stays up.
+
+The image is docker/demo-reset.Dockerfile: the migrator, the seed and kubectl.
+*/}}
+{{- define "ourdriveway.demoResetPod" }}
+metadata:
+  labels:
+    app.kubernetes.io/name: demo-reset
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    # Admitted to YSQL and NATS by templates/network-policy.yaml.
+    ourdriveway.com/db-client: "true"
+    ourdriveway.com/nats-client: "true"
+spec:
+  serviceAccountName: demo-reset
+  restartPolicy: Never
+  initContainers:
+    # On a first install this runs as soon as the chart's objects exist, before the
+    # database or NATS are listening.
+    - name: wait-for-dependencies
+      image: {{ .Values.registry }}/ourdriveway-demo-reset:{{ .Values.tag }}
+      imagePullPolicy: {{ .Values.imagePullPolicy }}
+      command:
+        - bash
+        - -c
+        - 'until : </dev/tcp/db/5433 && : </dev/tcp/{{ .Release.Name }}-nats/4222; do echo "waiting for the database and nats"; sleep 2; done'
+  containers:
+    - name: reset
+      image: {{ .Values.registry }}/ourdriveway-demo-reset:{{ .Values.tag }}
+      imagePullPolicy: {{ .Values.imagePullPolicy }}
+      env:
+        - name: YSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.secretName }}
+              key: YSQL_PASSWORD
+        - name: NATS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.secretName }}
+              key: NATS_PASSWORD
+        # The seed's.
+        - name: DATABASE_URL_BASE
+          value: "postgres://yugabyte:$(YSQL_PASSWORD)@db:5433"
+        - name: NATS_URL
+          value: "nats://{{ .Values.natsUser }}:$(NATS_PASSWORD)@{{ .Release.Name }}-nats:4222"
+        # The base the seed builds photo URLs on, and the one spot-service checks them
+        # against: the same ConfigMap entry, so they cannot disagree.
+        - name: MEDIA_BASE
+          valueFrom:
+            configMapKeyRef:
+              name: spot-service-config
+              key: MEDIA_BASE
+        # The migrator's, as in migrator-job.yaml.
+        {{- range $db := list "user" "spot" "booking" "payment" "view" }}
+        - name: {{ $db | upper }}_DATABASE_URL
+          value: "postgres://yugabyte:$(YSQL_PASSWORD)@db:5433/{{ $db }}"
+        {{- end }}
+      command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+          deploys=({{ range $name, $_ := .Values.services }}{{ $name }}-service {{ end }})
+
+          # Back up to the chart's counts rather than the ones read before scaling down:
+          # a run killed half way would otherwise leave zeros for the next run to restore.
+          restore() {
+            set +e  # one that fails must not keep the others down
+          {{- range $name, $svc := .Values.services }}
+            kubectl scale deploy {{ $name }}-service --replicas={{ $svc.replicas | default $.Values.replicas }}
+          {{- end }}
+          }
+          trap restore EXIT
+          # So a deadline or a delete still runs the trap on the way out.
+          trap 'exit 143' TERM INT
+
+          kubectl scale deploy "${deploys[@]}" --replicas=0
+          selector="app.kubernetes.io/name in ($(IFS=,; echo "${deploys[*]}"))"
+          for i in $(seq 90); do
+            [ -z "$(kubectl get pods -l "$selector" -o name)" ] && break
+            [ "$i" = 90 ] && { echo "the services are still running after three minutes" >&2; exit 1; }
+            sleep 2
+          done
+
+          demo_seed --reset
+          migrator
+          demo_seed
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          memory: 256Mi
+{{- end }}
+{{- if .Values.demo.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demo-reset
+---
+# Just enough to scale this namespace's Deployments and see their pods go.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: demo-reset
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: demo-reset
+subjects:
+  - kind: ServiceAccount
+    name: demo-reset
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: demo-reset
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: demo-reset
+spec:
+  schedule: {{ .Values.demo.schedule | quote }}
+  # Never two at once, and a missed hour is skipped rather than run late.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # No retry: a half-run reset is put right by the next hour, not by running the
+      # scale-down again straight away.
+      backoffLimit: 0
+      activeDeadlineSeconds: 900
+      template:
+        {{- include "ourdriveway.demoResetPod" . | nindent 8 }}
+---
+# The first seed, right after the migrator's install hook (weight -5), so a new cluster
+# does not wait for the top of the hour. Upgrades leave the data alone; the schedule
+# resets it anyway.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-demo-seed
+  annotations:
+    "helm.sh/hook": post-install
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  template:
+    {{- include "ourdriveway.demoResetPod" . | nindent 4 }}
+{{- end }}

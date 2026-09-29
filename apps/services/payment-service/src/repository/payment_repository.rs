@@ -45,24 +45,6 @@ impl PaymentRepository {
             .optional()?)
     }
 
-    /// Every payment, for `PaymentService::backfill`.
-    ///
-    /// Ordered by `created_at` so a rebuild replays a payment's history in the order it
-    /// happened. Not required for correctness — each payment is its own aggregate and
-    /// its two backfilled events are enqueued together — but a log that reads
-    /// chronologically is worth the `ORDER BY`.
-    ///
-    /// ponytail: whole table in one pass, same ceiling and same fix as the others —
-    /// keyset on `created_at` if this ever has to run against a table that does not fit
-    /// in memory.
-    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<Payment>> {
-        Ok(payment::table
-            .order(payment::created_at.asc())
-            .select(Payment::as_select())
-            .load(conn)
-            .await?)
-    }
-
     /// Insert-or-replace the whole row, keyed by its own id.
     ///
     /// Idempotent by construction, which is what lets a projector replay the same

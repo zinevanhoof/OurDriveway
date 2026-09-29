@@ -8,7 +8,7 @@ use shared::{
     extract::Valid,
     extractors::authed_jwt::AuthedJwt,
     requests::payment::{CreateSessionRequest, PayoutRequest},
-    responses::common::{BackfilledResponse, X_VERSION},
+    responses::common::X_VERSION,
     responses::payment::{CreateSessionResponse, PayoutResponse, SessionStateResponse},
 };
 
@@ -96,17 +96,4 @@ pub async fn request_payout(
         [(X_VERSION, version)],
         Json(PayoutResponse { amount_cents }),
     ))
-}
-
-/// `POST /internal/backfill` — re-emit every payout, for rebuilding a consumer.
-///
-/// Off the ingress and unauthenticated by construction; see the same handler in
-/// user-service for why that is the whole of the access control.
-///
-/// Payouts only. `PaymentService::backfill` says why the payments themselves have
-/// nothing downstream to rebuild.
-pub async fn backfill(State(state): State<AppState>) -> MyResult<Json<BackfilledResponse>> {
-    Ok(Json(BackfilledResponse {
-        events: state.payment_service.backfill().await?,
-    }))
 }

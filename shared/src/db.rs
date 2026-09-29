@@ -215,9 +215,9 @@ macro_rules! next_version {
 /// booking-service's sweeper, and `SpotProjector::cancel`, both of which bump a version
 /// outside the event they are applying.
 ///
-/// Still not fatal. The streams expire (seven days), so a consumer created after an
-/// aggregate's early events aged out legitimately sees its first event at version 5, and
-/// `POST /internal/backfill` is what repairs a projection that is merely incomplete.
+/// Still not fatal: an incomplete projection is repaired by replaying the stream into
+/// it (see `shared::events::STREAMS`), and stopping would only take the service down
+/// until then.
 ///
 /// ```ignore
 /// shared::set_version!(conn, "spot", shared::schema::view::spot, &spot_id, version)?;

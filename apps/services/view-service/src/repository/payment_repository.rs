@@ -37,8 +37,8 @@ impl ViewPaymentRepository {
     /// redelivery a no-op.
     ///
     /// A patch for a payment this projection has not seen updates nothing and is not an
-    /// error: the row arrives with `Created`, and if PAYMENTS expired before that
-    /// reached us, `POST /internal/backfill` on payment-service re-emits it.
+    /// error: the row arrives with `Created`, and the version gate holds a patch back
+    /// until it has.
     ///
     /// `COALESCE($n, column)` is absent-is-unchanged, and is also the ceiling: no patch
     /// can set a column back to NULL. Nothing un-refunds a payment.

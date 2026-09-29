@@ -32,10 +32,8 @@ shared = { path = "../shared" }
 # `examples/demo_seed.rs` only. Dev-dependencies, so no service build pays for them, and
 # all are already in the workspace graph, so nothing new compiles. argon2 hashes the demo
 # password; a booking's `ends_at` is its last slot in the spot's own zone (chrono-tz);
-# MEDIA_BASE is read from spot-service's .env (dotenvy); and the seed triggers each
-# service's `/internal/backfill` over HTTP (reqwest).
+# and MEDIA_BASE is read from spot-service's .env (dotenvy).
 [dev-dependencies]
 argon2 = { workspace = true }
 chrono-tz = { workspace = true }
 dotenvy = { workspace = true }
-reqwest = { workspace = true }

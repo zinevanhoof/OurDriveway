@@ -51,19 +51,6 @@ pub struct Envelope<T> {
     /// Whoever caused this, from a verified JWT claim. `None` for events raised by
     /// a service rather than a request.
     pub actor_id: Option<Uuid>,
-    /// True when this is a re-emission of current state rather than something that
-    /// just happened — see `bus::outbox::backfill`.
-    ///
-    /// **Projectors must ignore this.** Rebuilding a projection is the whole point,
-    /// and a projector that skipped these would rebuild nothing. It exists for
-    /// consumers whose reaction is a side effect *outside* this system: a backfill
-    /// of USERS re-emits `Registered` for every account, and notification-service
-    /// would send every one of them a fresh verification email.
-    ///
-    /// `#[serde(default)]` so an event encoded before this field existed still
-    /// decodes — and decodes as `false`, which is the safe direction.
-    #[serde(default)]
-    pub backfill: bool,
     pub payload: T,
 }
 
@@ -76,7 +63,6 @@ impl<T> Envelope<T> {
             version,
             occurred_at: Utc::now(),
             actor_id,
-            backfill: false,
             payload,
         }
     }
@@ -150,26 +136,21 @@ const DAY: u64 = 24 * 60 * 60;
 /// derives `users.>` from it, so the stream's binding and its consumers' cannot drift
 /// apart.
 ///
-/// **Every stream expires.** Four of these used to be `None` — infinite — because
-/// each service database was an `emptyDir` wiped on every pod restart and a
-/// projection could only be rebuilt by replaying from sequence 1. That was normal
-/// operation, several times a day, so the log genuinely was the source of truth.
+/// **Four of these never expire** (`Duration::ZERO` is JetStream's "no limit"). The
+/// log is how a projection is rebuilt: stop its service, empty its tables, delete its
+/// durable consumers, and start it again. The consumers are recreated with
+/// `DeliverPolicy::All`, replay from sequence 1 through the same projector code as live
+/// traffic, and the version gate orders them. Only the rebuilding consumer sees the
+/// replay. Workers are untouched, because a replay publishes nothing.
 ///
-/// TiKV is now, and it survives restarts. What is left is an integration bus: a
-/// week is far longer than any consumer is ever behind, and a projection that does
-/// need re-deriving is re-emitted from current state by each owning service —
-/// `bus::outbox::backfill`, reached at `POST /internal/backfill`.
+/// This replaced a per-service `POST /internal/backfill` that re-emitted current state
+/// as synthetic events. Those went to *every* consumer, so they needed a flag telling
+/// workers to ignore them.
 ///
-/// One thing that genuinely goes away with the old retention: PAYMENTS stopped
-/// being an audit trail of every charge and refund. That record is the `payment`
-/// and `payout` tables now. If an *independent* ledger is ever wanted it has to be
-/// an explicit table somewhere else, not a side effect of never deleting anything.
+/// YugabyteDB stays the source of truth. The log is the source of *projections*, so
+/// every event ever published has to keep decoding.
 pub const STREAMS: &[(&str, &str, std::time::Duration)] = &[
-    (
-        STREAM_USERS,
-        "users",
-        std::time::Duration::from_secs(7 * DAY),
-    ),
+    (STREAM_USERS, "users", std::time::Duration::ZERO),
     // The one that was already bounded, and the longest: a refresh token lives 31
     // days, so its events stop meaning anything at exactly that point.
     (
@@ -177,21 +158,9 @@ pub const STREAMS: &[(&str, &str, std::time::Duration)] = &[
         "sessions",
         std::time::Duration::from_secs(31 * DAY),
     ),
-    (
-        STREAM_SPOTS,
-        "spots",
-        std::time::Duration::from_secs(7 * DAY),
-    ),
-    (
-        STREAM_BOOKINGS,
-        "bookings",
-        std::time::Duration::from_secs(7 * DAY),
-    ),
-    (
-        STREAM_PAYMENTS,
-        "payments",
-        std::time::Duration::from_secs(7 * DAY),
-    ),
+    (STREAM_SPOTS, "spots", std::time::Duration::ZERO),
+    (STREAM_BOOKINGS, "bookings", std::time::Duration::ZERO),
+    (STREAM_PAYMENTS, "payments", std::time::Duration::ZERO),
 ];
 
 /// What a stream binds — every subject in its bounded context, partitioned or not.

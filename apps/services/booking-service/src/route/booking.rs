@@ -6,7 +6,7 @@ use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::booking::{CreateBookingRequest, RateBookingRequest};
 use shared::responses::booking::CreateBookingResponse;
-use shared::responses::common::{BackfilledResponse, X_VERSION};
+use shared::responses::common::X_VERSION;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -80,18 +80,4 @@ pub async fn rate(
         .rate(&user_id, &booking_id, request)
         .await?;
     Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
-}
-
-/// `POST /internal/backfill` — re-emit every booking, for rebuilding a consumer.
-///
-/// Off the ingress and unauthenticated by construction; see the same handler in
-/// user-service for why that is the whole of the access control.
-///
-/// The one of the four that wakes a side-effect consumer — payment-service settles
-/// on the terminal booking events. `BookingService::backfill` says why that is safe
-/// and what would make it stop being.
-pub async fn backfill(State(state): State<AppState>) -> MyResult<Json<BackfilledResponse>> {
-    Ok(Json(BackfilledResponse {
-        events: state.booking_service.backfill().await?,
-    }))
 }

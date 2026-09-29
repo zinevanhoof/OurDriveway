@@ -8,6 +8,16 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Tailwind's own `hover`, minus the phone frame: a phone has no hover, and the framed app
+   is meant to behave like one even though a mouse drives it. */
+@custom-variant hover {
+  @media (hover: hover) {
+    html:not(.framed) &:hover {
+      @slot;
+    }
+  }
+}
+
 @theme inline {
   --font-sans: "Inter Variable", sans-serif;
   --font-heading: var(--font-sans);
@@ -238,6 +248,13 @@
   body {
     @apply bg-background text-foreground;
     @apply font-sans;
+  }
+  /* A fingertip instead of a cursor, and no scrollbars — a phone shows neither. Important
+     so it beats every `cursor-pointer` and MapLibre's grab hand. */
+  html.framed,
+  html.framed * {
+    cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28'%3E%3Ccircle cx='14' cy='14' r='11' fill='rgba(0,0,0,.25)' stroke='white' stroke-width='2'/%3E%3C/svg%3E") 14 14, default !important;
+    scrollbar-width: none;
   }
   button:not(:disabled),
   [role="button"]:not(:disabled) {

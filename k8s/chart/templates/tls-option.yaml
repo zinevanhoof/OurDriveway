@@ -1,0 +1,22 @@
+{{/*
+Cloudflare Authenticated Origin Pulls: Traefik accepts a TLS connection only when the
+client presents a certificate signed by Cloudflare's origin-pull CA. Only Cloudflare's
+edge has one, so the origin cannot be reached around the proxy even if its address leaks,
+and CF-Connecting-IP (rate-limit.yaml) cannot be forged.
+
+Attached to every Ingress by templates/ingress.yaml. The CA Secret is created by hand,
+like the certificate — see k8s/README.md. If it is missing, Traefik refuses the routers
+rather than serving them without the check.
+*/}}
+{{- if and .Values.ingress.tls.enabled .Values.ingress.tls.originPull }}
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: cloudflare-aop
+spec:
+  minVersion: VersionTLS12
+  clientAuth:
+    clientAuthType: RequireAndVerifyClientCert
+    secretNames:
+      - {{ .Values.ingress.tls.originPullCaSecret }}
+{{- end }}

@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-# Compiles the whole workspace once and exposes the seven binaries at /out.
+# Compiles the whole workspace once and exposes the binaries at /out: the seven
+# services, the migrator, and the demo seed (a `bus` example) for the demo-reset image.
 # Not a deployable image — the per-service Dockerfiles consume it as a named
 # build context (see docker-bake.hcl), so bake resolves it a single time for
 # all of them and the Rust workspace compiles once.
@@ -16,12 +17,13 @@ COPY . .
 RUN --mount=type=cache,target=/app/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release --workspace \
+    cargo build --release --workspace --bins --examples \
     && mkdir /out \
     && cp target/release/user-service target/release/booking-service \
           target/release/spot-service target/release/view-service \
           target/release/media-service target/release/notification-service \
-          target/release/payment-service target/release/migrator /out/
+          target/release/payment-service target/release/migrator \
+          target/release/examples/demo_seed /out/
 # ^ the cp is required: /app/target is a cache mount, scratch space that never
 # lands in a layer. Only what reaches /out is visible to COPY --from=builder.
 

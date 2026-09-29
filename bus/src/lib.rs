@@ -45,5 +45,5 @@ pub use worker::Worker;
 // a restart resumes from its cursor and a new replica builds nothing.
 //
 // Durability of the store itself is TiKV's job (BR), not a SurrealDB export, and
-// rebuilding a projection is the backfill path rather than a snapshot. Deleting
+// rebuilding a projection is a replay of the streams rather than a snapshot. Deleting
 // it also took the HTTP engine with it: it was the only user of `protocol-http`.

@@ -1,0 +1,155 @@
+{{/*
+One template for every backend in `.Values.services`: a stateless Deployment and the
+ClusterIP Service in front of it. Scaling is `replicas: N` and nothing else.
+
+Where a pod's environment comes from:
+
+  PORT, DATABASE_URL, NATS_URL   wired here, from the `db` / `nats` flags
+  <name>-service-config          ConfigMap, from environments/<env>/config/<name>.env
+  the `secrets` list             single keys from the Secret, never the whole of it
+
+Both the ConfigMap and the Secret are created by deploy.sh, which also passes
+`configHash` — a hash of the environment's config and secrets files — so a change to
+either rolls the pods.
+*/}}
+{{- range $name, $svc := .Values.services }}
+{{- $needsNats := true }}
+{{- if hasKey $svc "nats" }}{{- $needsNats = $svc.nats }}{{- end }}
+{{- $needsDb := true }}
+{{- if hasKey $svc "db" }}{{- $needsDb = $svc.db }}{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-service
+  labels:
+    app.kubernetes.io/name: {{ $name }}-service
+spec:
+  replicas: {{ $svc.replicas | default $.Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}-service
+        {{- /* What templates/network-policy.yaml admits to the database and the broker.
+               Set from the same flags that decide whether the pod gets the URL at all. */}}
+        {{- if $needsDb }}
+        ourdriveway.com/db-client: "true"
+        {{- end }}
+        {{- if $needsNats }}
+        ourdriveway.com/nats-client: "true"
+        {{- end }}
+      annotations:
+        checksum/config: {{ $.Values.configHash | default "" | quote }}
+    spec:
+      # No service talks to the Kubernetes API, so no pod carries a token for it.
+      automountServiceAccountToken: false
+      {{- if or $needsNats $needsDb }}
+      initContainers:
+        {{/*
+        Kubernetes has no `depends_on`: these block until the dependency listens, because
+        the app dials each once at boot and exits if it cannot. They reuse the app image
+        and bash's /dev/tcp — no second image to pin.
+
+        Enough for NATS, whose Service only routes to ready endpoints. Weaker for the
+        headless `db` Service, which proves only a listener; on a first install the
+        migrator Job runs alongside these pods, so a service can still fail once with
+        3D000 and be fine on the retry. It turns the common case into a wait, not a
+        guarantee.
+        */}}
+        {{- if $needsNats }}
+        - name: wait-for-nats
+          image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          command:
+            - bash
+            - -c
+            # Quoted: unquoted, `until : <…` is a YAML mapping key, not a string.
+            - 'until : </dev/tcp/{{ $.Release.Name }}-nats/4222; do echo "waiting for nats"; sleep 2; done'
+        {{- end }}
+        {{- if $needsDb }}
+        - name: wait-for-db
+          image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          command:
+            - bash
+            - -c
+            # 5433 for either database — see templates/postgres.yaml.
+            - 'until : </dev/tcp/db/5433; do echo "waiting for the database"; sleep 2; done'
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: app
+          image: {{ $.Values.registry }}/ourdriveway-{{ $name }}-service:{{ $.Values.tag }}
+          imagePullPolicy: {{ $.Values.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $.Values.port }}
+          # Config has no defaults, so anything missing here or in the ConfigMap crashes
+          # the pod at startup rather than surfacing as a 500 later.
+          envFrom:
+            - configMapRef:
+                name: {{ $name }}-service-config
+          env:
+            - name: PORT
+              value: {{ $.Values.port | quote }}
+            {{- if $needsDb }}
+            # The password is a `$(VAR)` reference, expanded at container start, so
+            # `kubectl get pod -o yaml` never shows it. Same secret entry the database reads.
+            - name: YSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: YSQL_PASSWORD
+            - name: DATABASE_URL
+              value: "postgres://yugabyte:$(YSQL_PASSWORD)@db:5433/{{ $name }}"
+            {{- end }}
+            {{- if $needsNats }}
+            # Same shape. bus::connect lifts the credentials back out of the URL.
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: NATS_PASSWORD
+            - name: NATS_URL
+              value: "nats://{{ $.Values.natsUser }}:$(NATS_PASSWORD)@{{ $.Release.Name }}-nats:4222"
+            {{- end }}
+            {{- range $key := $svc.secrets }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: {{ $key }}
+            {{- end }}
+          # /readyz means "my projections have caught up" (for user, spot and payment,
+          # which project nothing, just "NATS is reachable" for the outbox relay).
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          # /healthz deliberately ignores NATS (bus/src/health.rs): liveness on /readyz
+          # would restart every pod during a broker blip and fix nothing.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          resources: {{- toYaml ($svc.resources | default $.Values.serviceResources) | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ $name }}-service
+  ports:
+    - name: http
+      port: {{ $.Values.port }}
+      targetPort: http
+{{- end }}

@@ -1,0 +1,101 @@
+{{/*
+PostgreSQL: the authoritative store when `database: postgres` — the small-box choice,
+about a tenth of YugabyteDB's memory. Same schema, same migrator, same URLs: the code
+speaks plain PostgreSQL and treats YugabyteDB as one implementation of it.
+
+Made to look like YugabyteDB to its clients, so neither the services nor the migrator
+know which one they got:
+
+  PGPORT=5433      YSQL's port. The server, the image's init scripts and pg_isready all
+                   read it, so the `db` Service and every URL stay the same.
+  POSTGRES_USER    `yugabyte`, the role every DATABASE_URL logs in as.
+  POSTGRES_DB      `yugabyte`, the maintenance database the migrator connects to for
+                   CREATE DATABASE (apps/migrator/src/lib.rs, `maintenance_url`).
+
+Read Committed, which booking-service's reserve path needs (see yugabyte.yaml), is
+PostgreSQL's default — nothing to set.
+
+User, database and password are applied at FIRST boot only, onto an empty volume.
+Switching `database` therefore starts from an empty store: nothing is carried across.
+*/}}
+{{- if eq .Values.database "postgres" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  # Headless, like yugabyte.yaml's, so the two are interchangeable.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: sql
+      port: 5433
+      targetPort: sql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  serviceName: db
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        # What templates/network-policy.yaml selects, whichever database this is.
+        app.kubernetes.io/component: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          # Each pod's pool may grow to 20 (shared/src/db.rs): 5 services × 2 prod replicas
+          # is 200 at the ceiling, over the default 100. Idle slots cost next to nothing.
+          args: ["-c", "max_connections={{ .Values.postgres.maxConnections }}"]
+          env:
+            - name: PGPORT
+              value: "5433"
+            - name: POSTGRES_USER
+              value: yugabyte
+            - name: POSTGRES_DB
+              value: yugabyte
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: YSQL_PASSWORD
+          ports:
+            - name: sql
+              containerPort: 5433
+          volumeMounts:
+            # The mount point of the 18+ image; PGDATA is a versioned directory under it.
+            - name: data
+              mountPath: /var/lib/postgresql
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "yugabyte"]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "yugabyte"]
+            periodSeconds: 20
+            # Deliberately slack. A blip must not restart the only copy of the data.
+            failureThreshold: 12
+          resources: {{- toYaml .Values.postgres.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+{{- end }}

@@ -109,8 +109,7 @@ pub trait Projector: Send + Sync + 'static {
 /// - payment-service's `BookingWorker` waits **5s** for its own mirror
 ///   (`PROJECTION_WAIT`) before deciding whether to move money.
 /// - Readiness is a one-way latch (`health::Readiness::mark_caught_up`), so a park can
-///   delay a replica joining rotation but cannot 503 one already in it. Still, a cold
-///   consumer over a stream whose early history has aged out pays this per aggregate.
+///   delay a replica joining rotation but cannot 503 one already in it.
 /// - The gap actually being gated against is two relays publishing out of order, which
 ///   is milliseconds.
 ///
@@ -120,13 +119,13 @@ const NAK_DELAY: Duration = Duration::from_millis(200);
 
 /// How many deliveries a gap gets before it is applied anyway.
 ///
-/// **One legitimate source of gaps is left, and it is why the hatch stays:** the streams
-/// expire (seven days), so a consumer created after an aggregate's early events aged out
-/// sees its first event at version 5 on a row that is empty or behind. Nothing is wrong,
-/// there is simply no earlier event to wait for, and `POST /internal/backfill` is what
-/// repairs it.
+/// **No legitimate source of gaps is left.** The last one was stream expiry: a consumer
+/// created after an aggregate's early events aged out saw its first event at version 5.
+/// The event streams keep everything now (`shared::events::STREAMS`), so every consumer
+/// starts at version 1. The hatch stays as a safety net for an event that genuinely went
+/// missing. Holding a projection up for ever would be worse than applying with an error.
 ///
-/// This used to list two more, both of which the codebase manufactured: two replicas
+/// There used to be two more sources, both of which the codebase manufactured: two replicas
 /// sweeping one booking, and `SpotProjector::cancel`. Each minted a version, committed it
 /// for a guarded `UPDATE` that had matched nothing, and enqueued an event that a
 /// deterministic id then collapsed — leaving a version with no event behind it, for ever.
@@ -172,21 +171,12 @@ pub enum Decision {
 /// write nothing and log nothing in the ordinary case, which is exactly the kind of rule
 /// that rots undetected without a table of assertions against it.
 ///
-/// - `backfill` bypasses everything. `outbox::backfill` re-emits an aggregate's whole
-///   chain — `Created`, `Confirmed`, `Cancelled` — **all carrying the same version**,
-///   because the chain exists to satisfy the downstream `WHERE status IN [...]` guards
-///   rather than to describe a version history. Gated, steps two and three would be
-///   `Skip`ped and a rebuilt projection would leave every cancelled booking `reserved`.
 /// - [`Applied::Unavailable`] is not a fault: it means this database does not store the
 ///   aggregate, so there is no version to be next to and nothing to refuse.
 /// - [`Applied::Pending`] is a row that does not exist. Only a create belongs there.
 /// - `incoming <= stored` is a redelivery or a duplicate, which is the common case after
 ///   a relay restart and must stay cheap.
-fn decide(stored: Applied, incoming: i64, delivered: i64, backfill: bool) -> Decision {
-    if backfill {
-        return Decision::Apply;
-    }
-
+fn decide(stored: Applied, incoming: i64, delivered: i64) -> Decision {
     match stored {
         Applied::Unavailable => Decision::Apply,
         // `<= 1` rather than `== 1` so a version below the first one a create can carry
@@ -274,7 +264,6 @@ impl<P: Projector> Tx<P> {
         let version = envelope.version;
         let projector = self.projector.clone();
         let payload = envelope.payload;
-        let backfill = envelope.backfill;
 
         // `"booking:019f…"` -> `("booking", <uuid>)`. Every publisher builds this from
         // the real aggregate rather than from the subject key, which is why the gate can
@@ -303,13 +292,13 @@ impl<P: Projector> Tx<P> {
                         None => Applied::Unavailable,
                     };
 
-                    let decision = decide(stored, version, delivered, backfill);
+                    let decision = decide(stored, version, delivered);
 
                     // The escape hatch fired: this is a gap that did not close in
                     // `MAX_GAP_WAIT` redeliveries. Same error `set_version!` used to log
                     // on its own, minus every case that was really just an event
                     // arriving early — those are a `Park` now and never get here.
-                    if decision == Decision::Apply && !backfill && delivered >= MAX_GAP_WAIT {
+                    if decision == Decision::Apply && delivered >= MAX_GAP_WAIT {
                         tracing::error!(
                             stream = P::STREAM,
                             aggregate = %name,
@@ -619,45 +608,37 @@ mod tests {
         use Decision::{Apply, Park, Skip};
 
         // The ordinary path.
-        assert_eq!(decide(Pending, 1, 1, false), Apply, "the create");
-        assert_eq!(decide(At(3), 4, 1, false), Apply, "the next event");
+        assert_eq!(decide(Pending, 1, 1), Apply, "the create");
+        assert_eq!(decide(At(3), 4, 1), Apply, "the next event");
 
         // Already applied. The common case after a relay restart republishes its tail,
         // and it must stay cheap rather than becoming a redelivery loop.
-        assert_eq!(decide(At(3), 3, 1, false), Skip, "a redelivery");
-        assert_eq!(decide(At(3), 2, 1, false), Skip, "an out-of-order duplicate");
+        assert_eq!(decide(At(3), 3, 1), Skip, "a redelivery");
+        assert_eq!(decide(At(3), 2, 1), Skip, "an out-of-order duplicate");
 
         // Early. This is the whole point: v5 on a row at v3 means v4 has not been
         // applied here yet, so it goes back to the server rather than landing on top.
-        assert_eq!(decide(At(3), 5, 1, false), Park, "one missing");
-        assert_eq!(decide(Pending, 4, 1, false), Park, "a non-create on no row");
+        assert_eq!(decide(At(3), 5, 1), Park, "one missing");
+        assert_eq!(decide(Pending, 4, 1), Park, "a non-create on no row");
 
         // The escape hatch. A gap that survives this many deliveries is not an event in
         // flight — it is one that was never published — so it degrades to exactly what
         // `set_version!` did before the gate existed.
-        assert_eq!(decide(At(3), 5, MAX_GAP_WAIT, false), Apply, "gap gave up");
+        assert_eq!(decide(At(3), 5, MAX_GAP_WAIT), Apply, "gap gave up");
         assert_eq!(
-            decide(At(3), 5, MAX_GAP_WAIT - 1, false),
+            decide(At(3), 5, MAX_GAP_WAIT - 1),
             Park,
             "one delivery short of the budget still waits"
         );
 
-        // Backfill re-emits a whole chain at ONE version — `Created`, `Confirmed`,
-        // `Cancelled` all at v7 — because the chain exists to satisfy the downstream
-        // status guards, not to describe a version history. Gated, steps two and three
-        // would `Skip` and a rebuilt projection would leave the booking `reserved`.
-        assert_eq!(decide(At(7), 7, 1, true), Apply, "backfill step two");
-        assert_eq!(decide(At(9), 7, 1, true), Apply, "backfill onto a newer row");
-        assert_eq!(decide(Pending, 7, 1, true), Apply, "backfill onto no row");
-
         // Nothing to be next to: this database does not store the aggregate, or the
         // envelope's `aggregate` did not parse. Neither is a fault and neither is a
         // reason to hold the message.
-        assert_eq!(decide(Unavailable, 9, 1, false), Apply, "not stored here");
+        assert_eq!(decide(Unavailable, 9, 1), Apply, "not stored here");
 
         // A version at or below the first one a create can carry must not park against
         // a row that will never exist.
-        assert_eq!(decide(Pending, 0, 1, false), Apply, "version zero");
+        assert_eq!(decide(Pending, 0, 1), Apply, "version zero");
     }
 
     /// Every stream a projector can name has to resolve to a subject domain, or
@@ -992,7 +973,6 @@ mod live_tests {
     recorder!(DuplicateLanes, "bus-lt-duplicate");
     recorder!(GapLanes, "bus-lt-gap");
     recorder!(ParkLanes, "bus-lt-park");
-    recorder!(BackfillLanes, "bus-lt-backfill");
 
     /// Creates the scratch table, tolerating the race between concurrent tests.
     ///
@@ -1102,30 +1082,21 @@ mod live_tests {
         /// Same shape as `outbox::append`: the envelope encoded, `Nats-Msg-Id` set to
         /// the event id so the stream's `duplicate_window` can see a repeat.
         async fn publish(&self, key: Uuid, version: i64, event_id: Uuid) -> u64 {
-            self.publish_as(key, version, event_id, false).await
-        }
-
-        /// The same, flagged as a rebuild. `outbox::backfill` emits a whole chain at one
-        /// version, so this is the only way to produce several events that are all
-        /// legitimately "not the next one".
-        async fn publish_backfill(&self, key: Uuid, version: i64, event_id: Uuid) -> u64 {
-            self.publish_as(key, version, event_id, true).await
-        }
-
-        async fn publish_as(&self, key: Uuid, version: i64, event_id: Uuid, backfill: bool) -> u64 {
             let envelope = Envelope {
                 event_id,
                 aggregate: aggregate_id(self.aggregate, &key),
                 version,
                 occurred_at: Utc::now(),
                 actor_id: None,
-                backfill,
                 // The aggregate again, in the payload: `Projector::apply` is handed
                 // the decoded event and not the envelope, so this is how a recorded
                 // apply knows which key it was for.
                 payload: serde_json::json!({ "key": key.to_string() }),
             };
+            self.send(key, event_id, &envelope).await
+        }
 
+        async fn send(&self, key: Uuid, event_id: Uuid, envelope: &Envelope<serde_json::Value>) -> u64 {
             self.js
                 .send_publish(
                     session_subject(&key),
@@ -1593,48 +1564,5 @@ mod live_tests {
         );
 
         live.drop_lanes(GapLanes::DURABLE).await;
-    }
-
-    /// A rebuild bypasses the gate entirely.
-    ///
-    /// `outbox::backfill` re-emits an aggregate's whole chain — for a cancelled booking
-    /// that is `Created`, `Confirmed`, `Cancelled` — with **every event carrying the same
-    /// version**, because the chain exists to satisfy the downstream `WHERE status IN
-    /// [...]` guards rather than to describe a version history.
-    ///
-    /// Gated, the second and third would be `Skip`ped as duplicates and a rebuilt
-    /// projection would leave every cancelled booking sitting at `reserved`. Three
-    /// applies at one version is what says the bypass is still there.
-    #[tokio::test]
-    #[ignore = "needs docker/docker-compose-dev.yml"]
-    async fn a_backfill_chain_at_one_version_applies_every_step() {
-        let live = live(BackfillLanes::DURABLE).await;
-        live.drop_lanes(BackfillLanes::DURABLE).await;
-
-        let key = Uuid::now_v7();
-        for _ in 0..3 {
-            live.publish_backfill(key, 7, Uuid::now_v7()).await;
-        }
-
-        let recorder = Recorder::new(Duration::ZERO, [key]);
-        let running = tokio::spawn(run(
-            live.js.clone(),
-            Arc::new(BackfillLanes(recorder.clone())),
-            live.db.clone(),
-            live.readiness.clone(),
-        ));
-        until(Duration::from_secs(30), "the whole chain", || {
-            recorder.applies(key).len() == 3
-        })
-        .await;
-        running.abort();
-
-        assert_eq!(
-            recorder.versions(key),
-            vec![7, 7, 7],
-            "a gated backfill drops every step after the first"
-        );
-
-        live.drop_lanes(BackfillLanes::DURABLE).await;
     }
 }

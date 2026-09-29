@@ -1,3 +1,4 @@
+use async_nats::ServerAddr;
 use async_nats::jetstream::{self, Context, stream::Config};
 use shared::error::myerror::{MyError, MyResult};
 use shared::events::STREAMS;
@@ -7,22 +8,42 @@ use shared::events::STREAMS;
 /// The URL is passed in from the caller's `Config`. It used to default to
 /// `nats://localhost:4222` when unset — which in a container meant a service
 /// quietly dialled itself, failed, and looked like a broker outage.
+///
+/// `nats://user:pass@host:4222` is accepted, so a service still reads one variable —
+/// but the credentials are lifted out and handed over as options, because async-nats
+/// 0.50 **ignores** a password in the URL: its connector only reads `ConnectOptions`,
+/// and against a server with authorization on, the URL form is refused as anonymous.
 pub async fn connect(url: &str) -> MyResult<Context> {
-    let client = async_nats::connect(url)
+    let (address, credentials) = split_credentials(url)?;
+
+    let mut options = async_nats::ConnectOptions::new();
+    if let Some((user, password)) = credentials {
+        options = options.user_and_password(user, password);
+    }
+
+    // `address`, never `url`, in anything that is logged or returned: the URL carries
+    // the password.
+    let client = options
+        .connect(address.as_str())
         .await
-        .map_err(|e| MyError::Bus(format!("connect {url}: {e}")))?;
-    tracing::info!(%url, "connected to NATS");
+        .map_err(|e| MyError::Bus(format!("connect {address}: {e}")))?;
+    tracing::info!(url = %address, "connected to NATS");
     Ok(jetstream::new(client))
 }
 
-/// Per-stream ceiling on disk. The second half of a retention limit, and the half
-/// that holds when the first one doesn't: `max_age` bounds a *normal* week, this
-/// bounds a bug — a loop that republishes, or a relay that never deletes.
-///
-/// Old messages are discarded to stay under it, which is the right failure for an
-/// integration bus and would have been the wrong one while the log was
-/// authoritative. That is the trade the whole of step 5 makes.
-const MAX_BYTES: i64 = 1024 * 1024 * 1024;
+/// `nats://user:pass@host:4222` -> (`nats://host:4222`, `Some((user, pass))`).
+fn split_credentials(url: &str) -> MyResult<(String, Option<(String, String)>)> {
+    // The parse error is not formatted in: it may quote the input, password and all.
+    let addr: ServerAddr = url
+        .parse()
+        .map_err(|_| MyError::Bus("NATS_URL is not a valid URL".into()))?;
+
+    let address = format!("{}://{}:{}", addr.scheme(), addr.host(), addr.port());
+    let credentials = addr
+        .username()
+        .map(|user| (user.to_string(), addr.password().unwrap_or_default().to_string()));
+    Ok((address, credentials))
+}
 
 /// Declares the streams. Safe to call from every instance concurrently and on every
 /// boot.
@@ -60,13 +81,14 @@ pub async fn ensure_streams(js: &Context) -> MyResult<()> {
         js.create_or_update_stream(Config {
             name: (*name).to_string(),
             subjects: vec![shared::events::stream_filter(domain)],
-            // File storage, still — a week of events outlives any single node's
-            // memory and a consumer that was down overnight must find them. Not
-            // because the stream is the source of truth; TiKV is.
+            // File storage: the whole history is what a projection rebuilds from.
             storage: jetstream::stream::StorageType::File,
             retention: jetstream::stream::RetentionPolicy::Limits,
             max_age: *max_age,
-            max_bytes: MAX_BYTES,
+            // No `max_bytes`. A byte ceiling would discard the oldest events, which
+            // are exactly what a rebuild needs. When the disk fills, JetStream refuses
+            // new publishes instead; the outbox keeps those rows and retries, so
+            // nothing is lost, only delayed.
             // Publishers set Nats-Msg-Id to the event id, so a retried publish
             // within this window is discarded instead of duplicating the event.
             //
@@ -93,4 +115,27 @@ pub async fn ensure_streams(js: &Context) -> MyResult<()> {
         tracing::info!(stream = name, domain, "stream ready");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_leave_the_url_that_gets_logged() {
+        let (address, credentials) =
+            split_credentials("nats://ourdriveway:0123abcd@ourdriveway-nats:4222").unwrap();
+        assert_eq!(address, "nats://ourdriveway-nats:4222");
+        assert_eq!(
+            credentials,
+            Some(("ourdriveway".to_string(), "0123abcd".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_url_without_credentials_connects_anonymously() {
+        let (address, credentials) = split_credentials("nats://127.0.0.1:4222").unwrap();
+        assert_eq!(address, "nats://127.0.0.1:4222");
+        assert_eq!(credentials, None);
+    }
 }

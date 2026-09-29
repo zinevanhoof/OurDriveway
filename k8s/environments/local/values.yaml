@@ -1,0 +1,22 @@
+# Local k3d cluster — see k8s/README.md. Everything not set here is the chart default.
+ingress:
+  # Any host, so a phone on the LAN reaches it by IP (config/notification.env's
+  # APP_BASE_URL) — an Ingress host cannot be an IP, and ourdriveway.local only resolves
+  # on this machine.
+  host: ""
+  tls:
+    enabled: false
+
+# Run the images you built and `k3d image import`ed, not the last ones CI published.
+imagePullPolicy: IfNotPresent
+
+# A laptop also running a cargo build: hard caps, the same numbers as
+# docker/docker-compose-dev.yml. One shard per tserver keeps a single node from splitting
+# every table into tablets it cannot use.
+yugabyte:
+  tserverFlags: "memory_limit_hard_bytes=1500000000,yb_num_shards_per_tserver=1"
+  masterFlags: "memory_limit_hard_bytes=500000000"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi

@@ -1,11 +1,10 @@
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderName, StatusCode};
 use shared::error::myerror::MyResult;
 use shared::extract::Valid;
 use shared::extractors::authed_jwt::AuthedJwt;
 use shared::requests::spot::{CreateSpotRequest, UpdateSpotRequest};
-use shared::responses::common::{BackfilledResponse, X_VERSION};
+use shared::responses::common::X_VERSION;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -57,14 +56,4 @@ pub async fn delete_spot(
 ) -> MyResult<(StatusCode, [(HeaderName, String); 1])> {
     let version = state.spot_service.delete_spot(&user_id, &id).await?;
     Ok((StatusCode::ACCEPTED, [(X_VERSION, version)]))
-}
-
-/// `POST /internal/backfill` — re-emit every spot, for rebuilding a consumer.
-///
-/// Off the ingress and unauthenticated by construction; see the same handler in
-/// user-service for why that is the whole of the access control.
-pub async fn backfill(State(state): State<AppState>) -> MyResult<Json<BackfilledResponse>> {
-    Ok(Json(BackfilledResponse {
-        events: state.spot_service.backfill().await?,
-    }))
 }

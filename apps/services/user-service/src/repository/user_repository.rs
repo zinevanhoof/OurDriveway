@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use shared::domain_models::user::{User, UserPatch};
@@ -7,8 +8,7 @@ use uuid::Uuid;
 
 /// The `app_user` table.
 ///
-/// Five statements: two lookups, the backfill scan, the write, and the partial
-/// update.
+/// Four statements: two lookups, the write, and the partial update.
 ///
 /// **The table is `app_user`; the aggregate is `user`.** `user` is a reserved word,
 /// and an unquoted `FROM user` silently reads the current-user keyword instead of
@@ -59,15 +59,6 @@ impl UserRepository {
             .optional()?)
     }
 
-    /// Every user, for `UserService::backfill`.
-    ///
-    /// ponytail: reads the whole table into memory in one pass. Fine for a
-    /// maintenance endpoint on a table of accounts; page on `id` — `WHERE id > $after
-    /// ORDER BY id LIMIT $n` — if one ever gets big enough to notice.
-    pub async fn all(conn: &mut AsyncPgConnection) -> MyResult<Vec<User>> {
-        Ok(app_user::table.select(User::as_select()).load(conn).await?)
-    }
-
     /// Insert-or-replace the whole row, keyed by its own id.
     ///
     /// Upsert rather than insert: replay must be idempotent, and a database-generated
@@ -113,6 +104,39 @@ impl UserRepository {
     ) -> MyResult<()> {
         diesel::update(app_user::table.find(user_id))
             .set(&patch)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
+    /// When this account last had a verification or reset email queued — `None` for
+    /// never, or for no such row.
+    ///
+    /// Only meaningful inside the transaction that took `next_version!`'s row lock:
+    /// read outside it, two concurrent requests would both see the old time and both
+    /// send.
+    pub async fn mail_requested_at(
+        conn: &mut AsyncPgConnection,
+        user_id: Uuid,
+    ) -> MyResult<Option<DateTime<Utc>>> {
+        Ok(app_user::table
+            .find(user_id)
+            .select(app_user::mail_requested_at)
+            .first::<Option<DateTime<Utc>>>(conn)
+            .await
+            .optional()?
+            .flatten())
+    }
+
+    /// Stamps the send. Not part of [`User`] or [`UserPatch`] on purpose: it belongs to
+    /// no event and no projection, only to this service's own rate limit.
+    pub async fn set_mail_requested_at(
+        conn: &mut AsyncPgConnection,
+        user_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> MyResult<()> {
+        diesel::update(app_user::table.find(user_id))
+            .set(app_user::mail_requested_at.eq(at))
             .execute(conn)
             .await?;
         Ok(())

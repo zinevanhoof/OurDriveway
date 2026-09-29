@@ -32,9 +32,7 @@ pub enum UserEvent {
     /// The user opened their notifications. The envelope's `occurred_at` is the
     /// watermark: everything visible before it now reads as seen.
     ///
-    /// Projected by view-service only. Not stored by user-service, so a backfill
-    /// cannot reproduce it — a rebuilt view shows every open notification as new
-    /// once more, which costs a badge and nothing else.
+    /// Projected by view-service only; user-service stores nothing for it.
     NotificationsSeen {
         user_id: Uuid,
     },
@@ -93,10 +91,9 @@ impl UserEvent {
 /// through a stream four services consume purely because of where the writer
 /// happened to keep it. `User::registered` takes it as an argument now.
 ///
-/// The event-sourcing case for carrying it is gone too: STREAM_USERS expires after
-/// a week (see [`crate::events::STREAMS`]), so nothing older is rebuildable from
-/// the log, and user-service's row is read rather than re-derived — see
-/// `UserService::backfill`, which no longer re-emits every account's hash.
+/// Nor is there an event-sourcing case for carrying it. STREAM_USERS is kept forever,
+/// but only to rebuild *projections*. user-service's own row, hash included, is
+/// authoritative and never re-derived from the log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserRegistered {
     pub user_id: Uuid,

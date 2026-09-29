@@ -7,13 +7,18 @@
 //! 1. migrates through `migrator::run_all` — the one thing that migrates anywhere,
 //! 2. starts [`fake::Fake`] for LocationIQ and Stripe,
 //! 3. spawns the seven binaries `cargo build --workspace --bins` left in `target/debug`,
-//!    with an explicit environment and ports 13000–13006, so the natively-run dev
-//!    services on 3000–3006 can stay up,
+//!    with an explicit environment and ports 13000–13006,
 //! 4. waits for every `/readyz`.
 //!
 //! Infra is `docker/docker-compose-dev.yml`'s `nats` and `yugabyte`, the same pair the
 //! `live_tests` modules use, and assertions only ever look at rows a test created — so
 //! all of them can share one cluster with whatever a dev already has in it.
+//!
+//! **Stop the natively-run dev services first.** The ports do not clash, but the NATS
+//! durables are shared by name, so a running dev payment-service takes its share of
+//! the e2e stack's events — and acts on them against *real* Stripe, which has never
+//! heard of the fake's sessions. The e2e instance never sees the event and the test
+//! waiting for it times out.
 
 mod fake;
 
@@ -555,6 +560,8 @@ fn env(service: &str, port: u16, fake: &str) -> Vec<(&'static str, String)> {
             ("EMAIL_TOKEN_SECRET", EMAIL_TOKEN_SECRET.into()),
             ("JWT_EXPIRATION", "15".into()),
             ("REFRESH_TOKEN_EXPIRATION", "15".into()),
+            // The suite talks plain HTTP; it reads the cookie from Set-Cookie itself.
+            ("COOKIE_SECURE", "false".into()),
         ],
         "booking-service" => vec![db("booking")],
         "spot-service" => vec![

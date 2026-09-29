@@ -1,0 +1,26 @@
+# k3s's bundled Traefik, tuned for sitting behind Cloudflare. Cluster-wide, not part of
+# the chart: apply once per cluster with `kubectl apply -f k8s/traefik-config.yaml`
+# (or drop it in /var/lib/rancher/k3s/server/manifests/). k3s redeploys Traefik with it.
+#
+# Access logs with the visitor's address. Traefik's own view of the client is Cloudflare's
+# edge (or a node address, behind ServiceLB) and is left that way: Cloudflare overwrites
+# CF-Connecting-IP on every request, and Authenticated Origin Pulls (chart/templates/
+# tls-option.yaml) means nothing else can connect, so that header is the visitor — the same
+# one rate-limit.yaml keys on and backends can read. It shows as `request_Cf-Connecting-Ip`.
+#
+# JSON because the default common log format prints no headers at all.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    logs:
+      access:
+        enabled: true
+        format: json
+        fields:
+          headers:
+            names:
+              CF-Connecting-IP: keep

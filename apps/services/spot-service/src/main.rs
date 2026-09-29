@@ -54,7 +54,7 @@ pub struct Config {
     /// `https://api.locationiq.com` everywhere real. Configurable only so the e2e suite
     /// can answer geocoding itself — see `e2e/src/fake.rs`.
     pub locationiq_base_url: String,
-    /// Where listing photos are served from, e.g. `https://images.ourdriveway.com`.
+    /// Where listing photos are served from, e.g. `https://assets.ourdriveway.com`.
     ///
     /// Read only to VALIDATE: the images a host sends back must be URLs
     /// media-service minted on this origin, or a listing could point its photos at
@@ -190,10 +190,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             bus::AwaitVersions(await_db, version_of),
             bus::await_version::await_version,
         ))
-        // After the layer, deliberately — a backfill is not a client read and has
-        // no version to wait on. Not under `/api` either, which is what keeps it
-        // off the ingress; see `route::spot::backfill`.
-        .route("/internal/backfill", post(route::spot::backfill))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

@@ -1,6 +1,7 @@
-//! Demo data for recording the README videos: six people and twenty driveways in
-//! Hasselt, with three months of bookings, payments, ratings, a refund and payouts behind
-//! them.
+//! Demo data for the README videos and the public demo: fourteen people and eighty
+//! driveways, twenty of them hand-placed in Hasselt and sixty generated across Belgium
+//! ([`TOWNS`]), with three months of bookings, payments, ratings, refunds and payouts
+//! behind them.
 //!
 //! **Every summary has something to show.** Each driveway has at least one completed,
 //! rated booking, so its manage-screen tiles, its public rating and its host's line on the
@@ -8,39 +9,58 @@
 //! "vs last" has a percentage; one of Sam's driveways is paused, so "active" reads 2/3;
 //! and when run before 22:00 one of Sam's driveways is occupied right now.
 //!
+//!     docker compose -f docker/docker-compose-dev.yml down -v
 //!     docker compose -f docker/docker-compose-dev.yml up -d
 //!     scripts/migrate.sh
-//!     # start all seven services, then:
 //!     cargo build --workspace --all-targets && ./target/debug/examples/demo_seed
+//!     # only now start the seven services
+//!
+//! Or, on a stack that has already run, with the services stopped:
+//!
+//!     ./target/debug/examples/demo_seed --reset    # drops the databases and the streams
+//!     scripts/migrate.sh
+//!     ./target/debug/examples/demo_seed
+//!
+//! In production that sequence is `k8s/chart/templates/demo-reset.yaml`, every hour and
+//! once after install, with the services scaled to zero around it.
+//!
+//! **Photos follow the environment.** They are paths in the bucket, joined onto
+//! `MEDIA_BASE`: the environment's if set (the cluster sets it from spot-service's
+//! config), else `apps/services/spot-service/.env`. So dev gets the dev bucket's URLs and
+//! prod gets `https://assets.ourdriveway.com/...`, provided each bucket holds the files.
 //!
 //! Log in as `sam@example.com` / `Demo1234!` — a host with three driveways, income, a
 //! pending balance and two payouts, and a renter with a history, a refund and a booking
 //! coming up. Every account below shares that password.
 //!
-//! **Rows only, then the services' own backfill.** This enqueues no events itself. It
-//! writes the authoritative rows into user-, spot-, booking- and
-//! payment-service's databases and then calls each one's `POST /internal/backfill`,
-//! which re-emits every row as the events that reproduce it — the same path a projection
-//! rebuild takes. So the event chains (a cancelled booking is Created, Confirmed,
-//! Cancelled; a refunded payment is Created then Refunded) are derived by the services
-//! that own them, not restated here to drift.
+//! **Rows and their events, before any service runs.** Each row is written together with
+//! the chain of events that produced it — a cancelled booking is Created, Confirmed,
+//! Cancelled at versions 1, 2, 3 — into the owning service's `_outbox`, and the row's
+//! version is the chain's length. The seed then relays every outbox to NATS itself.
+//! When the services start, their projectors (`DeliverPolicy::All`) build the read model
+//! and every mirror from that history, the same way a projection rebuild does.
 //!
-//! That also makes the history inert. Backfilled envelopes carry `backfill: true`, and
-//! `bus::worker` acks those without running a handler: no verification emails, no Stripe
-//! refunds against the fake `pi_test_demo_…` intents, no transfers for the seeded
-//! payouts. Projectors apply them like any other event.
+//! **That ordering is what makes the history inert.** Workers are created with
+//! `DeliverPolicy::New`, so a worker consumer that does not exist yet when the events
+//! land never sees them: no verification emails, no Stripe refunds against the fake
+//! `pi_test_demo_…` intents, no transfers for the seeded payouts. So the seed refuses to
+//! run once the streams exist, because that means the services, and their workers, have
+//! already started.
 //!
 //! **Run it once, on a fresh stack.** Dates are relative to today, so a re-run on a later
 //! day would move rows the read model has already seen at the same version, and the
-//! projectors would keep the old copy. It refuses to run twice; reset the stack instead.
+//! projectors would keep the old copy. It refuses to run twice; `--reset` first.
 //!
-//! **Don't cancel a seeded booking on camera.** A live cancel is not a backfill: it wakes
-//! the settlement worker, which asks Stripe to refund an intent that does not exist.
+//! **Don't cancel a seeded booking on camera.** A live cancel is new, so the workers do
+//! see it: it wakes the settlement worker, which asks Stripe to refund an intent that
+//! does not exist.
 //! Cancel something booked during the recording.
 //!
-//! Coordinates are placed by hand along the named streets — close enough for a map, not
-//! survey-grade. The three clusters (Grote Markt, the station, Kolonel Dusartplein) are
-//! tight on purpose, so the map groups them until you zoom in.
+//! Hasselt's coordinates are placed by hand along the named streets — close enough for a
+//! map, not survey-grade. The three clusters (Grote Markt, the station, Kolonel
+//! Dusartplein) are tight on purpose, so the map groups them until you zoom in. The rest
+//! of Belgium is generated: real streets, but each spot is put on a ring around its
+//! town's centre, not on the street itself.
 
 use std::collections::HashMap;
 
@@ -53,14 +73,20 @@ use chrono::{
 };
 use chrono_tz::Europe::Brussels;
 use diesel::{OptionalExtension, QueryDsl};
-use diesel_async::RunQueryDsl;
-use serde::Deserialize;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use serde::Serialize;
 use shared::domain_models::booking::{Booking, status as booking_status};
 use shared::domain_models::payment::{Payment, Payout, payout, status as payment_status};
 use shared::domain_models::spot::Spot;
 use shared::domain_models::user::User;
-use shared::events::booking::{CancelReason, ReleaseReason};
-use shared::events::{spot::SpotCreated, user::UserRegistered};
+use shared::events::booking::{BookingCreated, BookingEvent, CancelReason, ReleaseReason};
+use shared::events::payment::{PaymentCreated, PaymentEvent};
+use shared::events::spot::{SpotCreated, SpotEvent, SpotUpdated};
+use shared::events::user::{UserEvent, UserRegistered, UserUpdated};
+use shared::events::{
+    Envelope, aggregate_id, booking_subject, payment_subject, payout_subject, spot_subject,
+    user_subject,
+};
 use shared::general_models::booking::Booked;
 use shared::general_models::spot::{Address, Availability, TimeSlot, WeeklyAvailability};
 use shared::schema::{booking::booking, payment::payment, payment::payout as payout_table};
@@ -69,7 +95,8 @@ use uuid::Uuid;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// Spot photos: whole URLs of images already uploaded to the R2 bucket, under `spots/`.
+/// Spot photos: paths of images already uploaded to the bucket, under `spots/`. The URL
+/// is `{MEDIA_BASE}/{path}` — see [`media_base`] for which base.
 ///
 /// They must pass `shared::media::is_media_url`, the check a real upload meets:
 /// `{MEDIA_BASE}/spots/<32 hex chars>.<ext>` — name each file with
@@ -81,12 +108,12 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// works, but the edit form requires at least one photo, so a seeded spot could not be
 /// saved.
 const SPOT_PHOTOS: &[&str] = &[
-    "https://pub-840a7b1ce14341a5ba374ccba35a2c6f.r2.dev/spots/6cda5af46c115fc4afe3c74cbb207286.jpg",
-    "https://pub-840a7b1ce14341a5ba374ccba35a2c6f.r2.dev/spots/f420da83d3935c72a24c59af10569aea.webp",
-    "https://pub-840a7b1ce14341a5ba374ccba35a2c6f.r2.dev/spots/f5ddc5a10181578592e20a61549729dd.webp",
-    "https://pub-840a7b1ce14341a5ba374ccba35a2c6f.r2.dev/spots/f81440ae90bf5ccf857b73f4f4c56271.jpg",
-    "https://pub-840a7b1ce14341a5ba374ccba35a2c6f.r2.dev/spots/442e833db66f5cb88282edfa9f0bff5e.webp",
-    "https://pub-840a7b1ce14341a5ba374ccba35a2c6f.r2.dev/spots/ce42ddec216157c8bc5b4474bec58dc8.webp",
+    "spots/6cda5af46c115fc4afe3c74cbb207286.jpg",
+    "spots/f420da83d3935c72a24c59af10569aea.webp",
+    "spots/f5ddc5a10181578592e20a61549729dd.webp",
+    "spots/f81440ae90bf5ccf857b73f4f4c56271.jpg",
+    "spots/442e833db66f5cb88282edfa9f0bff5e.webp",
+    "spots/ce42ddec216157c8bc5b4474bec58dc8.webp",
 ];
 
 /// Profile pictures, same rules under `avatars/`. Handed out in [`PEOPLE`] order; anyone
@@ -98,14 +125,23 @@ const PASSWORD: &str = "Demo1234!";
 /// `(key, first name, last name, licence plates)`. Email is `<key>@example.com`.
 ///
 /// Sam is the account the videos are recorded as. Everyone has a country, because
-/// Stripe will not open a payout account without one.
-const PEOPLE: [(&str, &str, &str, &[&str]); 6] = [
+/// Stripe will not open a payout account without one. The last eight host the driveways
+/// outside Hasselt, alongside the Hasselt hosts.
+const PEOPLE: &[(&str, &str, &str, &[&str])] = &[
     ("sam", "Sam", "Janssens", &["1-SAM-742"]),
     ("lotte", "Lotte", "Peeters", &["1-LPT-318"]),
     ("jonas", "Jonas", "Claes", &["2-JCL-904"]),
     ("lina", "Lina", "Jacobs", &["1-LJA-551"]),
     ("emma", "Emma", "Maes", &["1-EMM-260", "2-EMA-114"]),
     ("noah", "Noah", "Wouters", &["1-NWO-837"]),
+    ("lucas", "Lucas", "Dubois", &["1-LDU-406"]),
+    ("marie", "Marie", "Lambert", &["2-MLA-273"]),
+    ("arthur", "Arthur", "Martin", &["1-ARM-915"]),
+    ("louise", "Louise", "Dupont", &["1-LOD-628"]),
+    ("victor", "Victor", "Hermans", &["2-VHE-340"]),
+    ("elise", "Elise", "Goossens", &["1-EGO-782"]),
+    ("mathis", "Mathis", "Leroy", &["1-MLE-159"]),
+    ("julie", "Julie", "Vermeulen", &["2-JVE-467"]),
 ];
 
 #[derive(Clone, Copy)]
@@ -118,6 +154,7 @@ enum Hours {
     EveningsAndWeekends,
 }
 
+#[derive(Clone)]
 struct SpotSeed {
     key: &'static str,
     host: &'static str,
@@ -127,6 +164,9 @@ struct SpotSeed {
     price: i64,
     line1: &'static str,
     postal_code: &'static str,
+    city: &'static str,
+    /// The province, as the autocomplete writes it.
+    region: &'static str,
     lat: f64,
     lng: f64,
     hours: Hours,
@@ -145,6 +185,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9299,
         lng: 5.3368,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("07:00", "22:00"),
         listed_days_ago: 120,
     },
@@ -158,6 +200,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9312,
         lng: 5.3372,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("00:00", "23:30"),
         listed_days_ago: 110,
     },
@@ -171,6 +215,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9309,
         lng: 5.3389,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Weekdays("08:00", "18:00"),
         listed_days_ago: 95,
     },
@@ -184,6 +230,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9302,
         lng: 5.3384,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("08:00", "20:00"),
         listed_days_ago: 80,
     },
@@ -197,6 +245,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9296,
         lng: 5.3380,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::EveningsAndWeekends,
         listed_days_ago: 60,
     },
@@ -211,6 +261,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9262,
         lng: 5.3285,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("06:00", "22:00"),
         listed_days_ago: 100,
     },
@@ -224,6 +276,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9272,
         lng: 5.3302,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("07:00", "21:00"),
         listed_days_ago: 90,
     },
@@ -237,6 +291,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9253,
         lng: 5.3310,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Weekdays("07:00", "19:00"),
         listed_days_ago: 70,
     },
@@ -251,6 +307,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9291,
         lng: 5.3412,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("08:00", "23:30"),
         listed_days_ago: 85,
     },
@@ -264,6 +322,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9284,
         lng: 5.3431,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("10:00", "23:30"),
         listed_days_ago: 75,
     },
@@ -277,6 +337,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9270,
         lng: 5.3440,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("00:00", "23:30"),
         listed_days_ago: 50,
     },
@@ -291,6 +353,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9395,
         lng: 5.3405,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("07:00", "21:00"),
         listed_days_ago: 105,
     },
@@ -304,6 +368,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9500,
         lng: 5.3515,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Weekdays("07:00", "19:00"),
         listed_days_ago: 45,
     },
@@ -317,6 +383,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9368,
         lng: 5.3262,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::EveningsAndWeekends,
         listed_days_ago: 40,
     },
@@ -330,6 +398,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9380,
         lng: 5.3290,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("07:00", "21:00"),
         listed_days_ago: 65,
     },
@@ -343,6 +413,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9273,
         lng: 5.3360,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("07:00", "22:00"),
         listed_days_ago: 100,
     },
@@ -356,6 +428,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3511",
         lat: 50.9480,
         lng: 5.3035,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("06:00", "23:30"),
         listed_days_ago: 30,
     },
@@ -369,6 +443,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9200,
         lng: 5.3245,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Weekdays("07:00", "19:00"),
         listed_days_ago: 25,
     },
@@ -382,6 +458,8 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9440,
         lng: 5.3600,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::EveningsAndWeekends,
         listed_days_ago: 20,
     },
@@ -395,10 +473,186 @@ const SPOTS: &[SpotSeed] = &[
         postal_code: "3500",
         lat: 50.9655,
         lng: 5.3560,
+        city: "Hasselt",
+        region: "Limburg",
         hours: Hours::Daily("08:00", "20:00"),
         listed_days_ago: 15,
     },
 ];
+
+/// A town outside Hasselt and the real streets its driveways are on, one spot per street.
+/// Generated rather than written out like [`SPOTS`] by [`belgium`]: sixty hand-written
+/// entries would say nothing the pattern does not.
+struct Town {
+    city: &'static str,
+    region: &'static str,
+    postal_code: &'static str,
+    /// The centre; the spots go on a ring around it.
+    lat: f64,
+    lng: f64,
+    /// EUR cents per hour for the cheapest spot in town.
+    price: i64,
+    streets: &'static [&'static str],
+}
+
+const TOWNS: &[Town] = &[
+    Town { city: "Brussels", region: "Brussels", postal_code: "1000", lat: 50.8467, lng: 4.3525, price: 450, streets: &["Rue Antoine Dansaert", "Rue de Flandre", "Rue Haute"] },
+    Town { city: "Ixelles", region: "Brussels", postal_code: "1050", lat: 50.8275, lng: 4.3720, price: 450, streets: &["Rue du Bailli", "Rue de la Brasserie"] },
+    Town { city: "Schaerbeek", region: "Brussels", postal_code: "1030", lat: 50.8676, lng: 4.3737, price: 350, streets: &["Avenue Louis Bertrand"] },
+    Town { city: "Etterbeek", region: "Brussels", postal_code: "1040", lat: 50.8360, lng: 4.3890, price: 400, streets: &["Avenue d'Auderghem"] },
+    Town { city: "Uccle", region: "Brussels", postal_code: "1180", lat: 50.8003, lng: 4.3375, price: 350, streets: &["Chaussée d'Alsemberg"] },
+    Town { city: "Antwerp", region: "Antwerp", postal_code: "2000", lat: 51.2194, lng: 4.4025, price: 400, streets: &["Kloosterstraat", "Nationalestraat", "Lange Koepoortstraat", "Sint-Paulusstraat"] },
+    Town { city: "Berchem", region: "Antwerp", postal_code: "2600", lat: 51.1996, lng: 4.4274, price: 300, streets: &["Driekoningenstraat", "Statiestraat"] },
+    Town { city: "Ghent", region: "East Flanders", postal_code: "9000", lat: 51.0543, lng: 3.7174, price: 350, streets: &["Sint-Pietersnieuwstraat", "Brugsepoortstraat", "Coupure Links", "Dampoortstraat", "Kortrijksesteenweg"] },
+    Town { city: "Bruges", region: "West Flanders", postal_code: "8000", lat: 51.2093, lng: 3.2247, price: 350, streets: &["Langestraat", "Ezelstraat", "Smedenstraat"] },
+    Town { city: "Leuven", region: "Flemish Brabant", postal_code: "3000", lat: 50.8798, lng: 4.7005, price: 350, streets: &["Naamsestraat", "Tiensestraat", "Brusselsestraat", "Diestsestraat"] },
+    Town { city: "Mechelen", region: "Antwerp", postal_code: "2800", lat: 51.0259, lng: 4.4777, price: 300, streets: &["Hanswijkstraat", "Adegemstraat"] },
+    Town { city: "Ostend", region: "West Flanders", postal_code: "8400", lat: 51.2254, lng: 2.9195, price: 400, streets: &["Christinastraat", "Torhoutsesteenweg", "Leopold II-laan"] },
+    Town { city: "Knokke-Heist", region: "West Flanders", postal_code: "8300", lat: 51.3500, lng: 3.2870, price: 500, streets: &["Lippenslaan", "Kustlaan"] },
+    Town { city: "De Panne", region: "West Flanders", postal_code: "8660", lat: 51.1003, lng: 2.5920, price: 300, streets: &["Zeelaan"] },
+    Town { city: "Kortrijk", region: "West Flanders", postal_code: "8500", lat: 50.8279, lng: 3.2649, price: 250, streets: &["Doorniksestraat", "Sint-Janslaan"] },
+    Town { city: "Aalst", region: "East Flanders", postal_code: "9300", lat: 50.9378, lng: 4.0403, price: 250, streets: &["Kerkstraat", "Moorselbaan"] },
+    Town { city: "Sint-Niklaas", region: "East Flanders", postal_code: "9100", lat: 51.1650, lng: 4.1430, price: 250, streets: &["Stationsstraat"] },
+    Town { city: "Turnhout", region: "Antwerp", postal_code: "2300", lat: 51.3225, lng: 4.9447, price: 200, streets: &["Gasthuisstraat"] },
+    Town { city: "Genk", region: "Limburg", postal_code: "3600", lat: 50.9650, lng: 5.5008, price: 200, streets: &["Molenstraat", "Stalenstraat"] },
+    Town { city: "Liège", region: "Liège", postal_code: "4000", lat: 50.6326, lng: 5.5797, price: 350, streets: &["Rue Saint-Gilles", "Rue Hors-Château", "Quai de Rome", "Boulevard de la Sauvenière"] },
+    Town { city: "Spa", region: "Liège", postal_code: "4900", lat: 50.4920, lng: 5.8650, price: 250, streets: &["Avenue Reine Astrid"] },
+    Town { city: "Namur", region: "Namur", postal_code: "5000", lat: 50.4674, lng: 4.8720, price: 300, streets: &["Rue de Fer", "Avenue de la Plante", "Rue Saint-Nicolas"] },
+    Town { city: "Dinant", region: "Namur", postal_code: "5500", lat: 50.2606, lng: 4.9122, price: 250, streets: &["Rue Grande"] },
+    Town { city: "Charleroi", region: "Hainaut", postal_code: "6000", lat: 50.4108, lng: 4.4446, price: 250, streets: &["Boulevard Tirou", "Rue de la Montagne", "Boulevard Audent"] },
+    Town { city: "Mons", region: "Hainaut", postal_code: "7000", lat: 50.4542, lng: 3.9567, price: 250, streets: &["Rue de Nimy", "Rue d'Havré"] },
+    Town { city: "Tournai", region: "Hainaut", postal_code: "7500", lat: 50.6056, lng: 3.3878, price: 200, streets: &["Rue Royale"] },
+    Town { city: "Wavre", region: "Walloon Brabant", postal_code: "1300", lat: 50.7167, lng: 4.6000, price: 250, streets: &["Rue du Commerce", "Chaussée de Bruxelles"] },
+    Town { city: "Arlon", region: "Luxembourg", postal_code: "6700", lat: 49.6833, lng: 5.8167, price: 200, streets: &["Grand-Rue"] },
+];
+
+/// Who hosts the driveways outside Hasselt, round-robin. Not Sam: the videos lean on
+/// Sam's exact numbers (three driveways, one paused, one occupied right now).
+const TOWN_HOSTS: &[&str] = &[
+    "lucas", "marie", "arthur", "louise", "victor", "elise", "mathis", "julie", "lotte", "jonas",
+    "lina", "emma", "noah",
+];
+
+/// Kept free of opening hours, since any of them can land on any [`HOURS`].
+const DESCRIPTIONS: &[&str] = &[
+    "Flat driveway with plenty of room for a family car. No gate, just pull in.",
+    "Ten minutes' walk to the centre. The spot is on the left side of the house.",
+    "Room for one car, and SUVs fit fine. Please don't block the garage door.",
+    "Close to the station, handy if you're taking the train further.",
+    "Quiet street, no parking meters and no driving around looking for a spot.",
+    "Behind a gate. You get the code as soon as your booking is confirmed.",
+    "Good for a day in town, a football match or a night out.",
+    "Short driveway, best for a small or medium car.",
+    "Under a carport, so your car stays dry when it rains.",
+];
+
+const HOURS: &[Hours] = &[
+    Hours::Daily("07:00", "22:00"),
+    Hours::Weekdays("08:00", "18:00"),
+    Hours::Daily("00:00", "23:30"),
+    Hours::EveningsAndWeekends,
+    Hours::Daily("08:00", "20:00"),
+];
+
+// Slots every entry of [`HOURS`] covers on some day of any week, which is what lets
+// `open_day` place them whatever the hours.
+const MORNING: &[(&str, &str)] = &[("09:00", "12:00")];
+const MIDDAY: &[(&str, &str)] = &[("10:00", "14:00")];
+const AFTERNOON: &[(&str, &str)] = &[("13:00", "16:30")];
+
+/// For the few generated strings the seed's `&'static` tables need. It runs once and
+/// exits, so nothing is really leaked.
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// The driveways in [`TOWNS`], their bookings, and the ratings on those bookings.
+///
+/// Per spot: two confirmed, rated bookings in the past, at least fourteen days apart, so
+/// every driveway has a rating; every third also has an older cancelled one, every fifth
+/// an abandoned checkout, and every other one a booking coming up. `open_day` moves a
+/// booking up to six days to fit the hours, always away from today, so the fourteen-day
+/// gaps keep one spot's bookings from ever landing on the same day.
+fn belgium() -> (Vec<SpotSeed>, Vec<BookingSeed>, Vec<(&'static str, i32)>) {
+    let renters: Vec<&str> = PEOPLE
+        .iter()
+        .map(|(key, ..)| *key)
+        .filter(|key| *key != "sam")
+        .collect();
+    let (mut spots, mut bookings, mut ratings) = (vec![], vec![], vec![]);
+
+    let towns = TOWNS.iter().flat_map(|t| t.streets.iter().map(move |s| (t, *s)));
+    for (i, (town, street)) in towns.enumerate() {
+        let spot = leak(format!("be{i:02}"));
+        let host = TOWN_HOSTS[i % TOWN_HOSTS.len()];
+        let city = town.city;
+        let title = match i % 8 {
+            0 => format!("Driveway on {street}"),
+            1 => format!("Private parking in {city}"),
+            2 => format!("Covered spot off {street}"),
+            3 => format!("Quiet driveway in {city}"),
+            4 => format!("In front of the garage on {street}"),
+            5 => format!("Easy parking near the centre of {city}"),
+            6 => format!("Spot behind the house on {street}"),
+            _ => format!("Wide driveway in {city}"),
+        };
+        // 400 to 900 m out, at a golden-angle bearing so no two in a town line up. A
+        // degree of longitude is about two thirds of a degree of latitude here.
+        let angle = i as f64 * 2.4;
+        let radius = 0.004 + 0.0025 * (i % 3) as f64;
+        spots.push(SpotSeed {
+            key: spot,
+            host,
+            title: leak(title),
+            description: DESCRIPTIONS[i % DESCRIPTIONS.len()],
+            price: town.price + (i as i64 % 3) * 50,
+            line1: leak(format!("{street} {}", 3 + (i * 7) % 60)),
+            postal_code: town.postal_code,
+            city,
+            region: town.region,
+            lat: town.lat + radius * angle.sin(),
+            lng: town.lng + radius * angle.cos() * 1.5,
+            hours: HOURS[i % HOURS.len()],
+            // Before its oldest booking, which is at most about seventy days back.
+            listed_days_ago: 75 + (i as i64 * 11) % 90,
+        });
+
+        let renter = |n: usize| {
+            let pick = renters[(i + n) % renters.len()];
+            if pick == host { renters[(i + n + 1) % renters.len()] } else { pick }
+        };
+        let mut book = |n: usize, day: i64, slots, before, fate, stars: Option<i32>| {
+            let key = leak(format!("{spot}-{n}"));
+            bookings.push(BookingSeed {
+                key,
+                spot,
+                renter: renter(n),
+                day,
+                slots,
+                booked_days_before: before,
+                fate,
+            });
+            if let Some(stars) = stars {
+                ratings.push((key, stars));
+            }
+        };
+        let stars = |n: usize| [5, 4, 5, 4, 3, 5, 4][(i + n) % 7];
+        let recent = -(2 + i as i64 % 20);
+        let older = recent - 14 - i as i64 % 10;
+        book(1, recent, MORNING, 1 + i as i64 % 5, Fate::Confirmed, Some(stars(1)));
+        book(2, older, AFTERNOON, 2, Fate::Confirmed, Some(stars(2)));
+        if i % 5 == 1 {
+            book(3, older - 7, MIDDAY, 1, Fate::Abandoned, None);
+        }
+        if i % 3 == 0 {
+            book(4, older - 14, MORNING, 6, Fate::Cancelled { after_days: 2 }, None);
+        }
+        if i % 2 == 0 {
+            book(5, 1 + i as i64 % 9, MIDDAY, 3, Fate::Confirmed, None);
+        }
+    }
+    (spots, bookings, ratings)
+}
 
 #[derive(Clone, Copy)]
 enum Fate {
@@ -983,6 +1237,32 @@ const LIVE: (&str, &str, &str) = ("b70", "zuivelmarkt", "lina");
 const PAYOUTS: &[(&str, &str, i64, i64)] = &[("p1", "sam", 4_000, 45), ("p2", "sam", 2_500, 14)];
 
 /// Upserts a whole row, keyed on its primary key.
+/// Enqueues an aggregate's history into its service's `_outbox`, one event per version
+/// starting at 1, each dated when it happened in the story. Returns the last version,
+/// which is what the row must carry: the projectors gate on it, and the next live event
+/// on this aggregate will be that plus one.
+async fn emit<T: Serialize>(
+    conn: &mut AsyncPgConnection,
+    subject: &str,
+    aggregate: String,
+    chain: Vec<(DateTime<Utc>, T)>,
+) -> Result<i64, Error> {
+    let mut version = 0;
+    for (occurred_at, payload) in chain {
+        version += 1;
+        let envelope = Envelope {
+            event_id: Uuid::now_v7(),
+            aggregate: aggregate.clone(),
+            version,
+            occurred_at,
+            actor_id: None,
+            payload,
+        };
+        bus::outbox::enqueue(conn, subject, &envelope).await?;
+    }
+    Ok(version)
+}
+
 macro_rules! upsert {
     ($conn:expr, $table:expr, $id:expr, $row:expr) => {{
         let row = $row;
@@ -1019,8 +1299,8 @@ fn plate(key: &str) -> String {
         .to_string()
 }
 
-fn spot_seed(key: &str) -> &'static SpotSeed {
-    SPOTS
+fn spot_seed(spots: &'static [SpotSeed], key: &str) -> &'static SpotSeed {
+    spots
         .iter()
         .find(|s| s.key == key)
         .unwrap_or_else(|| panic!("no spot named {key}"))
@@ -1140,19 +1420,13 @@ fn hash(password: &str) -> String {
         .to_string()
 }
 
-/// Fails before anything is written if a photo URL would not survive the edit form.
-fn check_photos() -> Result<(), Error> {
-    if SPOT_PHOTOS.is_empty() {
-        println!(
-            "note: SPOT_PHOTOS is empty — spots will have no photos, and the edit form needs one"
-        );
-    }
-    if SPOT_PHOTOS.is_empty() && AVATARS.is_empty() {
-        return Ok(());
-    }
-
-    // The same value spot-service validates against, read from its own .env unless the
-    // environment already says otherwise.
+/// Where the photos are served from, which is how the seed tells prod from dev: the
+/// environment's `MEDIA_BASE` when set (the cluster sets it from spot-service's config),
+/// else the one in spot-service's dev `.env`. The same value spot-service validates
+/// against, so the URLs built on it pass the edit form.
+///
+/// Fails before anything is written if a photo URL would not survive that form.
+fn media_base() -> Result<String, Error> {
     let base = match std::env::var("MEDIA_BASE") {
         Ok(base) => base,
         Err(_) => dotenvy::from_filename_iter("apps/services/spot-service/.env")?
@@ -1161,56 +1435,93 @@ fn check_photos() -> Result<(), Error> {
             .map(|(_, value)| value)
             .ok_or("MEDIA_BASE is not set and not in apps/services/spot-service/.env")?,
     };
+    if SPOT_PHOTOS.is_empty() {
+        println!(
+            "note: SPOT_PHOTOS is empty — spots will have no photos, and the edit form needs one"
+        );
+    }
     shared::media::init_base(&base);
 
-    for (urls, prefix) in [
+    for (paths, prefix) in [
         (SPOT_PHOTOS, shared::media::PREFIX_SPOTS),
         (AVATARS, shared::media::PREFIX_AVATARS),
     ] {
-        if let Some(bad) = urls
+        if let Some(bad) = paths
             .iter()
+            .map(|path| format!("{base}/{path}"))
             .find(|url| !shared::media::is_media_url(url, prefix))
         {
             return Err(format!("{bad} is not a {base}/{prefix}/<32 hex chars>.<ext> URL").into());
         }
     }
-    Ok(())
+    println!("photos    {base}");
+    Ok(base)
 }
 
 /// One photo per spot, round-robin over [`SPOT_PHOTOS`].
-fn photos_for(index: usize) -> Vec<String> {
+fn photos_for(base: &str, index: usize) -> Vec<String> {
     SPOT_PHOTOS
         .get(index % SPOT_PHOTOS.len().max(1))
-        .map(|url| vec![url.to_string()])
+        .map(|path| vec![format!("{base}/{path}")])
         .unwrap_or_default()
+}
+
+/// `--reset`: drops every service database and deletes every stream, consumers with
+/// them, so the next migrate and seed start from nothing. Run with the services stopped:
+/// a running one would hold connections the drop waits on, and would recreate the
+/// streams and its worker consumers before the seed's history is in them.
+async fn reset(db_url: impl Fn(&str) -> String) -> Result<(), Error> {
+    // The maintenance database the migrator creates the others from.
+    let admin = shared::db::connect(&db_url("yugabyte")).await?;
+    let mut admin = admin.get_owned().await?;
+    for db in ["user", "spot", "booking", "payment", "view"] {
+        diesel::sql_query(format!("DROP DATABASE IF EXISTS \"{db}\""))
+            .execute(&mut *admin)
+            .await?;
+        println!("dropped   database {db}");
+    }
+
+    let js = bus::connect(
+        &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
+    )
+    .await?;
+    for (stream, ..) in shared::events::STREAMS {
+        if js.get_stream(*stream).await.is_ok() {
+            js.delete_stream(*stream).await?;
+            println!("deleted   stream {stream}");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    check_photos()?;
-
     let db_url = |name: &str| {
         std::env::var("DATABASE_URL_BASE")
             .unwrap_or_else(|_| "postgres://yugabyte@127.0.0.1:5433".into())
             + "/"
             + name
     };
-    let mut users = shared::db::connect(&db_url("user"))
-        .await?
-        .get_owned()
-        .await?;
-    let mut spots = shared::db::connect(&db_url("spot"))
-        .await?
-        .get_owned()
-        .await?;
-    let mut bookings = shared::db::connect(&db_url("booking"))
-        .await?
-        .get_owned()
-        .await?;
-    let mut payments = shared::db::connect(&db_url("payment"))
-        .await?
-        .get_owned()
-        .await?;
+    // Before any pool below: a connection held into a database blocks its DROP.
+    if std::env::args().any(|arg| arg == "--reset") {
+        return reset(db_url).await;
+    }
+
+    let media_base = media_base()?;
+    let (town_spots, town_bookings, town_ratings) = belgium();
+    let all_spots: &'static [SpotSeed] =
+        Box::leak(SPOTS.iter().cloned().chain(town_spots).collect());
+
+    // The pools as well as a connection from each: the relay at the end drains from the
+    // pool.
+    let user_db = shared::db::connect(&db_url("user")).await?;
+    let spot_db = shared::db::connect(&db_url("spot")).await?;
+    let booking_db = shared::db::connect(&db_url("booking")).await?;
+    let payment_db = shared::db::connect(&db_url("payment")).await?;
+    let mut users = user_db.get_owned().await?;
+    let mut spots = spot_db.get_owned().await?;
+    let mut bookings = booking_db.get_owned().await?;
+    let mut payments = payment_db.get_owned().await?;
 
     let already = app_user::table
         .find(person("sam"))
@@ -1219,11 +1530,27 @@ async fn main() -> Result<(), Error> {
         .await
         .optional()?;
     if already.is_some() {
-        return Err("the demo data is already there. It runs once per fresh stack: \
-                    `docker compose -f docker/docker-compose-dev.yml down -v`, up, \
-                    scripts/migrate.sh, start the services, then run this again. To only \
-                    re-send the events: curl -XPOST localhost:<3000|3001|3002|3006>/internal/backfill"
+        return Err("the demo data is already there. It runs once per fresh stack: stop the \
+                    services, then `demo_seed --reset`, scripts/migrate.sh, and this again."
             .into());
+    }
+
+    // Every service declares the streams on boot, so a stream that exists means a
+    // service has run and its workers' consumers exist. They would act on this history:
+    // mails to the demo addresses, and Stripe calls against the fake ids.
+    let js = bus::connect(
+        &std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
+    )
+    .await?;
+    for (stream, ..) in shared::events::STREAMS {
+        if js.get_stream(*stream).await.is_ok() {
+            return Err(format!(
+                "NATS already has the {stream} stream, so the services have run on this \
+                 stack and their workers would act on the seeded history. Stop the \
+                 services, then `demo_seed --reset`, scripts/migrate.sh, and this again."
+            )
+            .into());
+        }
     }
 
     let now = Utc::now();
@@ -1234,58 +1561,104 @@ async fn main() -> Result<(), Error> {
     let password_hash = hash(PASSWORD);
     for (i, (key, first, last, plates)) in PEOPLE.iter().enumerate() {
         let id = person(key);
-        let mut row = User::registered(
-            UserRegistered {
-                user_id: id,
-                first_name: first.to_string(),
-                last_name: last.to_string(),
-                email: format!("{key}@example.com"),
-            },
-            1,
-            password_hash.clone(),
-        );
+        let registered = UserRegistered {
+            user_id: id,
+            first_name: first.to_string(),
+            last_name: last.to_string(),
+            email: format!("{key}@example.com"),
+        };
+        let mut row = User::registered(registered.clone(), 1, password_hash.clone());
         row.email_verified = true;
         row.license_plates = plates.iter().map(|p| p.to_string()).collect();
         row.country = Some("BE".into());
         row.profile_picture = AVATARS.get(i).map(|url| url.to_string());
+
+        // Signed up, then filled in the profile. No `EmailVerified`: nothing downstream
+        // projects it, and the row already says verified. No `VerificationRequested`
+        // either — it is a mail, and it is the one a worker would send.
+        row.version = emit(
+            &mut *users,
+            &user_subject(&id),
+            aggregate_id("user", &id),
+            vec![
+                (now, UserEvent::Registered(registered)),
+                (
+                    now,
+                    UserEvent::Updated(UserUpdated {
+                        user_id: id,
+                        first_name: None,
+                        last_name: None,
+                        email: None,
+                        profile_picture: row.profile_picture.clone(),
+                        license_plates: Some(row.license_plates.clone()),
+                        country: row.country.clone(),
+                    }),
+                ),
+            ],
+        )
+        .await?;
         upsert!(&mut *users, app_user::table, app_user::id, row);
     }
     println!("people    {}", PEOPLE.len());
 
     // ── driveways ───────────────────────────────────────────────────────────
-    for (i, s) in SPOTS.iter().enumerate() {
+    for (i, s) in all_spots.iter().enumerate() {
         let created = SpotCreated {
             spot_id: stable(&format!("spot:{}", s.key)),
             host_id: person(s.host),
             title: s.title.into(),
             description: Some(s.description.into()),
             price_per_hour_cents: s.price,
-            images: photos_for(i),
+            images: photos_for(&media_base, i),
             lng: s.lng,
             lat: s.lat,
             address: Address {
                 line1: s.line1.into(),
                 line2: None,
-                city: "Hasselt".into(),
+                city: s.city.into(),
                 postal_code: s.postal_code.into(),
-                region: Some("Limburg".into()),
+                region: Some(s.region.into()),
                 country: "Belgium".into(),
                 // The shape spot-service's autocomplete builds, so a seeded address reads
                 // like one a host picked from the suggestions.
-                formatted: format!("{}, {} Hasselt, Limburg, Belgium", s.line1, s.postal_code),
+                formatted: format!(
+                    "{}, {} {}, {}, Belgium",
+                    s.line1, s.postal_code, s.city, s.region
+                ),
             },
             availability: availability(s.hours),
             timezone: "Europe/Brussels".into(),
         };
-        let mut row = Spot::created(created, now - Duration::days(s.listed_days_ago), 1);
+        let spot_id = created.spot_id;
+        let listed_at = now - Duration::days(s.listed_days_ago);
+        let mut row = Spot::created(created.clone(), listed_at, 1);
+        let mut chain = vec![(listed_at, SpotEvent::Created(created))];
         if PAUSED.contains(&s.key) {
-            // Created, then switched off: the two events the backfill replays for it.
+            // Created, then switched off — the shape the manage screen's toggle sends.
             row.active = false;
-            row.version = 2;
+            chain.push((
+                listed_at,
+                SpotEvent::Updated(SpotUpdated {
+                    spot_id,
+                    title: None,
+                    description: None,
+                    price_per_hour_cents: None,
+                    images: None,
+                    availability: None,
+                    active: Some(false),
+                }),
+            ));
         }
+        row.version = emit(
+            &mut *spots,
+            &spot_subject(&spot_id),
+            aggregate_id("spot", &spot_id),
+            chain,
+        )
+        .await?;
         upsert!(&mut *spots, spot::table, spot::id, row);
     }
-    println!("spots     {}", SPOTS.len());
+    println!("spots     {}", all_spots.len());
 
     // ── bookings, and the payment behind each paid one ──────────────────────
     // Settled income per host, to hold the payouts to.
@@ -1295,8 +1668,9 @@ async fn main() -> Result<(), Error> {
     // a day their spot is open, plus the live one built from the clock.
     let mut plans: Vec<Plan> = BOOKINGS
         .iter()
+        .chain(&town_bookings)
         .map(|b| {
-            let s = spot_seed(b.spot);
+            let s = spot_seed(all_spots, b.spot);
             let slots: Vec<(String, String)> = b
                 .slots
                 .iter()
@@ -1319,7 +1693,7 @@ async fn main() -> Result<(), Error> {
             let (key, spot, renter) = LIVE;
             plans.push(Plan {
                 key,
-                spot: spot_seed(spot),
+                spot: spot_seed(all_spots, spot),
                 renter,
                 date: today,
                 slots: vec![slot],
@@ -1330,7 +1704,7 @@ async fn main() -> Result<(), Error> {
         None => println!("note: too late in the day for a booking happening right now"),
     }
 
-    let ratings: HashMap<&str, i32> = RATINGS.iter().copied().collect();
+    let ratings: HashMap<&str, i32> = RATINGS.iter().copied().chain(town_ratings).collect();
 
     for b in &plans {
         let s = b.spot;
@@ -1366,30 +1740,8 @@ async fn main() -> Result<(), Error> {
             );
         }
 
-        // Versions are the length of each chain `replay::events` rebuilds from the row:
-        // a rating is one more event after the confirmation.
-        let (status, version, cancel_reason, release_reason) = match b.fate {
-            Fate::Confirmed => (
-                booking_status::CONFIRMED,
-                if rating.is_some() { 3 } else { 2 },
-                None,
-                None,
-            ),
-            Fate::Cancelled { .. } => (
-                booking_status::CANCELLED,
-                3,
-                Some(CancelReason::ByRenter),
-                None,
-            ),
-            Fate::Abandoned => (
-                booking_status::RELEASED,
-                2,
-                None,
-                Some(ReleaseReason::Abandoned),
-            ),
-        };
-
         let booking_id = stable(&format!("booking:{}", b.key));
+        let spot_id = stable(&format!("spot:{}", s.key));
         let host_id = person(s.host);
         let renter_id = person(b.renter);
         let booked: Booked = [(
@@ -1405,6 +1757,74 @@ async fn main() -> Result<(), Error> {
         .into_iter()
         .collect();
 
+        // Checkout is paid two minutes after the hold, and an unpaid hold lapses after
+        // booking-service's fifteen.
+        let paid_at = created_at + Duration::minutes(2);
+        let refunded_at = match b.fate {
+            Fate::Cancelled { after_days } => {
+                let refunded_at = created_at + Duration::days(after_days);
+                let starts_at = local(date, &b.slots[0].0);
+                assert!(
+                    refunded_at <= now && refunded_at < starts_at - Duration::hours(1),
+                    "{} is refunded after the cancel deadline",
+                    b.key
+                );
+                Some(refunded_at)
+            }
+            _ => None,
+        };
+
+        // The path the booking took. Every consumer guards its transitions with
+        // `WHERE status IN [...]`, so a cancellation needs the confirmation before it, and
+        // a rating lands only on a confirmed row.
+        let mut chain = vec![(
+            created_at,
+            BookingEvent::Created(BookingCreated {
+                booking_id,
+                spot_id,
+                host_id,
+                renter_id,
+                booked: booked.clone(),
+                license_plate: plate(b.renter),
+                amount_cents: amount,
+                expires_at: created_at + Duration::minutes(15),
+                ends_at,
+            }),
+        )];
+        let (status, cancel_reason, release_reason) = match b.fate {
+            Fate::Confirmed => {
+                chain.push((paid_at, BookingEvent::Confirmed { booking_id }));
+                if let Some(rating) = rating {
+                    chain.push((ends_at, BookingEvent::Rated { booking_id, rating }));
+                }
+                (booking_status::CONFIRMED, None, None)
+            }
+            Fate::Cancelled { .. } => {
+                let reason = CancelReason::ByRenter;
+                chain.push((paid_at, BookingEvent::Confirmed { booking_id }));
+                chain.push((
+                    refunded_at.expect("a cancelled booking is refunded"),
+                    BookingEvent::Cancelled { booking_id, reason },
+                ));
+                (booking_status::CANCELLED, Some(reason), None)
+            }
+            Fate::Abandoned => {
+                let reason = ReleaseReason::Abandoned;
+                chain.push((
+                    created_at + Duration::minutes(15),
+                    BookingEvent::Released { booking_id, reason },
+                ));
+                (booking_status::RELEASED, None, Some(reason))
+            }
+        };
+        let version = emit(
+            &mut *bookings,
+            &booking_subject(&spot_id),
+            aggregate_id("booking", &booking_id),
+            chain,
+        )
+        .await?;
+
         upsert!(
             &mut *bookings,
             booking::table,
@@ -1412,7 +1832,7 @@ async fn main() -> Result<(), Error> {
             Booking {
                 id: booking_id,
                 version,
-                spot_id: stable(&format!("spot:{}", s.key)),
+                spot_id,
                 host_id,
                 renter_id,
                 booked,
@@ -1430,40 +1850,78 @@ async fn main() -> Result<(), Error> {
         );
 
         // An abandoned checkout never paid, so it has no payment to show.
-        let (paid_status, payment_version, refunded_at) = match b.fate {
-            Fate::Confirmed => (payment_status::SUCCEEDED, 2, None),
-            Fate::Cancelled { after_days } => {
-                let refunded_at = created_at + Duration::days(after_days);
-                let starts_at = local(date, &b.slots[0].0);
-                assert!(
-                    refunded_at <= now && refunded_at < starts_at - Duration::hours(1),
-                    "{} is refunded after the cancel deadline",
-                    b.key
-                );
-                (payment_status::REFUNDED, 3, Some(refunded_at))
-            }
-            Fate::Abandoned => continue,
-        };
+        if matches!(b.fate, Fate::Abandoned) {
+            continue;
+        }
 
         let payment_id = stable(&format!("payment:{}", b.key));
+        let intent_id = fake_stripe("pi", &payment_id);
+        let refund_id = refunded_at.map(|_| fake_stripe("re", &payment_id));
+        let mut chain = vec![
+            (
+                paid_at,
+                PaymentEvent::Created(PaymentCreated {
+                    payment_id,
+                    booking_id,
+                    host_id,
+                    renter_id,
+                    session_id: fake_stripe("cs", &payment_id),
+                    amount_cents: amount,
+                    created_at: paid_at,
+                }),
+            ),
+            (
+                paid_at,
+                PaymentEvent::Succeeded {
+                    payment_id,
+                    booking_id,
+                    intent_id: intent_id.clone(),
+                },
+            ),
+        ];
+        if let (Some(refunded_at), Some(refund_id)) = (refunded_at, refund_id.clone()) {
+            chain.push((
+                refunded_at,
+                PaymentEvent::Refunded {
+                    payment_id,
+                    booking_id,
+                    refund_id,
+                    amount_cents: amount,
+                    refunded_at,
+                },
+            ));
+        }
+        let paid_status = if refunded_at.is_some() {
+            payment_status::REFUNDED
+        } else {
+            payment_status::SUCCEEDED
+        };
+        let version = emit(
+            &mut *payments,
+            &payment_subject(&booking_id),
+            aggregate_id("payment", &payment_id),
+            chain,
+        )
+        .await?;
+
         upsert!(
             &mut *payments,
             payment::table,
             payment::id,
             Payment {
                 id: payment_id,
-                version: payment_version,
+                version,
                 booking_id,
                 host_id,
                 renter_id,
                 amount_cents: amount,
                 session_id: fake_stripe("cs", &payment_id),
-                intent_id: Some(fake_stripe("pi", &payment_id)),
+                intent_id: Some(intent_id),
                 status: paid_status.into(),
-                refund_id: refunded_at.map(|_| fake_stripe("re", &payment_id)),
+                refund_id,
                 refunded_at,
                 failure_reason: None,
-                created_at: created_at + Duration::minutes(2),
+                created_at: paid_at,
             }
         );
 
@@ -1471,7 +1929,7 @@ async fn main() -> Result<(), Error> {
             *earned.entry(host_id).or_default() += amount;
         }
     }
-    println!("bookings  {} ({} rated)", plans.len(), RATINGS.len());
+    println!("bookings  {} ({} rated)", plans.len(), ratings.len());
 
     // ── payouts ─────────────────────────────────────────────────────────────
     let mut paid_out: HashMap<Uuid, i64> = HashMap::new();
@@ -1480,20 +1938,50 @@ async fn main() -> Result<(), Error> {
         let host_id = person(host);
         *paid_out.entry(host_id).or_default() += cents;
 
+        let requested_at = now - Duration::days(days_ago);
+        let transfer_id = fake_stripe("tr", &id);
+        // Requested, then paid. Keyed by host, like the live path: that subject is what
+        // serialises one host's withdrawals.
+        let version = emit(
+            &mut *payments,
+            &payout_subject(&host_id),
+            aggregate_id("payout", &id),
+            vec![
+                (
+                    requested_at,
+                    PaymentEvent::PayoutRequested {
+                        payout_id: id,
+                        host_id,
+                        amount_cents: cents,
+                        requested_at,
+                    },
+                ),
+                (
+                    requested_at,
+                    PaymentEvent::PayoutPaid {
+                        payout_id: id,
+                        host_id,
+                        transfer_id: transfer_id.clone(),
+                        paid_at: requested_at,
+                    },
+                ),
+            ],
+        )
+        .await?;
+
         upsert!(
             &mut *payments,
             payout_table::table,
             payout_table::id,
             Payout {
                 id,
-                // Requested, then paid.
-                version: 2,
+                version,
                 host_id,
                 amount_cents: cents,
                 status: payout::status::PAID.into(),
-                transfer_id: Some(fake_stripe("tr", &id)),
+                transfer_id: Some(transfer_id),
                 failure_reason: None,
-                created_at: now - Duration::days(days_ago),
+                created_at: requested_at,
             }
         );
     }
@@ -1507,46 +1995,20 @@ async fn main() -> Result<(), Error> {
     println!("payouts   {}", PAYOUTS.len());
 
     // ── events ──────────────────────────────────────────────────────────────
-    // Each writing service re-emits its rows. The read model and every mirror build
-    // themselves from those, the same way a projection rebuild does.
-    #[derive(Deserialize)]
-    struct Backfilled {
-        events: usize,
-    }
-
-    let client = reqwest::Client::new();
-    let mut missed = vec![];
-    for (service, port) in [
-        ("user-service", 3000),
-        ("spot-service", 3002),
-        ("booking-service", 3001),
-        ("payment-service", 3006),
+    // What each service's relay would do on boot, done here instead, so the history is
+    // in the streams before any worker consumer exists.
+    bus::ensure_streams(&js).await?;
+    for (service, pool) in [
+        ("user-service", &user_db),
+        ("spot-service", &spot_db),
+        ("booking-service", &booking_db),
+        ("payment-service", &payment_db),
     ] {
-        let url = format!("http://localhost:{port}/internal/backfill");
-        match client
-            .post(&url)
-            .send()
-            .await
-            .and_then(|res| res.error_for_status())
-        {
-            Ok(res) => println!(
-                "{service:<16} re-emitted {} events",
-                res.json::<Backfilled>().await?.events
-            ),
-            Err(e) => {
-                println!("{service:<16} unreachable: {e}");
-                missed.push(url);
-            }
-        }
+        let sent = bus::outbox::drain(pool, &js).await?;
+        println!("{service:<16} published {sent} events");
     }
 
-    if !missed.is_empty() {
-        println!("\nThe rows are written, but some services were not running. Start them, then:");
-        for url in missed {
-            println!("  curl -XPOST {url}");
-        }
-    }
-
-    println!("\nlog in as sam@example.com / {PASSWORD} (every demo account shares it)");
+    println!("\nnow start the services; the read model builds itself from the streams");
+    println!("log in as sam@example.com / {PASSWORD} (every demo account shares it)");
     Ok(())
 }

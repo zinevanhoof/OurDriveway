@@ -48,6 +48,10 @@ pub struct Config {
     pub jwt_expiration: i64,
     /// Days.
     pub refresh_token_expiration: i64,
+    /// `Secure` on the refresh-token cookie. `true` behind HTTPS, which production
+    /// always is. `false` only for dev over plain HTTP on the LAN, where a browser
+    /// would silently drop a `Secure` cookie and every refresh would log the user out.
+    pub cookie_secure: bool,
 }
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
@@ -59,9 +63,11 @@ static CONFIG: LazyLock<Config> = LazyLock::new(|| Config {
     email_token_secret: env::require("EMAIL_TOKEN_SECRET"),
     jwt_expiration: env::require_parsed("JWT_EXPIRATION"),
     refresh_token_expiration: env::require_parsed("REFRESH_TOKEN_EXPIRATION"),
+    cookie_secure: env::require_parsed("COOKIE_SECURE"),
 });
 
 mod auth;
+mod policy;
 mod repository;
 mod route;
 mod service;
@@ -170,10 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             bus::AwaitVersions(await_db, version_of),
             bus::await_version::await_version,
         ))
-        // After the layer, deliberately — a backfill is not a client read and has
-        // no version to wait on. Not under `/api` either, which is what keeps it
-        // off the ingress; see `route::user::backfill`.
-        .route("/internal/backfill", post(route::user::backfill))
         .merge(bus::health::routes(readiness))
         .with_state(state);
 

@@ -41,6 +41,7 @@ pub fn clear() -> Cookie<'static> {
 fn build(builder: CookieBuilder<'static>) -> CookieBuilder<'static> {
     builder
         .http_only(true)
+        .secure(CONFIG.cookie_secure)
         .same_site(SameSite::Strict)
         .path(SESSION_PATH)
 }

@@ -1,5 +1,6 @@
 import { createApp, watch } from "vue";
 import App from "./App.vue";
+import WebLayout from "./layouts/WebLayout.vue";
 import { router } from "./router/index.ts";
 import { createPinia } from "pinia";
 import { MotionPlugin } from "motion-v";
@@ -13,7 +14,21 @@ import { installNativeFetch, native } from "./api/http.ts";
 import { refreshAccessToken } from "./api/refresh.ts";
 import { fetchMe } from "./api/me.ts";
 
+/** This copy is the app inside WebLayout's phone frame, not the page around it. */
+const framed = window.self !== window.top;
+
 async function bootstrap() {
+  // The web build on a screen bigger than a phone gets the landing page, with the app in
+  // a phone frame on it: WebLayout frames a second copy of this app, and that copy is the
+  // real one. This page mounts
+  // nothing else — above all no `refreshAccessToken`, which would race the framed copy
+  // for the one refresh cookie. A phone's browser (and native) render the app directly.
+  if (!native && !framed && matchMedia("(min-width: 640px)").matches) {
+    createApp(WebLayout).mount("#app");
+    return;
+  }
+  if (framed) document.documentElement.classList.add("framed");
+
   // Route all fetches through plugin-http on native, before the first request
   // (refreshAccessToken below) fires. No-op on web.
   installNativeFetch();
@@ -72,6 +87,10 @@ async function bootstrap() {
   if (await refreshAccessToken()) auth.setUser(await fetchMe());
 
   app.use(router);
+
+  // Keep the address bar on the framed app's route, so a reload or a copied link lands
+  // on the same screen. Same origin, so the parent's history is ours to write.
+  if (framed) router.afterEach((to) => window.parent.history.replaceState(null, "", to.fullPath));
 
   // The router guard only covers navigations, so it misses a session that dies
   // on the page you're already on (a 401 retry that fails to refresh).
