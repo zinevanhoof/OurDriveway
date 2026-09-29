@@ -16,6 +16,7 @@ k8s/
       rate-limit.yaml      Traefik middlewares the ingress attaches
       tls-option.yaml      Cloudflare Authenticated Origin Pulls (mTLS)
       migrator-job.yaml    Helm hook: creates and migrates every database
+      demo-reset.yaml      the public demo: wipe and reseed hourly (prod only)
       yugabyte.yaml        the database when `database: yugabyte`, single node
       postgres.yaml        the database when `database: postgres`, single node
       network-policy.yaml  who may reach YSQL and NATS
@@ -246,6 +247,25 @@ The same works for `payment-booking-mirror`, `payment-host-mirror` and `booking-
 **Never delete a worker's durable** (`notification-users`, `booking-payments`,
 `payment-bookings`, `payment-payments`): it is recreated at `DeliverPolicy::New` and
 silently skips whatever was pending.
+
+## The public demo
+
+With `demo.enabled` (prod), `templates/demo-reset.yaml` wipes the whole cluster's data
+and seeds it again from `bus/examples/demo_seed.rs`: once right after install, then every
+hour. It scales the backends to 0, drops the databases and the NATS streams, runs the
+migrator and the seed, and scales back up, so the API is down for a minute or two on the
+hour. **Every account goes**, visitors' own included; the landing page's tutorial says so.
+
+The seed builds photo URLs as `MEDIA_BASE` + `spots/<file>`, with `MEDIA_BASE` from
+spot-service's config, so the prod bucket must hold the same files under the same names
+as the dev one (`SPOT_PHOTOS` in the seed). A missing file shows as a broken image, not
+as a failed seed.
+
+```sh
+kubectl create job -n ourdriveway --from=cronjob/demo-reset demo-reset-now   # reset now
+kubectl logs -n ourdriveway job/demo-reset-now -f
+kubectl patch cronjob -n ourdriveway demo-reset -p '{"spec":{"suspend":true}}'   # pause
+```
 
 ## Known ceilings
 

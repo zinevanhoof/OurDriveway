@@ -15,6 +15,10 @@ ingress:
     enabled: true
     originPull: true
 
+# A public demo: reseeded every hour, everyone's data wiped with it.
+demo:
+  enabled: true
+
 # PostgreSQL on the small box. The yugabyte block below stays so `database: yugabyte` is
 # a one-line switch back (onto an empty store — see chart/values.yaml).
 database: postgres

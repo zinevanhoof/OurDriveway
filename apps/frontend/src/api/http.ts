@@ -10,8 +10,8 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 // **Never hardcode this.** It is a capability check, not a design preference, and
 // `installNativeFetch` below replaces `window.fetch` on the strength of it — forcing it
 // true in a browser would route every request through a plugin that isn't there and break
-// the whole app. If you want the phone *layout* everywhere, that is `MOBILE_SHELL` in
-// App.vue, which is a separate question deliberately kept separate.
+// the whole app. It also picks the shell in `main.ts`: native renders the app directly,
+// never inside WebLayout's phone frame.
 //
 // Its other callers are capability decisions too: the platform geolocation prompt
 // (lib/geo.ts), opening a maps app (RenterBookingRow), and choosing an `ourdriveway://`
