@@ -13,6 +13,17 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// The release signing key: `storeFile`, `storePassword`, `keyAlias`, `keyPassword` in
+// src-tauri/gen/android/keystore.properties, which is gitignored. The keystore itself lives
+// outside the repo. Its SHA-256 is in public/.well-known/assetlinks.json, so App Links only
+// verify for an APK signed with this exact key. See the README's Android section.
+val keystoreProperties = Properties().apply {
+    val propFile = rootProject.file("keystore.properties")
+    if (propFile.exists()) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+
 android {
     compileSdk = 36
     namespace = "com.gromit.our_driveway"
@@ -26,14 +37,14 @@ android {
     }
     signingConfigs {
         create("release") {
-            // ponytail: the Android debug keystore, so a release build installs on a dev
-            // device without a key ceremony. It cannot go to Play, and a real-key build
-            // will not upgrade over it. Move to a gitignored keystore.properties (the
-            // .gitignore already expects one) before this ships anywhere.
-            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            // Filled only when the key is there, so a debug build (`tauri android dev`)
+            // still configures without it. A release build without it is stopped below.
+            if (!keystoreProperties.isEmpty) {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
         }
     }
     buildTypes {
@@ -90,3 +101,13 @@ dependencies {
 }
 
 apply(from = "tauri.build.gradle.kts")
+
+// Without the key a release build still succeeds, as an unsigned APK no phone installs.
+gradle.taskGraph.whenReady {
+    if (keystoreProperties.isEmpty && allTasks.any { it.name.contains("Release") }) {
+        throw GradleException(
+            "src-tauri/gen/android/keystore.properties is missing, so a release build cannot " +
+                "be signed. See the README's Android section."
+        )
+    }
+}

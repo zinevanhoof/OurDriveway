@@ -28,7 +28,7 @@
     "geolocation:allow-get-current-position",
     {
       "identifier": "deep-link:default",
-      "comment": "Only `onOpenUrl` is used, so the app can be brought back after a redirect payment. The scheme is declared in tauri.conf.json under plugins.deep-link.mobile — desktop registers nothing, since a redirect there returns to the web origin instead."
+      "comment": "`getCurrent` and `onOpenUrl`, for App Links to ourdriveway.com (the emailed links and a bank's return), declared in tauri.conf.json under plugins.deep-link.mobile. Desktop registers nothing."
     }
   ]
 }

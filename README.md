@@ -607,6 +607,47 @@ k8s/deploy.sh local             # or: k8s/deploy.sh prod
 [`k8s/README.md`](k8s/README.md) covers TLS, a local k3d cluster, what load-balances what,
 where state lives, and rebuilding projections in detail.
 
+### The Android app
+
+A release build talks to `https://ourdriveway.com` (`apps/frontend/.env.production`) and
+is signed with the release key, which never goes in the repo:
+
+```sh
+keytool -genkeypair -v -keystore ~/.android/ourdriveway-release.jks \
+  -alias ourdriveway -keyalg RSA -keysize 4096 -validity 10000
+```
+
+Back the keystore up: an app signed with it can only ever be updated by an APK signed
+with it. Then `apps/frontend/src-tauri/gen/android/keystore.properties` (gitignored):
+
+```properties
+storeFile=/home/<you>/.android/ourdriveway-release.jks
+storePassword=…
+keyAlias=ourdriveway
+keyPassword=…
+```
+
+```sh
+cd apps/frontend
+npm run tauri android build -- --apk --target aarch64
+adb install src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+```
+
+**Links into the app are the website's URLs.** The emailed `/verify-email` and
+`/reset-password` links and a bank's return to `/checkout` are App Links: tapped in a
+mail or bank app they open the app on that screen, and without the app they open the
+site. Android checks the claim against `apps/frontend/public/.well-known/assetlinks.json`,
+which must hold the release key's SHA-256 (`keytool -list -v -keystore … -alias
+ourdriveway`), and the Play App Signing one too once the app is on Play. When the same
+URL is reached inside the app's own webview, as a bank redirect normally is,
+`catch_deep_link` in `src-tauri/src/lib.rs` turns it into the in-app route; it knows the
+site's origin from `VITE_API_BASE`, read at build time by `src-tauri/build.rs`.
+
+```sh
+adb shell pm verify-app-links --re-verify com.gromit.our_driveway
+adb shell pm get-app-links com.gromit.our_driveway    # ourdriveway.com: verified
+```
+
 ## How it scales
 
 - **Request throughput scales with replicas.** The services hold no state between

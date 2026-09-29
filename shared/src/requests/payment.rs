@@ -21,9 +21,11 @@ pub struct CreateSessionRequest {
     /// Where Stripe sends the renter after a redirect payment method, including the
     /// literal `{CHECKOUT_SESSION_ID}` placeholder Stripe substitutes.
     ///
-    /// The client builds it because only the client knows where it is running: the web
-    /// build returns to its own origin, the Tauri build to a `ourdriveway://` deep link.
-    /// The server has no way to tell them apart and no business guessing.
+    /// The client builds it because only the client knows which site it belongs to: the
+    /// web build returns to its own origin, which in dev may be the Vite server or the LAN
+    /// Caddy, and the Tauri build to the site it talks to, whose `/checkout` the app
+    /// catches in its webview. The server has no way to tell them apart and no business
+    /// guessing.
     ///
     /// Deliberately only checked for presence. It looks like an open redirect and
     /// effectively isn't: Stripe performs the redirect from *its* own domain, and a caller

@@ -14,15 +14,25 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 // never inside WebLayout's phone frame.
 //
 // Its other callers are capability decisions too: the platform geolocation prompt
-// (lib/geo.ts), opening a maps app (RenterBookingRow), and choosing an `ourdriveway://`
-// return URL over an http one for a redirect payment.
+// (lib/geo.ts), opening a maps app (RenterBookingRow), and listening for App Links.
 export const native = isTauri();
 
 // reqwest can't resolve a relative URL and rejects the `tauri://` scheme a bundled
 // build loads from, so native needs an absolute base: the public origin in a release
 // build, Caddy on the LAN under `tauri dev`. Picked by Vite's mode — .env.production
-// or .env.development — so the same code ships to both.
+// or .env.development — so the same code ships to both. src-tauri/build.rs reads the
+// same line, for the navigations `catch_deep_link` turns back into app routes.
 const apiBase: string | undefined = import.meta.env.VITE_API_BASE;
+
+/**
+ * The website's origin: the page's own on the web, `VITE_API_BASE`'s in the app, whose
+ * own origin (`http://tauri.localhost`) nothing outside the phone can reach. For URLs
+ * handed to the outside world that must come back to the right screen — a redirect
+ * payment's `return_url`.
+ */
+export function webOrigin(): string {
+  return native && apiBase ? new URL(apiBase).origin : window.location.origin;
+}
 
 // Replace window.fetch once, at startup, so every caller (king.ts REST + urql) stays
 // on plain relative-URL fetch and is routed correctly without knowing about Tauri.

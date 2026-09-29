@@ -28,8 +28,10 @@
     "deep-link": {
       "mobile": [
         {
-          "scheme": ["ourdriveway"],
-          "appLink": false
+          "scheme": ["https"],
+          "host": "ourdriveway.com",
+          "pathPrefix": ["/verify-email", "/reset-password", "/checkout"],
+          "appLink": true
         }
       ]
     }
