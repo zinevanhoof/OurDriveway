@@ -155,19 +155,6 @@ services:
       - --forward-to=localhost:3006/api/payment/webhook
       - --events=payment_intent.succeeded,payment_intent.payment_failed
 
-  # Single origin for every client (browser + tauri): serves the built SPA and
-  # reverse-proxies /api/* to the Rust services running on the host. Same-origin
-  # is what keeps the SameSite=Strict refresh cookie working and CORS unnecessary
-  # — the one deliberate exception is the PUT straight to R2, which carries a
-  # signature instead of a cookie.
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    network_mode: "host"
-    volumes:
-      - ./Caddyfile-dev:/etc/caddy/Caddyfile:ro
-      - ../apps/frontend/dist:/srv/dist:ro
-
 # The authoritative data. A named volume rather than the container's own layer,
 # because this does NOT rebuild from the log — `docker compose down -v` is data
 # loss, not a replay.

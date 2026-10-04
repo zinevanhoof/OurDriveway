@@ -19,19 +19,30 @@ export const native = isTauri();
 
 // reqwest can't resolve a relative URL and rejects the `tauri://` scheme a bundled
 // build loads from, so native needs an absolute base: the public origin in a release
-// build, Caddy on the LAN under `tauri dev`. Picked by Vite's mode — .env.production
-// or .env.development — so the same code ships to both. src-tauri/build.rs reads the
-// same line, for the navigations `catch_deep_link` turns back into app routes.
+// build (`VITE_API_BASE` in .env.production — the same site as the App Link host in
+// tauri.conf.json, which is where `catch_deep_link` gets it from).
+//
+// Under `tauri dev` it is the Vite server (.env.development), whose proxy
+// (vite.config.ts) already reaches every service. Written out rather than taken from
+// `window.location`: the app's page is `http://tauri.localhost` even in dev — Tauri
+// fetches the dev server on the webview's behalf — and reqwest cannot resolve that.
+// Still through plugin-http, so dev keeps exercising the release path; the address has
+// to be in the http scope, which is what src-tauri/capabilities/dev-lan.json is for.
 const apiBase: string | undefined = import.meta.env.VITE_API_BASE;
 
 /**
- * The website's origin: the page's own on the web, `VITE_API_BASE`'s in the app, whose
- * own origin (`http://tauri.localhost`) nothing outside the phone can reach. For URLs
- * handed to the outside world that must come back to the right screen — a redirect
- * payment's `return_url`.
+ * The website's origin: the page's own on the web and in dev, `VITE_API_BASE`'s in the
+ * released app, whose own origin (`http://tauri.localhost`) nothing outside the phone
+ * can reach. For URLs handed to the outside world that must come back to the right
+ * screen — a redirect payment's `return_url`.
+ *
+ * In dev on the phone that is `http://tauri.localhost` too, which only a return that
+ * stays inside the webview can reach.
  */
 export function webOrigin(): string {
-  return native && apiBase ? new URL(apiBase).origin : window.location.origin;
+  return native && apiBase && !import.meta.env.DEV
+    ? new URL(apiBase).origin
+    : window.location.origin;
 }
 
 // Replace window.fetch once, at startup, so every caller (king.ts REST + urql) stays

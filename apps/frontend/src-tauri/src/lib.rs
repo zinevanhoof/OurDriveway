@@ -2,9 +2,18 @@ use std::sync::OnceLock;
 
 use tauri::{Manager, Url, WebviewWindowBuilder};
 
-/// The website's origin, `VITE_API_BASE` of this build's frontend env file (build.rs):
-/// `https://ourdriveway.com` in a release build, the dev machine's Caddy under `tauri dev`.
-const WEB_ORIGIN: &str = env!("WEB_ORIGIN");
+/// The website's origin, `https://ourdriveway.com`, read from the App Link declared under
+/// `plugins.deep-link.mobile` in tauri.conf.json.
+///
+/// From there rather than a constant or an env file because that entry is already the
+/// statement of which site's URLs are the app's own — the links arriving from outside and
+/// the ones `catch_deep_link` catches inside the webview are the same URLs.
+fn web_origin(config: &tauri::Config) -> Option<String> {
+    let link = config.plugins.0.get("deep-link")?.get("mobile")?.get(0)?;
+    let scheme = link.get("scheme")?.get(0)?.as_str()?;
+    let host = link.get("host")?.as_str()?;
+    Some(format!("{scheme}://{host}"))
+}
 
 /// The app's own base URL, taken from the first page it loads.
 ///
@@ -49,13 +58,23 @@ pub fn run() {
                 .ok_or("no `main` window in tauri.conf.json")?
                 .clone();
 
-            let handle = app.handle().clone();
-            WebviewWindowBuilder::from_config(app.handle(), &config)?
-                .on_navigation(move |url| catch_deep_link(&handle, url))
+            let mut window = WebviewWindowBuilder::from_config(app.handle(), &config)?
                 .on_page_load(|_, payload| {
                     let _ = APP_URL.set(payload.url().clone());
-                })
-                .build()?;
+                });
+
+            // Not under `tauri dev`: there a payment returns to the app's own origin
+            // (`webOrigin` in src/api/http.ts), so nothing navigates to the site. `is_dev` and not a debug check — a `tauri build --debug` bundle talks
+            // to the real site and needs this as much as a release one.
+            if !tauri::is_dev() {
+                let web_origin = web_origin(app.config())
+                    .ok_or("no deep-link scheme and host in tauri.conf.json")?;
+                let handle = app.handle().clone();
+                window = window
+                    .on_navigation(move |url| catch_deep_link(&handle, &web_origin, url));
+            }
+
+            window.build()?;
 
             Ok(())
         })
@@ -67,7 +86,7 @@ pub fn run() {
 /// everything else pass.
 ///
 /// The app and the site share their URLs: a redirect payment returns to
-/// `{WEB_ORIGIN}/checkout?session_id=…` on both (api/paymentApi.ts). In the app that whole
+/// `{web_origin}/checkout?session_id=…` on both (api/paymentApi.ts). In the app that whole
 /// redirect — bank, Stripe, the return — runs inside the webview, which would load the
 /// website there: another origin, and no session, since the refresh cookie lives in
 /// reqwest's jar. App Links don't help with this one: Android only hands them over for
@@ -83,13 +102,13 @@ pub fn run() {
 /// has none.
 ///
 /// Returning `false` cancels the navigation, so the website never renders in the app.
-fn catch_deep_link(handle: &tauri::AppHandle, url: &Url) -> bool {
+fn catch_deep_link(handle: &tauri::AppHandle, web_origin: &str, url: &Url) -> bool {
     let Some(mut target) = APP_URL.get().cloned() else {
         return true;
     };
     // Also passes when the app is served from the site's origin itself, which would
     // otherwise send every one of its own loads round again.
-    if url.origin().ascii_serialization() != WEB_ORIGIN || url.origin() == target.origin() {
+    if url.origin().ascii_serialization() != web_origin || url.origin() == target.origin() {
         return true;
     }
 

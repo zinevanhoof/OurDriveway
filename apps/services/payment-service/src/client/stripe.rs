@@ -25,7 +25,8 @@ use stripe_checkout::checkout_session::{
 // which this crate does not cover — see `Stripe::create_account`. What is left on v1 is
 // only what has no v2 endpoint at all.
 use stripe_connect::account_session::{
-    AccountConfigParam, CreateAccountSession, CreateAccountSessionComponents,
+    AccountConfigParam, AccountFeaturesParam, CreateAccountSession,
+    CreateAccountSessionComponents,
 };
 use stripe_connect::transfer::CreateTransfer;
 // These enums come from `stripe_shared` but are re-exported here, so that crate stays
@@ -438,20 +439,23 @@ impl Stripe {
     /// to a bank, which is the whole of what a host needs. No `merchant` configuration:
     /// nothing is ever charged on this account.
     ///
-    /// `dashboard: express` fixes the two responsibilities, and it is not a choice:
+    /// `dashboard: none`, with both responsibilities on the platform. There is no request
+    /// field for who collects requirements — Stripe derives it, and this combination is
+    /// the one that answers `requirements_collector: application` (verified against the
+    /// sandbox). That is what `account_session` below needs: only an account whose
+    /// requirements the platform collects may skip Stripe's own sign-in, and that sign-in
+    /// is a popup the Tauri webview cannot open.
     ///
-    ///     If `dashboard` is `express`, `fees_collector` must be `application` and
-    ///     `losses_collector` must be `application`.
-    ///
-    /// The Express dashboard means the platform owns the relationship with the host, so
-    /// the platform carries the fees and the negative balances.
+    /// It used to be `express`. The cost of leaving is that Stripe no longer emails a
+    /// host when it needs more from them; the withdraw screen asks Stripe on every visit
+    /// and shows onboarding again, so they find out there.
     ///
     /// `contact_email` and `identity.country` are both **required** before a recipient
     /// configuration is accepted, which is why this takes them as arguments — see the
     /// `host` mirror in `migrations/payment/0004`. The country is immutable after
     /// creation, so it is asked of the host rather than guessed.
     ///
-    /// # The `v4` in the idempotency key, and why it must be bumped
+    /// # The `v5` in the idempotency key, and why it must be bumped
     ///
     /// **Stripe stores a failed request against its idempotency key**, parameters and
     /// all. A request rejected for a bad parameter poisons that key: fixing the
@@ -464,7 +468,7 @@ impl Stripe {
     /// fixed. The key therefore carries a version of the *request shape*, not just the
     /// host. Change any field in the body below and bump it, or every host who already
     /// tried waits a day. It has been bumped for a wrong `losses` value, for a platform
-    /// that had not enabled Connect yet, and now for the move to v2.
+    /// that had not enabled Connect yet, for the move to v2, and now for `dashboard: none`.
     pub async fn create_account(
         &self,
         host_id: &Uuid,
@@ -474,7 +478,7 @@ impl Stripe {
         let body = serde_json::json!({
             "contact_email": email,
             "identity": { "country": country },
-            "dashboard": "express",
+            "dashboard": "none",
             "configuration": {
                 "recipient": {
                     "capabilities": {
@@ -497,7 +501,7 @@ impl Stripe {
             .v2(
                 self.http
                     .post(&self.v2_accounts)
-                    .header("Idempotency-Key", format!("connect:v4:{host_id}"))
+                    .header("Idempotency-Key", format!("connect:v5:{host_id}"))
                     .json(&body),
                 "create connected account",
             )
@@ -518,15 +522,30 @@ impl Stripe {
     /// host change that bank account later. Without the second, changing a bank means
     /// re-running onboarding.
     ///
+    /// Both with `disable_stripe_user_authentication`. Without it each component opens a
+    /// Stripe sign-in in a popup before it renders, and in the app's webview that popup
+    /// never opens and the component loads forever. Stripe accepts the flag only for the
+    /// account shape `create_account` makes. The trade is that our own session is now
+    /// the only thing between a caller and a host's bank details.
+    ///
     /// Deliberately **not** idempotent. A session expires, and the frontend's
     /// `fetchClientSecret` is called again precisely to get a fresh one — replaying the
     /// first would hand back an expired secret forever.
     pub async fn account_session(&self, account_id: &str) -> MyResult<String> {
+        // `external_account_collection` is spelled out because the other flag's default
+        // is defined as its opposite; naming both leaves nothing to a default.
+        let component = AccountConfigParam {
+            enabled: true,
+            features: Some(AccountFeaturesParam {
+                disable_stripe_user_authentication: Some(true),
+                external_account_collection: Some(true),
+            }),
+        };
         let session = CreateAccountSession::new(
             account_id.to_string(),
             CreateAccountSessionComponents {
-                account_onboarding: Some(AccountConfigParam::new(true)),
-                account_management: Some(AccountConfigParam::new(true)),
+                account_onboarding: Some(component),
+                account_management: Some(component),
                 ..CreateAccountSessionComponents::new()
             },
         )
