@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "dev-lan",
-  "description": "Dev only: lets plugin-http reach Caddy on the dev machine's LAN address (VITE_API_BASE in .env.development). Enabled by tauri.dev.conf.json; tauri.conf.json lists only `default`, so a release build cannot talk to it.",
+  "description": "Dev only: lets plugin-http reach the Vite dev server, whose proxy fronts the services, on the dev machine's LAN address. Enabled by tauri.dev.conf.json; tauri.conf.json lists only `default`, so a release build cannot talk to it.",
   "windows": ["main"],
   "permissions": [
     {

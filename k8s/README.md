@@ -8,7 +8,7 @@ k8s/
   secrets.env.example      the template for every environment's secrets.env
   traefik-config.yaml      k3s's Traefik access logs with the visitor's IP (once per cluster)
   chart/
-    values.yaml            chart defaults — no env values, only shape
+    values.yaml            chart defaults: no env values, only shape
     templates/
       backends.yaml        every service: Deployment + Service, from `services` in values
       frontend.yaml        Caddy serving the SPA
@@ -29,8 +29,8 @@ k8s/
 
 ## Configuration
 
-**Every environment variable a service reads lives in a file, never in the chart** —
-the same split as `apps/services/<svc>/.env`, one file per service:
+**Every environment variable a service reads lives in a file, never in the chart**.
+It is the same split as `apps/services/<svc>/.env`, one file per service:
 
 | Where | What | Becomes |
 |---|---|---|
@@ -49,7 +49,7 @@ missing variable crashes the pod at startup (`kubectl logs` names it).
   variable the other sets);
 - a config value is quoted (`kubectl --from-env-file` keeps quotes as part of the value) or empty;
 - `MEDIA_BASE` differs between user, spot and media, or `SETTLEMENT_SECS` between payment
-  and view — those must agree byte for byte.
+  and view. Those must agree byte for byte.
 
 Adding a variable: add it to the service's `Config`, its dev `.env`, and
 `environments/*/config/<svc>.env`. A new secret additionally goes in
@@ -58,7 +58,7 @@ Adding a variable: add it to the service's `Config`, its dev `.env`, and
 
 Changing either file and re-running `deploy.sh` rolls the backends: it passes a hash of
 the environment's config and secrets to the chart as a pod annotation. YugabyteDB and NATS
-are not rolled by it — and `YSQL_PASSWORD` only takes effect at the database's first boot,
+are not rolled by it, and `YSQL_PASSWORD` only takes effect at the database's first boot,
 so rotating it means changing the role's password in YSQL too.
 
 The Secret is created by kubectl rather than templated because Helm stores every rendered
@@ -79,7 +79,7 @@ ourdriveway` once the new release is up.
 ## TLS
 
 The chart references a `ourdriveway-tls` Secret when `ingress.tls.enabled` is on, but
-does not create it — a certificate is not something a chart should mint.
+does not create it, because a certificate is not something a chart should mint.
 
 Behind Cloudflare, use a **Cloudflare Origin CA** certificate: free, valid 15 years,
 trusted only by Cloudflare, issued under SSL/TLS → Origin Server.
@@ -105,7 +105,7 @@ kubectl apply -f k8s/traefik-config.yaml     # once per cluster, see below
   handshake, and every Ingress is on `websecure` only, so :80 routes nothing. That is also
   what makes `CF-Connecting-IP`, which rate limiting reads, impossible to forge.
 - **Client IPs are `CF-Connecting-IP`.** Everything that needs the visitor reads that
-  header — the rate limits, and any backend that ever wants it (`X-Forwarded-For` and
+  header: the rate limits, and any backend that ever wants it (`X-Forwarded-For` and
   `X-Real-IP` hold Cloudflare's or a node's address). `traefik-config.yaml` puts it in
   Traefik's access logs (`kubectl logs -n kube-system deploy/traefik`); it is a
   HelmChartConfig for k3s's bundled Traefik, so cluster-wide and not part of the chart.
@@ -132,7 +132,7 @@ Then http://localhost here, or http://192.168.50.29 (this machine's LAN IP) from
 The local Ingress has no host, so it answers on any address. Local config differs from
 prod in what plain HTTP on a LAN needs: `COOKIE_SECURE=false`, the `ourdriveway-dev`
 bucket and its public URL, and `APP_BASE_URL` on the LAN IP so emailed links open on a
-phone — change it in `environments/local/config/notification.env` if the IP moves.
+phone. Change it in `environments/local/config/notification.env` if the IP moves.
 `environments/local/values.yaml` also caps YugabyteDB's memory, which otherwise sizes
 itself to the whole machine.
 
@@ -154,7 +154,7 @@ Extra arguments go to Helm, so `k8s/deploy.sh prod --dry-run` works.
 **Migrations** are `chart/templates/migrator-job.yaml`, a `post-install,pre-upgrade` Helm
 hook: Helm waits for it and fails the release before any pod rolls if it fails. One Job,
 not every replica at boot, because `diesel_migrations` takes no lock. It is not
-`pre-install` because on a cold install the yugabyte StatefulSet would not exist yet —
+`pre-install` because on a cold install the yugabyte StatefulSet would not exist yet,
 which is also why a first install can see the one restart above.
 
 ## Routing and load balancing
@@ -167,16 +167,16 @@ nothing, it only means NATS is reachable.
 The Ingress owns all routing on **one host**, so the `SameSite=Strict` refresh cookie
 works: `/api/<name>` to each service with an API (all but notification), everything else
 to the frontend. Stripe's webhook arrives at `/api/payment/webhook` through the same
-Ingress — the one route with no JWT; it authenticates by signature (`route/webhook.rs`).
+Ingress. It is the one route with no JWT; it authenticates by signature (`route/webhook.rs`).
 
 ## YugabyteDB or PostgreSQL
 
-`database` in the values picks one; local runs `yugabyte`, prod `postgres` — the VPS
+`database` in the values picks one; local runs `yugabyte`, prod `postgres`, so the VPS
 gets a database at a tenth of the memory, and the same images still run unchanged on
 YugabyteDB. Nothing but the chart knows which: both are the `db` Service on 5433, with
 the `yugabyte` role and maintenance database (the Postgres pod creates both at first
 boot), so every `DATABASE_URL` and the migrator are identical. The services speak plain
-PostgreSQL — no Yugabyte-only SQL in the migrations — and the Read Committed behaviour
+PostgreSQL (no Yugabyte-only SQL in the migrations), and the Read Committed behaviour
 booking needs is PostgreSQL's default.
 
 Switching an existing environment starts from an **empty** store: the old StatefulSet
@@ -200,12 +200,12 @@ services  ──►  db: yugabyte or postgres (StatefulSet, one database per ser
 | NATS | every event on USERS, SPOTS, BOOKINGS, PAYMENTS (SESSIONS: 31 days) | no data loss, but projections can no longer be rebuilt |
 
 **The database is authoritative.** The log rebuilds projections, not the owning services'
-rows — they hold things no event carries (password hashes) — so deleting the database's
+rows, which hold things no event carries (password hashes), so deleting the database's
 PVC is data loss, not a replay.
 
 The NATS PVC grows forever: the four event streams have no `max_age` or `max_bytes`
 (`shared::events::STREAMS`). When it fills, publishes are refused and every outbox holds
-its rows and retries — writes still commit, projections stop. Watch it and resize first.
+its rows and retries: writes still commit, projections stop. Watch it and resize first.
 
 ### Projectors
 
@@ -270,7 +270,7 @@ kubectl patch cronjob -n ourdriveway demo-reset -p '{"spec":{"suspend":true}}'  
 ## Known ceilings
 
 - **Single database node**, one copy of the authoritative data, and no backup story.
-  Multi-node YugabyteDB needs `--join` and a replication factor — a different template,
+  Multi-node YugabyteDB needs `--join` and a replication factor, which is a different template,
   not `replicas: 3`; PostgreSQL has no multi-node story here at all. Add a backup
   (`pg_dump`/`ysql_dump`, or YugabyteDB snapshots) before anything real lives here.
 - **Single NATS node** holding the only rebuild source. Set `nats.config.cluster.enabled`

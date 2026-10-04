@@ -318,7 +318,7 @@ const cards = [
         <div class="mt-10 rounded-xl border bg-card p-5 text-sm leading-6 text-muted-foreground">
           <p class="font-medium text-foreground">Something broke?</p>
           <p class="mt-1">
-            It's a work in progress, so that can happen. You can let me know by opening an issue on
+            It's a one-person project, so that can happen. You can let me know by opening an issue on
             <a :href="`${repo}/issues`" target="_blank" rel="noopener"
               class="font-medium text-primary underline-offset-4 hover:underline">GitHub</a>.
           </p>
@@ -505,7 +505,7 @@ const cards = [
         <section class="border-t py-14">
           <h2 class="text-2xl font-semibold tracking-tight">Where it stands</h2>
           <p class="mt-4 leading-7 text-foreground/80">
-            This is a work in progress, not a business. The main flow works from start to finish:
+            This is a finished portfolio project, not a business. Everything works from start to finish:
             sign up, list a spot, book it, pay, cancel, get a refund and withdraw your earnings.
           </p>
           <p class="mt-4 leading-7 text-foreground/80">

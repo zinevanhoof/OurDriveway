@@ -1,33 +1,32 @@
-# OurDriveway (WIP)
+# OurDriveway
 
-**Rent out your driveway.** OurDriveway is a marketplace for private parking: a host lists
+**Rent out your driveway.** OurDriveway is a marketplace for private parking. A host lists
 their driveway with the hours it is free, and a renter finds it on a map, books a slot and
 pays for it. Once the booking is over and has settled, the host can withdraw the money.
 
 > [!NOTE]
-> **This is a portfolio project, and a work in progress.** It is not a live product and
-> is not meant to become one. It exists to explore how to build a fast, horizontally
-> scalable backend properly. The core flow works end to end — sign up, list a spot, find
-> it on a map, book it, pay with Stripe (in test mode), cancel, get refunded, withdraw
-> earnings — but the architecture is still moving. See
+> **This is a portfolio project.** It is not a live business and is not meant to become
+> one. I built it to learn how to make a fast backend that scales horizontally, and to do
+> it properly. Everything works end to end: sign up, list a spot, find it on a map, book
+> it, pay with Stripe (in test mode), cancel, get refunded and withdraw earnings. What a
+> real production deployment would still need is listed under
 > [Status and known gaps](#status-and-known-gaps).
 
 ---
 
 ## Showcase
 
-A walkthrough of the running app, recorded on the Android build — the same Vue frontend
-the web app uses, wrapped in the Tauri shell, against the real services.
+A walkthrough of the running app, recorded on the Android build. It is the same Vue
+frontend the web app uses, wrapped in the Tauri shell and talking to the real services.
 
-Watch it as a **work in progress**: it shows the core flow working end to end, not a
-finished product — see [Status and known gaps](#status-and-known-gaps). The frontend is
-also a **development build** on both sides, `npm run tauri android dev` — the web layer
-from the Vite dev server, the native Tauri shell a debug `cargo` build — so it runs
-slower in the video than a release build would.
+The frontend in the video is a **development build** on both sides
+(`npm run tauri android dev`): the web layer comes from the Vite dev server and the native
+Tauri shell is a debug `cargo` build. That makes it slower in the video than a release
+build would be.
 
 <!-- To replace the video: drag the .mp4 into a comment box on a GitHub issue, wait for
      the upload, and paste the https://github.com/user-attachments/assets/… URL it gives
-     back on its own line below — GitHub renders an inline player only for that kind of
+     back on its own line below. GitHub renders an inline player only for that kind of
      URL, and it has to be its own paragraph. Keep the file under 10 MB, which is the
      attachment ceiling for video; the one below is 540×1200, CRF 27, ~7.4 MB. -->
 
@@ -74,21 +73,21 @@ on how far and how cheaply it could grow.
 I decided to rewrite it from scratch with two goals:
 
 1. **No dependency on Firebase or any other backend-as-a-service.** Every piece is either
-   code in this repository or a piece of infrastructure that can run anywhere — a laptop,
-   a single VPS, or a Kubernetes cluster. The only outside services left are the ones
-   that genuinely have to be: Stripe for money, Resend for email, LocationIQ for address
-   lookup, and an S3-compatible bucket (Cloudflare R2) for photos.
+   code in this repository or infrastructure that can run anywhere: a laptop, a single
+   VPS or a Kubernetes cluster. The only outside services left are the ones that really
+   have to be outside: Stripe for money, Resend for email, LocationIQ for address lookup,
+   and an S3-compatible bucket (Cloudflare R2) for photos.
 2. **A very fast backend that scales well.** The services are written in **Rust** on
    **axum** and **tokio**. They are stateless, so scaling out means running more copies.
    The storage is **YugabyteDB**, a distributed, PostgreSQL-compatible SQL database that
    scales horizontally. The services talk to each other through events on **NATS
-   JetStream** rather than by calling each other, so one slow or failing service does not
+   JetStream** instead of calling each other, so one slow or failing service does not
    take the others down with it.
 
 The frontend was rewritten too: **Vue 3 + TypeScript**, shipped as a web app and wrapped
 with **Tauri 2** for native builds (including Android).
 
-The rewrite has been through a few foundations of its own:
+The rewrite went through a few foundations of its own:
 
 1. **A private SurrealDB per service instance.** At first, the event log was the source
    of truth. Every running instance kept its own copy of all the data it needed, replayed
@@ -101,7 +100,7 @@ The rewrite has been through a few foundations of its own:
    with real SQL, Read Committed transactions and PostgreSQL compatibility. sqlx was then
    replaced with diesel, so queries are checked against the schema at compile time.
 
-Most of the long comments in the code are notes from those moves, explaining why things
+Most of the long comments in the code are notes from those moves. They explain why things
 are shaped the way they are.
 
 ## What the app does
@@ -109,8 +108,8 @@ are shaped the way they are.
 **As a host**
 
 - List a driveway: title, description, photos, hourly price, address, and a weekly
-  availability grid. The address is re-geocoded on the server, and the spot's timezone is
-  worked out from its coordinates.
+  availability grid. The address is geocoded again on the server, and the spot's timezone
+  is worked out from its coordinates.
 - Pause a listing with a live switch, edit it, or delete it. Deleting cancels and refunds
   every booking the spot still has.
 - See who has booked each spot and when.
@@ -126,11 +125,13 @@ are shaped the way they are.
   pay, then confirms when Stripe says the money arrived.
 - Cancel a confirmed booking up to an hour before it starts and get a refund.
 - See your upcoming and past bookings, and the next one up on the home screen.
+- Rate a booking once it is over.
 
 **As anyone**
 
 - Sign up, verify your email address through a mailed link, and log in. Sessions are
   short-lived JWTs plus a rotating refresh token in an httponly cookie.
+- Reset a forgotten password through a mailed link.
 - Edit your profile: name, picture, licence plates, and the country Stripe needs for
   payouts.
 
@@ -201,12 +202,12 @@ The short version:
 
 | Service                  | Port (dev)  | Owns                                                             | Publishes           | Consumes                                                                     |
 | ------------------------ | ----------- | ---------------------------------------------------------------- | ------------------- | ---------------------------------------------------------------------------- |
-| **user-service**         | 3000        | accounts, passwords, email verification, sessions                | `USERS`, `SESSIONS` | —                                                                            |
+| **user-service**         | 3000        | accounts, passwords, email verification, sessions                | `USERS`, `SESSIONS` | nothing                                                                      |
 | **booking-service**      | 3001        | bookings, holds, cancellations                                   | `BOOKINGS`          | `SPOTS` (a mirror of what can be booked), `PAYMENTS` (confirms bookings)     |
-| **spot-service**         | 3002        | listings, availability, geocoding                                | `SPOTS`             | — (answers one RPC: a spot's card)                                           |
-| **view-service**         | 3003        | the read model every screen reads                                | —                   | `USERS`, `SPOTS`, `BOOKINGS`, `PAYMENTS`                                     |
-| **media-service**        | 3004        | nothing — mints presigned upload URLs                            | —                   | —                                                                            |
-| **notification-service** | health only | nothing — sends email                                            | —                   | `USERS` (verification mail)                                                  |
+| **spot-service**         | 3002        | listings, availability, geocoding                                | `SPOTS`             | nothing (it answers one RPC: a spot's card)                                  |
+| **view-service**         | 3003        | the read model every screen reads                                | nothing             | `USERS`, `SPOTS`, `BOOKINGS`, `PAYMENTS`                                     |
+| **media-service**        | 3004        | nothing, it only mints presigned upload URLs                     | nothing             | nothing                                                                      |
+| **notification-service** | health only | nothing, it only sends email                                     | nothing             | `USERS` (verification mail)                                                  |
 | **payment-service**      | 3006        | payments, refunds, payouts, Stripe Connect accounts, the webhook | `PAYMENTS`          | `BOOKINGS`, `USERS` (mirrors), `BOOKINGS` + `PAYMENTS` (settlement, payouts) |
 
 Two background loops are worth knowing about. booking-service runs a **sweeper** that
@@ -235,12 +236,11 @@ themselves. In dev it is `scripts/migrate.sh`; in Kubernetes it is a Helm hook J
 
 ### Events on NATS JetStream
 
-There is **one stream per bounded context** — `USERS`, `SESSIONS`, `SPOTS`, `BOOKINGS`,
+There is **one stream per bounded context**: `USERS`, `SESSIONS`, `SPOTS`, `BOOKINGS` and
 `PAYMENTS`. The four event streams keep everything, because replaying them is how a
-projection is rebuilt; `SESSIONS` keeps 31 days, as long as a refresh token lives.
-Every event travels in a shared **envelope**
-(`shared/src/events/`) carrying an event id, the actor, when it happened, the aggregate
-it belongs to, and that aggregate's **version**.
+projection is rebuilt. `SESSIONS` keeps 31 days, which is as long as a refresh token lives.
+Every event travels in a shared **envelope** (`shared/src/events/`) carrying an event id,
+the actor, when it happened, the aggregate it belongs to, and that aggregate's **version**.
 
 Subjects follow one grammar, `<domain>.<entity>.<id>`. The key a subject is built from
 decides what shares an ordering: bookings are keyed on their **spot**, payments on their
@@ -252,14 +252,14 @@ gapless per-aggregate `version` its owning service assigned inside the writing
 transaction, and a projector reads that version under `FOR UPDATE` before it applies
 anything (`bus::projector::decide`):
 
-- the next version → apply;
-- one already stored → ack and do nothing, so a redelivery or a duplicate is free;
-- a version from the future → **`Nak`**, and JetStream redelivers it once the event
+- the next version: apply it;
+- a version already stored: ack and do nothing, so a redelivery or a duplicate is free;
+- a version from the future: **`Nak`**, and JetStream redelivers it once the event
   before it has landed.
 
 That last case is the whole buffering mechanism. There is no park queue, no reorder
-window and no in-memory holding area — the server already has a durable one that is
-shared across replicas and survives a restart.
+window and no in-memory holding area, because the server already has a durable one that
+is shared across replicas and survives a restart.
 
 Because of that, each projector needs only **one durable consumer per stream**, with a
 real in-flight window and applies running concurrently. This replaced sixteen consumers
@@ -285,9 +285,9 @@ afterwards. Either both the data and the event exist, or neither does.
 
 **Every replica runs a relay.** There used to be one, elected through a 30-second lease
 row, because two relays interleaving could publish a booking's `reserved → confirmed →
-cancelled` out of order. The version gate above refuses such an event rather than applying
-it, so the election, its lease table, its heartbeat and its half-minute handover on a
-rolling restart are all gone, and relay throughput scales with pods.
+cancelled` out of order. The version gate above now refuses such an event instead of
+applying it, so the election, its lease table, its heartbeat and its half-minute handover
+on a rolling restart are all gone, and relay throughput scales with pods.
 
 ### CQRS: writes in the owner, reads in view-service
 
@@ -329,8 +329,8 @@ The fix is keyed on the **aggregate**, not the whole log:
    it reached, e.g. `spot:019f…@3`.
 2. The frontend remembers the newest version per aggregate (`src/lib/awaitVersion.ts`) and
    sends them all back on every request as **`X-Await-Version`**.
-3. A middleware layer in every service with a database (`bus/src/await_version.rs`) holds the request until
-   its projection has reached those versions, capped at two seconds.
+3. A middleware layer in every service with a database (`bus/src/await_version.rs`) holds
+   the request until its projection has reached those versions, capped at two seconds.
 
 It waits for _one row_, not for every event in a stream, so other people's writes never
 slow your reads down.
@@ -339,11 +339,11 @@ slow your reads down.
 
 Background work comes in exactly three shapes, and each has its generic half in `bus`:
 
-| Loop                           | Driven by             | Does                                                                  | Example                                                           |
-| ------------------------------ | --------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| **Projector** (`projector.rs`) | a stream consumer     | applies events to this service's tables — idempotent, ordered per aggregate by its version | view-service building the read model         |
-| **Worker** (`worker.rs`)       | a stream consumer     | performs a side effect once per event                                 | send a verification email, issue a refund, make a payout transfer |
-| **Sweeper** (`sweeper.rs`)     | a timer               | reacts to time passing                                                | release booking holds whose 15 minutes are up                     |
+| Loop                           | Driven by         | Does                                                                                     | Example                                                           |
+| ------------------------------ | ----------------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| **Projector** (`projector.rs`) | a stream consumer | applies events to this service's tables (idempotent, ordered per aggregate by version)   | view-service building the read model                              |
+| **Worker** (`worker.rs`)       | a stream consumer | performs a side effect once per event                                                    | send a verification email, issue a refund, make a payout transfer |
+| **Sweeper** (`sweeper.rs`)     | a timer           | reacts to time passing                                                                   | release booking holds whose 15 minutes are up                     |
 
 Workers make decisions from **current state**, not from which event woke them. The
 settlement rule is one function, reached from either direction: "a booking ended before
@@ -359,7 +359,7 @@ booking path. Here is how it is handled:
   the **first** statement of the reserve transaction.
 - YugabyteDB runs in **Read Committed**, so once the loser gets the lock, its next statement
   sees a **fresh snapshot** that includes the winner's booking. The availability check
-  then refuses the slot by name, and the renter gets a clean **409** rather than a retry
+  then refuses the slot by name, and the renter gets a clean **409** instead of a retry
   loop.
 - This depends on a real property of the database version: YugabyteDB **≥ 2025.2**
   started through `yugabyted`. On older versions Read Committed silently degrades to
@@ -376,8 +376,8 @@ booking path. Here is how it is handled:
 
 There is a third way data crosses a service boundary: NATS request/reply
 (`bus/src/service.rs`, `shared/src/rpc`). It is for a single value you need **right now**,
-keyed by an id you already hold — payment-service asking spot-service for a spot's title
-to label a checkout.
+keyed by an id you already hold. The one case today is payment-service asking
+spot-service for a spot's title to label a checkout.
 
 It is **best-effort by design**. A request couples the caller's availability to the
 responder's, which is exactly what the event log exists to avoid. So nothing load-bearing
@@ -423,7 +423,7 @@ apps/services/<name>/src/
   route/           HTTP shape only: extract, call one service method, build the response
   service/         holds the I/O handles (db, clients) and writes + enqueues events
   client/          the only place a third-party SDK is named (Stripe, LocationIQ, Resend)
-  policy/          pure functions: no I/O, no clock, no state — and unit-tested without a database
+  policy/          pure functions: no I/O, no clock, no state, unit-tested without a database
   repository/      one file per table, diesel DSL against generated schema modules
   projector.rs     applies a stream to this service's tables
   worker.rs        reacts to a stream with side effects
@@ -454,7 +454,7 @@ bus/                 NATS plumbing: outbox relay, projector, worker, await-versi
 shared/              runtime-free types: events, domain models, requests, responses, schema
 migrations/<db>/     SQL migrations per database (user, spot, booking, payment, view)
 docker/              dev compose file (YugabyteDB, NATS, Caddy, Stripe CLI) and Caddyfile
-k8s/                 Helm chart, values per environment, deploy script — see k8s/README.md
+k8s/                 Helm chart, values per environment, deploy script (see k8s/README.md)
 scripts/             migrate.sh, print-schema.sh
 docker-bake.hcl      builds every image
 ```
@@ -555,9 +555,9 @@ docker compose -f docker/docker-compose-dev.yml up -d yugabyte
 cargo test --workspace -- --ignored         # database tests; they migrate themselves
 ```
 
-Most of the logic that matters — availability, pricing, cancel deadlines, settlement,
-payout limits, the wallet fold, the geo bounding box, validation — is in `policy/`
-modules and `shared/src/requests`, and is tested there with no infrastructure at all.
+Most of the logic that matters (availability, pricing, cancel deadlines, settlement,
+payout limits, the wallet fold, the geo bounding box, validation) is in `policy/` modules
+and `shared/src/requests`, and is tested there with no infrastructure at all.
 CI (`.github/workflows/ci.yml`) runs `cargo test --workspace` and a frontend build, and
 publishes images to GHCR from `main`.
 
@@ -572,9 +572,9 @@ through a pull request; nothing is committed to `main` directly.
 
 Both paths run [`.github/workflows/ci.yml`](.github/workflows/ci.yml), but they stop at
 different points. A pull request runs `cargo test --workspace` and the frontend's
-`vue-tsc --noEmit && vite build`, and that is all — nothing is published for code that was
+`vue-tsc --noEmit && vite build`, and that is all. Nothing is published for code that was
 never merged. A push to `main` runs the same tests and then, only if they pass, builds all
-nine images with `docker buildx bake`, pushes them to `ghcr.io` tagged with the commit sha,
+ten images with `docker buildx bake`, pushes them to `ghcr.io` tagged with the commit sha,
 and moves `:latest` onto them once every image is up, so a partial failure leaves the
 previous release serving. Older tags are pruned to roughly twenty pushes of rollback depth.
 
@@ -585,8 +585,9 @@ that commit exist in the registry. Rolling the cluster onto them is still a deli
 ### The cluster
 
 Production is **Kubernetes with plain Helm**: one chart and one directory per environment
-under `k8s/environments/` — `local` for a k3d cluster, `prod` for a VPS behind Cloudflare —
-each holding the chart overrides, one config `.env` per service, and the secrets.
+under `k8s/environments/`. `local` is for a k3d cluster and `prod` is for a VPS behind
+Cloudflare. Each holds the chart overrides, one config `.env` per service, and the
+secrets.
 
 ```sh
 docker buildx bake              # build every image
@@ -641,7 +642,7 @@ which must hold the release key's SHA-256 (`keytool -list -v -keystore … -alia
 ourdriveway`), and the Play App Signing one too once the app is on Play. When the same
 URL is reached inside the app's own webview, as a bank redirect normally is,
 `catch_deep_link` in `src-tauri/src/lib.rs` turns it into the in-app route; it knows the
-site's origin from `VITE_API_BASE`, read at build time by `src-tauri/build.rs`.
+site's origin from the same `plugins.deep-link` entry in `tauri.conf.json`.
 
 ```sh
 adb shell pm verify-app-links --re-verify com.gromit.our_driveway
@@ -669,34 +670,30 @@ adb shell pm get-app-links com.gromit.our_driveway    # ourdriveway.com: verifie
 
 ## Status and known gaps
 
-This is a **work in progress** and a portfolio project, so the list below is not a to-do
-list for a launch. It is what a production deployment of this design would still need,
-written down so the gaps are known rather than hidden.
+The project is finished for what it set out to be: a portfolio piece, not a business. So
+the list below is not a launch checklist. It is what a production deployment of this
+design would still need, written down so the gaps are known and not hidden.
 
-- **Single-node YugabyteDB, with no backups.** One copy of the authoritative data. A real
-  cluster needs `--join`, a replication factor and a backup story (`ysql_dump` or
-  snapshots). This is not just `replicas: 3` in a values file.
+- **A single database node, with no backups.** There is one copy of the authoritative
+  data. The public demo even runs plain PostgreSQL in place of YugabyteDB to fit a small
+  VPS (`database: postgres` in `k8s/environments/prod/values.yaml`); the code is the same
+  on both. A real YugabyteDB cluster needs `--join`, a replication factor and a backup
+  story (`ysql_dump` or snapshots). This is not just `replicas: 3` in a values file.
 - **Single-node NATS, and it holds the only rebuild source.** Losing its volume loses
-  no data, since YugabyteDB is authoritative, but no projection can be rebuilt after it.
-  The volume also grows for ever, so it needs watching. JetStream clustering needs
+  no data, since the database is authoritative, but no projection can be rebuilt after
+  it. The volume also grows forever, so it needs watching. JetStream clustering needs
   switching on.
-- **No resource limits, only requests**, and **no NetworkPolicy**. Every pod in the
-  namespace can reach the database, guarded only by its password.
-- **No rate limiting.** Nothing throttles by IP or by user yet.
 - **The event log is kept forever but is not an audit trail.** Money records live in the
   `payment` and `payout` tables, and if the two disagree the tables are right.
 - **Every event ever published has to keep decoding**, because a rebuild replays all of
   them. Event types can only grow defaulted fields.
-- **The frontend is mid-refactor** onto a set of shared base components, and the native
-  (Tauri/Android) build is less exercised than the web one.
-- **The architecture is still moving.** Expect breaking changes to schemas, events and
-  APIs. Migrations are kept, but databases have been wiped at big cutovers.
+- **The native (Tauri/Android) build is less exercised than the web one.**
 
 ## Things to do
 
-Planned work, roughly in order of how much it matters. Most of these are marked in the
-code with a `ponytail:` comment at the spot where the shortcut was taken, which also says
-what the fix is.
+This is what I would pick up next if I kept going, roughly in order of how much it
+matters. Most of these are marked in the code with a `ponytail:` comment at the spot where
+the shortcut was taken, which also says what the fix is.
 
 ### Architecture
 
@@ -705,21 +702,22 @@ what the fix is.
       service's build to changes that concern only one of them, and it blurs which service
       owns what. A type should live in `shared` only when more than one crate needs it. Today
       these don't:
-  - the diesel schema modules `schema::{user,spot,booking,payment,view}` — each belongs to
+  - the diesel schema modules `schema::{user,spot,booking,payment,view}`. Each belongs to
     the service that owns that database. `bus` keeps `_outbox`.
-  - `projections::*`, `responses::view` and `domain_models::view` — view-service only.
-  - the row structs in `domain_models::{user,spot,booking,payment}` — each is used by its
+  - `projections::*`, `responses::view` and `domain_models::view`, which only view-service
+    uses.
+  - the row structs in `domain_models::{user,spot,booking,payment}`. Each is used by its
     owner. Other services only read the `status` constants, which can stay shared as
     vocabulary.
   - the single-service `requests::*` / `responses::*` modules, e.g. `requests::media`,
     `responses::spot`, `requests::payment`. This reverses the current "validators live in
     `shared`" rule in `CLAUDE.md`, so decide it once and update the rule with it.
-  - `notification::Mail` — only notification-service uses it, until a second service
+  - `notification::Mail`, which only notification-service uses until a second service
     raises mail of its own.
 
-  What genuinely stays shared: `events`, `general_models`, `rpc`, `email_token`, `media`,
-  and the plumbing (`claims`, `extractors`, `error`, `db`, `env`, `validation`). One catch
-  to plan for: `bus/examples/demo_seed.rs` writes user, spot, booking and payment rows
+  What does stay shared: `events`, `general_models`, `rpc`, `email_token`, `media`, and
+  the plumbing (`claims`, `extractors`, `error`, `db`, `env`, `validation`). One catch to
+  plan for: `bus/examples/demo_seed.rs` writes user, spot, booking and payment rows
   directly with those types, so the seed has to move with them or go through the HTTP API
   instead.
 
@@ -727,33 +725,18 @@ what the fix is.
   - a payout row left in `requested` if a transfer is made but the event is lost
     (`payout_worker_service.rs`);
   - a booking confirmed just after its host removed those hours (`booking-service/src/projector.rs`).
-- [ ] **Paginate every list endpoint in view-service.** Every list is currently returned
-      whole:
-  - `GET /host/spots` — all of a host's spots;
-  - `GET /renter/bookings` — a renter's entire history;
-  - the bookings inside `GET /host/spots/{id}` and `GET /public/spots/{id}`;
-  - a wallet month, where the month is the only page there is.
-
-  `GET /public/spots/nearby` is the exception, but only because it stops at a hard
-  `LIMIT 500` and silently drops the rest. Keyset pagination fits them all: each list
-  already has a stable order (`created_at`, `ends_at`, `occurred_at`) to page on, with
-  `id` as the tie-breaker and a `next` cursor in the response, the way the wallet's
-  `nextMonth` already works. The wallet's in/out totals would then have to become
-  aggregates instead of a sum over the rows that came back.
-
 - [ ] **Group map pins on the backend.** Today `GET /public/spots/nearby` sends every
-      spot in the radius — each one with its whole availability grid — and the browser
-      groups nearby pins itself (MapLibre runs supercluster client-side). At a zoom level
-      where fifty spots share a few pixels, that is fifty full spots over the wire to draw
-      one circle with "50" on it.
+      spot in the radius and the browser groups nearby pins itself
+      (`apps/frontend/src/lib/mapPins.ts`). At a zoom level where fifty spots share a few
+      pixels, that is fifty spots over the wire to draw one circle with "50" on it.
 
   If view-service does the grouping, the map request carries the visible bounding box
   and zoom level. The answer then holds individual spots only where they stand apart,
   and a single `{ lat, lng, count }` for each group everywhere else. The payload grows
   with the number of pins drawn, not with the number of spots in the area, so it also
-  replaces the `LIMIT 500` cap. That needs:
+  replaces the hard `LIMIT` that query stops at today. That needs:
   - a **grid bucket per zoom level**, computed in SQL (a `GROUP BY` on rounded
-    coordinates), which works without PostGIS — YugabyteDB has none;
+    coordinates), which works without PostGIS. YugabyteDB has none;
   - the **day-and-time filter moved to the server with it**, because it is a
     client-side fold over each spot's availability today, and a group has to count only
     the spots that pass the filter;
@@ -762,28 +745,8 @@ what the fix is.
 
 ### Features
 
-- [ ] **Forgot password, through notification-service.** Part of the groundwork is already
-      there: `shared::email_token` has a `Purpose::ResetPassword`, so a reset link can't be
-      replayed against email verification. What's missing:
-  - a `POST /api/user/password/forgot` that always answers 204, like
-    `/email/resend`, so it never reveals which addresses are registered;
-  - a `UserEvent` for the request, and a `Mail` variant and template in
-    notification-service that mints the reset token at send time;
-  - a `POST /api/user/password/reset` that verifies the token, sets the new password and
-    **revokes every refresh token** of that user;
-  - the two screens in the frontend.
-
-  Email tokens are stateless JWTs, so to make a reset link single-use it should be bound
-  to something the reset changes, such as the user's version or a fingerprint of the
-  current password hash.
-
-- [ ] **Ratings.** A `rating` column exists on bookings, but nothing writes it, and the
-      home screen shows a hardcoded value. Needs an event, an endpoint and a projected
-      average per spot.
 - [ ] **Show failed withdrawals in the wallet.** A failed payout currently just disappears
       from the list instead of telling the host.
-- [ ] **A cooldown on "resend verification email".** Every request sends a mail, and
-      nothing throttles it.
 - [ ] **iOS.** The Tauri shell is only generated for Android today.
 
 ### Correctness and polish
@@ -804,8 +767,6 @@ what the fix is.
       live on each visit; an `account.updated` webhook writing a cached flag would do.
 - [ ] **A confidence threshold on geocoding.** Any LocationIQ hit currently counts as a
       verified address.
-- [ ] **Configurable native API host.** The Tauri build points at a hardcoded LAN address
-      in `src/api/http.ts`; it needs a `VITE_API_URL`.
 - [ ] **Supported countries from Stripe**, instead of the hand-kept SEPA list in
       `src/lib/countries.ts`.
 - [ ] **Keyboard and screen-reader access on the home screen.** Its tap targets are
