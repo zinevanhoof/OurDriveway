@@ -249,10 +249,10 @@ const cards = [
         <div class="mt-8 flex gap-3 rounded-xl border border-primary/20 bg-accent p-4 text-sm leading-6">
           <RotateCcwIcon class="mt-0.5 size-5 shrink-0 text-primary" />
           <p class="text-foreground/80">
-            <span class="font-medium text-foreground">The demo resets every hour.</span>
-            On the hour, everything is wiped and filled with the demo data again. That includes
-            accounts you made yourself, so after a reset you'll need to sign up again. The app is
-            also offline for a minute or two while that happens.
+            <span class="font-medium text-foreground">The demo resets every night.</span>
+            At 04:00 Belgian time, everything is wiped and filled with the demo data again. That
+            includes accounts you made yourself, so after a reset you'll need to sign up again. The
+            app is also offline for a minute or two while that happens.
           </p>
         </div>
 

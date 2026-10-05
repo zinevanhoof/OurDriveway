@@ -21,7 +21,7 @@
 //!     scripts/migrate.sh
 //!     ./target/debug/examples/demo_seed
 //!
-//! In production that sequence is `k8s/chart/templates/demo-reset.yaml`, every hour and
+//! In production that sequence is `k8s/chart/templates/demo-reset.yaml`, every night and
 //! once after install, with the services scaled to zero around it.
 //!
 //! **Photos follow the environment.** They are paths in the bucket, joined onto

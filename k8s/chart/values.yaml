@@ -138,11 +138,14 @@ ingress:
     originPullCaSecret: cloudflare-aop-ca
 
 # The public demo: wipe and reseed on this schedule and once after install, so what a
-# visitor breaks is gone within the hour. **Deletes every account**, visitors' own
+# visitor breaks is gone by the next morning. **Deletes every account**, visitors' own
 # included. See templates/demo-reset.yaml.
 demo:
   enabled: false
-  schedule: "0 * * * *"
+  # 04:00 in `timeZone`, every day. The landing page's tutorial names this time
+  # (apps/frontend/src/layouts/WebLayout.vue), so change the two together.
+  schedule: "0 4 * * *"
+  timeZone: Europe/Brussels
 
 # Per-client limits at Traefik — see templates/rate-limit.yaml for how a client is
 # identified, templates/ingress.yaml for which paths get which limit.

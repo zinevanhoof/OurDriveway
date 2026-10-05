@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# The public demo's hourly reset: scale the services down, wipe, migrate, seed, scale
+# The public demo's nightly reset: scale the services down, wipe, migrate, seed, scale
 # back up. The script is k8s/chart/templates/demo-reset.yaml's; this image only carries
 # what it runs: the migrator, the demo seed and kubectl.
 FROM debian:bookworm-slim
