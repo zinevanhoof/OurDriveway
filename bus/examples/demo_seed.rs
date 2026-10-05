@@ -63,6 +63,7 @@
 //! town's centre, not on the street itself.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use argon2::{
     Argon2, PasswordHasher,
@@ -1276,9 +1277,19 @@ macro_rules! upsert {
     }};
 }
 
-/// A stable id, so every run derives the same ones.
+/// Drawn once per run, and the namespace every seeded id is derived in.
+static RUN: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
+
+/// An id that is stable within this run, so the same name always derives the same one
+/// and a booking finds its spot and its renter, and different on the next run.
+///
+/// It used to be the same on every run, which made Sam one host to Stripe across every
+/// reset and every environment sharing a sandbox. payment-service keys the creation of a
+/// connected account on the host id, API v2 remembers that key for 30 days, and a
+/// reseeded Sam was either handed the account from before the reset or refused with a
+/// 409. A fresh id per run means a fresh host, so onboarding starts from nothing.
 fn stable(name: &str) -> Uuid {
-    Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("demo:{name}").as_bytes())
+    Uuid::new_v5(&RUN, format!("demo:{name}").as_bytes())
 }
 
 fn person(key: &str) -> Uuid {
