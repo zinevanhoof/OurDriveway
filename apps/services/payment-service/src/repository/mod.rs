@@ -47,7 +47,6 @@ pub mod payout_repository;
 mod live_tests {
     use chrono::{TimeDelta, Utc};
     use diesel::prelude::*;
-    use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, RunQueryDsl};
     use shared::db::Changed;
     use shared::domain_models::booking::status as booking_status;
@@ -328,15 +327,12 @@ mod live_tests {
         // then commits nothing.
         let apply = async |event, version| {
             let mut conn = shared::db::conn(&pool).await.unwrap();
-            conn.transaction::<(), shared::error::myerror::MyError, _>(|conn| {
-                async move {
-                    crate::projector::UserProjector
-                        .apply(conn, event, Utc::now(), version)
-                        .await
-                        .unwrap();
-                    Ok(())
-                }
-                .scope_boxed()
+            conn.transaction::<(), shared::error::myerror::MyError, _>(async move |conn| {
+                crate::projector::UserProjector
+                    .apply(conn, event, Utc::now(), version)
+                    .await
+                    .unwrap();
+                Ok(())
             })
             .await
             .unwrap();
@@ -570,38 +566,35 @@ mod live_tests {
         // rather than on the advisory lock under test.
         let mut conn = shared::db::conn(pool).await.unwrap();
 
-        conn.transaction::<Option<i64>, shared::error::myerror::MyError, _>(|conn| {
-            async move {
-                let early = if read_before_lock {
-                    Some(balance(conn, &host_id).await)
-                } else {
-                    None
-                };
+        conn.transaction::<Option<i64>, shared::error::myerror::MyError, _>(async move |conn| {
+            let early = if read_before_lock {
+                Some(balance(conn, &host_id).await)
+            } else {
+                None
+            };
 
-                if lock {
-                    PayoutRepository::lock_host(conn, &host_id).await.unwrap();
-                }
-
-                // Both racers are certainly past the lock decision before either commits.
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-                let amount = match early {
-                    Some(stale) => stale,
-                    None => balance(conn, &host_id).await,
-                };
-
-                if amount <= 0 {
-                    // Nothing written, so returning and rolling back are the same — and
-                    // returning also releases the advisory lock, which is xact-scoped.
-                    return Ok(None);
-                }
-
-                PayoutRepository::upsert(conn, a_payout(Uuid::now_v7(), host_id, amount))
-                    .await
-                    .unwrap();
-                Ok(Some(amount))
+            if lock {
+                PayoutRepository::lock_host(conn, &host_id).await.unwrap();
             }
-            .scope_boxed()
+
+            // Both racers are certainly past the lock decision before either commits.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            let amount = match early {
+                Some(stale) => stale,
+                None => balance(conn, &host_id).await,
+            };
+
+            if amount <= 0 {
+                // Nothing written, so returning and rolling back are the same — and
+                // returning also releases the advisory lock, which is xact-scoped.
+                return Ok(None);
+            }
+
+            PayoutRepository::upsert(conn, a_payout(Uuid::now_v7(), host_id, amount))
+                .await
+                .unwrap();
+            Ok(Some(amount))
         })
         .await
         .unwrap()
@@ -620,20 +613,17 @@ mod live_tests {
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
                 let mut conn = shared::db::conn(&db).await.unwrap();
-                conn.transaction::<i64, shared::error::myerror::MyError, _>(|conn| {
-                    async move {
-                        let amount = balance(conn, &host_id).await;
-                        // Neither may commit until both have read.
-                        barrier.wait().await;
-                        if amount <= 0 {
-                            return Ok(0);
-                        }
-                        PayoutRepository::upsert(conn, a_payout(Uuid::now_v7(), host_id, amount))
-                            .await
-                            .unwrap();
-                        Ok(amount)
+                conn.transaction::<i64, shared::error::myerror::MyError, _>(async move |conn| {
+                    let amount = balance(conn, &host_id).await;
+                    // Neither may commit until both have read.
+                    barrier.wait().await;
+                    if amount <= 0 {
+                        return Ok(0);
                     }
-                    .scope_boxed()
+                    PayoutRepository::upsert(conn, a_payout(Uuid::now_v7(), host_id, amount))
+                        .await
+                        .unwrap();
+                    Ok(amount)
                 })
                 .await
                 .unwrap()

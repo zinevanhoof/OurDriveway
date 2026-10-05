@@ -74,7 +74,11 @@ const formSchema = toTypedSchema(
     })
 )
 
-const { handleSubmit, resetForm, setErrors, values, meta } = useForm({
+// `isSubmitting`, not the mutation's `isPending`, is what the save button shows. It is
+// true for the whole submit handler: the picture upload that runs before the PATCH, which
+// is the slow part, and the refetches after it. `isPending` covered only the PATCH, so the
+// button looked idle during the upload and could be tapped a second time.
+const { handleSubmit, resetForm, setErrors, values, meta, isSubmitting: loading } = useForm({
     validationSchema: formSchema,
     initialValues: { firstName: '', lastName: '', email: '', licensePlates: [], country: '', currentPassword: '' },
 })
@@ -83,7 +87,7 @@ const { fields: plates, push: addPlate, remove: removePlate } = useFieldArray<st
 
 const emailChanged = computed(() => !!loadedEmail.value && values.email !== loadedEmail.value)
 
-const { mutateAsync: save, isPending: loading } = useUpdateUser()
+const { mutateAsync: save } = useUpdateUser()
 const formErrors = ref<string[]>([])
 
 // Prefills once the query lands, and again if it refetches while the form is untouched —

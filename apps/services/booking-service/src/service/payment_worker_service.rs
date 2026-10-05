@@ -9,7 +9,6 @@
 //! Nothing here takes a caller id, because there is no caller — Stripe acted.
 
 use diesel_async::AsyncConnection;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::{
     domain_models::booking::status,
@@ -65,53 +64,56 @@ impl PaymentWorkerService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    let version = shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                let version =
+                    shared::next_version!(conn, shared::schema::booking::booking, &booking_id)?;
 
-                    // `status = ANY(['reserved'])` is what keeps this idempotent: a redelivered
-                    // webhook, or a payment landing after the hold already lapsed, applies to
-                    // nothing.
-                    let confirmed = BookingRepository::transition(
-                        conn,
-                        booking_id,
-                        status::CONFIRMED,
-                        &[status::RESERVED],
-                        None,
-                        None,
-                    )
-                    .await?;
+                // `status = ANY(['reserved'])` is what keeps this idempotent: a redelivered
+                // webhook, or a payment landing after the hold already lapsed, applies to
+                // nothing.
+                let confirmed = BookingRepository::transition(
+                    conn,
+                    booking_id,
+                    status::CONFIRMED,
+                    &[status::RESERVED],
+                    None,
+                    None,
+                )
+                .await?;
 
-                    // Applied to nothing, which is the idempotency this path is built for —
-                    // and it now says so rather than bumping a version for it. The caller
-                    // waits on the version that IS stored (`next_version!` returns
-                    // `stored + 1`, and nothing has written since under its `FOR UPDATE`),
-                    // so a redelivered webhook still resolves instead of waiting out a
-                    // version no event will ever carry.
-                    if !confirmed.applied() {
-                        return Ok(version - 1);
-                    }
-
-                    shared::set_version!(conn, "booking", shared::schema::booking::booking, &booking_id, version)?;
-
-                    // `actor_id: None` — Stripe acted, not a user holding a token.
-                    //
-                    // A plain v7 event id. This used to be
-                    // `v5("payment-confirm:{payment_id}")` so a redelivered webhook could
-                    // not append a second `Confirmed`; the `[reserved]` guard above ends
-                    // that path before it reaches here instead.
-                    let envelope = Envelope::new(
-                        BookingEvent::Confirmed { booking_id },
-                        None,
-                        aggregate_id("booking", &booking_id),
-                        version,
-                    );
-
-                    bus::outbox::enqueue(conn, &booking_subject(&booking.spot_id), &envelope)
-                        .await?;
-                    Ok(version)
+                // Applied to nothing, which is the idempotency this path is built for —
+                // and it now says so rather than bumping a version for it. The caller
+                // waits on the version that IS stored (`next_version!` returns
+                // `stored + 1`, and nothing has written since under its `FOR UPDATE`),
+                // so a redelivered webhook still resolves instead of waiting out a
+                // version no event will ever carry.
+                if !confirmed.applied() {
+                    return Ok(version - 1);
                 }
-                .scope_boxed()
+
+                shared::set_version!(
+                    conn,
+                    "booking",
+                    shared::schema::booking::booking,
+                    &booking_id,
+                    version
+                )?;
+
+                // `actor_id: None` — Stripe acted, not a user holding a token.
+                //
+                // A plain v7 event id. This used to be
+                // `v5("payment-confirm:{payment_id}")` so a redelivered webhook could
+                // not append a second `Confirmed`; the `[reserved]` guard above ends
+                // that path before it reaches here instead.
+                let envelope = Envelope::new(
+                    BookingEvent::Confirmed { booking_id },
+                    None,
+                    aggregate_id("booking", &booking_id),
+                    version,
+                );
+
+                bus::outbox::enqueue(conn, &booking_subject(&booking.spot_id), &envelope).await?;
+                Ok(version)
             })
             .await?;
 

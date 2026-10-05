@@ -65,7 +65,9 @@ const formSchema = toTypedSchema(
     })
 )
 
-const { handleSubmit, resetForm, setErrors, meta } = useForm({ validationSchema: formSchema })
+// `isSubmitting` rather than the mutation's `isPending`: it also covers the photo uploads
+// that run before the save, which is where the time goes.
+const { handleSubmit, resetForm, setErrors, meta, isSubmitting: loading } = useForm({ validationSchema: formSchema })
 
 // Declared before the watcher below, not after it: with `immediate: true` that
 // watcher runs during setup, so anything it calls has to already be initialized.
@@ -77,7 +79,7 @@ const emptyWeek = (): Availability['weekly'] =>
 const availability = ref<Availability>({ weekly: emptyWeek(), single: {} })
 const images = ref<(string | File)[]>([])
 
-const { mutateAsync: save, isPending: loading } = useUpdateSpot()
+const { mutateAsync: save } = useUpdateSpot()
 const { mutateAsync: destroy, isPending: deleting } = useDeleteSpot()
 const confirmOpen = ref(false)
 const slotErrors = ref<string[]>([])

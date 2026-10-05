@@ -16,7 +16,6 @@
 use std::time::Duration;
 
 use diesel_async::AsyncConnection;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::{
     domain_models::booking::status,
     error::myerror::{MyError, MyResult},
@@ -81,9 +80,9 @@ async fn sweep(db: &shared::db::Db) -> MyResult<()> {
         };
 
         let released = conn
-            .transaction::<_, MyError, _>(|conn| {
+            .transaction::<_, MyError, _>({
                 let event = event.clone();
-                async move {
+                async move |conn| {
                     let version =
                         shared::next_version!(conn, shared::schema::booking::booking, &booking_id)
                             .inspect_err(|e| {
@@ -149,7 +148,6 @@ async fn sweep(db: &shared::db::Db) -> MyResult<()> {
 
                     Ok(())
                 }
-                .scope_boxed()
             })
             .await;
 

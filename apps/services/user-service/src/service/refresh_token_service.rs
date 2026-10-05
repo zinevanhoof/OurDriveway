@@ -1,7 +1,6 @@
 use bus::outbox;
 use chrono::Utc;
 use diesel_async::AsyncConnection;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::domain_models::user::{RefreshToken, RefreshTokenPatch, User};
 use shared::error::myerror::{ContextExt, MyError, MyResult};
@@ -68,45 +67,37 @@ impl RefreshTokenService {
         let user_id = user.id;
 
         // `transaction` owns the begin, the commit and the rollback: `Ok` commits, `Err`
-        // rolls back, and there is no path that can forget either. `scope_boxed` is
-        // required by the signature — it cannot be generic over an arbitrary future
-        // without boxing (rustc#100013).
+        // rolls back, and there is no path that can forget either.
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    let version = shared::next_version!(
-                        conn,
-                        shared::schema::user::refresh_token,
-                        &token_id
-                    )?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                let version =
+                    shared::next_version!(conn, shared::schema::user::refresh_token, &token_id)?;
 
-                    RefreshTokenRepository::upsert(
-                        conn,
-                        RefreshToken::issued(issued.clone(), Utc::now()),
-                    )
-                    .await?;
-                    shared::set_version!(
-                        conn,
-                        "refresh_token",
-                        shared::schema::user::refresh_token,
-                        &token_id,
-                        version
-                    )?;
+                RefreshTokenRepository::upsert(
+                    conn,
+                    RefreshToken::issued(issued.clone(), Utc::now()),
+                )
+                .await?;
+                shared::set_version!(
+                    conn,
+                    "refresh_token",
+                    shared::schema::user::refresh_token,
+                    &token_id,
+                    version
+                )?;
 
-                    let envelope = Envelope::new(
-                        SessionEvent::Issued(issued),
-                        Some(user_id),
-                        aggregate_id("refresh_token", &token_id),
-                        version,
-                    );
+                let envelope = Envelope::new(
+                    SessionEvent::Issued(issued),
+                    Some(user_id),
+                    aggregate_id("refresh_token", &token_id),
+                    version,
+                );
 
-                    // Still the user's subject: one user's whole session history stays on
-                    // one ordered subject, even though each session versions
-                    // independently.
-                    outbox::enqueue(conn, &session_subject(&user_id), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
-                }
-                .scope_boxed()
+                // Still the user's subject: one user's whole session history stays on
+                // one ordered subject, even though each session versions
+                // independently.
+                outbox::enqueue(conn, &session_subject(&user_id), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
@@ -152,51 +143,45 @@ impl RefreshTokenService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    let version = shared::next_version!(
-                        conn,
-                        shared::schema::user::refresh_token,
-                        &token_id
-                    )?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                let version =
+                    shared::next_version!(conn, shared::schema::user::refresh_token, &token_id)?;
 
-                    // Revoke-and-issue in one transaction, mirroring the single event:
-                    // there is no instant at which the old token is dead and the new one
-                    // does not exist.
-                    RefreshTokenRepository::patch_by_token_hash(
-                        conn,
-                        rotated.old_token_hash.clone(),
-                        RefreshTokenPatch {
-                            revoked: Some(true),
-                            revoked_reason: Some("Rotation".to_string()),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-                    RefreshTokenRepository::upsert(
-                        conn,
-                        RefreshToken::rotated(rotated.clone(), Utc::now()),
-                    )
-                    .await?;
-                    shared::set_version!(
-                        conn,
-                        "refresh_token",
-                        shared::schema::user::refresh_token,
-                        &token_id,
-                        version
-                    )?;
+                // Revoke-and-issue in one transaction, mirroring the single event:
+                // there is no instant at which the old token is dead and the new one
+                // does not exist.
+                RefreshTokenRepository::patch_by_token_hash(
+                    conn,
+                    rotated.old_token_hash.clone(),
+                    RefreshTokenPatch {
+                        revoked: Some(true),
+                        revoked_reason: Some("Rotation".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                RefreshTokenRepository::upsert(
+                    conn,
+                    RefreshToken::rotated(rotated.clone(), Utc::now()),
+                )
+                .await?;
+                shared::set_version!(
+                    conn,
+                    "refresh_token",
+                    shared::schema::user::refresh_token,
+                    &token_id,
+                    version
+                )?;
 
-                    let envelope = Envelope::new(
-                        SessionEvent::Rotated(rotated),
-                        Some(user_uuid),
-                        aggregate_id("refresh_token", &token_id),
-                        version,
-                    );
+                let envelope = Envelope::new(
+                    SessionEvent::Rotated(rotated),
+                    Some(user_uuid),
+                    aggregate_id("refresh_token", &token_id),
+                    version,
+                );
 
-                    outbox::enqueue(conn, &session_subject(&user_uuid), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
-                }
-                .scope_boxed()
+                outbox::enqueue(conn, &session_subject(&user_uuid), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
@@ -224,44 +209,41 @@ impl RefreshTokenService {
 
         let mut conn = db::conn(&self.db).await?;
 
-        conn.transaction::<_, MyError, _>(|conn| {
-            async move {
-                let version =
-                    shared::next_version!(conn, shared::schema::user::refresh_token, &existing.id)?;
+        conn.transaction::<_, MyError, _>(async move |conn| {
+            let version =
+                shared::next_version!(conn, shared::schema::user::refresh_token, &existing.id)?;
 
-                RefreshTokenRepository::patch_by_token_hash(
-                    conn,
-                    revoked.token_hash.clone(),
-                    RefreshTokenPatch {
-                        revoked: Some(true),
-                        revoked_reason: Some(revoked.reason.clone()),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-                // `Utc::now()` is this process's clock, which is fine now that this is
-                // the only writer — it used to have to be the envelope's, because every
-                // replica replayed the same event and had to drop exactly the same rows.
-                RefreshTokenRepository::delete_expired(conn, Utc::now()).await?;
-                shared::set_version!(
-                    conn,
-                    "refresh_token",
-                    shared::schema::user::refresh_token,
-                    &existing.id,
-                    version
-                )?;
+            RefreshTokenRepository::patch_by_token_hash(
+                conn,
+                revoked.token_hash.clone(),
+                RefreshTokenPatch {
+                    revoked: Some(true),
+                    revoked_reason: Some(revoked.reason.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            // `Utc::now()` is this process's clock, which is fine now that this is
+            // the only writer — it used to have to be the envelope's, because every
+            // replica replayed the same event and had to drop exactly the same rows.
+            RefreshTokenRepository::delete_expired(conn, Utc::now()).await?;
+            shared::set_version!(
+                conn,
+                "refresh_token",
+                shared::schema::user::refresh_token,
+                &existing.id,
+                version
+            )?;
 
-                let envelope = Envelope::new(
-                    SessionEvent::Revoked(revoked),
-                    Some(existing.user_id),
-                    aggregate_id("refresh_token", &existing.id),
-                    version,
-                );
+            let envelope = Envelope::new(
+                SessionEvent::Revoked(revoked),
+                Some(existing.user_id),
+                aggregate_id("refresh_token", &existing.id),
+                version,
+            );
 
-                outbox::enqueue(conn, &session_subject(&existing.user_id), &envelope).await?;
-                Ok(())
-            }
-            .scope_boxed()
+            outbox::enqueue(conn, &session_subject(&existing.user_id), &envelope).await?;
+            Ok(())
         })
         .await?;
 

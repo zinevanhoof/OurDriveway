@@ -26,6 +26,7 @@ import {
 import { DateFormatter, DateValue, getLocalTimeZone, today } from "@internationalized/date";
 import { computed, onMounted, ref, watch } from "vue";
 import { COVERED } from "@/router/transition";
+import { Spinner } from "@/components/ui/spinner";
 import { useRouter } from "vue-router";
 import { useQuery } from "@tanstack/vue-query";
 import type { AcceptableValue } from "reka-ui";
@@ -468,8 +469,9 @@ async function submit() {
                          picker's estimate; the server reprices from the minutes it actually
                          authorises, and that is what the checkout screen shows. -->
             <Button class="w-full h-11 font-bold" :disabled="!totals.slots || !plate || busy" @click="submit">
+                <Spinner v-if="busy" />
                 Continue to payment
-                <ArrowRight />
+                <ArrowRight v-if="!busy" />
             </Button>
         </template>
     </DetailLayout>

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 
+use sha2::{Digest, Sha256};
 use shared::error::myerror::{ContextExt, MyError, MyResult};
 // `StripeRequest` is imported for its `customize()` method, which is what carries an
 // idempotency key onto a request — it is a trait method, not an inherent one.
@@ -455,20 +456,31 @@ impl Stripe {
     /// `host` mirror in `migrations/payment/0004`. The country is immutable after
     /// creation, so it is asked of the host rather than guessed.
     ///
-    /// # The `v5` in the idempotency key, and why it must be bumped
+    /// # The idempotency key carries a digest of the body
     ///
-    /// **Stripe stores a failed request against its idempotency key**, parameters and
-    /// all. A request rejected for a bad parameter poisons that key: fixing the
-    /// parameter and retrying answers
+    /// Stripe remembers a key together with the parameters it was first used with, and
+    /// a second request under that key with *different* parameters is refused:
     ///
-    ///     Keys for idempotent requests can only be used with the same parameters they
-    ///     were first used with.
+    ///     Idempotency keys can only be reused with the same parameters they were
+    ///     first used with.
     ///
-    /// for the next 24 hours — a host locked out of onboarding by a bug that is already
-    /// fixed. The key therefore carries a version of the *request shape*, not just the
-    /// host. Change any field in the body below and bump it, or every host who already
-    /// tried waits a day. It has been bumped for a wrong `losses` value, for a platform
-    /// that had not enabled Connect yet, for the move to v2, and now for `dashboard: none`.
+    /// On API v2 it remembers for **30 days**, not v1's 24 hours, and nothing clears a
+    /// key early, not even wiping the sandbox's data. So a key made of the host id alone
+    /// locks a host out for a month the moment anything in this body differs from their
+    /// first attempt: a field changed here in a deploy, or their own email or country
+    /// edited between two tries. It did exactly that to the demo account, whose id was
+    /// the same in every environment sharing one sandbox.
+    ///
+    /// The key used to answer the first of those with a hand-bumped `v1`…`v5`, which
+    /// someone had to remember and which did nothing for the second. Hashing the body
+    /// covers both and cannot be forgotten: the same request is the same key and still
+    /// replays, and any other request is a key Stripe has never seen.
+    ///
+    /// The cost is the case the old key got right: an account created at Stripe whose
+    /// row never reached `connect_account`, followed by a retry with a changed email or
+    /// country. That retry now opens a second account and leaves the first one empty
+    /// and orphaned at Stripe, where it used to be refused. An unused account costs
+    /// nothing; a host who cannot be paid for a month does.
     pub async fn create_account(
         &self,
         host_id: &Uuid,
@@ -501,7 +513,7 @@ impl Stripe {
             .v2(
                 self.http
                     .post(&self.v2_accounts)
-                    .header("Idempotency-Key", format!("connect:v5:{host_id}"))
+                    .header("Idempotency-Key", account_idempotency_key(host_id, &body))
                     .json(&body),
                 "create connected account",
             )
@@ -873,6 +885,17 @@ fn idempotency_key(prefix: &str, id: &Uuid) -> MyResult<IdempotencyKey> {
         .map_err(|e| MyError::Bus(format!("idempotency key: {e}")))
 }
 
+/// The idempotency key for creating a host's connected account: the host, and a digest
+/// of exactly what is being asked for. Why both is written out over
+/// [`Stripe::create_account`].
+///
+/// Sixteen hex characters of SHA-256. It only has to tell one host's few possible
+/// bodies apart, and the whole key must stay under Stripe's 255.
+fn account_idempotency_key(host_id: &Uuid, body: &serde_json::Value) -> String {
+    let digest = Sha256::digest(body.to_string().as_bytes());
+    format!("connect:{host_id}:{}", &hex::encode(digest)[..16])
+}
+
 /// A v2 call that never reached Stripe, or whose answer could not be read off the
 /// socket. The v1 half of this is `StripeError::ClientError`, handled by the fallback
 /// arm of [`stripe_err`].
@@ -926,6 +949,46 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "whsec_test_secret";
+
+    fn account_body(email: &str, country: &str) -> serde_json::Value {
+        serde_json::json!({ "contact_email": email, "identity": { "country": country } })
+    }
+
+    /// A retry of the same request has to be the same key, or it stops being a retry
+    /// and opens a second account.
+    #[test]
+    fn the_same_account_request_is_the_same_key() {
+        let host = Uuid::from_u128(7);
+        assert_eq!(
+            account_idempotency_key(&host, &account_body("sam@example.com", "BE")),
+            account_idempotency_key(&host, &account_body("sam@example.com", "BE")),
+        );
+    }
+
+    /// The lockout: one host, a body that differs from their first attempt. Under a
+    /// key of the host alone Stripe refuses that for 30 days.
+    #[test]
+    fn a_changed_account_request_is_a_new_key() {
+        let host = Uuid::from_u128(7);
+        let first = account_idempotency_key(&host, &account_body("sam@example.com", "BE"));
+
+        assert_ne!(first, account_idempotency_key(&host, &account_body("sam@example.com", "NL")));
+        assert_ne!(first, account_idempotency_key(&host, &account_body("s@example.com", "BE")));
+        assert_ne!(
+            first,
+            account_idempotency_key(&Uuid::from_u128(8), &account_body("sam@example.com", "BE")),
+            "two hosts asking for the same thing are still two accounts"
+        );
+    }
+
+    #[test]
+    fn the_account_key_fits_stripes_limit_and_names_the_host() {
+        let host = Uuid::from_u128(7);
+        let key = account_idempotency_key(&host, &account_body("sam@example.com", "BE"));
+
+        assert!(key.len() <= 255);
+        assert!(key.starts_with(&format!("connect:{host}:")));
+    }
 
     /// A minimal `payment_intent.succeeded` body. Only the fields `verify` reads have
     /// to be right; the rest of a real Stripe payload is noise here.

@@ -1,7 +1,6 @@
 use bus::outbox;
 use chrono::Utc;
 use diesel_async::AsyncConnection;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::domain_models::spot::{Spot, SpotPatch};
 use shared::error::myerror::{ContextExt, MyError, MyResult};
@@ -96,28 +95,23 @@ impl SpotService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    let version =
-                        shared::next_version!(conn, shared::schema::spot::spot, &spot_id)?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                let version = shared::next_version!(conn, shared::schema::spot::spot, &spot_id)?;
 
-                    // No `set_version` after this: the row carries its own version and this is
-                    // a whole-row write. `update_spot` and `delete_spot` still need it — they
-                    // patch, and a patch does not touch the column.
-                    SpotRepository::upsert(conn, Spot::created(created.clone(), now, version))
-                        .await?;
+                // No `set_version` after this: the row carries its own version and this is
+                // a whole-row write. `update_spot` and `delete_spot` still need it — they
+                // patch, and a patch does not touch the column.
+                SpotRepository::upsert(conn, Spot::created(created.clone(), now, version)).await?;
 
-                    let envelope = Envelope::new(
-                        SpotEvent::Created(created),
-                        Some(*host_id),
-                        aggregate_id("spot", &spot_id),
-                        version,
-                    );
+                let envelope = Envelope::new(
+                    SpotEvent::Created(created),
+                    Some(*host_id),
+                    aggregate_id("spot", &spot_id),
+                    version,
+                );
 
-                    outbox::enqueue(conn, &spot_subject(&spot_id), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
-                }
-                .scope_boxed()
+                outbox::enqueue(conn, &spot_subject(&spot_id), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
@@ -151,36 +145,26 @@ impl SpotService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    // Locks the row, which is what serialises two concurrent edits of one spot
-                    // now that a contended write no longer conflicts on its own — see
-                    // `shared::db::next_version`. Without it both would read version 3, both
-                    // write 4, and the projector would silently drop one of the two events.
-                    let version =
-                        shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                // Locks the row, which is what serialises two concurrent edits of one spot
+                // now that a contended write no longer conflicts on its own — see
+                // `shared::db::next_version`. Without it both would read version 3, both
+                // write 4, and the projector would silently drop one of the two events.
+                let version = shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
 
-                    SpotRepository::patch(conn, spot.id, SpotPatch::updated(updated.clone(), now))
-                        .await?;
-                    shared::set_version!(
-                        conn,
-                        "spot",
-                        shared::schema::spot::spot,
-                        &spot.id,
-                        version
-                    )?;
+                SpotRepository::patch(conn, spot.id, SpotPatch::updated(updated.clone(), now))
+                    .await?;
+                shared::set_version!(conn, "spot", shared::schema::spot::spot, &spot.id, version)?;
 
-                    let envelope = Envelope::new(
-                        SpotEvent::Updated(updated),
-                        Some(*host_id),
-                        aggregate_id("spot", &spot.id),
-                        version,
-                    );
+                let envelope = Envelope::new(
+                    SpotEvent::Updated(updated),
+                    Some(*host_id),
+                    aggregate_id("spot", &spot.id),
+                    version,
+                );
 
-                    outbox::enqueue(conn, &spot_subject(&spot.id), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
-                }
-                .scope_boxed()
+                outbox::enqueue(conn, &spot_subject(&spot.id), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
@@ -196,33 +180,23 @@ impl SpotService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    let version =
-                        shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                let version = shared::next_version!(conn, shared::schema::spot::spot, &spot.id)?;
 
-                    // A soft delete: the row survives so a renter's past bookings still resolve
-                    // a title and an address. Every list filters `deleted`.
-                    SpotRepository::patch(conn, spot.id, SpotPatch::deleted(now)).await?;
-                    shared::set_version!(
-                        conn,
-                        "spot",
-                        shared::schema::spot::spot,
-                        &spot.id,
-                        version
-                    )?;
+                // A soft delete: the row survives so a renter's past bookings still resolve
+                // a title and an address. Every list filters `deleted`.
+                SpotRepository::patch(conn, spot.id, SpotPatch::deleted(now)).await?;
+                shared::set_version!(conn, "spot", shared::schema::spot::spot, &spot.id, version)?;
 
-                    let envelope = Envelope::new(
-                        SpotEvent::Deleted { spot_id: spot.id },
-                        Some(*host_id),
-                        aggregate_id("spot", &spot.id),
-                        version,
-                    );
+                let envelope = Envelope::new(
+                    SpotEvent::Deleted { spot_id: spot.id },
+                    Some(*host_id),
+                    aggregate_id("spot", &spot.id),
+                    version,
+                );
 
-                    outbox::enqueue(conn, &spot_subject(&spot.id), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
-                }
-                .scope_boxed()
+                outbox::enqueue(conn, &spot_subject(&spot.id), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
