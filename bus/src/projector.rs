@@ -5,7 +5,6 @@ use async_nats::jetstream::{
     consumer::{AckPolicy, DeliverPolicy, PullConsumer},
 };
 use chrono::{DateTime, Utc};
-use diesel_async::scoped_futures::ScopedFutureExt;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
 use futures::{StreamExt, TryStreamExt};
 use shared::db::Db;
@@ -282,40 +281,38 @@ impl<P: Projector> Tx<P> {
         // explicit begin/commit/rollback this used to spell out — the branches are
         // gone because there is no longer a path that can forget one.
         //
-        // `scope_boxed` is required by the signature, which cannot be generic over an
-        // arbitrary future without boxing it (rustc#100013, cited in diesel-async).
+        // An async closure, which is what diesel-async takes since 0.9. It used to be a
+        // plain closure returning a `scope_boxed()` future, boxed because a closure
+        // could not otherwise name a future that borrows its argument.
         let decision = conn
-            .transaction::<Decision, shared::error::myerror::MyError, _>(|conn| {
-                async move {
-                    let stored = match &aggregate {
-                        Some((table, id)) => (P::VERSION_AT)(conn, table, id).await?,
-                        None => Applied::Unavailable,
-                    };
+            .transaction::<Decision, shared::error::myerror::MyError, _>(async move |conn| {
+                let stored = match &aggregate {
+                    Some((table, id)) => (P::VERSION_AT)(conn, table, id).await?,
+                    None => Applied::Unavailable,
+                };
 
-                    let decision = decide(stored, version, delivered);
+                let decision = decide(stored, version, delivered);
 
-                    // The escape hatch fired: this is a gap that did not close in
-                    // `MAX_GAP_WAIT` redeliveries. Same error `set_version!` used to log
-                    // on its own, minus every case that was really just an event
-                    // arriving early — those are a `Park` now and never get here.
-                    if decision == Decision::Apply && delivered >= MAX_GAP_WAIT {
-                        tracing::error!(
-                            stream = P::STREAM,
-                            aggregate = %name,
-                            stored = ?stored,
-                            got = version,
-                            delivered,
-                            "version gap did not close: applying anyway, projection may be incomplete"
-                        );
-                    }
-
-                    if decision == Decision::Apply {
-                        projector.apply(conn, payload, at, version).await?;
-                    }
-
-                    Ok(decision)
+                // The escape hatch fired: this is a gap that did not close in
+                // `MAX_GAP_WAIT` redeliveries. Same error `set_version!` used to log
+                // on its own, minus every case that was really just an event
+                // arriving early — those are a `Park` now and never get here.
+                if decision == Decision::Apply && delivered >= MAX_GAP_WAIT {
+                    tracing::error!(
+                        stream = P::STREAM,
+                        aggregate = %name,
+                        stored = ?stored,
+                        got = version,
+                        delivered,
+                        "version gap did not close: applying anyway, projection may be incomplete"
+                    );
                 }
-                .scope_boxed()
+
+                if decision == Decision::Apply {
+                    projector.apply(conn, payload, at, version).await?;
+                }
+
+                Ok(decision)
             })
             .await?;
 
@@ -678,11 +675,7 @@ fn bus_err(msg: String) -> MyError {
 /// an assertion.
 #[cfg(test)]
 mod live_tests {
-    use std::{
-        collections::HashSet,
-        sync::Mutex,
-        time::Instant,
-    };
+    use std::{collections::HashSet, sync::Mutex, time::Instant};
 
     use async_nats::jetstream::message::PublishMessage;
     use diesel_async::RunQueryDsl;
@@ -880,12 +873,13 @@ mod live_tests {
                 version: i64,
             }
 
-            let row: Option<Row> =
-                diesel::sql_query(format!("SELECT version FROM {TABLE} WHERE id = $1 FOR UPDATE"))
-                    .bind::<diesel::sql_types::Uuid, _>(*id)
-                    .get_result(conn)
-                    .await
-                    .optional()?;
+            let row: Option<Row> = diesel::sql_query(format!(
+                "SELECT version FROM {TABLE} WHERE id = $1 FOR UPDATE"
+            ))
+            .bind::<diesel::sql_types::Uuid, _>(*id)
+            .get_result(conn)
+            .await
+            .optional()?;
 
             Ok(match row {
                 Some(row) => Stored::At(row.version),
@@ -933,12 +927,9 @@ mod live_tests {
                     conn: &'a mut AsyncPgConnection,
                     aggregate: &'a str,
                     id: &'a Uuid,
-                ) -> futures::future::BoxFuture<'a, MyResult<crate::await_version::Applied>>
-                {
+                ) -> futures::future::BoxFuture<'a, MyResult<crate::await_version::Applied>> {
                     if aggregate != $durable {
-                        return Box::pin(async {
-                            Ok(crate::await_version::Applied::Unavailable)
-                        });
+                        return Box::pin(async { Ok(crate::await_version::Applied::Unavailable) });
                     }
                     scratch_version_at(conn, aggregate, id)
                 }
@@ -1096,7 +1087,12 @@ mod live_tests {
             self.send(key, event_id, &envelope).await
         }
 
-        async fn send(&self, key: Uuid, event_id: Uuid, envelope: &Envelope<serde_json::Value>) -> u64 {
+        async fn send(
+            &self,
+            key: Uuid,
+            event_id: Uuid,
+            envelope: &Envelope<serde_json::Value>,
+        ) -> u64 {
             self.js
                 .send_publish(
                     session_subject(&key),

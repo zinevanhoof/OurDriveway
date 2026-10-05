@@ -13,13 +13,16 @@
     },
     {
       "identifier": "http:default",
-      "comment": "The public origin only. The dev machine's LAN address is added by dev-lan.json, which tauri.dev.conf.json enables for `npm run tauri:dev` and `npm run tauri:android:dev` — never for a release build.",
+      "comment": "The public origin, the map tiles, and the R2 endpoint that image uploads PUT to with a presigned URL (media-service signs path-style, so the bucket is the first path segment: `ourdriveway` in prod, `ourdriveway-dev` in dev). The dev machine's LAN address is added by dev-lan.json, which tauri.dev.conf.json enables for `npm run tauri:dev` and `npm run tauri:android:dev` — never for a release build.",
       "allow": [
         {
           "url": "https://ourdriveway.com"
         },
         {
           "url": "https://tiles.openfreemap.org"
+        },
+        {
+          "url": "https://41b38b255942623d7927f3916220b974.r2.cloudflarestorage.com/ourdriveway*"
         }
       ]
     },

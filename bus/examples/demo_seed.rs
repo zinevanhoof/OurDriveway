@@ -65,10 +65,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use argon2::{
-    Argon2, PasswordHasher,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Argon2, PasswordHasher};
 use chrono::{
     DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday,
 };
@@ -1424,9 +1421,8 @@ fn local(date: NaiveDate, hhmm: &str) -> DateTime<Utc> {
 }
 
 fn hash(password: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .expect("hash demo password")
         .to_string()
 }

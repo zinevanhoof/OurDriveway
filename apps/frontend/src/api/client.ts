@@ -121,7 +121,12 @@ export class ApiError extends Error {
       .catch(() => ({}) as ValidationBody & DetailBody);
 
     const title = body.title ?? res.statusText ?? "Request failed";
-    const detail = body.detail?.length ? body.detail : [title];
+    // A server fault arrives with no detail on purpose (`MyError::render` in `shared`):
+    // the cause stays in the server's log. "Internal Server Error" under a form is not
+    // a sentence anyone can act on, so say the one thing that is true and useful.
+    const detail = body.detail?.length
+      ? body.detail
+      : [res.status >= 500 ? "Something went wrong on our side. Please try again." : title];
 
     return new ApiError(res.status, title, detail, body.errors ?? {});
   }

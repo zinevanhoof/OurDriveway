@@ -25,6 +25,11 @@ async-stripe-types = { workspace = true }
 # The Accounts v2 API only. `async-stripe` is generated from the v1 OpenAPI spec and
 # has no `/v2/core/accounts` in it — see the note over `Stripe::create_account`.
 reqwest = { workspace = true }
+# For one thing: the idempotency key of that same call carries a digest of its body.
+# SHA-256 rather than std's hasher because the key has to come out the same on every
+# build and every replica, and `DefaultHasher` promises neither across Rust releases.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 async-nats = { workspace = true }
 chrono = { workspace = true }

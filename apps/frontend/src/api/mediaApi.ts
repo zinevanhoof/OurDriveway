@@ -22,10 +22,17 @@ export async function uploadImage(file: File, kind: MediaKind): Promise<string> 
     { kind, contentType: file.type, contentLength: file.size },
   );
 
+  // A `fetch` that never gets an answer rejects with a bare `TypeError` (or, on native,
+  // whatever plugin-http rejects with). The api client turns that into an `ApiError`
+  // for every other request; this one bypasses the client, so it does the same here.
+  // Without it the forms' `err.applyTo(...)` blew up on a non-`ApiError` and the real
+  // failure was never shown.
   const uploaded = await fetch(uploadUrl, {
     method: "PUT",
     headers: { "Content-Type": file.type },
     body: file,
+  }).catch((cause) => {
+    throw ApiError.offline(cause);
   });
 
   // R2's failures are not `MyError` bodies, so this is the one place that mints an

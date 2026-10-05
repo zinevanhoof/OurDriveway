@@ -20,7 +20,7 @@ use uuid::Uuid;
 ///
 /// Every method now takes `&mut AsyncPgConnection`, which covers both positions
 /// without a trait of ours: a pooled connection derefs to it, and
-/// `conn.transaction(|conn| …)` hands back the same type. That is narrower than sqlx's
+/// `conn.transaction(async |conn| …)` hands back the same type. That is narrower than sqlx's
 /// `impl PgExecutor<'_>`, which also accepted `&PgPool` — so a caller holding only a
 /// pool now checks a connection out first, and the fact that a method runs inside
 /// someone's transaction is visible in its signature rather than implied.

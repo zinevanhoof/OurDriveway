@@ -23,7 +23,8 @@ pub enum MyError {
         detail: Vec<String>,
     },
 
-    // Everything below is an unexpected failure -> 500.
+    // Everything below is an unexpected failure: 500, or 503 when the database could not
+    // be reached. The client is told the status and nothing about the cause.
     ///
     /// Carries the diesel error whole rather than a string, which is what lets
     /// `db::is_write_conflict` match on `DatabaseErrorKind` instead of on message text.
@@ -81,7 +82,37 @@ impl From<JsonRejection> for MyError {
 
 impl IntoResponse for MyError {
     fn into_response(self) -> Response {
-        let (status, body) = match self {
+        let (status, body) = self.render();
+        (status, Json(body)).into_response()
+    }
+}
+
+/// A server fault as the client sees it: the status, its standard name, and nothing else.
+///
+/// The body used to carry the error's `Display`, which for a database error is the
+/// database's own text — a login during a full disk answered with YugabyteDB's
+/// `Write to tablet … rejected. Node … has insufficient disk space`, tablet and node ids
+/// included. None of that is the caller's to read or theirs to act on. It goes to the log
+/// at the call site instead, which is the only place it was ever useful.
+///
+/// `detail` is still present, and empty, so the body keeps the one shape every client
+/// already parses.
+fn opaque(status: StatusCode) -> (StatusCode, serde_json::Value) {
+    (
+        status,
+        json!({
+            "status": status.as_u16(),
+            "title": status.canonical_reason().unwrap_or("Server Error"),
+            "detail": [],
+        }),
+    )
+}
+
+impl MyError {
+    /// The status and body this error answers with. Split from `into_response` so the
+    /// tests can read the body without an async runtime to collect it.
+    fn render(self) -> (StatusCode, serde_json::Value) {
+        match self {
             MyError::Validation(report) => {
                 // A field can fail several rules, so collect all messages per field.
                 let mut errors: HashMap<String, Vec<String>> = HashMap::new();
@@ -97,6 +128,22 @@ impl IntoResponse for MyError {
                     status,
                     json!({ "status": status.as_u16(), "title": "Validation failed", "errors": errors }),
                 )
+            }
+            // A 500 someone raised on purpose (`context_internal`, media-service's
+            // `internal`). Its words were written for whoever reads the code — "locationiq
+            // search parse failed" — and name what sits behind this service, so they are
+            // logged and the client gets the same blank 500 as any other fault.
+            //
+            // Only 500. A 502 or 503 raised by hand is a sentence written *for* the user
+            // ("Could not reach the payment provider. Please try again.") with the cause
+            // already kept back in the log by whoever raised it.
+            MyError::Api {
+                status,
+                title,
+                detail,
+            } if status == StatusCode::INTERNAL_SERVER_ERROR => {
+                tracing::error!(%title, ?detail, "internal error");
+                opaque(status)
             }
             MyError::Api {
                 status,
@@ -131,15 +178,18 @@ impl IntoResponse for MyError {
                 )
             }
 
+            // Everything unexpected. 503 when the database could not be reached or the pool
+            // had no connection to give: nothing is wrong with the request and it is worth
+            // sending again, which is what 503 says and 500 does not. 500 for the rest.
             other => {
-                let status = StatusCode::INTERNAL_SERVER_ERROR;
-                (
-                    status,
-                    json!({ "status": status.as_u16(), "title": "Internal Server Error", "detail": [other.to_string()] }),
-                )
+                let status = match &other {
+                    MyError::Connection(_) | MyError::Pool(_) => StatusCode::SERVICE_UNAVAILABLE,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                tracing::error!(error = %other, %status, "request failed");
+                opaque(status)
             }
-        };
-        (status, Json(body)).into_response()
+        }
     }
 }
 
@@ -229,6 +279,9 @@ pub trait ContextExt<T> {
         self.context_status(StatusCode::UNPROCESSABLE_ENTITY, ctx)
     }
     /// Single-message internal (500) error, replaces anyhow's `.context("...")`.
+    ///
+    /// `detail` is for the log, not the caller: a 500's body is blank whatever is passed
+    /// here (see `render`), so write it for whoever will be reading the log.
     fn context_internal(self, detail: &str) -> MyResult<T>
     where
         Self: Sized,
@@ -269,6 +322,105 @@ impl ContextExt<()> for bool {
 mod tests {
     use super::*;
     use garde::Validate;
+
+    /// Status, title and detail of what a client receives.
+    fn rendered(e: MyError) -> (StatusCode, String, Vec<String>) {
+        let (status, body) = e.render();
+        let detail = body["detail"]
+            .as_array()
+            .expect("every error body carries a detail array")
+            .iter()
+            .map(|d| d.as_str().unwrap().to_string())
+            .collect();
+        (status, body["title"].as_str().unwrap().to_string(), detail)
+    }
+
+    /// The one that started it: a database error's text reached the login screen.
+    #[test]
+    fn a_database_error_answers_500_and_says_nothing() {
+        let leaked = "Write to tablet 34d4511b rejected. Node 5e390399 has insufficient disk space";
+        let e = MyError::Database(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::Unknown,
+            Box::new(leaked.to_string()),
+        ));
+
+        let (status, title, detail) = rendered(e);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(title, "Internal Server Error");
+        assert!(detail.is_empty(), "a server fault must not describe itself: {detail:?}");
+    }
+
+    #[test]
+    fn every_unexpected_error_answers_without_a_message() {
+        let errors = [
+            MyError::Database(diesel::result::Error::NotFound),
+            MyError::Bus("nats: no responders on BOOKINGS".into()),
+            MyError::Io(std::io::Error::other("/var/lib/secret: permission denied")),
+        ];
+        for e in errors {
+            let (status, _, detail) = rendered(e);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(detail.is_empty(), "leaked: {detail:?}");
+        }
+    }
+
+    /// Nothing is wrong with the request, and it is worth sending again.
+    #[test]
+    fn an_unreachable_database_answers_503_without_a_message() {
+        let errors = [
+            MyError::Pool("timed out waiting for connection".into()),
+            MyError::Connection(diesel::ConnectionError::BadConnection(
+                "connection to server at \"db\" (10.42.0.7), port 5433 failed".into(),
+            )),
+        ];
+        for e in errors {
+            let (status, title, detail) = rendered(e);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(title, "Service Unavailable");
+            assert!(detail.is_empty(), "leaked: {detail:?}");
+        }
+    }
+
+    /// `context_internal` words are for the log: they name what is behind the service.
+    #[test]
+    fn a_deliberate_500_keeps_its_words_out_of_the_body() {
+        let e = Err::<(), ()>(())
+            .context_internal("locationiq search parse failed")
+            .unwrap_err();
+
+        let (status, title, detail) = rendered(e);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(title, "Internal Server Error");
+        assert!(detail.is_empty(), "leaked: {detail:?}");
+    }
+
+    /// A 4xx, and a 502 written for the user, are the caller's to read.
+    #[test]
+    fn errors_meant_for_the_caller_keep_their_message() {
+        let (_, _, detail) = rendered(MyError::api(StatusCode::CONFLICT, "Taken", "Slot is taken."));
+        assert_eq!(detail, ["Slot is taken."]);
+
+        let (status, _, detail) = rendered(MyError::api(
+            StatusCode::BAD_GATEWAY,
+            "Payment Provider Unavailable",
+            "Could not reach the payment provider. Please try again.",
+        ));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(detail.len(), 1);
+    }
+
+    /// Still a 409, and still without the index name the database reported.
+    #[test]
+    fn a_unique_violation_stays_a_conflict() {
+        let e = MyError::Database(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            Box::new("duplicate key value violates unique constraint \"app_user_email_idx\"".to_string()),
+        ));
+
+        let (status, _, detail) = rendered(e);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(detail, ["That value is already taken."]);
+    }
 
     #[test]
     fn context_maps_to_api_error() {

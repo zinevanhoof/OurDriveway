@@ -1,7 +1,6 @@
 use bus::outbox;
 use chrono::Utc;
 use diesel_async::AsyncConnection;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::domain_models::user::{User, UserPatch};
 use shared::domain_models::view::notification::kinds;
@@ -108,31 +107,28 @@ impl UserService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    let version =
-                        shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                let version =
+                    shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
 
-                    // No `set_version` after this: the row carries its own version and this is
-                    // a whole-row write. The separate statement is still needed wherever a
-                    // *patch* moves a row, since a patch does not touch the column.
-                    UserRepository::upsert(
-                        conn,
-                        User::registered(registered.clone(), version, password_hash),
-                    )
-                    .await?;
+                // No `set_version` after this: the row carries its own version and this is
+                // a whole-row write. The separate statement is still needed wherever a
+                // *patch* moves a row, since a patch does not touch the column.
+                UserRepository::upsert(
+                    conn,
+                    User::registered(registered.clone(), version, password_hash),
+                )
+                .await?;
 
-                    let envelope = Envelope::new(
-                        UserEvent::Registered(registered),
-                        Some(user_id),
-                        aggregate_id("user", &user_id),
-                        version,
-                    );
+                let envelope = Envelope::new(
+                    UserEvent::Registered(registered),
+                    Some(user_id),
+                    aggregate_id("user", &user_id),
+                    version,
+                );
 
-                    outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
-                }
-                .scope_boxed()
+                outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
@@ -218,51 +214,48 @@ impl UserService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    // Read inside the transaction: the token proves which account, but this
-                    // must refuse one naming a user who no longer exists rather than writing
-                    // for them.
-                    UserRepository::find_by_id(conn, user_id)
-                        .await?
-                        .context_not_found(("Not Found", "Could not find user"))?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                // Read inside the transaction: the token proves which account, but this
+                // must refuse one naming a user who no longer exists rather than writing
+                // for them.
+                UserRepository::find_by_id(conn, user_id)
+                    .await?
+                    .context_not_found(("Not Found", "Could not find user"))?;
 
-                    // Takes `FOR UPDATE` on the row, which is what serialises two of these
-                    // against each other now that a contended write no longer conflicts on its
-                    // own. See `shared::db::next_version`.
-                    let version =
-                        shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
-                    // Idempotent by construction — setting `true` twice is setting `true`.
-                    // That matters because mail scanners prefetch links, so this endpoint is
-                    // deliberately re-runnable.
-                    UserRepository::patch(
-                        conn,
-                        user_id,
-                        UserPatch {
-                            email_verified: Some(true),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-                    shared::set_version!(
-                        conn,
-                        "user",
-                        shared::schema::user::app_user,
-                        &user_id,
-                        version
-                    )?;
+                // Takes `FOR UPDATE` on the row, which is what serialises two of these
+                // against each other now that a contended write no longer conflicts on its
+                // own. See `shared::db::next_version`.
+                let version =
+                    shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
+                // Idempotent by construction — setting `true` twice is setting `true`.
+                // That matters because mail scanners prefetch links, so this endpoint is
+                // deliberately re-runnable.
+                UserRepository::patch(
+                    conn,
+                    user_id,
+                    UserPatch {
+                        email_verified: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                shared::set_version!(
+                    conn,
+                    "user",
+                    shared::schema::user::app_user,
+                    &user_id,
+                    version
+                )?;
 
-                    let envelope = Envelope::new(
-                        UserEvent::EmailVerified { user_id },
-                        Some(user_id),
-                        aggregate_id("user", &user_id),
-                        version,
-                    );
+                let envelope = Envelope::new(
+                    UserEvent::EmailVerified { user_id },
+                    Some(user_id),
+                    aggregate_id("user", &user_id),
+                    version,
+                );
 
-                    outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
-                }
-                .scope_boxed()
+                outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
@@ -297,47 +290,43 @@ impl UserService {
         // still has to be atomic with the version it claims.
         let mut conn = db::conn(&self.db).await?;
 
-        conn.transaction::<_, MyError, _>(|conn| {
-            async move {
-                let version =
-                    shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
+        conn.transaction::<_, MyError, _>(async move |conn| {
+            let version = shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
 
-                // Under the row lock `next_version!` just took, so two requests racing for
-                // the same account cannot both see an old send. Suppressed is `Ok(())` —
-                // the same answer as a send, see `policy::mail`.
-                let now = Utc::now();
-                let last = UserRepository::mail_requested_at(conn, user.id).await?;
-                if !policy::mail::may_send(last, now) {
-                    return Ok(());
-                }
-                UserRepository::set_mail_requested_at(conn, user.id, now).await?;
-
-                shared::set_version!(
-                    conn,
-                    "user",
-                    shared::schema::user::app_user,
-                    &user.id,
-                    version
-                )?;
-
-                let envelope = Envelope::new(
-                    UserEvent::VerificationRequested(VerificationRequested {
-                        user_id: user.id,
-                        email: user.email,
-                        // Off the projection rather than the token: the template greets the
-                        // reader by name and the token carries only an id. No second query
-                        // for it — the row above is the whole user.
-                        first_name: user.first_name,
-                    }),
-                    Some(user.id),
-                    aggregate_id("user", &user.id),
-                    version,
-                );
-
-                outbox::enqueue(conn, &user_subject(&user.id), &envelope).await?;
-                Ok(())
+            // Under the row lock `next_version!` just took, so two requests racing for
+            // the same account cannot both see an old send. Suppressed is `Ok(())` —
+            // the same answer as a send, see `policy::mail`.
+            let now = Utc::now();
+            let last = UserRepository::mail_requested_at(conn, user.id).await?;
+            if !policy::mail::may_send(last, now) {
+                return Ok(());
             }
-            .scope_boxed()
+            UserRepository::set_mail_requested_at(conn, user.id, now).await?;
+
+            shared::set_version!(
+                conn,
+                "user",
+                shared::schema::user::app_user,
+                &user.id,
+                version
+            )?;
+
+            let envelope = Envelope::new(
+                UserEvent::VerificationRequested(VerificationRequested {
+                    user_id: user.id,
+                    email: user.email,
+                    // Off the projection rather than the token: the template greets the
+                    // reader by name and the token carries only an id. No second query
+                    // for it — the row above is the whole user.
+                    first_name: user.first_name,
+                }),
+                Some(user.id),
+                aggregate_id("user", &user.id),
+                version,
+            );
+
+            outbox::enqueue(conn, &user_subject(&user.id), &envelope).await?;
+            Ok(())
         })
         .await?;
 
@@ -385,17 +374,13 @@ impl UserService {
     async fn notification_event(&self, uid: Uuid, event: UserEvent) -> MyResult<String> {
         let mut conn = db::conn(&self.db).await?;
 
-        conn.transaction::<_, MyError, _>(|conn| {
-            async move {
-                let version = shared::next_version!(conn, shared::schema::user::app_user, &uid)?;
-                shared::set_version!(conn, "user", shared::schema::user::app_user, &uid, version)?;
+        conn.transaction::<_, MyError, _>(async move |conn| {
+            let version = shared::next_version!(conn, shared::schema::user::app_user, &uid)?;
+            shared::set_version!(conn, "user", shared::schema::user::app_user, &uid, version)?;
 
-                let envelope =
-                    Envelope::new(event, Some(uid), aggregate_id("user", &uid), version);
-                outbox::enqueue(conn, &user_subject(&uid), &envelope).await?;
-                Ok(format_version(&envelope.aggregate, envelope.version))
-            }
-            .scope_boxed()
+            let envelope = Envelope::new(event, Some(uid), aggregate_id("user", &uid), version);
+            outbox::enqueue(conn, &user_subject(&uid), &envelope).await?;
+            Ok(format_version(&envelope.aggregate, envelope.version))
         })
         .await
     }
@@ -437,43 +422,39 @@ impl UserService {
         // has to be atomic with the version it claims.
         let mut conn = db::conn(&self.db).await?;
 
-        conn.transaction::<_, MyError, _>(|conn| {
-            async move {
-                let version =
-                    shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
+        conn.transaction::<_, MyError, _>(async move |conn| {
+            let version = shared::next_version!(conn, shared::schema::user::app_user, &user.id)?;
 
-                // Same cooldown and the same column as `resend_verification`: the limit is
-                // on mail to this address, whichever form asked for it.
-                let now = Utc::now();
-                let last = UserRepository::mail_requested_at(conn, user.id).await?;
-                if !policy::mail::may_send(last, now) {
-                    return Ok(());
-                }
-                UserRepository::set_mail_requested_at(conn, user.id, now).await?;
-
-                shared::set_version!(
-                    conn,
-                    "user",
-                    shared::schema::user::app_user,
-                    &user.id,
-                    version
-                )?;
-
-                let envelope = Envelope::new(
-                    UserEvent::PasswordResetRequested(PasswordResetRequested {
-                        user_id: user.id,
-                        email: user.email,
-                        first_name: user.first_name,
-                    }),
-                    Some(user.id),
-                    aggregate_id("user", &user.id),
-                    version,
-                );
-
-                outbox::enqueue(conn, &user_subject(&user.id), &envelope).await?;
-                Ok(())
+            // Same cooldown and the same column as `resend_verification`: the limit is
+            // on mail to this address, whichever form asked for it.
+            let now = Utc::now();
+            let last = UserRepository::mail_requested_at(conn, user.id).await?;
+            if !policy::mail::may_send(last, now) {
+                return Ok(());
             }
-            .scope_boxed()
+            UserRepository::set_mail_requested_at(conn, user.id, now).await?;
+
+            shared::set_version!(
+                conn,
+                "user",
+                shared::schema::user::app_user,
+                &user.id,
+                version
+            )?;
+
+            let envelope = Envelope::new(
+                UserEvent::PasswordResetRequested(PasswordResetRequested {
+                    user_id: user.id,
+                    email: user.email,
+                    first_name: user.first_name,
+                }),
+                Some(user.id),
+                aggregate_id("user", &user.id),
+                version,
+            );
+
+            outbox::enqueue(conn, &user_subject(&user.id), &envelope).await?;
+            Ok(())
         })
         .await?;
 
@@ -523,71 +504,58 @@ impl UserService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    // Takes `FOR UPDATE`, which is what serialises two clicks of the same
-                    // link against each other: the second reads the version the first wrote.
-                    let next =
-                        shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                // Takes `FOR UPDATE`, which is what serialises two clicks of the same
+                // link against each other: the second reads the version the first wrote.
+                let next = shared::next_version!(conn, shared::schema::user::app_user, &user_id)?;
 
-                    // The single-use check. `next_version!` returns stored + 1, so this
-                    // reads "the row is still exactly where it was when the link was minted".
-                    //
-                    // No `find_by_id` above it, unlike `verify_email`: a row that is gone
-                    // makes `next` 1, which would need `minted_at == 0`, and versions start
-                    // at 1. A deleted user therefore falls out here as an invalid link —
-                    // which is the better answer anyway, since a 404 would confirm to an
-                    // anonymous caller that the id once existed.
-                    if next - 1 != minted_at {
-                        return Err(shared::email_token::invalid());
-                    }
-
-                    UserRepository::patch(
-                        conn,
-                        user_id,
-                        UserPatch {
-                            password: Some(password_hash),
-                            // The link proved the mailbox, which is the same claim
-                            // `EmailVerified` makes. Without this an account that never
-                            // verified resets successfully and still cannot log in.
-                            email_verified: Some(true),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-                    shared::set_version!(
-                        conn,
-                        "user",
-                        shared::schema::user::app_user,
-                        &user_id,
-                        next
-                    )?;
-
-                    // In this transaction rather than after it: the password and the
-                    // sessions it protected die together, or neither does.
-                    let ended = RefreshTokenRepository::revoke_all_for_user(
-                        conn,
-                        user_id,
-                        "password reset",
-                    )
-                    .await?;
-                    tracing::info!(%user_id, sessions_ended = ended, "password reset");
-
-                    // `PasswordChanged`, not a variant of its own: view-service and
-                    // payment-service already ignore it, and a consumer that reacts to a
-                    // password changing does not care why it changed — nor, now, what it
-                    // changed to.
-                    let envelope = Envelope::new(
-                        UserEvent::PasswordChanged(UserPasswordChanged { user_id }),
-                        Some(user_id),
-                        aggregate_id("user", &user_id),
-                        next,
-                    );
-
-                    outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
+                // The single-use check. `next_version!` returns stored + 1, so this
+                // reads "the row is still exactly where it was when the link was minted".
+                //
+                // No `find_by_id` above it, unlike `verify_email`: a row that is gone
+                // makes `next` 1, which would need `minted_at == 0`, and versions start
+                // at 1. A deleted user therefore falls out here as an invalid link —
+                // which is the better answer anyway, since a 404 would confirm to an
+                // anonymous caller that the id once existed.
+                if next - 1 != minted_at {
+                    return Err(shared::email_token::invalid());
                 }
-                .scope_boxed()
+
+                UserRepository::patch(
+                    conn,
+                    user_id,
+                    UserPatch {
+                        password: Some(password_hash),
+                        // The link proved the mailbox, which is the same claim
+                        // `EmailVerified` makes. Without this an account that never
+                        // verified resets successfully and still cannot log in.
+                        email_verified: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                shared::set_version!(conn, "user", shared::schema::user::app_user, &user_id, next)?;
+
+                // In this transaction rather than after it: the password and the
+                // sessions it protected die together, or neither does.
+                let ended =
+                    RefreshTokenRepository::revoke_all_for_user(conn, user_id, "password reset")
+                        .await?;
+                tracing::info!(%user_id, sessions_ended = ended, "password reset");
+
+                // `PasswordChanged`, not a variant of its own: view-service and
+                // payment-service already ignore it, and a consumer that reacts to a
+                // password changing does not care why it changed — nor, now, what it
+                // changed to.
+                let envelope = Envelope::new(
+                    UserEvent::PasswordChanged(UserPasswordChanged { user_id }),
+                    Some(user_id),
+                    aggregate_id("user", &user_id),
+                    next,
+                );
+
+                outbox::enqueue(conn, &user_subject(&user_id), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
@@ -731,72 +699,69 @@ impl UserService {
         let mut conn = db::conn(&self.db).await?;
 
         let version = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    let version =
-                        shared::next_version!(conn, shared::schema::user::app_user, &user_uuid)?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                let version =
+                    shared::next_version!(conn, shared::schema::user::app_user, &user_uuid)?;
 
-                    match &event {
-                        // The hash comes from the pair above, not from the event —
-                        // which no longer carries one. `PasswordChanged` implies
-                        // `Some`, so an unreachable `None` writes nothing rather than
-                        // panicking: this is inside a transaction, and the version
-                        // bump and the event below are still correct on their own.
-                        UserEvent::PasswordChanged(_) => {
+                match &event {
+                    // The hash comes from the pair above, not from the event —
+                    // which no longer carries one. `PasswordChanged` implies
+                    // `Some`, so an unreachable `None` writes nothing rather than
+                    // panicking: this is inside a transaction, and the version
+                    // bump and the event below are still correct on their own.
+                    UserEvent::PasswordChanged(_) => {
+                        UserRepository::patch(
+                            conn,
+                            user_uuid,
+                            UserPatch {
+                                password: new_password_hash.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    }
+
+                    // Order is the point, and it used to be the projector's: the submitted
+                    // address has to be compared against the stored one *before* it is
+                    // overwritten. Without this, changing to an unverified address keeps the
+                    // flag from the old one and login lets it straight through, which makes
+                    // the whole feature decorative.
+                    UserEvent::Updated(e) => {
+                        if e.email.as_ref().is_some_and(|new| *new != existing.email) {
                             UserRepository::patch(
                                 conn,
                                 user_uuid,
                                 UserPatch {
-                                    password: new_password_hash.clone(),
+                                    email_verified: Some(false),
                                     ..Default::default()
                                 },
                             )
                             .await?;
                         }
-
-                        // Order is the point, and it used to be the projector's: the submitted
-                        // address has to be compared against the stored one *before* it is
-                        // overwritten. Without this, changing to an unverified address keeps the
-                        // flag from the old one and login lets it straight through, which makes
-                        // the whole feature decorative.
-                        UserEvent::Updated(e) => {
-                            if e.email.as_ref().is_some_and(|new| *new != existing.email) {
-                                UserRepository::patch(
-                                    conn,
-                                    user_uuid,
-                                    UserPatch {
-                                        email_verified: Some(false),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await?;
-                            }
-                            UserRepository::patch(conn, user_uuid, e.clone().into()).await?;
-                        }
-
-                        // `update_user` builds only the two variants above.
-                        _ => {}
+                        UserRepository::patch(conn, user_uuid, e.clone().into()).await?;
                     }
 
-                    shared::set_version!(
-                        conn,
-                        "user",
-                        shared::schema::user::app_user,
-                        &user_uuid,
-                        version
-                    )?;
-
-                    let envelope = Envelope::new(
-                        event,
-                        Some(user_uuid),
-                        aggregate_id("user", &user_uuid),
-                        version,
-                    );
-
-                    outbox::enqueue(conn, &user_subject(&user_uuid), &envelope).await?;
-                    Ok(format_version(&envelope.aggregate, envelope.version))
+                    // `update_user` builds only the two variants above.
+                    _ => {}
                 }
-                .scope_boxed()
+
+                shared::set_version!(
+                    conn,
+                    "user",
+                    shared::schema::user::app_user,
+                    &user_uuid,
+                    version
+                )?;
+
+                let envelope = Envelope::new(
+                    event,
+                    Some(user_uuid),
+                    aggregate_id("user", &user_uuid),
+                    version,
+                );
+
+                outbox::enqueue(conn, &user_subject(&user_uuid), &envelope).await?;
+                Ok(format_version(&envelope.aggregate, envelope.version))
             })
             .await?;
 
@@ -905,7 +870,10 @@ mod live_tests {
             .get_result(&mut *c)
             .await
             .unwrap();
-        assert_eq!(events, 1, "the loser's outbox row must roll back with its row");
+        assert_eq!(
+            events, 1,
+            "the loser's outbox row must roll back with its row"
+        );
 
         // The outbox row as well. Nothing drains `_outbox` in a test run, so leaving it
         // grows a table this test then scans with `LIKE`.

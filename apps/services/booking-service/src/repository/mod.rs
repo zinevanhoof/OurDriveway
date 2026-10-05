@@ -44,7 +44,6 @@ mod live_tests {
 
     use chrono::{DateTime, TimeDelta, Utc};
     use diesel::prelude::*;
-    use diesel_async::scoped_futures::ScopedFutureExt;
     use diesel_async::{AsyncConnection, RunQueryDsl};
     use shared::db::Changed;
     use shared::domain_models::booking::{Booking, SpotMirrorPatch, status};
@@ -391,42 +390,39 @@ mod live_tests {
         // serialise on the connection rather than on the row lock under test.
         let mut conn = shared::db::conn(pool).await.unwrap();
 
-        conn.transaction::<bool, shared::error::myerror::MyError, _>(|conn| {
-            async move {
-                if lock {
-                    SpotMirrorRepository::find_for_update(conn, spot_id)
-                        .await
-                        .unwrap();
-                } else {
-                    SpotMirrorRepository::find_by_id(conn, spot_id)
-                        .await
-                        .unwrap();
-                }
-
-                // Both racers pause here, so each has definitely reached this point
-                // before either commits. Without the lock that means both read an empty
-                // set; with it, the second is still blocked above and has not read
-                // anything yet.
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-                let taken = BookingRepository::taken_for_spot(conn, &spot_id, Utc::now())
+        conn.transaction::<bool, shared::error::myerror::MyError, _>(async move |conn| {
+            if lock {
+                SpotMirrorRepository::find_for_update(conn, spot_id)
                     .await
                     .unwrap();
-                if !taken.is_empty() {
-                    // Returning rather than rolling back: nothing has been written, so
-                    // the two are the same except that this also releases the lock.
-                    return Ok(false);
-                }
+            } else {
+                SpotMirrorRepository::find_by_id(conn, spot_id)
+                    .await
+                    .unwrap();
+            }
 
-                BookingRepository::upsert(
-                    conn,
-                    a_booking(Uuid::now_v7(), spot_id, Utc::now() + TimeDelta::hours(2)),
-                )
+            // Both racers pause here, so each has definitely reached this point
+            // before either commits. Without the lock that means both read an empty
+            // set; with it, the second is still blocked above and has not read
+            // anything yet.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            let taken = BookingRepository::taken_for_spot(conn, &spot_id, Utc::now())
                 .await
                 .unwrap();
-                Ok(true)
+            if !taken.is_empty() {
+                // Returning rather than rolling back: nothing has been written, so
+                // the two are the same except that this also releases the lock.
+                return Ok(false);
             }
-            .scope_boxed()
+
+            BookingRepository::upsert(
+                conn,
+                a_booking(Uuid::now_v7(), spot_id, Utc::now() + TimeDelta::hours(2)),
+            )
+            .await
+            .unwrap();
+            Ok(true)
         })
         .await
         .unwrap()
@@ -517,24 +513,21 @@ mod live_tests {
             let pool = pool.clone();
             tokio::spawn(async move {
                 let mut conn = shared::db::conn(&pool).await.unwrap();
-                conn.transaction::<(), shared::error::myerror::MyError, _>(|conn| {
-                    async move {
-                        // The writer always locks — it is `create_booking`. What varies
-                        // is whether the *reader* does.
-                        SpotMirrorRepository::find_for_update(conn, spot_id)
-                            .await
-                            .unwrap();
-                        BookingRepository::upsert(
-                            conn,
-                            a_booking(Uuid::now_v7(), spot_id, Utc::now() + TimeDelta::hours(2)),
-                        )
+                conn.transaction::<(), shared::error::myerror::MyError, _>(async move |conn| {
+                    // The writer always locks — it is `create_booking`. What varies
+                    // is whether the *reader* does.
+                    SpotMirrorRepository::find_for_update(conn, spot_id)
                         .await
                         .unwrap();
-                        // Held open, so the reader below is guaranteed to start inside it.
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        Ok(())
-                    }
-                    .scope_boxed()
+                    BookingRepository::upsert(
+                        conn,
+                        a_booking(Uuid::now_v7(), spot_id, Utc::now() + TimeDelta::hours(2)),
+                    )
+                    .await
+                    .unwrap();
+                    // Held open, so the reader below is guaranteed to start inside it.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    Ok(())
                 })
                 .await
                 .unwrap();
@@ -547,23 +540,20 @@ mod live_tests {
 
         let mut conn = shared::db::conn(pool).await.unwrap();
         let taken = conn
-            .transaction::<_, shared::error::myerror::MyError, _>(|conn| {
-                async move {
-                    if lock {
-                        // Blocks here until the writer commits. Read Committed then
-                        // gives the NEXT statement a new snapshot — which is the entire
-                        // mechanism.
-                        SpotMirrorRepository::find_for_update(conn, spot_id)
-                            .await
-                            .unwrap();
-                    } else {
-                        SpotMirrorRepository::find_by_id(conn, spot_id)
-                            .await
-                            .unwrap();
-                    }
-                    BookingRepository::taken_for_spot(conn, &spot_id, Utc::now()).await
+            .transaction::<_, shared::error::myerror::MyError, _>(async move |conn| {
+                if lock {
+                    // Blocks here until the writer commits. Read Committed then
+                    // gives the NEXT statement a new snapshot — which is the entire
+                    // mechanism.
+                    SpotMirrorRepository::find_for_update(conn, spot_id)
+                        .await
+                        .unwrap();
+                } else {
+                    SpotMirrorRepository::find_by_id(conn, spot_id)
+                        .await
+                        .unwrap();
                 }
-                .scope_boxed()
+                BookingRepository::taken_for_spot(conn, &spot_id, Utc::now()).await
             })
             .await
             .unwrap();

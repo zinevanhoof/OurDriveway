@@ -52,7 +52,7 @@ diesel = { version = "2.3.13", default-features = false, features = [
 # `migrations` pulls diesel_migrations + async-connection-wrapper and, importantly, does
 # NOT enable `diesel/postgres` — which is what lets the migrator run migrations without
 # dragging libpq into the workspace per the note above.
-diesel-async = { version = "0.7", features = [
+diesel-async = { version = "0.9", features = [
     "postgres",
     "bb8",
     "async-connection-wrapper",
@@ -74,7 +74,7 @@ cookie = "0.18.1"
 # it to forward /api/view/graphql to SurrealDB with the client's own Authorization
 # header, so the browser got a RECORD identity and the schema's PERMISSIONS clauses did
 # the authorizing. Those reads are ordinary handlers now.
-jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 # `serde` is explicit now and must stay so. It used to arrive for free through
 # surrealdb, which depends on chrono-with-serde — so every `#[derive(Serialize)]` on a
 # struct holding a DateTime compiled only because of a dependency that never mentioned
@@ -91,20 +91,31 @@ chrono-tz = "0.10"
 uuid = { version = "1.23.4", features = ["v4", "v5", "v7", "serde"] }
 dotenvy = "0.15.7"
 reqwest = { version = "0.13.4", features = ["json", "query"] }
-geo = "=0.32.0"
-tzf-rs = "1.3.6"
+geo = "=0.33.1"
+tzf-rs = "2.1.2"
 garde = { version = "0.23.0", features = ["derive", "email"] }
 async-nats = "0.50.0"
 futures = "0.3.33"
-argon2 = "0.5.3"
-sha2 = "0.10.9"
+argon2 = "0.6.0"
+sha2 = "0.11.0"
 hex = "0.4.3"
 bytes = "1.12.0"
 tokio-util = { version = "0.7.18", features = ["io"] }
 # media-service only. Presigning is a local computation, but the SDK still wants a
 # client to hang it off, so the default HTTP stack comes along — it shares the
 # aws-lc-rs rustls provider the rest of the workspace already installs.
-aws-sdk-s3 = "1.141.0"
+#
+# The SDK's defaults minus `rustls`. That feature is its *legacy* client: hyper 0.14,
+# h2 0.3, rustls 0.21 and rustls-webpki 0.101, a whole second HTTP and TLS stack compiled
+# beside the current one (`default-https-client`) and never used, since
+# `BehaviorVersion::latest()` picks the current one. Its only contribution was four
+# RUSTSEC advisories with no fix on those old lines.
+aws-sdk-s3 = { version = "1.152.0", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 # notification-service only. Thin wrapper over one POST, but it carries the
 # idempotency-key and template plumbing that would otherwise be hand-rolled
 # against a JSON shape with no compiler checking it.
@@ -114,7 +125,7 @@ aws-sdk-s3 = "1.141.0"
 # distroless and splits the workspace across two TLS stacks — everything else
 # here runs on rustls with the aws-lc-rs provider that
 # `shared::install_default_crypto_provider` installs.
-resend-rs = { version = "0.29.0", default-features = false, features = ["rustls-tls"] }
+resend-rs = { version = "0.34.0", default-features = false, features = ["rustls-tls"] }
 
 # payment-service only. Chosen over hand-rolling reqwest for one reason: the webhook
 # signature verifier in async-stripe-webhook. That is a trust boundary — it is what

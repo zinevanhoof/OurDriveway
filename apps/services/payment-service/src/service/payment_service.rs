@@ -10,7 +10,6 @@ use async_nats::jetstream::Context;
 use bus::outbox;
 use chrono::Utc;
 use diesel_async::AsyncConnection;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::{
     domain_models::{
@@ -177,38 +176,35 @@ impl PaymentService {
 
         let mut conn = db::conn(&self.db).await?;
 
-        conn.transaction::<_, MyError, _>(|conn| {
-            async move {
-                let version =
-                    shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
+        conn.transaction::<_, MyError, _>(async move |conn| {
+            let version =
+                shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
 
-                PaymentRepository::upsert(conn, Payment::created(created.clone(), version)).await?;
+            PaymentRepository::upsert(conn, Payment::created(created.clone(), version)).await?;
 
-                // A plain v7 event id, and this is the one whose deterministic version was
-                // actively harmful rather than merely redundant.
-                //
-                // It was `v5("payment-created:{payment_id}")`, meant to collapse a
-                // resubmitted checkout. But the resume guard above only returns early
-                // while Stripe still hands back a `client_secret` — an expired session
-                // falls through, mints a genuinely new `session_id`, upserts, and bumps
-                // the version. That is a real change and its event must publish; under
-                // the old id the duplicate window swallowed it, leaving the payment row a
-                // version ahead of the stream for good.
-                //
-                // `payment_id` stays derived from the booking: that is an *entity* id, and
-                // it is what makes a resubmit upsert one row instead of tripping
-                // `payment_booking UNIQUE`. Naming a thing, not deduplicating an event.
-                let envelope = Envelope::new(
-                    PaymentEvent::Created(created),
-                    None,
-                    aggregate_id("payment", &payment_id),
-                    version,
-                );
+            // A plain v7 event id, and this is the one whose deterministic version was
+            // actively harmful rather than merely redundant.
+            //
+            // It was `v5("payment-created:{payment_id}")`, meant to collapse a
+            // resubmitted checkout. But the resume guard above only returns early
+            // while Stripe still hands back a `client_secret` — an expired session
+            // falls through, mints a genuinely new `session_id`, upserts, and bumps
+            // the version. That is a real change and its event must publish; under
+            // the old id the duplicate window swallowed it, leaving the payment row a
+            // version ahead of the stream for good.
+            //
+            // `payment_id` stays derived from the booking: that is an *entity* id, and
+            // it is what makes a resubmit upsert one row instead of tripping
+            // `payment_booking UNIQUE`. Naming a thing, not deduplicating an event.
+            let envelope = Envelope::new(
+                PaymentEvent::Created(created),
+                None,
+                aggregate_id("payment", &payment_id),
+                version,
+            );
 
-                outbox::enqueue(conn, &payment_subject(booking_id), &envelope).await?;
-                Ok(())
-            }
-            .scope_boxed()
+            outbox::enqueue(conn, &payment_subject(booking_id), &envelope).await?;
+            Ok(())
         })
         .await?;
 
@@ -301,64 +297,61 @@ impl PaymentService {
 
         let mut conn = db::conn(&self.db).await?;
 
-        conn.transaction::<_, MyError, _>(|conn| {
-            async move {
-                let version =
-                    shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
+        conn.transaction::<_, MyError, _>(async move |conn| {
+            let version =
+                shared::next_version!(conn, shared::schema::payment::payment, &payment_id)?;
 
-                // `status = ANY(UNPAID)` is the guard that makes a redelivered webhook a
-                // no-op, and it runs in the same transaction as the event rather than a
-                // projector's moment later.
-                let settled = match &event {
-                    PaymentEvent::Succeeded { intent_id, .. } => {
-                        PaymentRepository::transition(
-                            conn,
-                            payment_id,
-                            &status::UNPAID,
-                            PaymentPatch::succeeded(intent_id.clone()),
-                        )
-                        .await?
-                    }
-                    PaymentEvent::Failed { reason, .. } => {
-                        PaymentRepository::transition(
-                            conn,
-                            payment_id,
-                            &status::UNPAID,
-                            PaymentPatch::failed(reason.clone()),
-                        )
-                        .await?
-                    }
-                    // `handle_webhook` builds only the two above.
-                    _ => db::Changed::No,
-                };
-
-                // The payment already left `unpaid` — Stripe redelivering a webhook it
-                // has already had a 2xx for, which it does routinely. The money did not
-                // move a second time and neither should the version: committing one here
-                // with no event behind it is what left this aggregate permanently gapped.
-                if !settled.applied() {
-                    return Ok(());
+            // `status = ANY(UNPAID)` is the guard that makes a redelivered webhook a
+            // no-op, and it runs in the same transaction as the event rather than a
+            // projector's moment later.
+            let settled = match &event {
+                PaymentEvent::Succeeded { intent_id, .. } => {
+                    PaymentRepository::transition(
+                        conn,
+                        payment_id,
+                        &status::UNPAID,
+                        PaymentPatch::succeeded(intent_id.clone()),
+                    )
+                    .await?
                 }
+                PaymentEvent::Failed { reason, .. } => {
+                    PaymentRepository::transition(
+                        conn,
+                        payment_id,
+                        &status::UNPAID,
+                        PaymentPatch::failed(reason.clone()),
+                    )
+                    .await?
+                }
+                // `handle_webhook` builds only the two above.
+                _ => db::Changed::No,
+            };
 
-                shared::set_version!(
-                    conn,
-                    "payment",
-                    shared::schema::payment::payment,
-                    &payment_id,
-                    version
-                )?;
-
-                // A plain v7 event id. The `dedupe` key built by the caller used to become
-                // this event's id; the `[unpaid]` guard above is what makes a redelivered
-                // webhook a no-op now, and it does it before a version is committed rather
-                // than after.
-                let envelope =
-                    Envelope::new(event, None, aggregate_id("payment", &payment_id), version);
-
-                outbox::enqueue(conn, &payment_subject(&booking_id), &envelope).await?;
-                Ok(())
+            // The payment already left `unpaid` — Stripe redelivering a webhook it
+            // has already had a 2xx for, which it does routinely. The money did not
+            // move a second time and neither should the version: committing one here
+            // with no event behind it is what left this aggregate permanently gapped.
+            if !settled.applied() {
+                return Ok(());
             }
-            .scope_boxed()
+
+            shared::set_version!(
+                conn,
+                "payment",
+                shared::schema::payment::payment,
+                &payment_id,
+                version
+            )?;
+
+            // A plain v7 event id. The `dedupe` key built by the caller used to become
+            // this event's id; the `[unpaid]` guard above is what makes a redelivered
+            // webhook a no-op now, and it does it before a version is committed rather
+            // than after.
+            let envelope =
+                Envelope::new(event, None, aggregate_id("payment", &payment_id), version);
+
+            outbox::enqueue(conn, &payment_subject(&booking_id), &envelope).await?;
+            Ok(())
         })
         .await?;
 
@@ -432,60 +425,55 @@ impl PaymentService {
         let mut conn = db::conn(&self.db).await?;
 
         let (version, amount_cents) = conn
-            .transaction::<_, MyError, _>(|conn| {
-                async move {
-                    // First statement in the transaction. Everything below depends on it.
-                    PayoutRepository::lock_host(conn, host_id).await?;
+            .transaction::<_, MyError, _>(async move |conn| {
+                // First statement in the transaction. Everything below depends on it.
+                PayoutRepository::lock_host(conn, host_id).await?;
 
-                    // AFTER the lock, never before.
-                    let available_cents =
-                        self.earnings_with(conn, host_id).await?.available_cents();
+                // AFTER the lock, never before.
+                let available_cents = self.earnings_with(conn, host_id).await?.available_cents();
 
-                    // The client's figure meets the server's here, and only here. `check` never
-                    // clamps — a request for more than there is fails and names what there is,
-                    // rather than quietly paying out a different number than the screen showed.
-                    let amount_cents = match policy::payout::check(requested_cents, available_cents)
-                    {
-                        Ok(amount) => amount,
-                        Err(rejection) => return Err(refused(rejection)),
-                    };
+                // The client's figure meets the server's here, and only here. `check` never
+                // clamps — a request for more than there is fails and names what there is,
+                // rather than quietly paying out a different number than the screen showed.
+                let amount_cents = match policy::payout::check(requested_cents, available_cents) {
+                    Ok(amount) => amount,
+                    Err(rejection) => return Err(refused(rejection)),
+                };
 
-                    let payout_id = Uuid::now_v7();
-                    let requested = PaymentEvent::PayoutRequested {
-                        payout_id,
-                        host_id: *host_id,
-                        amount_cents,
-                        requested_at: Utc::now(),
-                    };
+                let payout_id = Uuid::now_v7();
+                let requested = PaymentEvent::PayoutRequested {
+                    payout_id,
+                    host_id: *host_id,
+                    amount_cents,
+                    requested_at: Utc::now(),
+                };
 
-                    let payout_version =
-                        shared::next_version!(conn, shared::schema::payment::payout, &payout_id)?;
-                    PayoutRepository::upsert(
-                        conn,
-                        Payout::requested(&requested, payout_version).ok_or_else(|| {
-                            MyError::Bus("payout event is not a PayoutRequested".into())
-                        })?,
-                    )
-                    .await?;
+                let payout_version =
+                    shared::next_version!(conn, shared::schema::payment::payout, &payout_id)?;
+                PayoutRepository::upsert(
+                    conn,
+                    Payout::requested(&requested, payout_version).ok_or_else(|| {
+                        MyError::Bus("payout event is not a PayoutRequested".into())
+                    })?,
+                )
+                .await?;
 
-                    let envelope = Envelope::new(
-                        requested,
-                        Some(*host_id),
-                        aggregate_id("payout", &payout_id),
-                        payout_version,
-                    );
-                    // The payout's own version is what the client waits on — view-service
-                    // records that, not the host counter this transaction contended over.
-                    let version = format_version(&envelope.aggregate, envelope.version);
+                let envelope = Envelope::new(
+                    requested,
+                    Some(*host_id),
+                    aggregate_id("payout", &payout_id),
+                    payout_version,
+                );
+                // The payout's own version is what the client waits on — view-service
+                // records that, not the host counter this transaction contended over.
+                let version = format_version(&envelope.aggregate, envelope.version);
 
-                    outbox::enqueue(conn, &payout_subject(host_id), &envelope).await?;
-                    // Both values are computed INSIDE the lock, so both leave the
-                    // transaction together — `amount_cents` is what the balance said at
-                    // the moment it was held, and reporting a figure read outside it
-                    // would be the very race the lock exists to close.
-                    Ok((version, amount_cents))
-                }
-                .scope_boxed()
+                outbox::enqueue(conn, &payout_subject(host_id), &envelope).await?;
+                // Both values are computed INSIDE the lock, so both leave the
+                // transaction together — `amount_cents` is what the balance said at
+                // the moment it was held, and reporting a figure read outside it
+                // would be the very race the lock exists to close.
+                Ok((version, amount_cents))
             })
             .await?;
 

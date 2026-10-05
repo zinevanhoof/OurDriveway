@@ -19,7 +19,6 @@ use std::sync::Arc;
 use bus::outbox;
 use chrono::Utc;
 use diesel_async::AsyncConnection;
-use diesel_async::scoped_futures::ScopedFutureExt;
 use shared::db;
 use shared::{
     domain_models::payment::{PayoutPatch, payout::status},
@@ -134,61 +133,56 @@ impl PayoutWorkerService {
 
         let mut conn = db::conn(&self.db).await?;
 
-        conn.transaction::<_, MyError, _>(|conn| {
-            async move {
-                let version =
-                    shared::next_version!(conn, shared::schema::payment::payout, payout_id)?;
+        conn.transaction::<_, MyError, _>(async move |conn| {
+            let version = shared::next_version!(conn, shared::schema::payment::payout, payout_id)?;
 
-                // The row moves in the same transaction as the event, guarded on the status the
-                // decision was made from.
-                let moved =
-                    PayoutRepository::transition(conn, *payout_id, &[status::REQUESTED], patch)
-                        .await?;
+            // The row moves in the same transaction as the event, guarded on the status the
+            // decision was made from.
+            let moved =
+                PayoutRepository::transition(conn, *payout_id, &[status::REQUESTED], patch).await?;
 
-                // The payout already left `requested`, so this outcome lost the race and
-                // must publish nothing. **This is the case the cheap status pre-check at
-                // the top of `settle` does not catch** — that one runs outside the
-                // transaction, so it only filters a *sequential* redelivery. Two
-                // concurrent deliveries both read `requested` there, both call Stripe
-                // (the idempotency key makes that safe), and both arrive here; the
-                // `FOR UPDATE` in `next_version!` serialises them and this is how the
-                // loser finds out.
-                //
-                // Without this the loser committed a version whose event was then
-                // collapsed by the deterministic id below — and worse, that id does not
-                // carry the outcome, so `ON CONFLICT DO UPDATE` could replace a pending
-                // `PayoutPaid` with a `PayoutFailed`.
-                if !moved.applied() {
-                    return Ok(());
-                }
-
-                shared::set_version!(
-                    conn,
-                    "payout",
-                    shared::schema::payment::payout,
-                    payout_id,
-                    version
-                )?;
-
-                // A plain v7 event id. This used to be `v5("payout:{payout_id}")`, so that
-                // a redelivery reaching this far — Stripe answered but the commit did not
-                // — was discarded by the stream's duplicate window. The guard above ends
-                // that path first, and removing the id closes something worse: it did not
-                // carry the *outcome*, so `PayoutPaid` and `PayoutFailed` for one payout
-                // hashed identically and `ON CONFLICT DO UPDATE` could replace a pending
-                // paid event with a failed one.
-                let envelope = Envelope::new(
-                    event,
-                    Some(host_id),
-                    aggregate_id("payout", payout_id),
-                    version,
-                );
-
-                // The same subject as the request, so one payout's events stay in order.
-                outbox::enqueue(conn, &payout_subject(&host_id), &envelope).await?;
-                Ok(())
+            // The payout already left `requested`, so this outcome lost the race and
+            // must publish nothing. **This is the case the cheap status pre-check at
+            // the top of `settle` does not catch** — that one runs outside the
+            // transaction, so it only filters a *sequential* redelivery. Two
+            // concurrent deliveries both read `requested` there, both call Stripe
+            // (the idempotency key makes that safe), and both arrive here; the
+            // `FOR UPDATE` in `next_version!` serialises them and this is how the
+            // loser finds out.
+            //
+            // Without this the loser committed a version whose event was then
+            // collapsed by the deterministic id below — and worse, that id does not
+            // carry the outcome, so `ON CONFLICT DO UPDATE` could replace a pending
+            // `PayoutPaid` with a `PayoutFailed`.
+            if !moved.applied() {
+                return Ok(());
             }
-            .scope_boxed()
+
+            shared::set_version!(
+                conn,
+                "payout",
+                shared::schema::payment::payout,
+                payout_id,
+                version
+            )?;
+
+            // A plain v7 event id. This used to be `v5("payout:{payout_id}")`, so that
+            // a redelivery reaching this far — Stripe answered but the commit did not
+            // — was discarded by the stream's duplicate window. The guard above ends
+            // that path first, and removing the id closes something worse: it did not
+            // carry the *outcome*, so `PayoutPaid` and `PayoutFailed` for one payout
+            // hashed identically and `ON CONFLICT DO UPDATE` could replace a pending
+            // paid event with a failed one.
+            let envelope = Envelope::new(
+                event,
+                Some(host_id),
+                aggregate_id("payout", payout_id),
+                version,
+            );
+
+            // The same subject as the request, so one payout's events stay in order.
+            outbox::enqueue(conn, &payout_subject(&host_id), &envelope).await?;
+            Ok(())
         })
         .await?;
 

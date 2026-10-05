@@ -1,9 +1,6 @@
 use std::sync::LazyLock;
 
-use argon2::{
-    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use shared::error::myerror::{ContextExt, MyResult};
 use tokio::sync::Semaphore;
 
@@ -46,9 +43,9 @@ pub async fn hash(password: &str) -> MyResult<String> {
         .acquire()
         .await
         .context_internal("Could not hash password")?;
-    let salt = SaltString::generate(&mut OsRng);
+    // A fresh random salt per call, drawn from the OS inside `hash_password`.
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         // Was `MyError::Bus`, which is for the event log and rendered the argon2
         // error straight into the response body. This is a 500 either way, and the
