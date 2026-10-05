@@ -1,9 +1,9 @@
 {{/*
-The public demo: wipe everything and seed it again, every hour and once after install, so
-whatever a visitor breaks is gone by the next hour. `demo.enabled` in the values.
+The public demo: wipe everything and seed it again, every night and once after install, so
+whatever a visitor breaks is gone by the next morning. `demo.enabled` in the values.
 
 **It deletes every account**, not just the demo ones: visitors who signed up with their
-own email lose theirs on the hour too. Keeping only theirs is not an option, because the
+own email lose theirs that night too. Keeping only theirs is not an option, because the
 read models are built from the event history and rows deleted under them would disagree
 with it. The landing page's tutorial says so.
 
@@ -18,7 +18,7 @@ The sequence, all in one script so the services always come back:
 The services must be down for 2 to 4: the seed's history has to be in the streams before
 any worker consumer exists (bus/examples/demo_seed.rs explains why), and a running
 service would recreate its consumers the moment the streams went. So the API is down for
-a minute or two each hour; the frontend stays up.
+a minute or two each night; the frontend stays up.
 
 The image is docker/demo-reset.Dockerfile: the migrator, the seed and kubectl.
 */}}
@@ -149,22 +149,24 @@ metadata:
   name: demo-reset
 spec:
   schedule: {{ .Values.demo.schedule | quote }}
-  # Never two at once, and a missed hour is skipped rather than run late.
+  timeZone: {{ .Values.demo.timeZone | quote }}
+  # Never two at once, and a missed night is skipped rather than run late.
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 600
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      # No retry: a half-run reset is put right by the next hour, not by running the
-      # scale-down again straight away.
+      # No retry: a half-run reset is put right by the next night, not by running the
+      # scale-down again straight away. That is a day now, not an hour, so a failed one
+      # is worth a manual run (k8s/README.md, "The public demo").
       backoffLimit: 0
       activeDeadlineSeconds: 900
       template:
         {{- include "ourdriveway.demoResetPod" . | nindent 8 }}
 ---
 # The first seed, right after the migrator's install hook (weight -5), so a new cluster
-# does not wait for the top of the hour. Upgrades leave the data alone; the schedule
+# does not wait for the night. Upgrades leave the data alone; the schedule
 # resets it anyway.
 apiVersion: batch/v1
 kind: Job

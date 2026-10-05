@@ -15,7 +15,7 @@ ingress:
     enabled: true
     originPull: true
 
-# A public demo: reseeded every hour, everyone's data wiped with it.
+# A public demo: reseeded every night, everyone's data wiped with it.
 demo:
   enabled: true
 

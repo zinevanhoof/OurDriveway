@@ -85,7 +85,7 @@ target "frontend" {
   tags       = ["${REGISTRY}/ourdriveway-frontend:${TAG}"]
 }
 
-// The public demo's hourly reset (k8s/chart/templates/demo-reset.yaml): the migrator, the
+// The public demo's nightly reset (k8s/chart/templates/demo-reset.yaml): the migrator, the
 // demo seed and kubectl. Not a service either; it runs to completion.
 target "demo-reset" {
   dockerfile = "docker/demo-reset.Dockerfile"
