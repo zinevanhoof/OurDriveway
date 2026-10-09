@@ -16,13 +16,7 @@ pays for it. Once the booking is over and has settled, the host can withdraw the
 
 ## Showcase
 
-A walkthrough of the running app, recorded on the Android build. It is the same Vue
-frontend the web app uses, wrapped in the Tauri shell and talking to the real services.
-
-The frontend in the video is a **development build** on both sides
-(`npm run tauri android dev`): the web layer comes from the Vite dev server and the native
-Tauri shell is a debug `cargo` build. That makes it slower in the video than a release
-build would be.
+URL: ourdriveway.com
 
 <!-- To replace the video: drag the .mp4 into a comment box on a GitHub issue, wait for
      the upload, and paste the https://github.com/user-attachments/assets/… URL it gives
