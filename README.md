@@ -30,7 +30,7 @@ build would be.
      URL, and it has to be its own paragraph. Keep the file under 10 MB, which is the
      attachment ceiling for video; the one below is 540×1200, CRF 27, ~7.4 MB. -->
 
-https://github.com/user-attachments/assets/8c8c9894-14c5-4362-84c5-5c076cd748a3
+<!-- https://github.com/user-attachments/assets/8c8c9894-14c5-4362-84c5-5c076cd748a3 -->
 
 ---
 
